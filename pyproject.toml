@@ -4,5 +4,6 @@ requires = [
     "torch",
     "numpy",
     "scipy",
+    "safetensors",
 ]
 build-backend = "setuptools.build_meta"
