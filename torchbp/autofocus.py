@@ -167,14 +167,16 @@ def _get_kwargs():
             kwargs[key] = values[key]
     return kwargs
 
-def minimum_entropy_autofocus(f, data: Tensor, data_time: Tensor, pos: Tensor, vel:
+def minimum_entropy_grad_autofocus(f, data: Tensor, data_time: Tensor, pos: Tensor, vel:
         Tensor, att: Tensor, fc: float, r_res: float, grid: dict, wa:
         Tensor, tx_norm: Tensor=None, max_steps: float=100, lr_max: float=10000,
         d0: float=0, ant_tx_dy: float=0, pos_reg: float=1,
         lr_reduce: float=0.8, verbose: bool=True, convergence_limit: float=0.01,
-        max_step_limit: float=0.25, grad_limit_quantile: float=0.9, fixed_pos: int=0):
+        max_step_limit: float=0.25, grad_limit_quantile: float=0.9, fixed_pos: int=0,
+        minimize_only: bool=False):
     """
-    Minimum entropy autofocus optimization autofocus.
+    Minimum entropy autofocus using backpropagation optimization through image
+    formation.
 
     Parameters
     ----------
@@ -229,6 +231,8 @@ def minimum_entropy_autofocus(f, data: Tensor, data_time: Tensor, pos: Tensor, v
         0 to 1 range.
     fixed_pos : int
         First `fixed_pos` positions are kept fixed and are not optimized.
+    minimize_only : bool
+        Reject steps that would increase image entropy.
 
     Returns
     ----------
@@ -269,6 +273,7 @@ def minimum_entropy_autofocus(f, data: Tensor, data_time: Tensor, pos: Tensor, v
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_sch)
 
     last_entr = None
+    v_prev = vopt.detach().clone()
 
     try:
         for step in range(max_steps):
@@ -294,7 +299,11 @@ def minimum_entropy_autofocus(f, data: Tensor, data_time: Tensor, pos: Tensor, v
             loss = entr + pos_loss# + acc_loss
             if last_entr is not None and entr > last_entr:
                 lr *= lr_reduce
+                if minimize_only:
+                    vopt.data = v_prev.data
+                    continue
             last_entr = entr
+            v_prev = vopt.detach().clone()
             if step < max_steps-1:
                 loss.backward()
                 l = scheduler.get_last_lr()[0]
@@ -325,7 +334,7 @@ def minimum_entropy_autofocus(f, data: Tensor, data_time: Tensor, pos: Tensor, v
 
     return sar_img.detach(), origin, pos.detach(), step
 
-def bp_polar_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
+def bp_polar_grad_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
         Tensor, att: Tensor, fc: float, r_res: float, grid: dict, wa:
         Tensor, tx_norm: Tensor=None, max_steps: float=100, lr_max: float=10000,
         d0: float=0, ant_tx_dy: float=0, pos_reg: float=1,
@@ -400,9 +409,9 @@ def bp_polar_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
         Number of steps.
     """
     kw = _get_kwargs()
-    return minimum_entropy_autofocus(backprojection_polar_2d, **kw)
+    return minimum_entropy_grad_autofocus(backprojection_polar_2d, **kw)
 
-def bp_cart_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
+def bp_cart_grad_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
         Tensor, att: Tensor, fc: float, r_res: float, grid: dict, wa:
         Tensor, tx_norm: Tensor=None, max_steps: float=100, lr_max: float=10000,
         d0: float=0, ant_tx_dy: float=0, pos_reg: float=1,
@@ -477,4 +486,4 @@ def bp_cart_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
         Number of steps.
     """
     kw = _get_kwargs()
-    return minimum_entropy_autofocus(backprojection_cart_2d, **kw)
+    return minimum_entropy_grad_autofocus(backprojection_cart_2d, **kw)
