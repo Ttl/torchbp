@@ -341,3 +341,17 @@ def make_polar_grid(r0: float, r1: float, nr: int, ntheta: int, theta_limit: int
     t1 = np.clip(np.sin(squint) + theta_limit, -1, 1)
     grid_polar = {"r": (r0, r1), "theta": (t0, t1), "nr": nr, "ntheta": ntheta}
     return grid_polar
+
+def phase_to_distance(p: Tensor, fc: float):
+    """
+    Convert radar reflection phase shift to distance.
+
+    Parameters
+    ----------
+    p : Tensor
+        Phase shift tensor.
+    fc : float
+        RF center frequency.
+    """
+    c0 = 299792458
+    return c0 * p / (4*torch.pi*fc)
