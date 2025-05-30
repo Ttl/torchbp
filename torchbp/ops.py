@@ -450,9 +450,116 @@ def backprojection_cart_2d(data: Tensor, grid: dict,
             x0, dx, y0, dy, nx, ny,
             beamwidth, d0, ant_tx_dy)
 
+def gpga_backprojection_2d_core(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor, att: Tensor, fc: float, r_res: float, d0: float=0.0, ant_tx_dy: float=0.0) -> Tensor:
+    """
+    Generalized phase gradient autofocus.
+
+    Parameters
+    ----------
+    target_pos : Tensor
+        Positions of point-like targets to use to focus the image.
+        3D Cartesian coordinates (x, y, z). Dimensions: [ntargets, 3].
+    data : Tensor
+        Range compressed input data. Shape should be [nsweeps, samples].
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3].
+    vel : Tensor
+        Velocity of the platform at each data point. Shape should be [nsweeps, 3].
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
+        [Roll, pitch, yaw]. Only the yaw is used at the moment.
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
+        and oversample is FFT oversampling factor.
+    d0 : float
+        Zero range correction.
+    ant_tx_dy : float
+        RX antenna Y-position (along the track) distance from TX antenna.
+
+    Returns
+    ----------
+    data_out : Tensor
+        Values from input data used in backprojection of each target in
+        target_pos tensor. Shape is [ntargets, nsweeps].
+    """
+    nsweeps = data.shape[0]
+    ntargets = target_pos.shape[0]
+    sweep_samples = data.shape[1]
+    assert target_pos.shape == (ntargets, 3)
+    assert pos.shape == (nsweeps, 3)
+    assert vel.shape == (nsweeps, 3)
+    assert att.shape == (nsweeps, 3)
+
+    return torch.ops.torchbp.gpga_backprojection_2d.default(
+            target_pos, data, pos, vel, att,
+            sweep_samples, nsweeps, fc, r_res,
+            ntargets,
+            d0, ant_tx_dy)
+
+def cfar_2d(img: Tensor, Navg: tuple, Nguard: tuple, threshold: float, peaks_only: bool=False) -> Tensor:
+    """
+    Constant False Alaram Rate detection for 2D image.
+
+    Parameters
+    ----------
+    img : Tensor
+        Absolute valued 2D image. If 3D then the first dimension is batch dimension.
+    Navg : tuple
+        Number of averaged cells in 2D (N1, N0).
+    Nguard : tuple
+        Number of guard cells in 2D (N1, N0).
+        Both dimensions need to be less or same than the same entry in Navg.
+    threshold : float
+        Threshold for detection.
+    peaks_only : bool
+        Reject pixels that are not higher than their immediate neighbors.
+        Defaults is False.
+
+    Returns
+    ----------
+    detection : Tensor
+        Detections tensor same shape as the input image. For each pixel 0 for no
+        detection, positive value is the SNR of detection at that position.
+    """
+    if img.dim() == 3:
+        nbatch = img.shape[0]
+        N0 = img.shape[1]
+        N1 = img.shape[2]
+    elif img.dim() == 2:
+        nbatch = 1
+        N0 = img.shape[0]
+        N1 = img.shape[1]
+    else:
+        raise ValueError(f"Invalid image shape: {img.shape}")
+
+    if threshold <= 0:
+        raise ValueError("Threshold should be positive")
+    if len(Navg) != 2:
+        raise ValueError("Navg dimension should be 2")
+    if len(Nguard) != 2:
+        raise ValueError("Nguard dimension should be 2")
+    if Nguard[0] > Navg[0]:
+        raise ValueError("Nguard[0] > Navg[0]")
+    if Nguard[1] > Navg[1]:
+        raise ValueError("Nguard[1] > Navg[1]")
+    if Navg[0] < 0:
+        raise ValueError("Navg[0] < 0")
+    if Navg[1] < 0:
+        raise ValueError("Navg[1] < 0")
+    if Nguard[0] < 0:
+        raise ValueError("Nguard[0] < 0")
+    if Nguard[1] < 0:
+        raise ValueError("Nguard[1] < 0")
+
+    return torch.ops.torchbp.cfar_2d.default(img, nbatch, N0, N1, Navg[0], Navg[1],
+            Nguard[0], Nguard[1], threshold, peaks_only)
+
 def backprojection_polar_2d_tx_power(wa: Tensor, gtx: Tensor, grx: Tensor,
         g_az0: float, g_el0: float, g_az1: float, g_el1: float, grid: dict,
-        r_res: float, pos: Tensor, att: Tensor) -> Tensor:
+        r_res: float, pos: Tensor, att: Tensor, sin_look_angle: bool=False) -> Tensor:
     """
     Calculate transmitted power to image plane. Can be used to correct for
     antenna pattern and distance effect on the radar image.
@@ -497,6 +604,8 @@ def backprojection_polar_2d_tx_power(wa: Tensor, gtx: Tensor, grx: Tensor,
     att : Tensor
         Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
         [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
+    sin_look_angle : bool
+        Multiply pixel value by sin of look angle.
 
     Returns
     ----------
@@ -532,7 +641,7 @@ def backprojection_polar_2d_tx_power(wa: Tensor, gtx: Tensor, grx: Tensor,
             wa, pos, att, gtx, grx, nbatch,
             g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
             nsweeps, r_res,
-            r0, dr, theta0, dtheta, nr, ntheta)
+            r0, dr, theta0, dtheta, nr, ntheta, sin_look_angle)
 
 # Registers a FakeTensor kernel (aka "meta kernel", "abstract impl")
 # that describes what the properties of the output Tensor are given

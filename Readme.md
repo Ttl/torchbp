@@ -8,6 +8,8 @@ On RTX 3090 Ti backprojection on polar grid achieves 225 billion backprojections
 
 ## Installation
 
+Tested with CUDA version 12.1, some newer versions might cause build issues.
+
 ### From source
 
 ```bash

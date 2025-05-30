@@ -1,12 +1,14 @@
 import torch
 import numpy as np
 from torch import Tensor
-from .ops import backprojection_polar_2d, backprojection_cart_2d
+from .ops import backprojection_polar_2d, backprojection_cart_2d, gpga_backprojection_2d_core
 from .ops import entropy
 from .util import quad_interp, fft_peak_1d, unwrap, detrend
 import inspect
 
-def pga_pd(img, window_width=None, max_iters=10, window_exp=0.5, min_window=5, remove_trend=True, offload=False):
+def pga_pd(img: Tensor, window_width: int | None=None, max_iters: int=10,
+        window_exp: float=0.5, min_window: int=5, remove_trend: bool=True,
+        offload: bool=False)-> (Tensor, Tensor):
     """
     Phase gradient autofocus
 
@@ -29,6 +31,13 @@ def pga_pd(img, window_width=None, max_iters=10, window_exp=0.5, min_window=5, r
     offload : bool
         Offload some variable to CPU to save VRAM on GPU at
         the expense of longer running time.
+
+    References
+    ----------
+    .. [#] D. E. Wahl, P. H. Eichel, D. C. Ghiglia and C. V. Jakowatz, "Phase
+    gradient autofocus - A robust tool for high resolution SAR phase
+    correction," in IEEE Transactions on Aerospace and Electronic Systems, vol.
+    30, no. 3, pp. 827-835, July 1994.
 
     Returns
     ----------
@@ -84,7 +93,9 @@ def pga_pd(img, window_width=None, max_iters=10, window_exp=0.5, min_window=5, r
 
     return img, phi_sum
 
-def pga_ml(img, window_width=None, max_iters=10, window_exp=0.5, min_window=5, remove_trend=True, offload=False):
+def pga_ml(img: Tensor, window_width: int | None=None, max_iters: int=10,
+        window_exp: float=0.5, min_window: int=5, remove_trend: bool=True,
+        offload: bool=False) -> (Tensor, Tensor):
     """
     Phase gradient autofocus
 
@@ -107,6 +118,12 @@ def pga_ml(img, window_width=None, max_iters=10, window_exp=0.5, min_window=5, r
     offload : bool
         Offload some variable to CPU to save VRAM on GPU at
         the expense of longer running time.
+
+    References
+    ----------
+    .. [#] Charles V. Jakowatz and Daniel E. Wahl, "Eigenvector method for
+    maximum-likelihood estimation of phase errors in synthetic-aperture-radar
+    imagery," J. Opt. Soc. Am. A 10, 2539-2546 (1993).
 
     Returns
     ----------
@@ -158,7 +175,192 @@ def pga_ml(img, window_width=None, max_iters=10, window_exp=0.5, min_window=5, r
 
     return img, phi_sum
 
-def _get_kwargs():
+def gpga_2d_iter(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor,
+        att: Tensor, fc: float, r_res: float, window_width: int | None=None,
+        d0: float=0.0, ant_tx_dy: float=0.0, estimator: str="ml") -> Tensor:
+    """
+    Single generalized phase gradient iteration.
+
+    Parameters
+    ----------
+    target_pos : Tensor
+        Positions of point-like targets to use to focus the image.
+        3D Cartesian coordinates (x, y, z). Dimensions: [ntargets, 3].
+    data : Tensor
+        Range compressed input data. Shape should be [nsweeps, samples].
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3].
+    vel : Tensor
+        Velocity of the platform at each data point. Shape should be [nsweeps, 3].
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
+        [Roll, pitch, yaw]. Only the yaw is used at the moment.
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
+        and oversample is FFT oversampling factor.
+    window_width : int or None
+        Low-pass filter window width in samples. None or more than nsweeps for
+        no low-pass filtering.
+    d0 : float
+        Zero range correction.
+    ant_tx_dy : float
+        RX antenna Y-position (along the track) distance from TX antenna.
+    estimator : str
+        Estimator to use.
+        "ml": Maximum likelihood.
+        "pd": Phase difference.
+
+    Returns
+    ----------
+    phi : Tensor
+        Solved phase error.
+    """
+    # Get range profile samples for each target
+    target_data = gpga_backprojection_2d_core(target_pos, data, pos, vel, att, fc,
+            r_res, d0, ant_tx_dy)
+    # Filter samples
+    if window_width is not None and window_width < target_data.shape[1]:
+        fdata = torch.fft.fft(target_data, dim=-1)
+        fdata[:,window_width//2:-window_width//2] = 0
+        target_data = torch.fft.ifft(fdata, dim=-1)
+        del fdata
+    if estimator == "ml":
+        u,s,v = torch.linalg.svd(target_data)
+        phi = torch.angle(v[0,:])
+    else:
+        g = target_data
+        gdot = torch.diff(g, prepend=g[:,0][:,None], axis=-1)
+        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(torch.abs(g)**2, axis=0)
+        phi = torch.cumsum(phidot, dim=0)
+    return phi
+
+def gpga_ml_bp_polar(img: Tensor | None, data: Tensor, pos: Tensor, vel: Tensor,
+        att: Tensor, fc: float, r_res: float, grid_polar: dict,
+        window_width: int | None=None, max_iters: int=10, window_exp: float=0.8,
+        min_window: int=5, d0: float=0.0, ant_tx_dy: float=0.0,
+        target_threshold_db: float=40, remove_trend: bool=True,
+        estimator: str="pd") -> (Tensor, Tensor):
+    """
+    Generalized phase gradient autofocus using 2D polar coordinate
+    backprojection image formation.
+
+    Parameters
+    ----------
+    img : Tensor or None
+        Complex input image. Shape should be: [Range, azimuth].
+        If None image is generated from the data.
+    data : Tensor
+        Range compressed input data. Shape should be [nsweeps, samples].
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3].
+    vel : Tensor
+        Velocity of the platform at each data point. Shape should be [nsweeps, 3].
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
+        [Roll, pitch, yaw]. Only the yaw is used at the moment.
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
+        and oversample is FFT oversampling factor.
+    grid_polar : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    window_width : int or None
+        Initial low-pass filter window width in samples. None for initial
+        maximum size.
+    max_iters : int
+        Maximum number of iterations.
+    window_exp : float
+        Exponent on window_width decrease for each iteration.
+    min_window : int
+        Minimum window size.
+    d0 : float
+        Zero range correction.
+    ant_tx_dy : float
+        RX antenna Y-position (along the track) distance from TX antenna.
+    target_threshold_db : float
+        Filter out targets that are this many dB below the maximum amplitude
+        target.
+    remove_trend : bool
+        Remove linear trend in phase correction.
+    estimator : str
+        Estimator to use.
+        "ml": Maximum likelihood.
+        "pd": Phase difference.
+
+    References
+    ----------
+    .. [#] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
+    Algorithm," in IEEE Transactions on Computational Imaging, vol. 5, no. 4,
+    pp. 606-619, Dec. 2019.
+
+    Returns
+    ----------
+    img : Tensor
+        Focused SAR image.
+    phi : Tensor
+        Solved phase error.
+    """
+    r0, r1 = grid_polar["r"]
+    theta0, theta1 = grid_polar["theta"]
+    ntheta = grid_polar["ntheta"]
+    nr = grid_polar["nr"]
+    dtheta = (theta1 - theta0) / ntheta
+    dr = (r1 - r0) / nr
+
+    phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
+
+    r = r0 + dr * torch.arange(nr, device=data.device)
+    theta = theta0 + dtheta * torch.arange(ntheta, device=data.device)
+    pos_new = pos.clone()
+
+    if window_width is None:
+        window_width = data.shape[0]
+
+    if img is None:
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, vel, att)
+        img = img.squeeze()
+
+    for i in range(max_iters):
+        rpeaks = torch.argmax(torch.abs(img), axis=1)
+        a = torch.abs(img[torch.arange(img.size(0)), rpeaks])
+        max_a = torch.max(a)
+
+        target_idx = a > max_a * 10**(-target_threshold_db/20)
+        target_theta = theta0 + dtheta * rpeaks[target_idx]
+        target_r = r[target_idx]
+
+        x = target_r * torch.sqrt(1 - target_theta**2)
+        y = target_r * target_theta
+        z = torch.zeros_like(target_r)
+        target_pos = torch.stack([x, y, z], dim=1)
+
+        phi = gpga_2d_iter(target_pos, data, pos_new, vel, att, fc, r_res,
+                window_width, d0, ant_tx_dy, estimator=estimator)
+        phi_sum = unwrap((phi_sum + phi) % (2 * torch.pi))
+        if remove_trend:
+            phi_sum = detrend(phi_sum)
+        # Phase to distance
+        d = phi_sum*3e8/(4*torch.pi*fc)
+        d = d - torch.mean(d)
+
+        pos_new[:,0] = pos[:,0] + d
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, vel, att)
+        img = img.squeeze()
+        window_width = int(window_width ** window_exp)
+        if window_width < min_window:
+            break
+    return img, phi_sum
+
+def _get_kwargs() -> dict:
     frame = inspect.currentframe().f_back
     keys, _, _, values = inspect.getargvalues(frame)
     kwargs = {}
@@ -173,7 +375,7 @@ def minimum_entropy_grad_autofocus(f, data: Tensor, data_time: Tensor, pos: Tens
         d0: float=0, ant_tx_dy: float=0, pos_reg: float=1,
         lr_reduce: float=0.8, verbose: bool=True, convergence_limit: float=0.01,
         max_step_limit: float=0.25, grad_limit_quantile: float=0.9, fixed_pos: int=0,
-        minimize_only: bool=False):
+        minimize_only: bool=False) -> (Tensor, Tensor, Tensor, int):
     """
     Minimum entropy autofocus using backpropagation optimization through image
     formation.

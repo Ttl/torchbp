@@ -489,6 +489,137 @@ __global__ void backprojection_polar_2d_grad_kernel(
     }
 }
 
+template<typename T, bool bistatic>
+__global__ void gpga_backprojection_2d_kernel(
+          const float* target_pos,
+          const T* data,
+          const float* pos,
+          const float* vel,
+          const float* att,
+          complex64_t* data_out,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          int Ntarget,
+          float d0,
+          float ant_tx_dy) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idsweep = idx % nsweeps;
+    const int idtarget = idx / nsweeps;
+
+    if (idtarget >= Ntarget || idsweep >= nsweeps) {
+        return;
+    }
+
+    const float x = target_pos[idtarget * 3 + 0];
+    const float y = target_pos[idtarget * 3 + 1];
+    const float z = target_pos[idtarget * 3 + 2];
+
+    // Sweep reference position.
+    float pos_x = pos[idsweep * 3 + 0];
+    float pos_y = pos[idsweep * 3 + 1];
+    float pos_z = pos[idsweep * 3 + 2];
+    float px = (x - pos_x);
+    float py = (y - pos_y);
+    float pz = (z - pos_z);
+
+    // Calculate distance to the pixel.
+    float d;
+    if constexpr (bistatic) {
+        float tx_dx = sinf(att[idsweep * 3 + 2]) * ant_tx_dy;
+        float tx_dy = cosf(att[idsweep * 3 + 2]) * ant_tx_dy;
+
+        float drx = sqrtf(px * px + py * py + pz*pz);
+        float dtx = sqrt((px - tx_dx) * (px - tx_dx) + (py - tx_dy) * (py - tx_dy) + pz * pz);
+        d = drx + dtx - d0;
+    } else {
+        float drx = sqrtf(px * px + py * py + pz * pz);
+        d = 2.0f * drx - d0;
+    }
+
+    float sx = delta_r * d;
+
+    // Linear interpolation.
+    int id0 = sx;
+    int id1 = id0 + 1;
+    if (id0 < 0 || id1 >= sweep_samples) {
+        data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
+    } else {
+        complex64_t s0, s1;
+        if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+            s0 = ((complex64_t*)data)[idsweep * sweep_samples + id0];
+            s1 = ((complex64_t*)data)[idsweep * sweep_samples + id1];
+        } else {
+            half2 s0h = ((half2*)data)[idsweep * sweep_samples + id0];
+            half2 s1h = ((half2*)data)[idsweep * sweep_samples + id1];
+            s0 = {__half2float(s0h.x), __half2float(s0h.y)};
+            s1 = {__half2float(s1h.x), __half2float(s1h.y)};
+        }
+        float interp_idx = sx - id0;
+        complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+        float ref_sin, ref_cos;
+        sincospif(ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        data_out[idtarget * nsweeps + idsweep] = s * ref;
+    }
+}
+
+__global__ void cfar_2d_kernel(
+          const float* img,
+          float* detections,
+          int N0,
+          int N1,
+          int Navg0,
+          int Navg1,
+          int Nguard0,
+          int Nguard1,
+          float threshold,
+          int peaks_only) {
+    const int id0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx = id0 % N1;
+    const int idy = id0 / N1;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (id0 >= N0 * N1) {
+        return;
+    }
+
+    if (peaks_only) {
+        float v = img[idbatch * N0 * N1 + idy * N1 + idx];
+        float v00 = img[idbatch * N0 * N1 + idy * N1 + max(0, idx - 1)];
+        float v01 = img[idbatch * N0 * N1 + idy * N1 + min(N1, idx + 1)];
+        float v10 = img[idbatch * N0 * N1 + max(0, idy - 1) * N1 + idx];
+        float v11 = img[idbatch * N0 * N1 + min(N0, idy + 1) * N1 + idx];
+        if (v < v00 || v < v01 || v < v10 || v < v11) {
+            detections[idbatch * N0 * N1 + idy * N1 + idx] = 0.0f;
+            return;
+        }
+    }
+
+    float avg = 0.0f;
+    int Navg = 0;
+    for (int i=-Navg0; i <= Navg0; i++) {
+        int x = idx + i;
+        if (x < 0 || x >= N1) continue;
+        for (int j=-Navg1; j <= Navg1; j++) {
+            if (i >= -Nguard0 && i <= Nguard0 && j >= -Nguard1 && j <= Nguard1) continue;
+            int y = idy + j;
+            if (y < 0 || y >= N0) continue;
+            avg += img[idbatch * N0 * N1 + y * N1 + x];
+            Navg += 1;
+        }
+    }
+    avg /= Navg;
+    float v = img[idbatch * N0 * N1 + idy * N1 + idx];
+    if (v > avg * threshold) {
+        detections[idbatch * N0 * N1 + idy * N1 + idx] = v / avg;
+    } else {
+        detections[idbatch * N0 * N1 + idy * N1 + idx] = 0.0f;
+    }
+}
+
 __global__ void backprojection_polar_2d_tx_power_kernel(
           const float* wa,
           const float* pos,
@@ -509,7 +640,8 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
           float theta0,
           float dtheta,
           int Nr,
-          int Ntheta) {
+          int Ntheta,
+          bool sin_look_angle) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
     const int idr = idx / Ntheta;
@@ -543,7 +675,8 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
 
         // Elevation angle.
         // Add roll to elevation.
-        const float el_deg = -atan2f(pos_z, d) - att[idbatch * nsweeps * 3 + 3 * i + 0];
+        const float look_angle = atan2f(pos_z, d);
+        const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
         const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
         // TODO: consider platform pitch
 
@@ -564,8 +697,15 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         float gtx_i = interp2d<float>(gtx, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
         float grx_i = interp2d<float>(grx, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
         const float g2 = gtx_i * grx_i;
+        float sinl = 1.0f;
 
-        pixel += g2 * wa[idbatch * nsweeps + i] / (d*d*d*d);
+        if (sin_look_angle) {
+            sinl = pos_z / d;
+            if (sinl < 0.0f) sinl = 0.0f;
+            if (sinl > 1.0f) sinl = 1.0f;
+        }
+
+        pixel += sinl * g2 * wa[idbatch * nsweeps + i] / (d*d*d*d);
     }
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
 }
@@ -1282,6 +1422,128 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
 	return ret;
 }
 
+at::Tensor gpga_backprojection_2d_cuda(
+          const at::Tensor &target_pos,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &vel,
+          const at::Tensor &att,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          int64_t Ntarget,
+          double d0,
+          double ant_tx_dy) {
+	TORCH_CHECK(target_pos.dtype() == at::kFloat);
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(vel.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
+	TORCH_INTERNAL_ASSERT(target_pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(vel.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
+
+	at::Tensor target_pos_contig = target_pos.contiguous();
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor vel_contig = vel.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor data_contig = data.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+	at::Tensor data_out = torch::zeros({Ntarget, nsweeps}, options);
+	const float* target_pos_ptr = target_pos_contig.data_ptr<float>();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* vel_ptr = vel_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+    c10::complex<float>* data_out_ptr = data_out.data_ptr<c10::complex<float>>();
+
+    // delta_r, ref_phase, d0 are bistatic, 2x monostatic
+	const float delta_r = 0.5f / r_res;
+    const float ref_phase = 2.0f * fc / kC0;
+    d0 *= 2.0f;
+
+	dim3 thread_per_block = {256};
+	// Up-rounding division.
+    int blocks = Ntarget * nsweeps;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x};
+
+	if (data.dtype() == at::kComplexFloat) {
+        const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+        if (ant_tx_dy != 0.0f) {
+            gpga_backprojection_2d_kernel<complex64_t, true>
+                  <<<block_count, thread_per_block>>>(
+                          target_pos_ptr,
+                          (complex64_t*)data_ptr,
+                          pos_ptr,
+                          vel_ptr,
+                          att_ptr,
+                          (complex64_t*)data_out_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          Ntarget,
+                          d0, ant_tx_dy);
+        } else {
+            gpga_backprojection_2d_kernel<complex64_t, false>
+                  <<<block_count, thread_per_block>>>(
+                          target_pos_ptr,
+                          (complex64_t*)data_ptr,
+                          pos_ptr,
+                          vel_ptr,
+                          att_ptr,
+                          (complex64_t*)data_out_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          Ntarget,
+                          d0, ant_tx_dy);
+        }
+    } else if (data.dtype() == at::kComplexHalf) {
+        const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
+        if (ant_tx_dy != 0.0f) {
+            gpga_backprojection_2d_kernel<half2, true>
+                  <<<block_count, thread_per_block>>>(
+                          target_pos_ptr,
+                          (half2*)data_ptr,
+                          pos_ptr,
+                          vel_ptr,
+                          att_ptr,
+                          (complex64_t*)data_out_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          Ntarget,
+                          d0, ant_tx_dy);
+        } else {
+            gpga_backprojection_2d_kernel<half2, false>
+                  <<<block_count, thread_per_block>>>(
+                          target_pos_ptr,
+                          (half2*)data_ptr,
+                          pos_ptr,
+                          vel_ptr,
+                          att_ptr,
+                          (complex64_t*)data_out_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          Ntarget,
+                          d0, ant_tx_dy);
+        }
+    }
+	return data_out;
+}
+
 at::Tensor backprojection_polar_2d_tx_power_cuda(
           const at::Tensor &wa,
           const at::Tensor &pos,
@@ -1302,7 +1564,8 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
           double theta0,
           double dtheta,
           int64_t Nr,
-          int64_t Ntheta) {
+          int64_t Ntheta,
+          int64_t sin_look_angle) {
 	TORCH_CHECK(wa.dtype() == at::kFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
@@ -1359,7 +1622,8 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
                   delta_r,
                   r0, dr,
                   theta0, dtheta,
-                  Nr, Ntheta);
+                  Nr, Ntheta,
+                  sin_look_angle);
 	return img;
 }
 
@@ -1573,6 +1837,45 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cuda(
     ret.push_back(data_grad);
     ret.push_back(pos_grad);
 	return ret;
+}
+
+at::Tensor cfar_2d_cuda(
+          const at::Tensor &img,
+          int64_t nbatch,
+          int64_t N0,
+          int64_t N1,
+          int64_t Navg0,
+          int64_t Navg1,
+          int64_t Nguard0,
+          int64_t Nguard1,
+          double threshold,
+          int64_t peaks_only) {
+	TORCH_CHECK(img.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	at::Tensor img_contig = img.contiguous();
+	const float* img_ptr = img_contig.data_ptr<float>();
+
+    at::Tensor detections = torch::zeros_like(img);
+	float* detections_ptr = detections.data_ptr<float>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+	unsigned int block_x = (N0 * N1 + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, nbatch};
+
+    cfar_2d_kernel<<<block_count, thread_per_block>>>(
+          img_ptr,
+          detections_ptr,
+          N0,
+          N1,
+          Navg0,
+          Navg1,
+          Nguard0,
+          Nguard1,
+          threshold,
+          peaks_only);
+
+	return detections;
 }
 
 __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
@@ -2645,6 +2948,8 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cuda);
   m.impl("backprojection_cart_2d", &backprojection_cart_2d_cuda);
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cuda);
+  m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cuda);
+  m.impl("cfar_2d", &cfar_2d_cuda);
   m.impl("polar_interp_linear", &polar_interp_linear_cuda);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cuda);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cuda);

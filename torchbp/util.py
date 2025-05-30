@@ -3,6 +3,48 @@ from torch import Tensor
 from math import pi
 import numpy as np
 
+def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float, grid_polar: dict) -> Tensor:
+    """
+    De-alias range-axis spectrum of polar SAR image processed with backprojection.
+
+    Parameters
+    ----------
+    img : Tensor
+        Complex input image. Shape should be: [Range, azimuth].
+    origin : Tensor
+        Center of the platform position.
+    fc : float
+        RF center frequency.
+    grid_polar : dict
+        Polar grid definition
+
+    Returns
+    ----------
+    img : Tensor
+        SAR image without range spectrum aliasing.
+    """
+    r0, r1 = grid_polar["r"]
+    theta0, theta1 = grid_polar["theta"]
+    ntheta = grid_polar["ntheta"]
+    nr = grid_polar["nr"]
+    dtheta = (theta1 - theta0) / ntheta
+    dr = (r1 - r0) / nr
+
+    r = r0 + dr * torch.arange(nr, device=img.device)
+    theta = theta0 + dtheta * torch.arange(ntheta, device=img.device)
+
+    x = r[:,None] * torch.sqrt(1 - torch.square(theta))[None,:]
+    y = r[:,None] * theta[None,:]
+
+    if origin.dim() == 2:
+        origin = origin[0]
+    d = torch.sqrt((x - origin[0])**2 + (y - origin[1])**2 + origin[2]**2)
+    c0 = 299792458
+    phase = torch.exp(-1j*4*pi*fc*d/c0)
+    if img.dim() == 3:
+        phase = phase.unsqueeze(0)
+    return phase * img
+
 def diff(x: Tensor, dim: int=-1, same_size: bool=False):
     """
     ``np.diff`` implemented in torch.
@@ -147,7 +189,7 @@ def detrend(x: Tensor):
     n = x.shape[0]
     k = np.arange(n) / n
     a, b = np.polyfit(k, x.cpu().numpy(), 1)
-    return x - a*torch.arange(n, device=x.device)/n + b
+    return x - (a*torch.arange(n, device=x.device)/n + b)
 
 def entropy(x: Tensor):
     """
@@ -218,7 +260,7 @@ def shift_spectrum(x: Tensor, dim: int=-1):
     return x * c
 
 def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc: float, bw: float,
-    tsweep: float, fs: float):
+        tsweep: float, fs: float, rvp: bool=True):
     """
     Generate FMCW radar time-domain IF signal.
 
@@ -238,6 +280,8 @@ def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc:
         Length of one sweep in seconds.
     fs : float
         Sampling frequency in Hz.
+    rvp : bool
+        True to include residual video phase term.
 
     Returns
     ----------
@@ -258,11 +302,13 @@ def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc:
 
     c0 = 299792458
 
+    use_rvp = 1 if rvp else 0
+
     t = t[None, :]
     for e, target in enumerate(target_pos):
         d = torch.linalg.vector_norm(pos - target[None,:], dim=-1)[:, None]
         tau = 2*d/c0
-        data += (target_rcs[e]/d**4) * torch.exp(-1j*2*pi*(fc*tau - k*tau*t + 0.5*k*tau**2))
+        data += (target_rcs[e]/d**4) * torch.exp(-1j*2*pi*(fc*tau - k*tau*t + use_rvp*0.5*k*tau**2))
     return data
 
 def make_polar_grid(r0: float, r1: float, nr: int, ntheta: int, theta_limit: int=1, squint: float=0):
