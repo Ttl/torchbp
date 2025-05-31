@@ -109,6 +109,9 @@ if __name__ == "__main__":
     # TX antenna distance to RX antenna
     ant_tx_dy = -96.6e-3
 
+    # Calculate initial estimate using PGA
+    initial_pga = False
+
     c0 = 299792458
 
     # Load the input data
@@ -229,9 +232,21 @@ if __name__ == "__main__":
     data_time = data_time.to(device=dev)
 
     if max_steps > 1:
-        print(
-            "Calculating autofocus. This might take a while. Press Ctrl-C to interrupt."
-        )
+        if initial_pga:
+            print("Calculating initial estimate with PGA")
+            origin = torch.tensor([torch.mean(pos[:,0]), torch.mean(pos[:,1]), 0],
+                    device=dev, dtype=torch.float32)[None,:]
+            pos_centered = pos - origin
+            sar_img, phi = torchbp.autofocus.gpga_ml_bp_polar(None, fsweeps,
+                    pos_centered, vel, att, fc, r_res, grid_polar_autofocus,
+                    window_width=nsweeps//8, d0=d0, target_threshold_db=20,
+                    ant_tx_dy=ant_tx_dy)
+
+            d = torchbp.util.phase_to_distance(phi, fc)
+            d -= torch.mean(d)
+            pos[:,0] = pos[:,0] + d
+
+        print("Calculating autofocus. This might take a while. Press Ctrl-C to interrupt.")
         sar_img, origin, pos, steps = torchbp.autofocus.bp_polar_grad_minimum_entropy(
             fsweeps,
             data_time,
@@ -281,6 +296,7 @@ if __name__ == "__main__":
     sar_img = torchbp.ops.backprojection_polar_2d(
         fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0, ant_tx_dy
     ).squeeze()
+    print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()
 
     plt.figure()

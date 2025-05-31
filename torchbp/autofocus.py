@@ -3,8 +3,9 @@ import numpy as np
 from torch import Tensor
 from .ops import backprojection_polar_2d, backprojection_cart_2d, gpga_backprojection_2d_core
 from .ops import entropy
-from .util import quad_interp, fft_peak_1d, unwrap, detrend
+from .util import unwrap, detrend, fft_lowpass_filter_window
 import inspect
+from scipy import signal
 
 def pga_pd(img: Tensor, window_width: int | None=None, max_iters: int=10,
         window_exp: float=0.5, min_window: int=5, remove_trend: bool=True,
@@ -177,7 +178,7 @@ def pga_ml(img: Tensor, window_width: int | None=None, max_iters: int=10,
 
 def gpga_2d_iter(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor,
         att: Tensor, fc: float, r_res: float, window_width: int | None=None,
-        d0: float=0.0, ant_tx_dy: float=0.0, estimator: str="ml") -> Tensor:
+        d0: float=0.0, ant_tx_dy: float=0.0, estimator: str="ml", lowpass_window="boxcar") -> Tensor:
     """
     Single generalized phase gradient iteration.
 
@@ -212,6 +213,9 @@ def gpga_2d_iter(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor,
         Estimator to use.
         "ml": Maximum likelihood.
         "pd": Phase difference.
+    lowpass_window : str
+        FFT window to use for lowpass filtering.
+        See `scipy.get_window` for syntax.
 
     Returns
     ----------
@@ -223,10 +227,8 @@ def gpga_2d_iter(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor,
             r_res, d0, ant_tx_dy)
     # Filter samples
     if window_width is not None and window_width < target_data.shape[1]:
-        fdata = torch.fft.fft(target_data, dim=-1)
-        fdata[:,window_width//2:-window_width//2] = 0
-        target_data = torch.fft.ifft(fdata, dim=-1)
-        del fdata
+        target_data = fft_lowpass_filter_window(target_data,
+                window=lowpass_window, window_width=window_width)
     if estimator == "ml":
         u,s,v = torch.linalg.svd(target_data)
         phi = torch.angle(v[0,:])
@@ -241,8 +243,8 @@ def gpga_ml_bp_polar(img: Tensor | None, data: Tensor, pos: Tensor, vel: Tensor,
         att: Tensor, fc: float, r_res: float, grid_polar: dict,
         window_width: int | None=None, max_iters: int=10, window_exp: float=0.8,
         min_window: int=5, d0: float=0.0, ant_tx_dy: float=0.0,
-        target_threshold_db: float=40, remove_trend: bool=True,
-        estimator: str="pd") -> (Tensor, Tensor):
+        target_threshold_db: float=20, remove_trend: bool=True,
+        estimator: str="pd", lowpass_window: str="boxcar") -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
     backprojection image formation.
@@ -295,6 +297,9 @@ def gpga_ml_bp_polar(img: Tensor | None, data: Tensor, pos: Tensor, vel: Tensor,
         Estimator to use.
         "ml": Maximum likelihood.
         "pd": Phase difference.
+    lowpass_window : str
+        FFT window to use for lowpass filtering.
+        See `scipy.get_window` for syntax.
 
     References
     ----------
@@ -344,8 +349,9 @@ def gpga_ml_bp_polar(img: Tensor | None, data: Tensor, pos: Tensor, vel: Tensor,
         target_pos = torch.stack([x, y, z], dim=1)
 
         phi = gpga_2d_iter(target_pos, data, pos_new, vel, att, fc, r_res,
-                window_width, d0, ant_tx_dy, estimator=estimator)
-        phi_sum = unwrap((phi_sum + phi) % (2 * torch.pi))
+                window_width, d0, ant_tx_dy, estimator=estimator,
+                lowpass_window=lowpass_window)
+        phi_sum = unwrap(phi_sum + phi)
         if remove_trend:
             phi_sum = detrend(phi_sum)
         # Phase to distance

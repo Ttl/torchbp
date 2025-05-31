@@ -172,7 +172,7 @@ if __name__ == "__main__":
     pos_centered = pos - origin
     sar_img, phi = torchbp.autofocus.gpga_ml_bp_polar(None, fsweeps,
             pos_centered, vel, att, fc, r_res, grid_polar_autofocus,
-            window_width=nsweeps//8, d0=d0,
+            window_width=nsweeps, d0=d0, target_threshold_db=15,
             ant_tx_dy=ant_tx_dy)
 
     d = torchbp.util.phase_to_distance(phi, fc)
@@ -189,6 +189,7 @@ if __name__ == "__main__":
     sar_img = torchbp.ops.backprojection_polar_2d(
         fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0, ant_tx_dy
     ).squeeze()
+    print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()
 
     plt.figure()

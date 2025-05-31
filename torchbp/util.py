@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 from math import pi
 import numpy as np
+from scipy.signal import get_window
 
 def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float, grid_polar: dict) -> Tensor:
     """
@@ -64,7 +65,7 @@ def diff(x: Tensor, dim: int=-1, same_size: bool=False):
         Difference tensor.
     """
     if dim != -1:
-        raise NotImplementedError("Only dim=-1 is implemente")
+        raise NotImplementedError("Only dim=-1 is implemented")
     if same_size:
         return torch.nn.functional.pad(x[...,1:]-x[...,:-1], (1,0))
     else:
@@ -87,13 +88,14 @@ def unwrap(phi: Tensor, dim: int=-1):
         Unwrapped tensor.
     """
     if dim != -1:
-        raise NotImplementedError("Only dim=-1 is implemente")
-    dphi = diff(phi, same_size=True)
-    dphi_m = ((dphi+torch.pi) % (2 * torch.pi)) - torch.pi
+        raise NotImplementedError("Only dim=-1 is implemented")
+    phi_wrap = ((phi + torch.pi) % (2 * torch.pi)) - torch.pi
+    dphi = diff(phi_wrap, same_size=True)
+    dphi_m = ((dphi + torch.pi) % (2 * torch.pi)) - torch.pi
     dphi_m[(dphi_m==-torch.pi)&(dphi>0)] = torch.pi
-    phi_adj = dphi_m-dphi
+    phi_adj = dphi_m - dphi
     phi_adj[dphi.abs()<torch.pi] = 0
-    return phi + phi_adj.cumsum(dim)
+    return phi_wrap + phi_adj.cumsum(dim)
 
 def quad_interp(a: Tensor, v: int):
     """
@@ -355,3 +357,40 @@ def phase_to_distance(p: Tensor, fc: float):
     """
     c0 = 299792458
     return c0 * p / (4*torch.pi*fc)
+
+def fft_lowpass_filter_window(target_data: Tensor, window: str | tuple='hamming',
+        window_width: int=None):
+    """
+    FFT low-pass filtering with a configurable window function.
+
+    Parameters
+    ----------
+    target_data : Tensor
+        Input data.
+    window_type : str
+        Window to apply. See scipy.get_window for syntax.
+        e.g., 'hann', 'hamming', 'blackman'.
+    window_width : int
+        Width of the window in samples. If None or larger than signal, returns
+        the input unchanged.
+
+    Returns:
+        Filtered tensor (same shape as input)
+    """
+    fdata = torch.fft.fft(target_data, dim=-1)
+    n = target_data.size(-1)
+
+    # If window_width is None, do nothing
+    if window_width is None or window_width > n:
+        return target_data
+
+    # Window needs to be centered at DC in FFT
+    half_width = (window_width + 1) // 2
+    half_window = get_window(window, 2*half_width - 1, fftbins=True)[half_width-1:]
+    w = np.zeros(n)
+    w[:half_width] = half_window
+    w[-half_width+1:] = np.flip(half_window[1:])
+
+    w = torch.tensor(w).to(target_data.device)
+    filtered_data = torch.fft.ifft(fdata * w, dim=-1)
+    return filtered_data
