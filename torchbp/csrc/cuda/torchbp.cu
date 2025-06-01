@@ -146,6 +146,53 @@ static __device__ void bicubic_interp2d_grad(T *img_grad, T *img_gx_grad,
     img_gxy_grad[3] = g * (xb[3] * by[3]);
 }
 
+static __device__ float lanczos_kernel(float x, int a) {
+    if (fabsf(x) >= a) {
+        return 0.0f;
+    }
+    if (x == 0.0f) {
+        return 1.0f;
+    }
+    return sinpif(x) / (kPI * x) * sinpif(x/a) / (kPI * x / a);
+}
+
+template<class T>
+static __device__ T lanczos_interp_1d(const T *img, int n, float pos, int a) {
+    int start = max(0, (int)ceilf(pos - a));
+    int end = min(n-1, (int)floorf(pos + a));
+    T sum{};
+    float total_weight = 0.0f;
+    for (int i = start; i <= end; i++) {
+        float dx = pos - i;
+        float w = lanczos_kernel(dx, a);
+        T val = img[i];
+        sum += w * val;
+        total_weight += w;
+    }
+    if (total_weight != 0.0f) {
+        sum /= total_weight;
+    }
+    return sum;
+}
+
+template<class T>
+static __device__ T lanczos_interp_2d(const T *img, int nx, int ny, float x, float y, int a) {
+    int start_x = max(0, (int)ceilf(x - a));
+    int end_x = min(nx-1, (int)floorf(x + a));
+    T sum{};
+    float total_weight = 0.0f;
+    for (int i = start_x; i <= end_x; i++) {
+        float dx = x - i;
+        float wx = lanczos_kernel(dx, a);
+        T row_val = lanczos_interp_1d<T>(img + i * ny, ny, y, a);
+        sum += wx * row_val;
+        total_weight += wx;
+    }
+    if (total_weight != 0.0f) {
+        sum /= total_weight;
+    }
+    return sum;
+}
 template<typename T>
 __global__ void abs_sum_kernel(
           const T *data,
@@ -263,7 +310,6 @@ template<typename T, bool bistatic>
 __global__ void backprojection_polar_2d_kernel(
           const T* data,
           const float* pos,
-          const float* vel,
           const float* att,
           complex64_t* img,
           int sweep_samples,
@@ -277,7 +323,9 @@ __global__ void backprojection_polar_2d_kernel(
           int Nr,
           int Ntheta,
           float d0,
-          float ant_tx_dy) {
+          float ant_tx_dy,
+          bool dealias,
+          float z0) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
     const int idr = idx / Ntheta;
@@ -343,6 +391,13 @@ __global__ void backprojection_polar_2d_kernel(
         complex64_t ref = {ref_cos, ref_sin};
         pixel += s * ref;
     }
+    if (dealias) {
+        const float d = 2.0f * sqrtf(x*x + y*y + z0*z0);
+        float ref_sin, ref_cos;
+        sincospif(-ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
+    }
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
 }
 
@@ -350,7 +405,6 @@ template<typename T, bool have_pos_grad, bool have_data_grad>
 __global__ void backprojection_polar_2d_grad_kernel(
           const T* data,
           const float* pos,
-          const float* vel,
           const float* att,
           int sweep_samples,
           int nsweeps,
@@ -364,6 +418,8 @@ __global__ void backprojection_polar_2d_grad_kernel(
           int Ntheta,
           float d0,
           float ant_tx_dy,
+          bool dealias,
+          float z0,
           const complex64_t* grad,
           float* pos_grad,
           complex64_t *data_grad) {
@@ -384,6 +440,14 @@ __global__ void backprojection_polar_2d_grad_kernel(
     const float y = r * theta;
 
     complex64_t g = grad[idbatch * Nr * Ntheta + idr * Ntheta + idtheta];
+
+    if (dealias) {
+        const float d = 2.0f * sqrtf(x*x + y*y + z0*z0);
+        float ref_sin, ref_cos;
+        sincospif(-ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        g *= ref;
+    }
 
     const complex64_t I = {0.0f, 1.0f};
 
@@ -487,6 +551,91 @@ __global__ void backprojection_polar_2d_grad_kernel(
             }
         }
     }
+}
+
+template<typename T, bool bistatic>
+__global__ void backprojection_polar_2d_lanczos_kernel(
+          const T* data,
+          const float* pos,
+          const float* att,
+          complex64_t* img,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          int Nr,
+          int Ntheta,
+          float d0,
+          float ant_tx_dy,
+          bool dealias,
+          float z0,
+          int order) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta;
+    const int idr = idx / Ntheta;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idr >= Nr || idtheta >= Ntheta) {
+        return;
+    }
+
+    const float r = r0 + idr * dr;
+    const float theta = theta0 + idtheta * dtheta;
+    const float x = r * sqrtf(1.0f - theta*theta);
+    const float y = r * theta;
+
+    complex64_t pixel = {0.0f, 0.0f};
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        float pz2 = pos_z * pos_z;
+
+        // Calculate distance to the pixel.
+        float d;
+        if constexpr (bistatic) {
+            float tx_dx = sinf(att[idbatch * nsweeps * 3 + i * 3 + 2]) * ant_tx_dy;
+            float tx_dy = cosf(att[idbatch * nsweeps * 3 + i * 3 + 2]) * ant_tx_dy;
+
+            float drx = sqrtf(px * px + py * py + pz2);
+            float dtx = sqrt((px - tx_dx) * (px - tx_dx) + (py - tx_dy) * (py - tx_dy) + pz2);
+            d = drx + dtx - d0;
+        } else {
+            float drx = sqrtf(px * px + py * py + pz2);
+            d = 2.0f * drx - d0;
+        }
+
+        float sx = delta_r * d;
+
+        if (sx < 0 || sx > sweep_samples - 1) {
+            continue;
+        }
+
+        complex64_t s = lanczos_interp_1d<complex64_t>(
+                &data[idbatch * sweep_samples * nsweeps + i * sweep_samples],
+                sweep_samples, sx, order);
+
+        float ref_sin, ref_cos;
+        sincospif(ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel += s * ref;
+    }
+    if (dealias) {
+        const float d = 2.0f * sqrtf(x*x + y*y + z0*z0);
+        float ref_sin, ref_cos;
+        sincospif(-ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
+    }
+    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
 }
 
 template<typename T, bool bistatic>
@@ -937,7 +1086,7 @@ at::Tensor abs_sum_cuda(
         .dtype(torch::kFloat)
         .layout(torch::kStrided)
         .device(data.device());
-	at::Tensor res = torch::zeros({nbatch, 1}, options);
+	at::Tensor res = torch::zeros({static_cast<unsigned int>(nbatch), 1}, options);
     float* res_ptr = res.data_ptr<float>();
 
 	dim3 thread_per_block = {256, 1};
@@ -945,7 +1094,7 @@ at::Tensor abs_sum_cuda(
     int blocks = data.numel() / nbatch;
 	TORCH_INTERNAL_ASSERT(blocks * nbatch == data.numel());
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 
@@ -980,7 +1129,7 @@ at::Tensor abs_sum_grad_cuda(
     int blocks = data.numel() / nbatch;
 	TORCH_INTERNAL_ASSERT(blocks * nbatch == data.numel());
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 
@@ -1011,7 +1160,7 @@ at::Tensor entropy_cuda(
         .dtype(torch::kFloat)
         .layout(torch::kStrided)
         .device(data.device());
-	at::Tensor res = torch::zeros({nbatch}, options);
+	at::Tensor res = torch::zeros({static_cast<unsigned int>(nbatch)}, options);
     float* res_ptr = res.data_ptr<float>();
 
 	dim3 thread_per_block = {256, 1};
@@ -1019,7 +1168,7 @@ at::Tensor entropy_cuda(
     int blocks = data.numel() / nbatch;
 	TORCH_INTERNAL_ASSERT(blocks * nbatch == data.numel());
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
     const float* norm_ptr = norm_contig.data_ptr<float>();
@@ -1062,7 +1211,7 @@ std::vector<at::Tensor> entropy_grad_cuda(
     int blocks = data.numel() / nbatch;
 	TORCH_INTERNAL_ASSERT(blocks * nbatch == data.numel());
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
     const float* norm_ptr = norm_contig.data_ptr<float>();
@@ -1100,18 +1249,17 @@ at::Tensor backprojection_polar_2d_cuda(
           int64_t Nr,
           int64_t Ntheta,
           double d0,
-          double ant_tx_dy) {
+          double ant_tx_dy,
+          int64_t dealias,
+          double z0) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(vel.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(vel.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor vel_contig = vel.contiguous();
 	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
     auto options =
@@ -1121,7 +1269,6 @@ at::Tensor backprojection_polar_2d_cuda(
         .device(data.device());
 	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* vel_ptr = vel_contig.data_ptr<float>();
 	const float* att_ptr = att_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
@@ -1134,7 +1281,7 @@ at::Tensor backprojection_polar_2d_cuda(
 	// Up-rounding division.
     int blocks = Nr * Ntheta;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
@@ -1143,7 +1290,6 @@ at::Tensor backprojection_polar_2d_cuda(
                   <<<block_count, thread_per_block>>>(
                           (complex64_t*)data_ptr,
                           pos_ptr,
-                          vel_ptr,
                           att_ptr,
                           (complex64_t*)img_ptr,
                           sweep_samples,
@@ -1153,13 +1299,13 @@ at::Tensor backprojection_polar_2d_cuda(
                           r0, dr,
                           theta0, dtheta,
                           Nr, Ntheta,
-                          d0, ant_tx_dy);
+                          d0, ant_tx_dy,
+                          dealias, z0);
         } else {
             backprojection_polar_2d_kernel<complex64_t, false>
                   <<<block_count, thread_per_block>>>(
                           (complex64_t*)data_ptr,
                           pos_ptr,
-                          vel_ptr,
                           att_ptr,
                           (complex64_t*)img_ptr,
                           sweep_samples,
@@ -1169,7 +1315,8 @@ at::Tensor backprojection_polar_2d_cuda(
                           r0, dr,
                           theta0, dtheta,
                           Nr, Ntheta,
-                          d0, ant_tx_dy);
+                          d0, ant_tx_dy,
+                          dealias, z0);
         }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
@@ -1178,7 +1325,6 @@ at::Tensor backprojection_polar_2d_cuda(
                   <<<block_count, thread_per_block>>>(
                           (half2*)data_ptr,
                           pos_ptr,
-                          vel_ptr,
                           att_ptr,
                           (complex64_t*)img_ptr,
                           sweep_samples,
@@ -1188,13 +1334,13 @@ at::Tensor backprojection_polar_2d_cuda(
                           r0, dr,
                           theta0, dtheta,
                           Nr, Ntheta,
-                          d0, ant_tx_dy);
+                          d0, ant_tx_dy,
+                          dealias, z0);
         } else {
             backprojection_polar_2d_kernel<half2, false>
                   <<<block_count, thread_per_block>>>(
                           (half2*)data_ptr,
                           pos_ptr,
-                          vel_ptr,
                           att_ptr,
                           (complex64_t*)img_ptr,
                           sweep_samples,
@@ -1204,7 +1350,8 @@ at::Tensor backprojection_polar_2d_cuda(
                           r0, dr,
                           theta0, dtheta,
                           Nr, Ntheta,
-                          d0, ant_tx_dy);
+                          d0, ant_tx_dy,
+                          dealias, z0);
         }
     }
 	return img;
@@ -1228,24 +1375,22 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
           int64_t Nr,
           int64_t Ntheta,
           double d0,
-          double ant_tx_dy) {
+          double ant_tx_dy,
+          int64_t dealias,
+          double z0) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(vel.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(vel.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CUDA);
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor vel_contig = vel.contiguous();
 	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
 	at::Tensor grad_contig = grad.contiguous();
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* vel_ptr = vel_contig.data_ptr<float>();
 	const float* att_ptr = att_contig.data_ptr<float>();
 	const c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
 
@@ -1279,7 +1424,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
 	// Up-rounding division.
     int blocks = Nr * Ntheta;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch, 1};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
@@ -1289,7 +1434,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                       <<<block_count, thread_per_block>>>(
                               (complex64_t*)data_ptr,
                               pos_ptr,
-                              vel_ptr,
                               att_ptr,
                               sweep_samples,
                               nsweeps,
@@ -1299,6 +1443,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               theta0, dtheta,
                               Nr, Ntheta,
                               d0, ant_tx_dy,
+                              dealias, z0,
                               (complex64_t*)grad_ptr,
                               pos_grad_ptr,
                               (complex64_t*)data_grad_ptr
@@ -1308,7 +1453,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                       <<<block_count, thread_per_block>>>(
                               (complex64_t*)data_ptr,
                               pos_ptr,
-                              vel_ptr,
                               att_ptr,
                               sweep_samples,
                               nsweeps,
@@ -1318,6 +1462,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               theta0, dtheta,
                               Nr, Ntheta,
                               d0, ant_tx_dy,
+                              dealias, z0,
                               (complex64_t*)grad_ptr,
                               pos_grad_ptr,
                               (complex64_t*)data_grad_ptr
@@ -1330,7 +1475,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                       <<<block_count, thread_per_block>>>(
                               (complex64_t*)data_ptr,
                               pos_ptr,
-                              vel_ptr,
                               att_ptr,
                               sweep_samples,
                               nsweeps,
@@ -1340,6 +1484,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               theta0, dtheta,
                               Nr, Ntheta,
                               d0, ant_tx_dy,
+                              dealias, z0,
                               (complex64_t*)grad_ptr,
                               pos_grad_ptr,
                               (complex64_t*)data_grad_ptr
@@ -1356,7 +1501,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                       <<<block_count, thread_per_block>>>(
                               (half2*)data_ptr,
                               pos_ptr,
-                              vel_ptr,
                               att_ptr,
                               sweep_samples,
                               nsweeps,
@@ -1366,6 +1510,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               theta0, dtheta,
                               Nr, Ntheta,
                               d0, ant_tx_dy,
+                              dealias, z0,
                               (complex64_t*)grad_ptr,
                               pos_grad_ptr,
                               (complex64_t*)data_grad_ptr
@@ -1375,7 +1520,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                       <<<block_count, thread_per_block>>>(
                               (half2*)data_ptr,
                               pos_ptr,
-                              vel_ptr,
                               att_ptr,
                               sweep_samples,
                               nsweeps,
@@ -1385,6 +1529,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               theta0, dtheta,
                               Nr, Ntheta,
                               d0, ant_tx_dy,
+                              dealias, z0,
                               (complex64_t*)grad_ptr,
                               pos_grad_ptr,
                               (complex64_t*)data_grad_ptr
@@ -1397,7 +1542,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                       <<<block_count, thread_per_block>>>(
                               (half2*)data_ptr,
                               pos_ptr,
-                              vel_ptr,
                               att_ptr,
                               sweep_samples,
                               nsweeps,
@@ -1407,6 +1551,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               theta0, dtheta,
                               Nr, Ntheta,
                               d0, ant_tx_dy,
+                              dealias, z0,
                               (complex64_t*)grad_ptr,
                               pos_grad_ptr,
                               (complex64_t*)data_grad_ptr
@@ -1420,6 +1565,97 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
     ret.push_back(data_grad);
     ret.push_back(pos_grad);
 	return ret;
+}
+
+at::Tensor backprojection_polar_2d_lanczos_cuda(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &vel,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          double ant_tx_dy,
+          int64_t dealias,
+          double z0,
+          int64_t order) {
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
+
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor data_contig = data.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+    c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
+
+    // delta_r, ref_phase, d0 are bistatic, 2x monostatic
+	const float delta_r = 0.5f / r_res;
+    const float ref_phase = 2.0f * fc / kC0;
+    d0 *= 2.0f;
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr * Ntheta;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+
+	if (data.dtype() == at::kComplexFloat) {
+        const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+        if (ant_tx_dy != 0.0f) {
+            backprojection_polar_2d_lanczos_kernel<complex64_t, true>
+                  <<<block_count, thread_per_block>>>(
+                          (complex64_t*)data_ptr,
+                          pos_ptr,
+                          att_ptr,
+                          (complex64_t*)img_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          r0, dr,
+                          theta0, dtheta,
+                          Nr, Ntheta,
+                          d0, ant_tx_dy,
+                          dealias, z0, order);
+        } else {
+            backprojection_polar_2d_lanczos_kernel<complex64_t, false>
+                  <<<block_count, thread_per_block>>>(
+                          (complex64_t*)data_ptr,
+                          pos_ptr,
+                          att_ptr,
+                          (complex64_t*)img_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          r0, dr,
+                          theta0, dtheta,
+                          Nr, Ntheta,
+                          d0, ant_tx_dy,
+                          dealias, z0, order);
+        }
+    }
+	return img;
 }
 
 at::Tensor gpga_backprojection_2d_cuda(
@@ -1602,7 +1838,7 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
 	// Up-rounding division.
     int blocks = Nr * Ntheta;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     backprojection_polar_2d_tx_power_kernel
           <<<block_count, thread_per_block>>>(
@@ -1675,7 +1911,7 @@ at::Tensor backprojection_cart_2d_cuda(
 	dim3 thread_per_block = {256, 1};
 	// Up-rounding division.
 	unsigned int block_x = (Nx * Ny + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
 	backprojection_cart_2d_kernel
           <<<block_count, thread_per_block>>>(
@@ -1767,7 +2003,7 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cuda(
 	dim3 thread_per_block = {256, 1};
 	// Up-rounding division.
 	unsigned int block_x = (Nx * Ny + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     if (have_pos_grad) {
         if (have_data_grad) {
@@ -1861,7 +2097,7 @@ at::Tensor cfar_2d_cuda(
 	dim3 thread_per_block = {256, 1};
 	// Up-rounding division.
 	unsigned int block_x = (N0 * N1 + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     cfar_2d_kernel<<<block_count, thread_per_block>>>(
           img_ptr,
@@ -1881,7 +2117,8 @@ at::Tensor cfar_2d_cuda(
 __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
         *out, const float *dorigin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float r1,
-        float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1) {
+        float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
+        float z0) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -1899,10 +2136,11 @@ __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
     if (t < -1.0f || t > 1.0f) {
         return;
     }
-    const float dorig0 = dorigin[idbatch * 2 + 0];
-    const float dorig1 = dorigin[idbatch * 2 + 1];
+    const float dorig0 = dorigin[idbatch * 3 + 0];
+    const float dorig1 = dorigin[idbatch * 3 + 1];
     const float sint = t;
     const float cost = sqrtf(1.0f - t*t);
+    // TODO: Add dorig2
     const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
     const float arg = (d*sint + dorig1) / (d*cost + dorig0);
     const float tp = arg / sqrtf(1.0f + arg*arg);
@@ -1918,7 +2156,10 @@ __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         complex64_t v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
-        sincospif(ref_phase * (rp - d), &ref_sin, &ref_cos);
+        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float dz = sqrtf(z1*z1 + d*d);
+        const float rpz = sqrtf(z0*z0 + rp*rp);
+        sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
         out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = v * ref;
     } else {
@@ -1929,7 +2170,7 @@ __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
 __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
         float *dorigin, float rotation, float ref_phase, float r0, float dr,
         float theta0, float dtheta, int Nr, int Ntheta, float r1, float dr1,
-        float theta1, float dtheta1, int Nr1, int Ntheta1, const complex64_t
+        float theta1, float dtheta1, int Nr1, int Ntheta1, float z0, const complex64_t
         *grad, complex64_t *img_grad, float *dorigin_grad) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
@@ -1955,10 +2196,11 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
     if (t < -1.0f || t > 1.0f) {
         return;
     }
-    const float dorig0 = dorigin[idbatch * 2 + 0];
-    const float dorig1 = dorigin[idbatch * 2 + 1];
+    const float dorig0 = dorigin[idbatch * 3 + 0];
+    const float dorig1 = dorigin[idbatch * 3 + 1];
     const float sint = t;
     const float cost = sqrtf(1.0f - t*t);
+    // TODO: Add dorig2
     const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
     const float arg = (d*sint + dorig1) / (d*cost + dorig0);
     const float tp = arg / sqrtf(1.0f + arg*arg);
@@ -1978,7 +2220,10 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
-        sincospif(ref_phase * (rp - d), &ref_sin, &ref_cos);
+        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float dz = sqrtf(z1*z1 + d*d);
+        const float rpz = sqrtf(z0*z0 + rp*rp);
+        sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
         ref = {ref_cos, ref_sin};
     }
 
@@ -1999,8 +2244,8 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
         }
 
         if (threadIdx.x % 32 == 0) {
-            atomicAdd(&(dorigin_grad[idbatch * 2 + 0]), drp_dorigin0);
-            atomicAdd(&(dorigin_grad[idbatch * 2 + 1]), drp_dorigin1);
+            atomicAdd(&(dorigin_grad[idbatch * 3 + 0]), drp_dorigin0);
+            atomicAdd(&(dorigin_grad[idbatch * 3 + 1]), drp_dorigin1);
         }
     }
 
@@ -2025,6 +2270,114 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
             atomicAdd(&x22->x, g22.real());
             atomicAdd(&x22->y, g22.imag());
         }
+    }
+}
+
+__global__ void polar_interp_kernel_bicubic(const complex64_t *img,
+        const complex64_t *img_gx, const complex64_t *img_gy,
+        const complex64_t *img_gxy, complex64_t *out, const float *dorigin,
+        float rotation, float ref_phase, float r0, float dr, float theta0,
+        float dtheta, int Nr, int Ntheta, float r1, float dr1, float theta1,
+        float dtheta1, int Nr1, int Ntheta1, float z0) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx >= Nr1 * Ntheta1) {
+        return;
+    }
+
+    const float d = r1 + dr1 * idr;
+    float t = theta1 + dtheta1 * idtheta;
+    if (rotation != 0.0f) {
+        t = sinf(asinf(t) - rotation);
+    }
+    if (t < -1.0f || t > 1.0f) {
+        return;
+    }
+    const float dorig0 = dorigin[idbatch * 3 + 0];
+    const float dorig1 = dorigin[idbatch * 3 + 1];
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    // TODO: Add dorig2
+    const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+    const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+    const float tp = arg / sqrtf(1.0f + arg*arg);
+
+    const float dri = (rp - r0) / dr;
+    const float dti = (tp - theta0) / dtheta;
+
+    const int dri_int = dri;
+    const float dri_frac = dri - dri_int;
+    const int dti_int = dti;
+    const float dti_frac = dti - dti_int;
+
+    if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+        complex64_t v = bicubic_interp2d<complex64_t>(
+                &img[idbatch * Nr * Ntheta],
+                &img_gx[idbatch * Nr * Ntheta],
+                &img_gy[idbatch * Nr * Ntheta],
+                &img_gxy[idbatch * Nr * Ntheta],
+                Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
+        float ref_sin, ref_cos;
+        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float dz = sqrtf(z1*z1 + d*d);
+        const float rpz = sqrtf(z0*z0 + rp*rp);
+        sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = v * ref;
+    } else {
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+    }
+}
+
+__global__ void polar_interp_kernel_lanczos(const complex64_t *img,
+        complex64_t *out, const float *dorigin,
+        float rotation, float ref_phase, float r0, float dr, float theta0,
+        float dtheta, int Nr, int Ntheta, float r1, float dr1, float theta1,
+        float dtheta1, int Nr1, int Ntheta1, float z0, int order) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx >= Nr1 * Ntheta1) {
+        return;
+    }
+
+    const float d = r1 + dr1 * idr;
+    float t = theta1 + dtheta1 * idtheta;
+    if (rotation != 0.0f) {
+        t = sinf(asinf(t) - rotation);
+    }
+    if (t < -1.0f || t > 1.0f) {
+        return;
+    }
+    const float dorig0 = dorigin[idbatch * 3 + 0];
+    const float dorig1 = dorigin[idbatch * 3 + 1];
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    // TODO: Add dorig2
+    const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+    const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+    const float tp = arg / sqrtf(1.0f + arg*arg);
+
+    const float dri = (rp - r0) / dr;
+    const float dti = (tp - theta0) / dtheta;
+
+    if (dri >= 0 && dri < Nr-1 && dti >= 0 && dti < Ntheta-1) {
+        complex64_t v = lanczos_interp_2d<complex64_t>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
+        float ref_sin, ref_cos;
+        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float dz = sqrtf(z1*z1 + d*d);
+        const float rpz = sqrtf(z0*z0 + rp*rp);
+        sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = v * ref;
+    } else {
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
     }
 }
 
@@ -2215,7 +2568,7 @@ at::Tensor polar_to_cart_linear_cuda(
 	// Up-rounding division.
     int blocks = Nx * Ny;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch, 1};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -2324,7 +2677,7 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cuda(
 	// Up-rounding division.
     int blocks = Nx * Ny;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch, 1};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -2609,7 +2962,7 @@ at::Tensor polar_to_cart_bicubic_cuda(
 	// Up-rounding division.
     int blocks = Nx * Ny;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch, 1};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -2756,7 +3109,7 @@ std::vector<at::Tensor> polar_to_cart_bicubic_grad_cuda(
 	// Up-rounding division.
     int blocks = Nx * Ny;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch, 1};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -2814,7 +3167,8 @@ at::Tensor polar_interp_linear_cuda(
           double theta1,
           double dtheta1,
           int64_t Nr1,
-          int64_t Ntheta1) {
+          int64_t Ntheta1,
+          double z0) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
@@ -2830,7 +3184,7 @@ at::Tensor polar_interp_linear_cuda(
 	// Up-rounding division.
     int blocks = Nr1 * Ntheta1;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch, 1};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -2852,7 +3206,8 @@ at::Tensor polar_interp_linear_cuda(
                   theta1,
                   dtheta1,
                   Nr1,
-                  Ntheta1
+                  Ntheta1,
+                  z0
                   );
 	return out;
 }
@@ -2875,7 +3230,8 @@ std::vector<at::Tensor> polar_interp_linear_grad_cuda(
           double theta1,
           double dtheta1,
           int64_t Nr1,
-          int64_t Ntheta1) {
+          int64_t Ntheta1,
+          double z0) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2910,7 +3266,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cuda(
 	// Up-rounding division.
     int blocks = Nr1 * Ntheta1;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, nbatch, 1};
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -2932,6 +3288,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cuda(
                   dtheta1,
                   Nr1,
                   Ntheta1,
+                  z0,
                   (complex64_t*)grad_ptr,
                   (complex64_t*)img_grad_ptr,
                   dorigin_grad_ptr
@@ -2942,16 +3299,162 @@ std::vector<at::Tensor> polar_interp_linear_grad_cuda(
 	return ret;
 }
 
+at::Tensor polar_interp_bicubic_cuda(
+          const at::Tensor &img,
+          const at::Tensor &img_gx,
+          const at::Tensor &img_gy,
+          const at::Tensor &img_gxy,
+          const at::Tensor &dorigin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double r0,
+          double dr0,
+          double theta0,
+          double dtheta0,
+          int64_t Nr0,
+          int64_t Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z0) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat);
+	TORCH_CHECK(img_gx.dtype() == at::kComplexFloat);
+	TORCH_CHECK(img_gy.dtype() == at::kComplexFloat);
+	TORCH_CHECK(img_gxy.dtype() == at::kComplexFloat);
+	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img_gx.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img_gy.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img_gxy.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+	at::Tensor dorigin_contig = dorigin.contiguous();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor img_gx_contig = img_gx.contiguous();
+	at::Tensor img_gy_contig = img_gy.contiguous();
+	at::Tensor img_gxy_contig = img_gxy.contiguous();
+	at::Tensor out = torch::empty({nbatch, Nr1, Ntheta1}, img_contig.options());
+	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* img_gx_ptr = img_gx_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* img_gy_ptr = img_gy_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* img_gxy_ptr = img_gxy_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr1 * Ntheta1;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    polar_interp_kernel_bicubic
+          <<<block_count, thread_per_block>>>(
+                  (const complex64_t*)img_ptr,
+                  (const complex64_t*)img_gx_ptr,
+                  (const complex64_t*)img_gy_ptr,
+                  (const complex64_t*)img_gxy_ptr,
+                  (complex64_t*)out_ptr,
+                  dorigin_ptr,
+                  rotation,
+                  ref_phase,
+                  r0,
+                  dr0,
+                  theta0,
+                  dtheta0,
+                  Nr0,
+                  Ntheta0,
+                  r1,
+                  dr1,
+                  theta1,
+                  dtheta1,
+                  Nr1,
+                  Ntheta1,
+                  z0
+                  );
+	return out;
+}
+
+at::Tensor polar_interp_lanczos_cuda(
+          const at::Tensor &img,
+          const at::Tensor &dorigin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double r0,
+          double dr0,
+          double theta0,
+          double dtheta0,
+          int64_t Nr0,
+          int64_t Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z0,
+          int64_t order) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat);
+	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+	at::Tensor dorigin_contig = dorigin.contiguous();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor out = torch::empty({nbatch, Nr1, Ntheta1}, img_contig.options());
+	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr1 * Ntheta1;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    polar_interp_kernel_lanczos
+          <<<block_count, thread_per_block>>>(
+                  (const complex64_t*)img_ptr,
+                  (complex64_t*)out_ptr,
+                  dorigin_ptr,
+                  rotation,
+                  ref_phase,
+                  r0,
+                  dr0,
+                  theta0,
+                  dtheta0,
+                  Nr0,
+                  Ntheta0,
+                  r1,
+                  dr1,
+                  theta1,
+                  dtheta1,
+                  Nr1,
+                  Ntheta1,
+                  z0,
+                  order
+                  );
+	return out;
+}
 // Registers CUDA implementations
 TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cuda);
   m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cuda);
+  m.impl("backprojection_polar_2d_lanczos", &backprojection_polar_2d_lanczos_cuda);
   m.impl("backprojection_cart_2d", &backprojection_cart_2d_cuda);
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cuda);
   m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cuda);
   m.impl("cfar_2d", &cfar_2d_cuda);
   m.impl("polar_interp_linear", &polar_interp_linear_cuda);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cuda);
+  m.impl("polar_interp_bicubic", &polar_interp_bicubic_cuda);
+  m.impl("polar_interp_lanczos", &polar_interp_lanczos_cuda);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cuda);
   m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cuda);
   m.impl("polar_to_cart_bicubic", &polar_to_cart_bicubic_cuda);

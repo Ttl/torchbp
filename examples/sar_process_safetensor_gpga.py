@@ -2,6 +2,7 @@
 # Example SAR data processing script.
 # Sample data can be downloaded from: https://hforsten.com/sar.safetensors.zip
 import sys
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.signal as signal
@@ -21,8 +22,6 @@ if __name__ == "__main__":
     # Final image dimensions
     x0 = 1
     x1 = 2000
-    y0 = -x1 / 2
-    y1 = x1 / 2
     # Image dimensions during autofocus, typically smaller than the final image
     autofocus_x0 = 400
     autofocus_x1 = 1200
@@ -45,6 +44,9 @@ if __name__ == "__main__":
     # TX antenna distance to RX antenna
     ant_tx_dy = -96.6e-3
     data_dtype = torch.complex64  # Can be `torch.complex32` to save VRAM
+    # Use fast factorized backprojection, slightly reduces the image quality
+    # but is faster.
+    ffbp = False
 
     c0 = 299792458
 
@@ -128,16 +130,10 @@ if __name__ == "__main__":
     f = torch.fft.rfftfreq(int(nsamples * fft_oversample), d=1 / fs).to(dev)
     rvp = torch.exp(-1j * torch.pi * f**2 * tsweep / bw)
     r_res = c0 / (2 * bw * fft_oversample)
-    d = torch.arange(f.shape[0], device=dev) * r_res
-    nfsamples = f.shape[-1]
     del f
 
     # Timestamp of each sweep
     data_time = sweep_interval * counts
-
-    v = torch.diff(pos, dim=0, prepend=pos[0].unsqueeze(0)) / sweep_interval
-    pos_mean = torch.mean(pos, dim=0)
-    v_orig = v.detach().clone()
 
     # Apply windowing
     sweeps *= wa[:, None, None].cpu()
@@ -186,9 +182,18 @@ if __name__ == "__main__":
     pos_centered[:,0] = pos_centered[:,0] + d
 
     print("Focusing final image")
-    sar_img = torchbp.ops.backprojection_polar_2d(
-        fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0, ant_tx_dy
-    ).squeeze()
+    torch.cuda.synchronize()
+    tstart = time.time()
+    if ffbp:
+        sar_img = torchbp.ops.ffbp(fsweeps, grid_polar, fc, r_res, pos_centered,
+                vel, att, stages=1, divisions=4, d0=d0, ant_tx_dy=ant_tx_dy,
+                interp_method=("lanczos", 4))
+    else:
+        sar_img = torchbp.ops.backprojection_polar_2d(
+            fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0,
+            ant_tx_dy)[0]
+    torch.cuda.synchronize()
+    print(f"Final image created in {time.time() - tstart:.3g} s")
     print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()
 

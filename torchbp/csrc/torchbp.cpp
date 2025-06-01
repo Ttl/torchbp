@@ -46,7 +46,7 @@ static void sincospi(T x, T *sinx, T *cosx) {
 template <typename T>
 static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::complex<T> *out, const T *dorigin, T rotation,
                   T ref_phase, T r0, T dr, T theta0, T dtheta, int Nr, int Ntheta,
-                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1, int idx, int idbatch) {
+                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1, T z0, int idx, int idbatch) {
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
 
@@ -62,8 +62,8 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
     if (t < -1.0f || t > 1.0f) {
         return;
     }
-    const T dorig0 = dorigin[idbatch * 2 + 0];
-    const T dorig1 = dorigin[idbatch * 2 + 1];
+    const T dorig0 = dorigin[idbatch * 3 + 0];
+    const T dorig1 = dorigin[idbatch * 3 + 1];
     const T sint = t;
     const T cost = sqrtf(1.0f - t*t);
     const T rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
@@ -81,7 +81,10 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         c10::complex<T> v = interp2d<c10::complex<T>>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         T ref_sin, ref_cos;
-        sincospi<T>(ref_phase * (rp - d), &ref_sin, &ref_cos);
+        const T z1 = z0 + dorigin[idbatch * 3 + 2];
+        const T dz = sqrtf(z1*z1 + d*d);
+        const T rpz = sqrtf(z0*z0 + rp*rp);
+        sincospi<T>(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
         c10::complex<T> ref = {ref_cos, ref_sin};
         out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = v * ref;
     } else {
@@ -92,7 +95,7 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
 template <typename T>
 static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, const T *dorigin, T rotation,
                   T ref_phase, T r0, T dr, T theta0, T dtheta, int Nr, int Ntheta,
-                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1,
+                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1, T z0,
                   const c10::complex<T> *grad, c10::complex<T> *img_grad, T *dorigin_grad,
                   int idx, int idbatch) {
     const int idtheta = idx % Ntheta1;
@@ -114,8 +117,8 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
     if (t < -1.0f || t > 1.0f) {
         return;
     }
-    const T dorig0 = dorigin[idbatch * 2 + 0];
-    const T dorig1 = dorigin[idbatch * 2 + 1];
+    const T dorig0 = dorigin[idbatch * 3 + 0];
+    const T dorig1 = dorigin[idbatch * 3 + 1];
     const T sint = t;
     const T cost = sqrtf(1.0f - t*t);
     const T rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
@@ -137,7 +140,10 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         v = interp2d<c10::complex<T>>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         T ref_sin, ref_cos;
-        sincospi<T>(ref_phase * (rp - d), &ref_sin, &ref_cos);
+        const T z1 = z0 + dorigin[idbatch * 3 + 2];
+        const T dz = sqrtf(z1*z1 + d*d);
+        const T rpz = sqrtf(z0*z0 + rp*rp);
+        sincospi<T>(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
         ref = {ref_cos, ref_sin};
     }
 
@@ -153,9 +159,9 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
         drp_dorigin1 *= gd;
 
 #pragma omp atomic
-        dorigin_grad[idbatch * 2 + 0] += drp_dorigin0;
+        dorigin_grad[idbatch * 3 + 0] += drp_dorigin0;
 #pragma omp atomic
-        dorigin_grad[idbatch * 2 + 1] += drp_dorigin1;
+        dorigin_grad[idbatch * 3 + 1] += drp_dorigin1;
     }
 
     if (img_grad != nullptr) {
@@ -195,7 +201,8 @@ at::Tensor polar_interp_linear_cpu(
           double theta1,
           double dtheta1,
           int64_t nr1,
-          int64_t ntheta1) {
+          int64_t ntheta1,
+          double z0) {
     TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kComplexDouble);
     TORCH_CHECK(dorigin.dtype() == at::kFloat || dorigin.dtype() == at::kDouble);
     TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
@@ -216,7 +223,7 @@ at::Tensor polar_interp_linear_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_cpu<float>(img_ptr, out_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1, idx, idbatch);
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0, idx, idbatch);
             }
         }
     } else {
@@ -231,7 +238,7 @@ at::Tensor polar_interp_linear_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_cpu<double>(img_ptr, out_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1, idx, idbatch);
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0, idx, idbatch);
             }
         }
     }
@@ -256,7 +263,8 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
           double theta1,
           double dtheta1,
           int64_t nr1,
-          int64_t ntheta1) {
+          int64_t ntheta1,
+          double z0) {
     TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kComplexDouble);
     TORCH_CHECK(dorigin.dtype() == at::kFloat || dorigin.dtype() == at::kDouble);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat || grad.dtype() == at::kComplexDouble);
@@ -298,7 +306,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_grad_cpu<float>(img_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1,
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0,
                       grad_ptr, img_grad_ptr, dorigin_grad_ptr,
                       idx, idbatch);
             }
@@ -332,7 +340,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_grad_cpu<double>(img_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1,
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0,
                       grad_ptr, img_grad_ptr, dorigin_grad_ptr,
                       idx, idbatch);
             }
@@ -348,7 +356,6 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
 static void backprojection_polar_2d_kernel_cpu(
           const complex64_t* data,
           const float* pos,
-          const float* vel,
           const float* att,
           complex64_t* img,
           int sweep_samples,
@@ -363,6 +370,7 @@ static void backprojection_polar_2d_kernel_cpu(
           int Ntheta,
           float d0,
           float ant_tx_dy,
+          bool dealias, float z0,
           int idx,
           int idbatch) {
     const int idtheta = idx % Ntheta;
@@ -415,6 +423,13 @@ static void backprojection_polar_2d_kernel_cpu(
         complex64_t ref = {ref_cos, ref_sin};
         pixel += s * ref;
     }
+    if (dealias) {
+        const float d = 2.0f * sqrtf(x*x + y*y + z0*z0);
+        float ref_sin, ref_cos;
+        sincospi(-ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
+    }
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
 }
 
@@ -435,18 +450,17 @@ at::Tensor backprojection_polar_2d_cpu(
           int64_t Nr,
           int64_t Ntheta,
           double d0,
-          double ant_tx_dy) {
+          double ant_tx_dy,
+          int64_t dealias,
+          double z0) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(vel.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
-	TORCH_INTERNAL_ASSERT(vel.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
 
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor vel_contig = vel.contiguous();
 	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
     auto options =
@@ -456,7 +470,6 @@ at::Tensor backprojection_polar_2d_cpu(
         .device(torch::kCPU, 1);
 	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* vel_ptr = vel_contig.data_ptr<float>();
 	const float* att_ptr = att_contig.data_ptr<float>();
 	const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
@@ -472,7 +485,6 @@ at::Tensor backprojection_polar_2d_cpu(
             backprojection_polar_2d_kernel_cpu(
                           data_ptr,
                           pos_ptr,
-                          vel_ptr,
                           att_ptr,
                           img_ptr,
                           sweep_samples,
@@ -483,6 +495,7 @@ at::Tensor backprojection_polar_2d_cpu(
                           theta0, dtheta,
                           Nr, Ntheta,
                           d0, ant_tx_dy,
+                          dealias, z0,
                           idx, idbatch);
         }
     }
@@ -492,7 +505,6 @@ at::Tensor backprojection_polar_2d_cpu(
 static void backprojection_polar_2d_grad_kernel_cpu(
           const complex64_t* data,
           const float* pos,
-          const float* vel,
           const float* att,
           int sweep_samples,
           int nsweeps,
@@ -506,6 +518,8 @@ static void backprojection_polar_2d_grad_kernel_cpu(
           int Ntheta,
           float d0,
           float ant_tx_dy,
+          bool dealias,
+          float z0,
           const complex64_t* grad,
           float* pos_grad,
           complex64_t *data_grad,
@@ -526,6 +540,14 @@ static void backprojection_polar_2d_grad_kernel_cpu(
     const float y = r * theta;
 
     complex64_t g = grad[idbatch * Nr * Ntheta + idr * Ntheta + idtheta];
+
+    if (dealias) {
+        const float d = 2.0f * sqrtf(x*x + y*y + z0*z0);
+        float ref_sin, ref_cos;
+        sincospi(-ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        g *= ref;
+    }
 
     complex64_t I = {0.0f, 1.0f};
 
@@ -636,24 +658,22 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
           int64_t Nr,
           int64_t Ntheta,
           double d0,
-          double ant_tx_dy) {
+          double ant_tx_dy,
+          int64_t dealias,
+          double z0) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(vel.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
-	TORCH_INTERNAL_ASSERT(vel.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor vel_contig = vel.contiguous();
 	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
 	at::Tensor grad_contig = grad.contiguous();
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* vel_ptr = vel_contig.data_ptr<float>();
 	const float* att_ptr = att_contig.data_ptr<float>();
 	const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 	const c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
@@ -687,7 +707,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
             backprojection_polar_2d_grad_kernel_cpu(
                           data_ptr,
                           pos_ptr,
-                          vel_ptr,
                           att_ptr,
                           sweep_samples,
                           nsweeps,
@@ -697,6 +716,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
                           theta0, dtheta,
                           Nr, Ntheta,
                           d0, ant_tx_dy,
+                          dealias, z0,
                           grad_ptr,
                           pos_grad_ptr,
                           data_grad_ptr,
@@ -861,14 +881,17 @@ at::Tensor polar_to_cart_linear_cpu(
 
 // Defines the operators
 TORCH_LIBRARY(torchbp, m) {
-  m.def("backprojection_polar_2d(Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy) -> Tensor");
-  m.def("backprojection_polar_2d_grad(Tensor grad, Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy) -> Tensor[]");
+  m.def("backprojection_polar_2d(Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy, int dealias, float z0) -> Tensor");
+  m.def("backprojection_polar_2d_grad(Tensor grad, Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy, int dealias, float z0) -> Tensor[]");
+  m.def("backprojection_polar_2d_lanczos(Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy, int dealias, float z0, int order) -> Tensor");
   m.def("backprojection_cart_2d(Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0, float ant_tx_dy) -> Tensor");
   m.def("backprojection_cart_2d_grad(Tensor grad, Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0, float ant_tx_dy) -> Tensor[]");
   m.def("gpga_backprojection_2d(Tensor target_pos, Tensor data, Tensor pos, Tensor vel, Tensor att, int sweep_samples, int nsweeps, float fc, float r_res, int Ntarget, float d0, float ant_tx_dy) -> Tensor");
   m.def("cfar_2d(Tensor img, int nbatch, int N0, int N1, int Navg0, int Navg1, int Nguard0, int Nguard1, float threshold, int peaks_only) -> Tensor");
-  m.def("polar_interp_linear(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1) -> Tensor");
-  m.def("polar_interp_linear_grad(Tensor grad, Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1) -> Tensor[]");
+  m.def("polar_interp_linear(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z0) -> Tensor");
+  m.def("polar_interp_linear_grad(Tensor grad, Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z0) -> Tensor[]");
+  m.def("polar_interp_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z0) -> Tensor");
+  m.def("polar_interp_lanczos(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z0, int order) -> Tensor");
   m.def("polar_to_cart_linear(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");
   m.def("polar_to_cart_linear_grad(Tensor grad, Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor[]");
   m.def("polar_to_cart_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");

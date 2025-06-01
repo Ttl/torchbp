@@ -79,8 +79,6 @@ if __name__ == "__main__":
     # Final image dimensions
     x0 = 1
     x1 = 2000
-    y0 = -x1 / 2
-    y1 = x1 / 2
     # Image dimensions during autofocus, typically smaller than the final image
     autofocus_x0 = 400
     autofocus_x1 = 1200
@@ -194,8 +192,6 @@ if __name__ == "__main__":
     f = torch.fft.rfftfreq(int(nsamples * fft_oversample), d=1 / fs).to(dev)
     rvp = torch.exp(-1j * torch.pi * f**2 * tsweep / bw)
     r_res = c0 / (2 * bw * fft_oversample)
-    d = torch.arange(f.shape[0], device=dev) * r_res
-    nfsamples = f.shape[-1]
     del f
 
     # Timestamp of each sweep
@@ -293,9 +289,8 @@ if __name__ == "__main__":
     )[None, :]
     pos_centered = pos - origin
     print("Focusing final image")
-    sar_img = torchbp.ops.backprojection_polar_2d(
-        fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0, ant_tx_dy
-    ).squeeze()
+    sar_img = torchbp.ops.backprojection_polar_2d( fsweeps, grid_polar, fc,
+            r_res, pos_centered, vel, att, d0, ant_tx_dy).squeeze()
     print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()
 

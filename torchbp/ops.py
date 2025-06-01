@@ -1,10 +1,12 @@
 import torch
 from math import pi
 from torch import Tensor
+from copy import deepcopy
+from .util import bp_polar_range_dealias
 
 cart_2d_nargs = 18
-polar_2d_nargs = 17
-polar_interp_linear_args = 17
+polar_2d_nargs = 19
+polar_interp_linear_args = 18
 polar_to_cart_linear_args = 18
 polar_to_cart_bicubic_args = 21
 entropy_args = 3
@@ -43,13 +45,17 @@ def entropy(img: Tensor) -> Tensor:
         return x.squeeze(0)
     return x
 
-def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
+def polar_interp(img: Tensor, dorigin: Tensor, grid_polar: dict,
         fc: float, rotation: float=0,
-        grid_polar_new: dict=None) -> Tensor:
+        grid_polar_new: dict=None, z0: float=0,
+        method : str | tuple="linear") -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
+    Allows choosing the interpolation method.
 
-    Gradient can be calculated with respect to img and dorigin.
+    Gradient calculation is only supported with "linear" method.
+
+    Note: Z-axis interpolation likely incorrect.
 
     Parameters
     ----------
@@ -57,8 +63,8 @@ def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
         2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
         [nbatch, range, angle] if interpolating multiple images at the same time.
     dorigin : Tensor
-        2D origin of the old image in with respect to new image. Units in meters
-        [nbatch, 2] if img shape is 3D.
+        Difference between the origin of the old image to the new image. Units in meters
+        [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
         "r": (r0, r1), tuple of min and max range,
@@ -72,6 +78,70 @@ def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
     grid_polar_new : dict, optional
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center.
+    method : str or tuple
+        Interpolation method. Valid choices are:
+        - "linear": Linear interpolation.
+        - "cubic": Cubic interpolation.
+        - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+    if type(method) in (list, tuple):
+        method_params = method[1]
+        method = method[0]
+    else:
+        method_params = None
+
+    if method == "linear":
+        return polar_interp_linear(img, dorigin, grid_polar, fc, rotation,
+                grid_polar_new, z0)
+    elif method == "cubic":
+        return polar_interp_bicubic(img, dorigin, grid_polar, fc, rotation,
+                grid_polar_new, z0)
+    elif method == "lanczos":
+        return polar_interp_lanczos(img, dorigin, grid_polar, fc, rotation,
+                grid_polar_new, z0, order=method_params)
+    else:
+        raise ValueError(f"Unknown interp_method: {interp_method}")
+
+def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
+        fc: float, rotation: float=0,
+        grid_polar_new: dict=None, z0: float=0) -> Tensor:
+    """
+    Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
+
+    Gradient can be calculated with respect to img and dorigin.
+
+    Note: Z-axis interpolation likely incorrect.
+
+    Parameters
+    ----------
+    img : Tensor
+        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
+        [nbatch, range, angle] if interpolating multiple images at the same time.
+    dorigin : Tensor
+        Difference between the origin of the old image to the new image. Units in meters
+        [nbatch, 3] if img shape is 3D.
+    grid_polar : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    rotation : float
+        Angle rotation to apply in radians.
+    grid_polar_new : dict, optional
+        Grid definition of the new image.
+        If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center.
 
     Returns
     ----------
@@ -81,10 +151,10 @@ def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
 
     if img.dim() == 3:
         nbatch = img.shape[0]
-        assert dorigin.shape == (nbatch, 2)
+        assert dorigin.shape == (nbatch, 3)
     else:
         nbatch = 1
-        assert dorigin.shape == (2,)
+        assert dorigin.shape == (3,)
 
     r1_0, r1_1 = grid_polar["r"]
     theta1_0, theta1_1 = grid_polar["theta"]
@@ -108,9 +178,159 @@ def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
     dtheta3 = (theta3_1 - theta3_0) / ntheta3
     dr3 = (r3_1 - r3_0) / nr3
 
-    return torch.ops.torchbp.polar_interp_linear.default(
-            img, dorigin, nbatch, rotation, fc, r1_0, dr1, theta1_0, dtheta1, nr1, ntheta1,
-            r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3)
+    return torch.ops.torchbp.polar_interp_linear.default( img, dorigin, nbatch,
+            rotation, fc, r1_0, dr1, theta1_0, dtheta1, nr1, ntheta1, r3_0, dr3,
+            theta3_0, dtheta3, nr3, ntheta3, z0)
+
+def polar_interp_bicubic(img: Tensor, dorigin: Tensor, grid_polar: dict,
+        fc: float, rotation: float=0,
+        grid_polar_new: dict=None, z0: float=0) -> Tensor:
+    """
+    Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
+
+    Gradient not supported.
+
+    Note: Z-axis interpolation likely incorrect.
+
+    Parameters
+    ----------
+    img : Tensor
+        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
+        [nbatch, range, angle] if interpolating multiple images at the same time.
+    dorigin : Tensor
+        Difference between the origin of the old image to the new image. Units in meters
+        [nbatch, 3] if img shape is 3D.
+    grid_polar : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    rotation : float
+        Angle rotation to apply in radians.
+    grid_polar_new : dict, optional
+        Grid definition of the new image.
+        If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+
+    if img.dim() == 3:
+        nbatch = img.shape[0]
+        assert dorigin.shape == (nbatch, 3)
+    else:
+        nbatch = 1
+        assert dorigin.shape == (3,)
+
+    r1_0, r1_1 = grid_polar["r"]
+    theta1_0, theta1_1 = grid_polar["theta"]
+    ntheta1 = grid_polar["ntheta"]
+    nr1 = grid_polar["nr"]
+    dtheta1 = (theta1_1 - theta1_0) / ntheta1
+    dr1 = (r1_1 - r1_0) / nr1
+
+    if grid_polar_new is None:
+        r3_0 = r1_0
+        r3_1 = r1_1
+        theta3_0 = theta1_0
+        theta3_1 = theta1_1
+        nr3 = nr1
+        ntheta3 = 2*ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    img_gx, img_gy = torch.gradient(img, dim=(-2,-1), edge_order=2)
+    img_gxy = torch.gradient(img_gx, dim=-1)[0]
+
+    return torch.ops.torchbp.polar_interp_bicubic.default(img, img_gx, img_gy,
+            img_gxy, dorigin, nbatch, rotation, fc, r1_0, dr1, theta1_0,
+            dtheta1, nr1, ntheta1, r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3,
+            z0)
+
+def polar_interp_lanczos(img: Tensor, dorigin: Tensor, grid_polar: dict,
+        fc: float, rotation: float=0,
+        grid_polar_new: dict=None, z0: float=0, order: int=4) -> Tensor:
+    """
+    Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
+
+    Gradient not supported.
+
+    Note: Z-axis interpolation likely incorrect.
+
+    Parameters
+    ----------
+    img : Tensor
+        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
+        [nbatch, range, angle] if interpolating multiple images at the same time.
+    dorigin : Tensor
+        Difference between the origin of the old image to the new image. Units in meters
+        [nbatch, 3] if img shape is 3D.
+    grid_polar : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    rotation : float
+        Angle rotation to apply in radians.
+    grid_polar_new : dict, optional
+        Grid definition of the new image.
+        If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+
+    if img.dim() == 3:
+        nbatch = img.shape[0]
+        assert dorigin.shape == (nbatch, 3)
+    else:
+        nbatch = 1
+        assert dorigin.shape == (3,)
+
+    r1_0, r1_1 = grid_polar["r"]
+    theta1_0, theta1_1 = grid_polar["theta"]
+    ntheta1 = grid_polar["ntheta"]
+    nr1 = grid_polar["nr"]
+    dtheta1 = (theta1_1 - theta1_0) / ntheta1
+    dr1 = (r1_1 - r1_0) / nr1
+
+    if grid_polar_new is None:
+        r3_0 = r1_0
+        r3_1 = r1_1
+        theta3_0 = theta1_0
+        theta3_1 = theta1_1
+        nr3 = nr1
+        ntheta3 = 2*ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    return torch.ops.torchbp.polar_interp_lanczos.default( img, dorigin, nbatch,
+            rotation, fc, r1_0, dr1, theta1_0, dtheta1, nr1, ntheta1, r3_0, dr3,
+            theta3_0, dtheta3, nr3, ntheta3, z0, order)
 
 def polar_to_cart_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
         grid_cart: dict, fc: float, rotation: float=0, polar_interp: bool=False) -> Tensor:
@@ -303,7 +523,8 @@ def _polar_to_cart_bicubic(img: Tensor, img_gx: Tensor, img_gy: Tensor, img_gxy:
 def backprojection_polar_2d(data: Tensor, grid: dict,
         fc: float, r_res: float,
         pos: Tensor, vel: Tensor, att: Tensor,
-        d0: float=0.0, ant_tx_dy: float=0.0) -> Tensor:
+        d0: float=0.0, ant_tx_dy: float=0.0,
+        dealias: bool=False) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
 
@@ -339,6 +560,10 @@ def backprojection_polar_2d(data: Tensor, grid: dict,
         Zero range correction.
     ant_tx_dy : float
         RX antenna Y-position (along the track) distance from TX antenna.
+    dealias : bool
+        If True removes the range spectrum aliasing. Equivalent to applying
+        `torchbp.util.bp_polar_range_dealias` on the SAR image.
+        Default is False.
 
     Returns
     ----------
@@ -368,11 +593,101 @@ def backprojection_polar_2d(data: Tensor, grid: dict,
         assert vel.shape == (nbatch, nsweeps, 3)
         assert att.shape == (nbatch, nsweeps, 3)
 
+    z0 = 0
+    if dealias:
+        z0 = torch.mean(pos[:,2])
+
     return torch.ops.torchbp.backprojection_polar_2d.default(
             data, pos, vel, att,
             nbatch, sweep_samples, nsweeps, fc, r_res,
             r0, dr, theta0, dtheta, nr, ntheta,
-            d0, ant_tx_dy)
+            d0, ant_tx_dy, dealias, z0)
+
+def backprojection_polar_2d_lanczos(data: Tensor, grid: dict,
+        fc: float, r_res: float,
+        pos: Tensor, vel: Tensor, att: Tensor,
+        d0: float=0.0, ant_tx_dy: float=0.0,
+        dealias: bool=False, order: int=4) -> Tensor:
+    """
+    2D backprojection with pseudo-polar coordinates. Interpolates input data
+    using lanczos interpolation.
+
+    Gradient not supported.
+
+    Parameters
+    ----------
+    data : Tensor
+        Range compressed input data. Shape should be [nbatch, nsweeps, samples] or
+        [nsweeps, samples]. If input is 3 dimensional the first dimensions is number
+        of independent images to form at the same time. Whole batch is processed
+        with same grid and other arguments.
+    grid : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
+        and oversample is FFT oversampling factor.
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+    vel : Tensor
+        Velocity of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3]. Unused.
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+        [Roll, pitch, yaw]. Only the yaw is used at the moment.
+    d0 : float
+        Zero range correction.
+    ant_tx_dy : float
+        RX antenna Y-position (along the track) distance from TX antenna.
+    dealias : bool
+        If True removes the range spectrum aliasing. Equivalent to applying
+        `torchbp.util.bp_polar_range_dealias` on the SAR image.
+        Default is False.
+    order : int
+        Lanczos interpolation order. The default is 4.
+
+    Returns
+    ----------
+    img : Tensor
+        Pseudo-polar format radar image.
+    """
+
+    r0, r1 = grid["r"]
+    theta0, theta1 = grid["theta"]
+    nr = grid["nr"]
+    ntheta = grid["ntheta"]
+    dr = (r1 - r0) / nr
+    dtheta = (theta1 - theta0) / ntheta
+
+    if data.dim() == 2:
+        nbatch = 1
+        nsweeps = data.shape[0]
+        sweep_samples = data.shape[1]
+        assert pos.shape == (nsweeps, 3)
+        assert vel.shape == (nsweeps, 3)
+        assert att.shape == (nsweeps, 3)
+    else:
+        nbatch = data.shape[0]
+        nsweeps = data.shape[1]
+        sweep_samples = data.shape[2]
+        assert pos.shape == (nbatch, nsweeps, 3)
+        assert vel.shape == (nbatch, nsweeps, 3)
+        assert att.shape == (nbatch, nsweeps, 3)
+
+    z0 = 0
+    if dealias:
+        z0 = torch.mean(pos[:,2])
+
+    return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(
+            data, pos, vel, att,
+            nbatch, sweep_samples, nsweeps, fc, r_res,
+            r0, dr, theta0, dtheta, nr, ntheta,
+            d0, ant_tx_dy, dealias, z0, order)
 
 def backprojection_cart_2d(data: Tensor, grid: dict,
         fc: float, r_res: float,
@@ -642,6 +957,93 @@ def backprojection_polar_2d_tx_power(wa: Tensor, gtx: Tensor, grx: Tensor,
             g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
             nsweeps, r_res,
             r0, dr, theta0, dtheta, nr, ntheta, sin_look_angle)
+
+def ffbp(data: Tensor, grid: dict, fc: float, r_res: float, pos: Tensor, vel:
+        Tensor, att: Tensor, stages: int, divisions: int=2, d0: float=0.0,
+        ant_tx_dy: float=0.0, interp_method: str | tuple=("lanczos", 3)) -> Tensor:
+    """
+    Fast factorized backprojection.
+
+    Large Z-axis movements likely not handled correctly.
+
+    Parameters
+    ----------
+    data : Tensor
+        Range compressed input data. Shape should be [nsweeps, samples].
+    grid : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
+        and oversample is FFT oversampling factor.
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+    vel : Tensor
+        Velocity of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3]. Unused.
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+        [Roll, pitch, yaw]. Only the yaw is used at the moment.
+    stages : int
+        Number of recursions.
+    divisions : int
+        Number of subapertures divisions per stage. Default is 2.
+    d0 : float
+        Zero range correction.
+    ant_tx_dy : float
+        RX antenna Y-position (along the track) distance from TX antenna.
+    interp_method : str or tuple
+        Interpolation method. See `polar_interp` function.
+    """
+    nsweeps = data.shape[0]
+    device = data.device
+
+    imgs = []
+    n = nsweeps // divisions
+    for d in range(divisions):
+        origin_local = torch.tensor([torch.mean(pos[d*n:(d+1)*n,0]),
+            torch.mean(pos[d*n:(d+1)*n,1]), 0], device=device,
+            dtype=torch.float32)[None,:]
+        pos_local = pos[d*n:(d+1)*n] - origin_local
+        z0 = torch.mean(pos_local[:,2])
+        vel_local = vel[d*n:(d+1)*n]
+        att_local = att[d*n:(d+1)*n]
+        grid_local = deepcopy(grid)
+        grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
+        data_local = data[d*n:(d+1)*n]
+        if stages > 1 and len(data_local) > 4*divisions:
+            img = ffbp(data_local, grid_local, fc, r_res, pos_local, vel_local, att_local,
+                    stages=stages-1, divisions=divisions, d0=d0, ant_tx_dy=ant_tx_dy)
+        else:
+            img = backprojection_polar_2d(data_local, grid_local, fc, r_res,
+                    pos_local, vel_local, att_local, d0=d0,
+                    ant_tx_dy=ant_tx_dy)[0]
+        imgs.append((origin_local[0], grid_local, img, z0))
+    while len(imgs) > 1:
+        img1 = imgs[0]
+        img2 = imgs[1]
+        new_origin = 0.5 * img1[0] + 0.5 * img2[0]
+        if len(imgs) == 2:
+            # Interpolate the final image to the desired grid.
+            grid_polar_new = grid
+        else:
+            grid_polar_new = deepcopy(img1[1])
+            grid_polar_new["ntheta"] += img2[1]["ntheta"]
+        i1 = img1[2]
+        i2 = img2[2]
+        img_interpolated1 = polar_interp(i1, new_origin - img1[0], img1[1], fc,
+                0, grid_polar_new, z0=img1[3], method=interp_method).squeeze()
+        img_interpolated2 = polar_interp(i2, new_origin - img2[0], img2[1], fc,
+                0, grid_polar_new, z0=img2[3], method=interp_method).squeeze()
+        img_sum = img_interpolated1 + img_interpolated2
+        merged = (new_origin, grid_polar_new, img_sum, img1[3])
+        imgs = imgs[2:] + [merged]
+    return imgs[0][2]
 
 # Registers a FakeTensor kernel (aka "meta kernel", "abstract impl")
 # that describes what the properties of the output Tensor are given

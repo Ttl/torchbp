@@ -54,7 +54,9 @@ class TestPolarInterpLinear(TestCase):
         nbatch = 2
         grid_polar = {"r": (10, 20), "theta": (-1, 1), "nr": 2, "ntheta": 2}
         grid_polar_new = {"r": (12, 18), "theta": (-0.8, 0.8), "nr": 3, "ntheta": 3}
-        dorigin = 0.1*make_tensor((nbatch, 2), dtype=dtype)
+        dorigin = 0.1*make_tensor((nbatch, 3), dtype=dtype)
+        # TODO: Remove this when Z-axis interpolation is supported.
+        dorigin[:,2] = 0
         args = {
             'img': make_tensor((nbatch, grid_polar["nr"], grid_polar["ntheta"]), dtype=complex_dtype),
             'dorigin': dorigin,
