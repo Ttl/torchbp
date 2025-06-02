@@ -4,7 +4,8 @@ from math import pi
 import numpy as np
 from scipy.signal import get_window
 
-def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float, grid_polar: dict) -> Tensor:
+def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float,
+        grid_polar: dict) -> Tensor:
     """
     De-alias range-axis spectrum of polar SAR image processed with backprojection.
 
@@ -18,6 +19,12 @@ def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float, grid_polar: d
         RF center frequency.
     grid_polar : dict
         Polar grid definition
+
+    References
+    ----------
+    .. [#] T. Shi, X. Mao, A. Jakobsson and Y. Liu, "Extended PGA for Spotlight
+    SAR-Filtered Backprojection Imagery," in IEEE Geoscience and Remote Sensing
+    Letters, vol. 19, pp. 1-5, 2022, Art no. 4516005.
 
     Returns
     ----------
@@ -46,7 +53,7 @@ def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float, grid_polar: d
         phase = phase.unsqueeze(0)
     return phase * img
 
-def diff(x: Tensor, dim: int=-1, same_size: bool=False):
+def diff(x: Tensor, dim: int=-1, same_size: bool=False) -> Tensor:
     """
     ``np.diff`` implemented in torch.
 
@@ -71,7 +78,7 @@ def diff(x: Tensor, dim: int=-1, same_size: bool=False):
     else:
         return x[...,1:]-x[...,:-1]
 
-def unwrap(phi: Tensor, dim: int=-1):
+def unwrap(phi: Tensor, dim: int=-1) -> Tensor:
     """
     ``np.unwrap`` implemented in torch.
 
@@ -97,7 +104,7 @@ def unwrap(phi: Tensor, dim: int=-1):
     phi_adj[dphi.abs()<torch.pi] = 0
     return phi_wrap + phi_adj.cumsum(dim)
 
-def quad_interp(a: Tensor, v: int):
+def quad_interp(a: Tensor, v: int) -> Tensor:
     """
     Quadractic peak interpolation.
     Useful for FFT peak interpolation.
@@ -119,7 +126,7 @@ def quad_interp(a: Tensor, v: int):
     a3 = a[(v+1) % len(a)]
     return 0.5 * (a1 - a3) / (a1 - 2*a2 + a3)
 
-def find_image_shift_1d(x: Tensor, y: Tensor, dim: int=-1):
+def find_image_shift_1d(x: Tensor, y: Tensor, dim: int=-1) -> Tensor:
     """
     Find shift between images that maximizes correlation.
 
@@ -148,7 +155,7 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int=-1):
         c = torch.mean(c, dim=other_dims)
     return torch.argmax(c)
 
-def fft_peak_1d(x: Tensor, dim: int=-1, fractional: bool=True):
+def fft_peak_1d(x: Tensor, dim: int=-1, fractional: bool=True) -> Tensor:
     """
     Find fractional peak of ``abs(fft(x))``.
 
@@ -175,7 +182,7 @@ def fft_peak_1d(x: Tensor, dim: int=-1, fractional: bool=True):
         a = l - a
     return a
 
-def detrend(x: Tensor):
+def detrend(x: Tensor) -> Tensor:
     """
     Removes linear trend
 
@@ -193,7 +200,7 @@ def detrend(x: Tensor):
     a, b = np.polyfit(k, x.cpu().numpy(), 1)
     return x - (a*torch.arange(n, device=x.device)/n + b)
 
-def entropy(x: Tensor):
+def entropy(x: Tensor) -> Tensor:
     """
     Calculates entropy:
 
@@ -215,7 +222,7 @@ def entropy(x: Tensor):
     ax /= torch.sum(ax)
     return -torch.sum(torch.xlogy(ax, ax))
 
-def contrast(x: Tensor, dim: int=-1):
+def contrast(x: Tensor, dim: int=-1) -> Tensor:
     """
     Calculates negative contrast:
 
@@ -238,7 +245,7 @@ def contrast(x: Tensor, dim: int=-1):
     contrast = torch.mean(std / mu)
     return -contrast
 
-def shift_spectrum(x: Tensor, dim: int=-1):
+def shift_spectrum(x: Tensor, dim: int=-1) -> Tensor:
     """
     Equivalent to: ``fft(ifftshift(ifft(x, dim), dim), dim)``,
     but avoids calculating FFTs.
@@ -261,8 +268,8 @@ def shift_spectrum(x: Tensor, dim: int=-1):
     c[...,1::2] = -1
     return x * c
 
-def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc: float, bw: float,
-        tsweep: float, fs: float, rvp: bool=True):
+def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc:
+        float, bw: float, tsweep: float, fs: float, rvp: bool=True) -> Tensor:
     """
     Generate FMCW radar time-domain IF signal.
 
@@ -313,7 +320,8 @@ def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc:
         data += (target_rcs[e]/d**4) * torch.exp(-1j*2*pi*(fc*tau - k*tau*t + use_rvp*0.5*k*tau**2))
     return data
 
-def make_polar_grid(r0: float, r1: float, nr: int, ntheta: int, theta_limit: int=1, squint: float=0):
+def make_polar_grid(r0: float, r1: float, nr: int, ntheta: int, theta_limit:
+        int=1, squint: float=0) -> dict:
     """
     Generate polar grid dict in format understood by other polar functions.
 
@@ -344,7 +352,7 @@ def make_polar_grid(r0: float, r1: float, nr: int, ntheta: int, theta_limit: int
     grid_polar = {"r": (r0, r1), "theta": (t0, t1), "nr": nr, "ntheta": ntheta}
     return grid_polar
 
-def phase_to_distance(p: Tensor, fc: float):
+def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     """
     Convert radar reflection phase shift to distance.
 
@@ -359,7 +367,7 @@ def phase_to_distance(p: Tensor, fc: float):
     return c0 * p / (4*torch.pi*fc)
 
 def fft_lowpass_filter_window(target_data: Tensor, window: str | tuple='hamming',
-        window_width: int=None):
+        window_width: int=None) -> Tensor:
     """
     FFT low-pass filtering with a configurable window function.
 

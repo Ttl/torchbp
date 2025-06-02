@@ -9,7 +9,7 @@ from scipy import signal
 
 def pga_pd(img: Tensor, window_width: int | None=None, max_iters: int=10,
         window_exp: float=0.5, min_window: int=5, remove_trend: bool=True,
-        offload: bool=False)-> (Tensor, Tensor):
+        offload: bool=False) -> (Tensor, Tensor):
     """
     Phase gradient autofocus
 
@@ -178,7 +178,8 @@ def pga_ml(img: Tensor, window_width: int | None=None, max_iters: int=10,
 
 def gpga_2d_iter(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor,
         att: Tensor, fc: float, r_res: float, window_width: int | None=None,
-        d0: float=0.0, ant_tx_dy: float=0.0, estimator: str="ml", lowpass_window="boxcar") -> Tensor:
+        d0: float=0.0, ant_tx_dy: float=0.0, estimator: str="ml",
+        lowpass_window="boxcar") -> Tensor:
     """
     Single generalized phase gradient iteration.
 
