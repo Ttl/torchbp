@@ -12,6 +12,7 @@ polar_to_cart_bicubic_args = 21
 entropy_args = 3
 abs_sum_args = 2
 
+
 def entropy(img: Tensor) -> Tensor:
     """
     Calculates entropy of:
@@ -45,10 +46,17 @@ def entropy(img: Tensor) -> Tensor:
         return x.squeeze(0)
     return x
 
-def polar_interp(img: Tensor, dorigin: Tensor, grid_polar: dict,
-        fc: float, rotation: float=0,
-        grid_polar_new: dict=None, z0: float=0,
-        method : str | tuple="linear") -> Tensor:
+
+def polar_interp(
+    img: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    fc: float,
+    rotation: float = 0,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+    method: str | tuple = "linear",
+) -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
     Allows choosing the interpolation method.
@@ -98,20 +106,37 @@ def polar_interp(img: Tensor, dorigin: Tensor, grid_polar: dict,
         method_params = None
 
     if method == "linear":
-        return polar_interp_linear(img, dorigin, grid_polar, fc, rotation,
-                grid_polar_new, z0)
+        return polar_interp_linear(
+            img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0
+        )
     elif method == "cubic":
-        return polar_interp_bicubic(img, dorigin, grid_polar, fc, rotation,
-                grid_polar_new, z0)
+        return polar_interp_bicubic(
+            img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0
+        )
     elif method == "lanczos":
-        return polar_interp_lanczos(img, dorigin, grid_polar, fc, rotation,
-                grid_polar_new, z0, order=method_params)
+        return polar_interp_lanczos(
+            img,
+            dorigin,
+            grid_polar,
+            fc,
+            rotation,
+            grid_polar_new,
+            z0,
+            order=method_params,
+        )
     else:
         raise ValueError(f"Unknown interp_method: {interp_method}")
 
-def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
-        fc: float, rotation: float=0,
-        grid_polar_new: dict=None, z0: float=0) -> Tensor:
+
+def polar_interp_linear(
+    img: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    fc: float,
+    rotation: float = 0,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+) -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
 
@@ -169,7 +194,7 @@ def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
         theta3_0 = theta1_0
         theta3_1 = theta1_1
         nr3 = nr1
-        ntheta3 = 2*ntheta1
+        ntheta3 = 2 * ntheta1
     else:
         r3_0, r3_1 = grid_polar_new["r"]
         theta3_0, theta3_1 = grid_polar_new["theta"]
@@ -178,13 +203,37 @@ def polar_interp_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
     dtheta3 = (theta3_1 - theta3_0) / ntheta3
     dr3 = (r3_1 - r3_0) / nr3
 
-    return torch.ops.torchbp.polar_interp_linear.default( img, dorigin, nbatch,
-            rotation, fc, r1_0, dr1, theta1_0, dtheta1, nr1, ntheta1, r3_0, dr3,
-            theta3_0, dtheta3, nr3, ntheta3, z0)
+    return torch.ops.torchbp.polar_interp_linear.default(
+        img,
+        dorigin,
+        nbatch,
+        rotation,
+        fc,
+        r1_0,
+        dr1,
+        theta1_0,
+        dtheta1,
+        nr1,
+        ntheta1,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        z0,
+    )
 
-def polar_interp_bicubic(img: Tensor, dorigin: Tensor, grid_polar: dict,
-        fc: float, rotation: float=0,
-        grid_polar_new: dict=None, z0: float=0) -> Tensor:
+
+def polar_interp_bicubic(
+    img: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    fc: float,
+    rotation: float = 0,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+) -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
 
@@ -242,7 +291,7 @@ def polar_interp_bicubic(img: Tensor, dorigin: Tensor, grid_polar: dict,
         theta3_0 = theta1_0
         theta3_1 = theta1_1
         nr3 = nr1
-        ntheta3 = 2*ntheta1
+        ntheta3 = 2 * ntheta1
     else:
         r3_0, r3_1 = grid_polar_new["r"]
         theta3_0, theta3_1 = grid_polar_new["theta"]
@@ -251,17 +300,44 @@ def polar_interp_bicubic(img: Tensor, dorigin: Tensor, grid_polar: dict,
     dtheta3 = (theta3_1 - theta3_0) / ntheta3
     dr3 = (r3_1 - r3_0) / nr3
 
-    img_gx, img_gy = torch.gradient(img, dim=(-2,-1), edge_order=2)
+    img_gx, img_gy = torch.gradient(img, dim=(-2, -1), edge_order=2)
     img_gxy = torch.gradient(img_gx, dim=-1)[0]
 
-    return torch.ops.torchbp.polar_interp_bicubic.default(img, img_gx, img_gy,
-            img_gxy, dorigin, nbatch, rotation, fc, r1_0, dr1, theta1_0,
-            dtheta1, nr1, ntheta1, r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3,
-            z0)
+    return torch.ops.torchbp.polar_interp_bicubic.default(
+        img,
+        img_gx,
+        img_gy,
+        img_gxy,
+        dorigin,
+        nbatch,
+        rotation,
+        fc,
+        r1_0,
+        dr1,
+        theta1_0,
+        dtheta1,
+        nr1,
+        ntheta1,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        z0,
+    )
 
-def polar_interp_lanczos(img: Tensor, dorigin: Tensor, grid_polar: dict,
-        fc: float, rotation: float=0,
-        grid_polar_new: dict=None, z0: float=0, order: int=4) -> Tensor:
+
+def polar_interp_lanczos(
+    img: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    fc: float,
+    rotation: float = 0,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+    order: int = 4,
+) -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
 
@@ -319,7 +395,7 @@ def polar_interp_lanczos(img: Tensor, dorigin: Tensor, grid_polar: dict,
         theta3_0 = theta1_0
         theta3_1 = theta1_1
         nr3 = nr1
-        ntheta3 = 2*ntheta1
+        ntheta3 = 2 * ntheta1
     else:
         r3_0, r3_1 = grid_polar_new["r"]
         theta3_0, theta3_1 = grid_polar_new["theta"]
@@ -328,12 +404,38 @@ def polar_interp_lanczos(img: Tensor, dorigin: Tensor, grid_polar: dict,
     dtheta3 = (theta3_1 - theta3_0) / ntheta3
     dr3 = (r3_1 - r3_0) / nr3
 
-    return torch.ops.torchbp.polar_interp_lanczos.default( img, dorigin, nbatch,
-            rotation, fc, r1_0, dr1, theta1_0, dtheta1, nr1, ntheta1, r3_0, dr3,
-            theta3_0, dtheta3, nr3, ntheta3, z0, order)
+    return torch.ops.torchbp.polar_interp_lanczos.default(
+        img,
+        dorigin,
+        nbatch,
+        rotation,
+        fc,
+        r1_0,
+        dr1,
+        theta1_0,
+        dtheta1,
+        nr1,
+        ntheta1,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        z0,
+        order,
+    )
 
-def polar_to_cart_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
-        grid_cart: dict, fc: float, rotation: float=0, polar_interp: bool=False) -> Tensor:
+
+def polar_to_cart_linear(
+    img: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    grid_cart: dict,
+    fc: float,
+    rotation: float = 0,
+    polar_interp: bool = False,
+) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid with linear interpolation.
 
@@ -392,11 +494,36 @@ def polar_to_cart_linear(img: Tensor, dorigin: Tensor, grid_polar: dict,
     dy = (y1 - y0) / ny
 
     return torch.ops.torchbp.polar_to_cart_linear.default(
-            img, dorigin, nbatch, rotation, fc, r0, dr, theta0, dtheta, nr, ntheta,
-            x0, y0, dx, dy, nx, ny, polar_interp)
+        img,
+        dorigin,
+        nbatch,
+        rotation,
+        fc,
+        r0,
+        dr,
+        theta0,
+        dtheta,
+        nr,
+        ntheta,
+        x0,
+        y0,
+        dx,
+        dy,
+        nx,
+        ny,
+        polar_interp,
+    )
 
-def polar_to_cart_bicubic(img: Tensor, dorigin: Tensor, grid_polar: dict,
-        grid_cart: dict, fc: float, rotation: float=0, polar_interp: bool=False) -> Tensor:
+
+def polar_to_cart_bicubic(
+    img: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    grid_cart: dict,
+    fc: float,
+    rotation: float = 0,
+    polar_interp: bool = False,
+) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid with bicubic interpolation.
 
@@ -440,15 +567,35 @@ def polar_to_cart_bicubic(img: Tensor, dorigin: Tensor, grid_polar: dict,
         nbatch = 1
         assert dorigin.shape == (2,)
 
-    img_gx, img_gy = torch.gradient(img, dim=(-2,-1), edge_order=2)
+    img_gx, img_gy = torch.gradient(img, dim=(-2, -1), edge_order=2)
     img_gxy = torch.gradient(img_gx, dim=-1)[0]
 
-    return _polar_to_cart_bicubic(img, img_gx, img_gy, img_gxy,
-        dorigin, grid_polar, grid_cart, fc, rotation, polar_interp)
+    return _polar_to_cart_bicubic(
+        img,
+        img_gx,
+        img_gy,
+        img_gxy,
+        dorigin,
+        grid_polar,
+        grid_cart,
+        fc,
+        rotation,
+        polar_interp,
+    )
 
-def _polar_to_cart_bicubic(img: Tensor, img_gx: Tensor, img_gy: Tensor, img_gxy:
-        Tensor, dorigin: Tensor, grid_polar: dict, grid_cart: dict, fc: float,
-        rotation: float=0, polar_interp: bool=False) -> Tensor:
+
+def _polar_to_cart_bicubic(
+    img: Tensor,
+    img_gx: Tensor,
+    img_gy: Tensor,
+    img_gxy: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    grid_cart: dict,
+    fc: float,
+    rotation: float = 0,
+    polar_interp: bool = False,
+) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid.
 
@@ -516,15 +663,43 @@ def _polar_to_cart_bicubic(img: Tensor, img_gx: Tensor, img_gy: Tensor, img_gxy:
     dx = (x1 - x0) / nx
     dy = (y1 - y0) / ny
 
-    return torch.ops.torchbp.polar_to_cart_bicubic.default(img, img_gx,
-            img_gy, img_gxy, dorigin, nbatch, rotation, fc, r0, dr, theta0,
-            dtheta, nr, ntheta, x0, y0, dx, dy, nx, ny, polar_interp)
+    return torch.ops.torchbp.polar_to_cart_bicubic.default(
+        img,
+        img_gx,
+        img_gy,
+        img_gxy,
+        dorigin,
+        nbatch,
+        rotation,
+        fc,
+        r0,
+        dr,
+        theta0,
+        dtheta,
+        nr,
+        ntheta,
+        x0,
+        y0,
+        dx,
+        dy,
+        nx,
+        ny,
+        polar_interp,
+    )
 
-def backprojection_polar_2d(data: Tensor, grid: dict,
-        fc: float, r_res: float,
-        pos: Tensor, vel: Tensor, att: Tensor,
-        d0: float=0.0, ant_tx_dy: float=0.0,
-        dealias: bool=False) -> Tensor:
+
+def backprojection_polar_2d(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    d0: float = 0.0,
+    ant_tx_dy: float = 0.0,
+    dealias: bool = False,
+) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
 
@@ -595,19 +770,44 @@ def backprojection_polar_2d(data: Tensor, grid: dict,
 
     z0 = 0
     if dealias:
-        z0 = torch.mean(pos[:,2])
+        z0 = torch.mean(pos[:, 2])
 
     return torch.ops.torchbp.backprojection_polar_2d.default(
-            data, pos, vel, att,
-            nbatch, sweep_samples, nsweeps, fc, r_res,
-            r0, dr, theta0, dtheta, nr, ntheta,
-            d0, ant_tx_dy, dealias, z0)
+        data,
+        pos,
+        vel,
+        att,
+        nbatch,
+        sweep_samples,
+        nsweeps,
+        fc,
+        r_res,
+        r0,
+        dr,
+        theta0,
+        dtheta,
+        nr,
+        ntheta,
+        d0,
+        ant_tx_dy,
+        dealias,
+        z0,
+    )
 
-def backprojection_polar_2d_lanczos(data: Tensor, grid: dict,
-        fc: float, r_res: float,
-        pos: Tensor, vel: Tensor, att: Tensor,
-        d0: float=0.0, ant_tx_dy: float=0.0,
-        dealias: bool=False, order: int=4) -> Tensor:
+
+def backprojection_polar_2d_lanczos(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    d0: float = 0.0,
+    ant_tx_dy: float = 0.0,
+    dealias: bool = False,
+    order: int = 4,
+) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
     using lanczos interpolation.
@@ -681,18 +881,44 @@ def backprojection_polar_2d_lanczos(data: Tensor, grid: dict,
 
     z0 = 0
     if dealias:
-        z0 = torch.mean(pos[:,2])
+        z0 = torch.mean(pos[:, 2])
 
     return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(
-            data, pos, vel, att,
-            nbatch, sweep_samples, nsweeps, fc, r_res,
-            r0, dr, theta0, dtheta, nr, ntheta,
-            d0, ant_tx_dy, dealias, z0, order)
+        data,
+        pos,
+        vel,
+        att,
+        nbatch,
+        sweep_samples,
+        nsweeps,
+        fc,
+        r_res,
+        r0,
+        dr,
+        theta0,
+        dtheta,
+        nr,
+        ntheta,
+        d0,
+        ant_tx_dy,
+        dealias,
+        z0,
+        order,
+    )
 
-def backprojection_cart_2d(data: Tensor, grid: dict,
-        fc: float, r_res: float,
-        pos: Tensor, vel: Tensor, att: Tensor,
-        d0: float=0.0, ant_tx_dy: float=0.0, beamwidth: float=pi) -> Tensor:
+
+def backprojection_cart_2d(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    d0: float = 0.0,
+    ant_tx_dy: float = 0.0,
+    beamwidth: float = pi,
+) -> Tensor:
     """
     2D backprojection with cartesian coordinates.
 
@@ -760,12 +986,38 @@ def backprojection_cart_2d(data: Tensor, grid: dict,
         assert att.shape == (nbatch, nsweeps, 3)
 
     return torch.ops.torchbp.backprojection_cart_2d.default(
-            data, pos, vel, att,
-            nbatch, sweep_samples, nsweeps, fc, r_res,
-            x0, dx, y0, dy, nx, ny,
-            beamwidth, d0, ant_tx_dy)
+        data,
+        pos,
+        vel,
+        att,
+        nbatch,
+        sweep_samples,
+        nsweeps,
+        fc,
+        r_res,
+        x0,
+        dx,
+        y0,
+        dy,
+        nx,
+        ny,
+        beamwidth,
+        d0,
+        ant_tx_dy,
+    )
 
-def gpga_backprojection_2d_core(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor, att: Tensor, fc: float, r_res: float, d0: float=0.0, ant_tx_dy: float=0.0) -> Tensor:
+
+def gpga_backprojection_2d_core(
+    target_pos: Tensor,
+    data: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    fc: float,
+    r_res: float,
+    d0: float = 0.0,
+    ant_tx_dy: float = 0.0,
+) -> Tensor:
     """
     Generalized phase gradient autofocus.
 
@@ -809,12 +1061,24 @@ def gpga_backprojection_2d_core(target_pos: Tensor, data: Tensor, pos: Tensor, v
     assert att.shape == (nsweeps, 3)
 
     return torch.ops.torchbp.gpga_backprojection_2d.default(
-            target_pos, data, pos, vel, att,
-            sweep_samples, nsweeps, fc, r_res,
-            ntargets,
-            d0, ant_tx_dy)
+        target_pos,
+        data,
+        pos,
+        vel,
+        att,
+        sweep_samples,
+        nsweeps,
+        fc,
+        r_res,
+        ntargets,
+        d0,
+        ant_tx_dy,
+    )
 
-def cfar_2d(img: Tensor, Navg: tuple, Nguard: tuple, threshold: float, peaks_only: bool=False) -> Tensor:
+
+def cfar_2d(
+    img: Tensor, Navg: tuple, Nguard: tuple, threshold: float, peaks_only: bool = False
+) -> Tensor:
     """
     Constant False Alaram Rate detection for 2D image.
 
@@ -869,12 +1133,34 @@ def cfar_2d(img: Tensor, Navg: tuple, Nguard: tuple, threshold: float, peaks_onl
     if Nguard[1] < 0:
         raise ValueError("Nguard[1] < 0")
 
-    return torch.ops.torchbp.cfar_2d.default(img, nbatch, N0, N1, Navg[0], Navg[1],
-            Nguard[0], Nguard[1], threshold, peaks_only)
+    return torch.ops.torchbp.cfar_2d.default(
+        img,
+        nbatch,
+        N0,
+        N1,
+        Navg[0],
+        Navg[1],
+        Nguard[0],
+        Nguard[1],
+        threshold,
+        peaks_only,
+    )
 
-def backprojection_polar_2d_tx_power(wa: Tensor, gtx: Tensor, grx: Tensor,
-        g_az0: float, g_el0: float, g_az1: float, g_el1: float, grid: dict,
-        r_res: float, pos: Tensor, att: Tensor, sin_look_angle: bool=False) -> Tensor:
+
+def backprojection_polar_2d_tx_power(
+    wa: Tensor,
+    gtx: Tensor,
+    grx: Tensor,
+    g_az0: float,
+    g_el0: float,
+    g_az1: float,
+    g_el1: float,
+    grid: dict,
+    r_res: float,
+    pos: Tensor,
+    att: Tensor,
+    sin_look_angle: bool = False,
+) -> Tensor:
     """
     Calculate transmitted power to image plane. Can be used to correct for
     antenna pattern and distance effect on the radar image.
@@ -953,14 +1239,44 @@ def backprojection_polar_2d_tx_power(wa: Tensor, gtx: Tensor, grx: Tensor,
     g_del = (g_el1 - g_el0) / g_nel
 
     return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(
-            wa, pos, att, gtx, grx, nbatch,
-            g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
-            nsweeps, r_res,
-            r0, dr, theta0, dtheta, nr, ntheta, sin_look_angle)
+        wa,
+        pos,
+        att,
+        gtx,
+        grx,
+        nbatch,
+        g_az0,
+        g_el0,
+        g_daz,
+        g_del,
+        g_naz,
+        g_nel,
+        nsweeps,
+        r_res,
+        r0,
+        dr,
+        theta0,
+        dtheta,
+        nr,
+        ntheta,
+        sin_look_angle,
+    )
 
-def ffbp(data: Tensor, grid: dict, fc: float, r_res: float, pos: Tensor, vel:
-        Tensor, att: Tensor, stages: int, divisions: int=2, d0: float=0.0,
-        ant_tx_dy: float=0.0, interp_method: str | tuple=("lanczos", 3)) -> Tensor:
+
+def ffbp(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    stages: int,
+    divisions: int = 2,
+    d0: float = 0.0,
+    ant_tx_dy: float = 0.0,
+    interp_method: str | tuple = ("lanczos", 3),
+) -> Tensor:
     """
     Fast factorized backprojection.
 
@@ -1006,23 +1322,48 @@ def ffbp(data: Tensor, grid: dict, fc: float, r_res: float, pos: Tensor, vel:
     imgs = []
     n = nsweeps // divisions
     for d in range(divisions):
-        origin_local = torch.tensor([torch.mean(pos[d*n:(d+1)*n,0]),
-            torch.mean(pos[d*n:(d+1)*n,1]), 0], device=device,
-            dtype=torch.float32)[None,:]
-        pos_local = pos[d*n:(d+1)*n] - origin_local
-        z0 = torch.mean(pos_local[:,2])
-        vel_local = vel[d*n:(d+1)*n]
-        att_local = att[d*n:(d+1)*n]
+        origin_local = torch.tensor(
+            [
+                torch.mean(pos[d * n : (d + 1) * n, 0]),
+                torch.mean(pos[d * n : (d + 1) * n, 1]),
+                0,
+            ],
+            device=device,
+            dtype=torch.float32,
+        )[None, :]
+        pos_local = pos[d * n : (d + 1) * n] - origin_local
+        z0 = torch.mean(pos_local[:, 2])
+        vel_local = vel[d * n : (d + 1) * n]
+        att_local = att[d * n : (d + 1) * n]
         grid_local = deepcopy(grid)
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
-        data_local = data[d*n:(d+1)*n]
-        if stages > 1 and len(data_local) > 4*divisions:
-            img = ffbp(data_local, grid_local, fc, r_res, pos_local, vel_local, att_local,
-                    stages=stages-1, divisions=divisions, d0=d0, ant_tx_dy=ant_tx_dy)
+        data_local = data[d * n : (d + 1) * n]
+        if stages > 1 and len(data_local) > 4 * divisions:
+            img = ffbp(
+                data_local,
+                grid_local,
+                fc,
+                r_res,
+                pos_local,
+                vel_local,
+                att_local,
+                stages=stages - 1,
+                divisions=divisions,
+                d0=d0,
+                ant_tx_dy=ant_tx_dy,
+            )
         else:
-            img = backprojection_polar_2d(data_local, grid_local, fc, r_res,
-                    pos_local, vel_local, att_local, d0=d0,
-                    ant_tx_dy=ant_tx_dy)[0]
+            img = backprojection_polar_2d(
+                data_local,
+                grid_local,
+                fc,
+                r_res,
+                pos_local,
+                vel_local,
+                att_local,
+                d0=d0,
+                ant_tx_dy=ant_tx_dy,
+            )[0]
         imgs.append((origin_local[0], grid_local, img, z0))
     while len(imgs) > 1:
         img1 = imgs[0]
@@ -1036,38 +1377,87 @@ def ffbp(data: Tensor, grid: dict, fc: float, r_res: float, pos: Tensor, vel:
             grid_polar_new["ntheta"] += img2[1]["ntheta"]
         i1 = img1[2]
         i2 = img2[2]
-        img_interpolated1 = polar_interp(i1, new_origin - img1[0], img1[1], fc,
-                0, grid_polar_new, z0=img1[3], method=interp_method).squeeze()
-        img_interpolated2 = polar_interp(i2, new_origin - img2[0], img2[1], fc,
-                0, grid_polar_new, z0=img2[3], method=interp_method).squeeze()
+        img_interpolated1 = polar_interp(
+            i1,
+            new_origin - img1[0],
+            img1[1],
+            fc,
+            0,
+            grid_polar_new,
+            z0=img1[3],
+            method=interp_method,
+        ).squeeze()
+        img_interpolated2 = polar_interp(
+            i2,
+            new_origin - img2[0],
+            img2[1],
+            fc,
+            0,
+            grid_polar_new,
+            z0=img2[3],
+            method=interp_method,
+        ).squeeze()
         img_sum = img_interpolated1 + img_interpolated2
         merged = (new_origin, grid_polar_new, img_sum, img1[3])
         imgs = imgs[2:] + [merged]
     return imgs[0][2]
+
 
 # Registers a FakeTensor kernel (aka "meta kernel", "abstract impl")
 # that describes what the properties of the output Tensor are given
 # the properties of the input Tensor. The FakeTensor kernel is necessary
 # for the op to work performantly with torch.compile.
 @torch.library.register_fake("torchbp::polar_interp_linear")
-def _fake_polar_interp_linear(img: Tensor, dorigin: Tensor, rotation: float,
-        fc: float, r0: float, dr0: float, theta0: float, dtheta0: float,
-        Nr0: float, Ntheta0: float, r1: float, dr1: float, theta1: float,
-        dtheta1: float, Nr1: float, Ntheta1: float) -> Tensor:
+def _fake_polar_interp_linear(
+    img: Tensor,
+    dorigin: Tensor,
+    rotation: float,
+    fc: float,
+    r0: float,
+    dr0: float,
+    theta0: float,
+    dtheta0: float,
+    Nr0: float,
+    Ntheta0: float,
+    r1: float,
+    dr1: float,
+    theta1: float,
+    dtheta1: float,
+    Nr1: float,
+    Ntheta1: float,
+) -> Tensor:
     torch._check(dorigin.dtype == torch.float)
     torch._check(img.dtype == torch.complex64)
     return torch.empty((Nr1, Ntheta1), dtype=torch.complex64, device=img.device)
 
+
 @torch.library.register_fake("torchbp::polar_interp_linear_grad")
-def _fake_polar_interp_linear_grad(grad: Tensor, img: Tensor, dorigin: Tensor, rotation: float,
-        fc: float, r0: float, dr0: float, theta0: float, dtheta0: float,
-        Nr0: float, Ntheta0: float, r1: float, dr1: float, theta1: float,
-        dtheta1: float, Nr1: float, Ntheta1: float) -> Tensor:
+def _fake_polar_interp_linear_grad(
+    grad: Tensor,
+    img: Tensor,
+    dorigin: Tensor,
+    rotation: float,
+    fc: float,
+    r0: float,
+    dr0: float,
+    theta0: float,
+    dtheta0: float,
+    Nr0: float,
+    Ntheta0: float,
+    r1: float,
+    dr1: float,
+    theta1: float,
+    dtheta1: float,
+    Nr1: float,
+    Ntheta1: float,
+) -> Tensor:
     torch._check(dorigin.dtype == torch.float)
     torch._check(img.dtype == torch.complex64)
     ret = []
     if img.requires_grad:
-        ret.append(torch.empty((Nr1, Ntheta1), dtype=torch.complex64, device=img.device))
+        ret.append(
+            torch.empty((Nr1, Ntheta1), dtype=torch.complex64, device=img.device)
+        )
     else:
         ret.append(None)
     if dorigin.requires_grad:
@@ -1076,19 +1466,52 @@ def _fake_polar_interp_linear_grad(grad: Tensor, img: Tensor, dorigin: Tensor, r
         ret.append(None)
     return ret
 
+
 @torch.library.register_fake("torchbp::polar_to_cart_linear")
-def _fake_polar_to_cart_linear(img: Tensor, dorigin: Tensor, nbatch: int, rotation: float,
-        fc: float, r0: float, dr: float, theta0: float, dtheta: float, nr: int, ntheta: int,
-        x0: float, y0: float, dx: float, dy: float, nx: int, ny: int) -> Tensor:
+def _fake_polar_to_cart_linear(
+    img: Tensor,
+    dorigin: Tensor,
+    nbatch: int,
+    rotation: float,
+    fc: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    nr: int,
+    ntheta: int,
+    x0: float,
+    y0: float,
+    dx: float,
+    dy: float,
+    nx: int,
+    ny: int,
+) -> Tensor:
     torch._check(dorigin.dtype == torch.float)
     torch._check(img.dtype == torch.complex64)
     return torch.empty((Nx, Ny), dtype=torch.complex64, device=img.device)
 
+
 @torch.library.register_fake("torchbp::polar_to_cart_linear_grad")
-def _fake_polar_interp_linear_grad(grad: Tensor, img: Tensor, dorigin: Tensor, rotation: float,
-        fc: float, r0: float, dr: float, theta0: float, dtheta: float,
-        Nr: float, Ntheta: float, x0: float, dx: float, y0: float,
-        dy: float, Nx: float, Ny: float) -> Tensor:
+def _fake_polar_interp_linear_grad(
+    grad: Tensor,
+    img: Tensor,
+    dorigin: Tensor,
+    rotation: float,
+    fc: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    Nr: float,
+    Ntheta: float,
+    x0: float,
+    dx: float,
+    y0: float,
+    dy: float,
+    Nx: float,
+    Ny: float,
+) -> Tensor:
     torch._check(dorigin.dtype == torch.float)
     torch._check(img.dtype == torch.complex64)
     ret = []
@@ -1102,22 +1525,58 @@ def _fake_polar_interp_linear_grad(grad: Tensor, img: Tensor, dorigin: Tensor, r
         ret.append(None)
     return ret
 
+
 @torch.library.register_fake("torchbp::polar_to_cart_bicubic")
-def _fake_polar_to_cart_bicubic(img: Tensor, img_gx: Tensor, img_gy: Tensor,
-        img_gxy: Tensor, dorigin: Tensor, nbatch: int, rotation: float, fc:
-        float, r0: float, dr: float, theta0: float, dtheta: float, nr: int,
-        ntheta: int, x0: float, y0: float, dx: float, dy: float, nx: int, ny:
-        int) -> Tensor:
+def _fake_polar_to_cart_bicubic(
+    img: Tensor,
+    img_gx: Tensor,
+    img_gy: Tensor,
+    img_gxy: Tensor,
+    dorigin: Tensor,
+    nbatch: int,
+    rotation: float,
+    fc: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    nr: int,
+    ntheta: int,
+    x0: float,
+    y0: float,
+    dx: float,
+    dy: float,
+    nx: int,
+    ny: int,
+) -> Tensor:
     torch._check(dorigin.dtype == torch.float)
     torch._check(img.dtype == torch.complex64)
     return torch.empty((Nx, Ny), dtype=torch.complex64, device=img.device)
 
+
 @torch.library.register_fake("torchbp::polar_to_cart_bicubic_grad")
-def _fake_polar_interp_bicubic_grad(grad: Tensor, img: Tensor, img_gx: Tensor,
-        img_gy: Tensor, img_gxy: Tensor, dorigin: Tensor, rotation: float, fc:
-        float, r0: float, dr: float, theta0: float, dtheta: float, Nr: float,
-        Ntheta: float, x0: float, dx: float, y0: float, dy: float, Nx: float,
-        Ny: float) -> Tensor:
+def _fake_polar_interp_bicubic_grad(
+    grad: Tensor,
+    img: Tensor,
+    img_gx: Tensor,
+    img_gy: Tensor,
+    img_gxy: Tensor,
+    dorigin: Tensor,
+    rotation: float,
+    fc: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    Nr: float,
+    Ntheta: float,
+    x0: float,
+    dx: float,
+    y0: float,
+    dy: float,
+    Nx: float,
+    Ny: float,
+) -> Tensor:
     torch._check(dorigin.dtype == torch.float)
     torch._check(img.dtype == torch.complex64)
     torch._check(img_gx.dtype == torch.complex64)
@@ -1140,22 +1599,55 @@ def _fake_polar_interp_bicubic_grad(grad: Tensor, img: Tensor, img_gx: Tensor,
         ret.append(None)
     return ret
 
+
 @torch.library.register_fake("torchbp::backprojection_polar_2d")
-def _fake_cart_2d(data: Tensor, pos: Tensor, vel: Tensor, att: Tensor,
-        nbatch: int, sweep_samples: int, nsweeps: int, fc: float, r_res: float,
-        r0: float, dr: float, theta0: float, dtheta: float, Nr: int, Ntheta: int,
-        d0: float, ant_tx_dy: float):
+def _fake_cart_2d(
+    data: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    nbatch: int,
+    sweep_samples: int,
+    nsweeps: int,
+    fc: float,
+    r_res: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    Nr: int,
+    Ntheta: int,
+    d0: float,
+    ant_tx_dy: float,
+):
     torch._check(pos.dtype == torch.float)
     torch._check(vel.dtype == torch.float)
     torch._check(att.dtype == torch.float)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
     return torch.empty((nbatch, Nr, Ntheta), dtype=torch.complex64, device=data.device)
 
+
 @torch.library.register_fake("torchbp::backprojection_polar_2d_grad")
-def _fake_cart_2d_grad(grad: Tensor, data: Tensor, pos: Tensor, vel: Tensor, att: Tensor,
-        nbatch: int, sweep_samples: int, nsweeps: int, fc: float, r_res: float,
-        r0: float, dr: float, theta0: float, dtheta: float, Nr: int, Ntheta: int,
-        d0: float, ant_tx_dy: float):
+def _fake_cart_2d_grad(
+    grad: Tensor,
+    data: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    nbatch: int,
+    sweep_samples: int,
+    nsweeps: int,
+    fc: float,
+    r_res: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    Nr: int,
+    Ntheta: int,
+    d0: float,
+    ant_tx_dy: float,
+):
     torch._check(pos.dtype == torch.float)
     torch._check(vel.dtype == torch.float)
     torch._check(att.dtype == torch.float)
@@ -1172,28 +1664,62 @@ def _fake_cart_2d_grad(grad: Tensor, data: Tensor, pos: Tensor, vel: Tensor, att
         ret.append(None)
     return ret
 
+
 @torch.library.register_fake("torchbp::backprojection_cart_2d")
-def _fake_cart_2d(data: Tensor, pos: Tensor, vel: Tensor, att: Tensor,
-        sweep_samples: int, nsweeps: int, fc: float, r_res: float,
-        x0: float, dx: float, y0: float, dy: float, Nx: int, Ny: int,
-        beamwidth: float, d0: float, ant_tx_dy: float):
+def _fake_cart_2d(
+    data: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    sweep_samples: int,
+    nsweeps: int,
+    fc: float,
+    r_res: float,
+    x0: float,
+    dx: float,
+    y0: float,
+    dy: float,
+    Nx: int,
+    Ny: int,
+    beamwidth: float,
+    d0: float,
+    ant_tx_dy: float,
+):
     torch._check(pos.dtype == torch.float)
     torch._check(vel.dtype == torch.float)
     torch._check(att.dtype == torch.float)
     torch._check(data.dtype == torch.complex64)
     return torch.empty((Nx, Ny), dtype=torch.complex64, device=data.device)
 
+
 @torch.library.register_fake("torchbp::backprojection_cart_2d_grad")
-def _fake_cart_2d_grad(grad: Tensor, data: Tensor, pos: Tensor, vel: Tensor, att: Tensor,
-        sweep_samples: int, nsweeps: int, fc: float, r_res: float,
-        x0: float, dx: float, y0: float, dy: float, Nx: int, Ny: int,
-        beamwidth: float, d0: float, ant_tx_dy: float):
+def _fake_cart_2d_grad(
+    grad: Tensor,
+    data: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    sweep_samples: int,
+    nsweeps: int,
+    fc: float,
+    r_res: float,
+    x0: float,
+    dx: float,
+    y0: float,
+    dy: float,
+    Nx: int,
+    Ny: int,
+    beamwidth: float,
+    d0: float,
+    ant_tx_dy: float,
+):
     torch._check(pos.dtype == torch.float)
     torch._check(vel.dtype == torch.float)
     torch._check(att.dtype == torch.float)
     torch._check(data.dtype == torch.complex64)
     torch._check(grad.dtype == torch.complex64)
     return torch.empty_like(pos)
+
 
 def _setup_context_polar_2d(ctx, inputs, output):
     data, pos, *rest = inputs
@@ -1205,26 +1731,30 @@ def _setup_context_polar_2d(ctx, inputs, output):
     ctx.saved = rest
     ctx.save_for_backward(data, pos)
 
+
 def _backward_polar_2d(ctx, grad):
     data = ctx.saved_tensors[0]
     pos = ctx.saved_tensors[1]
     ret = torch.ops.torchbp.backprojection_polar_2d_grad.default(
-            grad,
-            data, pos, *ctx.saved)
+        grad, data, pos, *ctx.saved
+    )
     grads = [None] * polar_2d_nargs
     grads[0] = ret[0]
     grads[1] = ret[1]
     return tuple(grads)
 
+
 def _backward_cart_2d(ctx, grad):
     data = ctx.saved_tensors[0]
-    pos  = ctx.saved_tensors[1]
+    pos = ctx.saved_tensors[1]
     ret = torch.ops.torchbp.backprojection_cart_2d_grad.default(
-            grad, data, pos, *ctx.saved)
+        grad, data, pos, *ctx.saved
+    )
     grads = [None] * cart_2d_nargs
     grads[0] = ret[0]
     grads[1] = ret[1]
     return tuple(grads)
+
 
 def _setup_context_cart_2d(ctx, inputs, output):
     data, pos, *rest = inputs
@@ -1236,15 +1766,18 @@ def _setup_context_cart_2d(ctx, inputs, output):
     ctx.saved = rest
     ctx.save_for_backward(data, pos)
 
+
 def _backward_polar_interp_linear(ctx, grad):
     img = ctx.saved_tensors[0]
     dorigin = ctx.saved_tensors[1]
     ret = torch.ops.torchbp.polar_interp_linear_grad.default(
-            grad, img, dorigin, *ctx.saved)
+        grad, img, dorigin, *ctx.saved
+    )
     grads = [None] * polar_interp_linear_args
     grads[0] = ret[0]
     grads[1] = ret[1]
     return tuple(grads)
+
 
 def _setup_context_polar_interp_linear(ctx, inputs, output):
     img, dorigin, *rest = inputs
@@ -1256,17 +1789,20 @@ def _setup_context_polar_interp_linear(ctx, inputs, output):
     ctx.saved = rest
     ctx.save_for_backward(img, dorigin)
 
+
 def _backward_polar_to_cart_linear(ctx, grad):
     img = ctx.saved_tensors[0]
     dorigin = ctx.saved_tensors[1]
     if ctx.saved[-1]:
         raise NotImplementedError("polar_interp gradient not supported")
     ret = torch.ops.torchbp.polar_to_cart_linear_grad.default(
-            grad, img, dorigin, *ctx.saved[:-1])
+        grad, img, dorigin, *ctx.saved[:-1]
+    )
     grads = [None] * polar_to_cart_linear_args
     grads[0] = ret[0]
     grads[1] = ret[1]
     return tuple(grads)
+
 
 def _setup_context_polar_to_cart_linear(ctx, inputs, output):
     img, dorigin, *rest = inputs
@@ -1278,15 +1814,18 @@ def _setup_context_polar_to_cart_linear(ctx, inputs, output):
     ctx.saved = rest
     ctx.save_for_backward(img, dorigin)
 
+
 def _backward_polar_to_cart_bicubic(ctx, grad):
     img, img_gx, img_gy, img_gxy, dorigin = ctx.saved_tensors
     if ctx.saved[-1]:
         raise NotImplementedError("polar_interp gradient not supported")
     ret = torch.ops.torchbp.polar_to_cart_bicubic_grad.default(
-            grad, img, img_gx, img_gy, img_gxy, dorigin, *ctx.saved[:-1])
+        grad, img, img_gx, img_gy, img_gxy, dorigin, *ctx.saved[:-1]
+    )
     grads = [None] * polar_to_cart_bicubic_args
-    grads[:len(ret)] = ret
+    grads[: len(ret)] = ret
     return tuple(grads)
+
 
 def _setup_context_polar_to_cart_bicubic(ctx, inputs, output):
     img, img_gx, img_gy, img_gxy, dorigin, *rest = inputs
@@ -1296,47 +1835,69 @@ def _setup_context_polar_to_cart_bicubic(ctx, inputs, output):
                 raise NotImplementedError("dorigin grad not supported")
             if i <= 4:
                 continue
-            raise NotImplementedError("Only img, img_gx, img_gy, img_gxy and dorigin gradient supported")
+            raise NotImplementedError(
+                "Only img, img_gx, img_gy, img_gxy and dorigin gradient supported"
+            )
     ctx.saved = rest
     ctx.save_for_backward(img, img_gx, img_gy, img_gxy, dorigin)
 
+
 def _backward_entropy(ctx, grad):
     data, norm = ctx.saved_tensors
-    ret = torch.ops.torchbp.entropy_grad.default(
-            data, norm, grad, *ctx.saved)
+    ret = torch.ops.torchbp.entropy_grad.default(data, norm, grad, *ctx.saved)
     grads = [None] * entropy_args
-    grads[:len(ret)] = ret
+    grads[: len(ret)] = ret
     return tuple(grads)
+
 
 def _setup_context_entropy(ctx, inputs, output):
     data, norm, *rest = inputs
     ctx.saved = rest
     ctx.save_for_backward(data, norm)
 
+
 def _backward_abs_sum(ctx, grad):
     data = ctx.saved_tensors[0]
-    ret = torch.ops.torchbp.abs_sum_grad.default(
-            data, grad, *ctx.saved)
+    ret = torch.ops.torchbp.abs_sum_grad.default(data, grad, *ctx.saved)
     grads = [None] * abs_sum_args
     grads[0] = ret
     return tuple(grads)
+
 
 def _setup_context_abs_sum(ctx, inputs, output):
     data, *rest = inputs
     ctx.saved = rest
     ctx.save_for_backward(data)
 
+
 torch.library.register_autograd(
-    "torchbp::backprojection_polar_2d", _backward_polar_2d, setup_context=_setup_context_polar_2d)
+    "torchbp::backprojection_polar_2d",
+    _backward_polar_2d,
+    setup_context=_setup_context_polar_2d,
+)
 torch.library.register_autograd(
-    "torchbp::backprojection_cart_2d", _backward_cart_2d, setup_context=_setup_context_cart_2d)
+    "torchbp::backprojection_cart_2d",
+    _backward_cart_2d,
+    setup_context=_setup_context_cart_2d,
+)
 torch.library.register_autograd(
-    "torchbp::polar_interp_linear", _backward_polar_interp_linear, setup_context=_setup_context_polar_interp_linear)
+    "torchbp::polar_interp_linear",
+    _backward_polar_interp_linear,
+    setup_context=_setup_context_polar_interp_linear,
+)
 torch.library.register_autograd(
-    "torchbp::polar_to_cart_linear", _backward_polar_to_cart_linear, setup_context=_setup_context_polar_to_cart_linear)
+    "torchbp::polar_to_cart_linear",
+    _backward_polar_to_cart_linear,
+    setup_context=_setup_context_polar_to_cart_linear,
+)
 torch.library.register_autograd(
-    "torchbp::polar_to_cart_bicubic", _backward_polar_to_cart_bicubic, setup_context=_setup_context_polar_to_cart_bicubic)
+    "torchbp::polar_to_cart_bicubic",
+    _backward_polar_to_cart_bicubic,
+    setup_context=_setup_context_polar_to_cart_bicubic,
+)
 torch.library.register_autograd(
-    "torchbp::entropy", _backward_entropy, setup_context=_setup_context_entropy)
+    "torchbp::entropy", _backward_entropy, setup_context=_setup_context_entropy
+)
 torch.library.register_autograd(
-    "torchbp::abs_sum", _backward_abs_sum, setup_context=_setup_context_abs_sum)
+    "torchbp::abs_sum", _backward_abs_sum, setup_context=_setup_context_abs_sum
+)

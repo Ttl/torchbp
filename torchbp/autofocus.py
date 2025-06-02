@@ -1,15 +1,26 @@
 import torch
 import numpy as np
 from torch import Tensor
-from .ops import backprojection_polar_2d, backprojection_cart_2d, gpga_backprojection_2d_core
+from .ops import (
+    backprojection_polar_2d,
+    backprojection_cart_2d,
+    gpga_backprojection_2d_core,
+)
 from .ops import entropy
 from .util import unwrap, detrend, fft_lowpass_filter_window
 import inspect
 from scipy import signal
 
-def pga_pd(img: Tensor, window_width: int | None=None, max_iters: int=10,
-        window_exp: float=0.5, min_window: int=5, remove_trend: bool=True,
-        offload: bool=False) -> (Tensor, Tensor):
+
+def pga_pd(
+    img: Tensor,
+    window_width: int | None = None,
+    max_iters: int = 10,
+    window_exp: float = 0.5,
+    min_window: int = 5,
+    remove_trend: bool = True,
+    offload: bool = False,
+) -> (Tensor, Tensor):
     """
     Phase gradient autofocus
 
@@ -70,14 +81,16 @@ def pga_pd(img: Tensor, window_width: int | None=None, max_iters: int=10,
         rpeaks = torch.argmax(torch.abs(g), axis=1)
         # Roll theta axis so that peak is at 0 bin
         for j in range(nr):
-            g[j, :] = torch.roll(g[j,:], -rpeaks[j].item())
+            g[j, :] = torch.roll(g[j, :], -rpeaks[j].item())
         # Apply window
-        g[:, 1+window//2:1-window//2] = 0
+        g[:, 1 + window // 2 : 1 - window // 2] = 0
         # IFFT across theta
         g = torch.fft.fft(g, axis=-1)
-        gdot = torch.diff(g, prepend=g[:,0][:,None], axis=-1)
+        gdot = torch.diff(g, prepend=g[:, 0][:, None], axis=-1)
         # Weighted sum over range
-        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(torch.abs(g)**2, axis=0)
+        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
+            torch.abs(g) ** 2, axis=0
+        )
         phi = torch.cumsum(phidot, dim=0)
         if remove_trend:
             phi = detrend(unwrap(phi))
@@ -89,14 +102,21 @@ def pga_pd(img: Tensor, window_width: int | None=None, max_iters: int=10,
         if offload:
             img = img.to(device=dev)
         img_ifft = torch.fft.fft(img, axis=-1)
-        img_ifft *= torch.exp(-1j*phi[None, :])
+        img_ifft *= torch.exp(-1j * phi[None, :])
         img = torch.fft.ifft(img_ifft, axis=-1)
 
     return img, phi_sum
 
-def pga_ml(img: Tensor, window_width: int | None=None, max_iters: int=10,
-        window_exp: float=0.5, min_window: int=5, remove_trend: bool=True,
-        offload: bool=False) -> (Tensor, Tensor):
+
+def pga_ml(
+    img: Tensor,
+    window_width: int | None = None,
+    max_iters: int = 10,
+    window_exp: float = 0.5,
+    min_window: int = 5,
+    remove_trend: bool = True,
+    offload: bool = False,
+) -> (Tensor, Tensor):
     """
     Phase gradient autofocus
 
@@ -156,13 +176,13 @@ def pga_ml(img: Tensor, window_width: int | None=None, max_iters: int=10,
         rpeaks = torch.argmax(torch.abs(g), axis=1)
         # Roll theta axis so that peak is at 0 bin
         for j in range(nr):
-            g[j, :] = torch.roll(g[j,:], -rpeaks[j].item())
+            g[j, :] = torch.roll(g[j, :], -rpeaks[j].item())
         # Apply window
-        g[:, 1+window//2:1-window//2] = 0
+        g[:, 1 + window // 2 : 1 - window // 2] = 0
         # IFFT across theta
         g = torch.fft.fft(g, axis=-1)
-        u,s,v = torch.linalg.svd(g)
-        phi = torch.angle(v[0,:])
+        u, s, v = torch.linalg.svd(g)
+        phi = torch.angle(v[0, :])
         if remove_trend:
             phi = detrend(unwrap(phi))
         phi_sum += phi
@@ -171,15 +191,26 @@ def pga_ml(img: Tensor, window_width: int | None=None, max_iters: int=10,
         if offload:
             img = img.to(device=dev)
         img_ifft = torch.fft.fft(img, axis=-1)
-        img_ifft *= torch.exp(-1j*phi[None, :])
+        img_ifft *= torch.exp(-1j * phi[None, :])
         img = torch.fft.ifft(img_ifft, axis=-1)
 
     return img, phi_sum
 
-def gpga_2d_iter(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor,
-        att: Tensor, fc: float, r_res: float, window_width: int | None=None,
-        d0: float=0.0, ant_tx_dy: float=0.0, estimator: str="ml",
-        lowpass_window="boxcar") -> Tensor:
+
+def gpga_2d_iter(
+    target_pos: Tensor,
+    data: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    fc: float,
+    r_res: float,
+    window_width: int | None = None,
+    d0: float = 0.0,
+    ant_tx_dy: float = 0.0,
+    estimator: str = "ml",
+    lowpass_window="boxcar",
+) -> Tensor:
     """
     Single generalized phase gradient iteration.
 
@@ -224,28 +255,47 @@ def gpga_2d_iter(target_pos: Tensor, data: Tensor, pos: Tensor, vel: Tensor,
         Solved phase error.
     """
     # Get range profile samples for each target
-    target_data = gpga_backprojection_2d_core(target_pos, data, pos, vel, att, fc,
-            r_res, d0, ant_tx_dy)
+    target_data = gpga_backprojection_2d_core(
+        target_pos, data, pos, vel, att, fc, r_res, d0, ant_tx_dy
+    )
     # Filter samples
     if window_width is not None and window_width < target_data.shape[1]:
-        target_data = fft_lowpass_filter_window(target_data,
-                window=lowpass_window, window_width=window_width)
+        target_data = fft_lowpass_filter_window(
+            target_data, window=lowpass_window, window_width=window_width
+        )
     if estimator == "ml":
-        u,s,v = torch.linalg.svd(target_data)
-        phi = torch.angle(v[0,:])
+        u, s, v = torch.linalg.svd(target_data)
+        phi = torch.angle(v[0, :])
     else:
         g = target_data
-        gdot = torch.diff(g, prepend=g[:,0][:,None], axis=-1)
-        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(torch.abs(g)**2, axis=0)
+        gdot = torch.diff(g, prepend=g[:, 0][:, None], axis=-1)
+        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
+            torch.abs(g) ** 2, axis=0
+        )
         phi = torch.cumsum(phidot, dim=0)
     return phi
 
-def gpga_ml_bp_polar(img: Tensor | None, data: Tensor, pos: Tensor, vel: Tensor,
-        att: Tensor, fc: float, r_res: float, grid_polar: dict,
-        window_width: int | None=None, max_iters: int=10, window_exp: float=0.8,
-        min_window: int=5, d0: float=0.0, ant_tx_dy: float=0.0,
-        target_threshold_db: float=20, remove_trend: bool=True,
-        estimator: str="pd", lowpass_window: str="boxcar") -> (Tensor, Tensor):
+
+def gpga_ml_bp_polar(
+    img: Tensor | None,
+    data: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    fc: float,
+    r_res: float,
+    grid_polar: dict,
+    window_width: int | None = None,
+    max_iters: int = 10,
+    window_exp: float = 0.8,
+    min_window: int = 5,
+    d0: float = 0.0,
+    ant_tx_dy: float = 0.0,
+    target_threshold_db: float = 20,
+    remove_trend: bool = True,
+    estimator: str = "pd",
+    lowpass_window: str = "boxcar",
+) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
     backprojection image formation.
@@ -340,7 +390,7 @@ def gpga_ml_bp_polar(img: Tensor | None, data: Tensor, pos: Tensor, vel: Tensor,
         a = torch.abs(img[torch.arange(img.size(0)), rpeaks])
         max_a = torch.max(a)
 
-        target_idx = a > max_a * 10**(-target_threshold_db/20)
+        target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
         target_theta = theta0 + dtheta * rpeaks[target_idx]
         target_r = r[target_idx]
 
@@ -349,40 +399,71 @@ def gpga_ml_bp_polar(img: Tensor | None, data: Tensor, pos: Tensor, vel: Tensor,
         z = torch.zeros_like(target_r)
         target_pos = torch.stack([x, y, z], dim=1)
 
-        phi = gpga_2d_iter(target_pos, data, pos_new, vel, att, fc, r_res,
-                window_width, d0, ant_tx_dy, estimator=estimator,
-                lowpass_window=lowpass_window)
+        phi = gpga_2d_iter(
+            target_pos,
+            data,
+            pos_new,
+            vel,
+            att,
+            fc,
+            r_res,
+            window_width,
+            d0,
+            ant_tx_dy,
+            estimator=estimator,
+            lowpass_window=lowpass_window,
+        )
         phi_sum = unwrap(phi_sum + phi)
         if remove_trend:
             phi_sum = detrend(phi_sum)
         # Phase to distance
-        d = phi_sum*3e8/(4*torch.pi*fc)
+        d = phi_sum * 3e8 / (4 * torch.pi * fc)
         d = d - torch.mean(d)
 
-        pos_new[:,0] = pos[:,0] + d
+        pos_new[:, 0] = pos[:, 0] + d
         img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, vel, att)
         img = img.squeeze()
-        window_width = int(window_width ** window_exp)
+        window_width = int(window_width**window_exp)
         if window_width < min_window:
             break
     return img, phi_sum
+
 
 def _get_kwargs() -> dict:
     frame = inspect.currentframe().f_back
     keys, _, _, values = inspect.getargvalues(frame)
     kwargs = {}
     for key in keys:
-        if key != 'self':
+        if key != "self":
             kwargs[key] = values[key]
     return kwargs
 
-def minimum_entropy_grad_autofocus(f, data: Tensor, data_time: Tensor, pos: Tensor, vel:
-        Tensor, att: Tensor, fc: float, r_res: float, grid: dict, wa:
-        Tensor, tx_norm: Tensor=None, max_steps: float=100, lr_max: float=10000,
-        d0: float=0, ant_tx_dy: float=0, pos_reg: float=1,
-        lr_reduce: float=0.8, verbose: bool=True, convergence_limit: float=0.01,
-        max_step_limit: float=0.25, grad_limit_quantile: float=0.9, fixed_pos: int=0,
-        minimize_only: bool=False) -> (Tensor, Tensor, Tensor, int):
+
+def minimum_entropy_grad_autofocus(
+    f,
+    data: Tensor,
+    data_time: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    fc: float,
+    r_res: float,
+    grid: dict,
+    wa: Tensor,
+    tx_norm: Tensor = None,
+    max_steps: float = 100,
+    lr_max: float = 10000,
+    d0: float = 0,
+    ant_tx_dy: float = 0,
+    pos_reg: float = 1,
+    lr_reduce: float = 0.8,
+    verbose: bool = True,
+    convergence_limit: float = 0.01,
+    max_step_limit: float = 0.25,
+    grad_limit_quantile: float = 0.9,
+    fixed_pos: int = 0,
+    minimize_only: bool = False,
+) -> (Tensor, Tensor, Tensor, int):
     """
     Minimum entropy autofocus using backpropagation optimization through image
     formation.
@@ -467,10 +548,11 @@ def minimum_entropy_grad_autofocus(f, data: Tensor, data_time: Tensor, pos: Tens
     pos_orig = pos.clone()
     vopt.requires_grad = True
 
-    wl = 3e8/fc
+    wl = 3e8 / fc
     lr = lr_max
 
     opt = torch.optim.SGD([vopt], momentum=0, lr=1)
+
     def lr_sch(epoch):
         p = int(0.75 * max_steps)
         if epoch > p:
@@ -492,20 +574,26 @@ def minimum_entropy_grad_autofocus(f, data: Tensor, data_time: Tensor, pos: Tens
                 v = vopt
             pos = torch.cumsum(v * dt, 0)
             pos = pos - torch.mean(pos, dim=0) + pos_mean
-            #pos_d2 = torch.diff(pos, n=2, dim=0) / dt
+            # pos_d2 = torch.diff(pos, n=2, dim=0) / dt
 
             pos_loss = pos_reg * torch.mean(torch.square(pos - pos_orig))
-            #acc_loss = acc_reg * torch.mean(torch.square(pos_d2[1:]))
+            # acc_loss = acc_reg * torch.mean(torch.square(pos_d2[1:]))
 
-            origin = torch.tensor([torch.mean(pos[:,0]), torch.mean(pos[:,1]), 0], device=dev, dtype=torch.float32)[None,:]
+            origin = torch.tensor(
+                [torch.mean(pos[:, 0]), torch.mean(pos[:, 1]), 0],
+                device=dev,
+                dtype=torch.float32,
+            )[None, :]
             pos_centered = pos - origin
 
-            sar_img = f(data, grid, fc, r_res, pos_centered, vel, att, d0, ant_tx_dy).squeeze()
+            sar_img = f(
+                data, grid, fc, r_res, pos_centered, vel, att, d0, ant_tx_dy
+            ).squeeze()
             if tx_norm is not None:
                 entr = entropy(sar_img / tx_norm)
             else:
                 entr = entropy(sar_img)
-            loss = entr + pos_loss# + acc_loss
+            loss = entr + pos_loss  # + acc_loss
             if last_entr is not None and entr > last_entr:
                 lr *= lr_reduce
                 if minimize_only:
@@ -513,14 +601,14 @@ def minimum_entropy_grad_autofocus(f, data: Tensor, data_time: Tensor, pos: Tens
                     continue
             last_entr = entr
             v_prev = vopt.detach().clone()
-            if step < max_steps-1:
+            if step < max_steps - 1:
                 loss.backward()
                 l = scheduler.get_last_lr()[0]
                 with torch.no_grad():
                     vopt.grad /= wa[:, None]
                     g = vopt.grad.detach()
-                    gpos = torch.cumsum(l*g* dt, 0)
-                    dp = torch.abs(gpos[:,0])
+                    gpos = torch.cumsum(l * g * dt, 0)
+                    dp = torch.abs(gpos[:, 0])
                     maxd = torch.quantile(dp, grad_limit_quantile)
                     dp = torch.linalg.vector_norm(gpos, dim=-1)
                     maxd2 = torch.quantile(dp, grad_limit_quantile)
@@ -536,19 +624,43 @@ def minimum_entropy_grad_autofocus(f, data: Tensor, data_time: Tensor, pos: Tens
                 opt.zero_grad()
                 scheduler.step()
             if verbose:
-                print(step, "Entropy", entr.detach().cpu().numpy(), "loss", loss.detach().cpu().numpy())
+                print(
+                    step,
+                    "Entropy",
+                    entr.detach().cpu().numpy(),
+                    "loss",
+                    loss.detach().cpu().numpy(),
+                )
     except KeyboardInterrupt:
         print("Interrupted")
         pass
 
     return sar_img.detach(), origin, pos.detach(), step
 
-def bp_polar_grad_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
-        Tensor, att: Tensor, fc: float, r_res: float, grid: dict, wa:
-        Tensor, tx_norm: Tensor=None, max_steps: float=100, lr_max: float=10000,
-        d0: float=0, ant_tx_dy: float=0, pos_reg: float=1,
-        lr_reduce: float=0.8, verbose: bool=True, convergence_limit: float=0.01,
-        max_step_limit: float=0.25, grad_limit_quantile: float=0.9, fixed_pos: int=0):
+
+def bp_polar_grad_minimum_entropy(
+    data: Tensor,
+    data_time: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    fc: float,
+    r_res: float,
+    grid: dict,
+    wa: Tensor,
+    tx_norm: Tensor = None,
+    max_steps: float = 100,
+    lr_max: float = 10000,
+    d0: float = 0,
+    ant_tx_dy: float = 0,
+    pos_reg: float = 1,
+    lr_reduce: float = 0.8,
+    verbose: bool = True,
+    convergence_limit: float = 0.01,
+    max_step_limit: float = 0.25,
+    grad_limit_quantile: float = 0.9,
+    fixed_pos: int = 0,
+):
     """
     Minimum entropy autofocus optimization autofocus.
 
@@ -620,12 +732,30 @@ def bp_polar_grad_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, 
     kw = _get_kwargs()
     return minimum_entropy_grad_autofocus(backprojection_polar_2d, **kw)
 
-def bp_cart_grad_minimum_entropy(data: Tensor, data_time: Tensor, pos: Tensor, vel:
-        Tensor, att: Tensor, fc: float, r_res: float, grid: dict, wa:
-        Tensor, tx_norm: Tensor=None, max_steps: float=100, lr_max: float=10000,
-        d0: float=0, ant_tx_dy: float=0, pos_reg: float=1,
-        lr_reduce: float=0.8, verbose: bool=True, convergence_limit: float=0.01,
-        max_step_limit: float=0.25, grad_limit_quantile: float=0.9, fixed_pos: int=0):
+
+def bp_cart_grad_minimum_entropy(
+    data: Tensor,
+    data_time: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    fc: float,
+    r_res: float,
+    grid: dict,
+    wa: Tensor,
+    tx_norm: Tensor = None,
+    max_steps: float = 100,
+    lr_max: float = 10000,
+    d0: float = 0,
+    ant_tx_dy: float = 0,
+    pos_reg: float = 1,
+    lr_reduce: float = 0.8,
+    verbose: bool = True,
+    convergence_limit: float = 0.01,
+    max_step_limit: float = 0.25,
+    grad_limit_quantile: float = 0.9,
+    fixed_pos: int = 0,
+):
     """
     Minimum entropy autofocus optimization autofocus.
 

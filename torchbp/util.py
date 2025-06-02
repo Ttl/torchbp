@@ -4,8 +4,10 @@ from math import pi
 import numpy as np
 from scipy.signal import get_window
 
-def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float,
-        grid_polar: dict) -> Tensor:
+
+def bp_polar_range_dealias(
+    img: Tensor, origin: Tensor, fc: float, grid_polar: dict
+) -> Tensor:
     """
     De-alias range-axis spectrum of polar SAR image processed with backprojection.
 
@@ -41,19 +43,20 @@ def bp_polar_range_dealias(img: Tensor, origin: Tensor, fc: float,
     r = r0 + dr * torch.arange(nr, device=img.device)
     theta = theta0 + dtheta * torch.arange(ntheta, device=img.device)
 
-    x = r[:,None] * torch.sqrt(1 - torch.square(theta))[None,:]
-    y = r[:,None] * theta[None,:]
+    x = r[:, None] * torch.sqrt(1 - torch.square(theta))[None, :]
+    y = r[:, None] * theta[None, :]
 
     if origin.dim() == 2:
         origin = origin[0]
-    d = torch.sqrt((x - origin[0])**2 + (y - origin[1])**2 + origin[2]**2)
+    d = torch.sqrt((x - origin[0]) ** 2 + (y - origin[1]) ** 2 + origin[2] ** 2)
     c0 = 299792458
-    phase = torch.exp(-1j*4*pi*fc*d/c0)
+    phase = torch.exp(-1j * 4 * pi * fc * d / c0)
     if img.dim() == 3:
         phase = phase.unsqueeze(0)
     return phase * img
 
-def diff(x: Tensor, dim: int=-1, same_size: bool=False) -> Tensor:
+
+def diff(x: Tensor, dim: int = -1, same_size: bool = False) -> Tensor:
     """
     ``np.diff`` implemented in torch.
 
@@ -74,11 +77,12 @@ def diff(x: Tensor, dim: int=-1, same_size: bool=False) -> Tensor:
     if dim != -1:
         raise NotImplementedError("Only dim=-1 is implemented")
     if same_size:
-        return torch.nn.functional.pad(x[...,1:]-x[...,:-1], (1,0))
+        return torch.nn.functional.pad(x[..., 1:] - x[..., :-1], (1, 0))
     else:
-        return x[...,1:]-x[...,:-1]
+        return x[..., 1:] - x[..., :-1]
 
-def unwrap(phi: Tensor, dim: int=-1) -> Tensor:
+
+def unwrap(phi: Tensor, dim: int = -1) -> Tensor:
     """
     ``np.unwrap`` implemented in torch.
 
@@ -99,10 +103,11 @@ def unwrap(phi: Tensor, dim: int=-1) -> Tensor:
     phi_wrap = ((phi + torch.pi) % (2 * torch.pi)) - torch.pi
     dphi = diff(phi_wrap, same_size=True)
     dphi_m = ((dphi + torch.pi) % (2 * torch.pi)) - torch.pi
-    dphi_m[(dphi_m==-torch.pi)&(dphi>0)] = torch.pi
+    dphi_m[(dphi_m == -torch.pi) & (dphi > 0)] = torch.pi
     phi_adj = dphi_m - dphi
-    phi_adj[dphi.abs()<torch.pi] = 0
+    phi_adj[dphi.abs() < torch.pi] = 0
     return phi_wrap + phi_adj.cumsum(dim)
+
 
 def quad_interp(a: Tensor, v: int) -> Tensor:
     """
@@ -121,12 +126,13 @@ def quad_interp(a: Tensor, v: int) -> Tensor:
     f : float
         Estimated fractional peak index.
     """
-    a1 = a[(v-1) % len(a)]
+    a1 = a[(v - 1) % len(a)]
     a2 = a[v % len(a)]
-    a3 = a[(v+1) % len(a)]
-    return 0.5 * (a1 - a3) / (a1 - 2*a2 + a3)
+    a3 = a[(v + 1) % len(a)]
+    return 0.5 * (a1 - a3) / (a1 - 2 * a2 + a3)
 
-def find_image_shift_1d(x: Tensor, y: Tensor, dim: int=-1) -> Tensor:
+
+def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
     """
     Find shift between images that maximizes correlation.
 
@@ -148,14 +154,15 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int=-1) -> Tensor:
         dim = x.dim() + dim
     fx = torch.fft.fft(x, dim=dim)
     fy = torch.fft.fft(y, dim=dim)
-    c = (fx*fy.conj()) / (torch.abs(fx) * torch.abs(fy))
+    c = (fx * fy.conj()) / (torch.abs(fx) * torch.abs(fy))
     other_dims = [i for i in range(x.dim()) if i != dim]
     c = torch.abs(torch.fft.ifft(c, dim=dim))
     if len(other_dims) > 0:
         c = torch.mean(c, dim=other_dims)
     return torch.argmax(c)
 
-def fft_peak_1d(x: Tensor, dim: int=-1, fractional: bool=True) -> Tensor:
+
+def fft_peak_1d(x: Tensor, dim: int = -1, fractional: bool = True) -> Tensor:
     """
     Find fractional peak of ``abs(fft(x))``.
 
@@ -178,9 +185,10 @@ def fft_peak_1d(x: Tensor, dim: int=-1, fractional: bool=True) -> Tensor:
     if fractional:
         a = a + quad_interp(fx, a)
     l = x.shape[dim]
-    if a > l//2:
+    if a > l // 2:
         a = l - a
     return a
+
 
 def detrend(x: Tensor) -> Tensor:
     """
@@ -198,7 +206,8 @@ def detrend(x: Tensor) -> Tensor:
     n = x.shape[0]
     k = np.arange(n) / n
     a, b = np.polyfit(k, x.cpu().numpy(), 1)
-    return x - (a*torch.arange(n, device=x.device)/n + b)
+    return x - (a * torch.arange(n, device=x.device) / n + b)
+
 
 def entropy(x: Tensor) -> Tensor:
     """
@@ -222,7 +231,8 @@ def entropy(x: Tensor) -> Tensor:
     ax /= torch.sum(ax)
     return -torch.sum(torch.xlogy(ax, ax))
 
-def contrast(x: Tensor, dim: int=-1) -> Tensor:
+
+def contrast(x: Tensor, dim: int = -1) -> Tensor:
     """
     Calculates negative contrast:
 
@@ -245,7 +255,8 @@ def contrast(x: Tensor, dim: int=-1) -> Tensor:
     contrast = torch.mean(std / mu)
     return -contrast
 
-def shift_spectrum(x: Tensor, dim: int=-1) -> Tensor:
+
+def shift_spectrum(x: Tensor, dim: int = -1) -> Tensor:
     """
     Equivalent to: ``fft(ifftshift(ifft(x, dim), dim), dim)``,
     but avoids calculating FFTs.
@@ -265,11 +276,20 @@ def shift_spectrum(x: Tensor, dim: int=-1) -> Tensor:
     shape = [1] * len(x.shape)
     shape[dim] = x.shape[dim]
     c = torch.ones(shape, dtype=torch.float32, device=x.device)
-    c[...,1::2] = -1
+    c[..., 1::2] = -1
     return x * c
 
-def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc:
-        float, bw: float, tsweep: float, fs: float, rvp: bool=True) -> Tensor:
+
+def generate_fmcw_data(
+    target_pos: Tensor,
+    target_rcs: Tensor,
+    pos: Tensor,
+    fc: float,
+    bw: float,
+    tsweep: float,
+    fs: float,
+    rvp: bool = True,
+) -> Tensor:
     """
     Generate FMCW radar time-domain IF signal.
 
@@ -315,13 +335,17 @@ def generate_fmcw_data(target_pos: Tensor, target_rcs: Tensor, pos : Tensor, fc:
 
     t = t[None, :]
     for e, target in enumerate(target_pos):
-        d = torch.linalg.vector_norm(pos - target[None,:], dim=-1)[:, None]
-        tau = 2*d/c0
-        data += (target_rcs[e]/d**4) * torch.exp(-1j*2*pi*(fc*tau - k*tau*t + use_rvp*0.5*k*tau**2))
+        d = torch.linalg.vector_norm(pos - target[None, :], dim=-1)[:, None]
+        tau = 2 * d / c0
+        data += (target_rcs[e] / d**4) * torch.exp(
+            -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
+        )
     return data
 
-def make_polar_grid(r0: float, r1: float, nr: int, ntheta: int, theta_limit:
-        int=1, squint: float=0) -> dict:
+
+def make_polar_grid(
+    r0: float, r1: float, nr: int, ntheta: int, theta_limit: int = 1, squint: float = 0
+) -> dict:
     """
     Generate polar grid dict in format understood by other polar functions.
 
@@ -352,6 +376,7 @@ def make_polar_grid(r0: float, r1: float, nr: int, ntheta: int, theta_limit:
     grid_polar = {"r": (r0, r1), "theta": (t0, t1), "nr": nr, "ntheta": ntheta}
     return grid_polar
 
+
 def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     """
     Convert radar reflection phase shift to distance.
@@ -364,10 +389,12 @@ def phase_to_distance(p: Tensor, fc: float) -> Tensor:
         RF center frequency.
     """
     c0 = 299792458
-    return c0 * p / (4*torch.pi*fc)
+    return c0 * p / (4 * torch.pi * fc)
 
-def fft_lowpass_filter_window(target_data: Tensor, window: str | tuple='hamming',
-        window_width: int=None) -> Tensor:
+
+def fft_lowpass_filter_window(
+    target_data: Tensor, window: str | tuple = "hamming", window_width: int = None
+) -> Tensor:
     """
     FFT low-pass filtering with a configurable window function.
 
@@ -394,10 +421,10 @@ def fft_lowpass_filter_window(target_data: Tensor, window: str | tuple='hamming'
 
     # Window needs to be centered at DC in FFT
     half_width = (window_width + 1) // 2
-    half_window = get_window(window, 2*half_width - 1, fftbins=True)[half_width-1:]
+    half_window = get_window(window, 2 * half_width - 1, fftbins=True)[half_width - 1 :]
     w = np.zeros(n)
     w[:half_width] = half_window
-    w[-half_width+1:] = np.flip(half_window[1:])
+    w[-half_width + 1 :] = np.flip(half_window[1:])
 
     w = torch.tensor(w).to(target_data.device)
     filtered_data = torch.fft.ifft(fdata * w, dim=-1)
