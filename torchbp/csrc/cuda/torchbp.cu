@@ -161,16 +161,11 @@ static __device__ T lanczos_interp_1d(const T *img, int n, float pos, int a) {
     int start = max(0, (int)ceilf(pos - a));
     int end = min(n-1, (int)floorf(pos + a));
     T sum{};
-    float total_weight = 0.0f;
     for (int i = start; i <= end; i++) {
         float dx = pos - i;
         float w = lanczos_kernel(dx, a);
         T val = img[i];
         sum += w * val;
-        total_weight += w;
-    }
-    if (total_weight != 0.0f) {
-        sum /= total_weight;
     }
     return sum;
 }
@@ -180,16 +175,11 @@ static __device__ T lanczos_interp_2d(const T *img, int nx, int ny, float x, flo
     int start_x = max(0, (int)ceilf(x - a));
     int end_x = min(nx-1, (int)floorf(x + a));
     T sum{};
-    float total_weight = 0.0f;
     for (int i = start_x; i <= end_x; i++) {
         float dx = x - i;
         float wx = lanczos_kernel(dx, a);
         T row_val = lanczos_interp_1d<T>(img + i * ny, ny, y, a);
         sum += wx * row_val;
-        total_weight += wx;
-    }
-    if (total_weight != 0.0f) {
-        sum /= total_weight;
     }
     return sum;
 }
@@ -2118,7 +2108,7 @@ __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
         *out, const float *dorigin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float r1,
         float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
-        float z0) {
+        float z1) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -2156,7 +2146,7 @@ __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         complex64_t v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
-        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float z0 = z1 + dorigin[idbatch * 3 + 2];
         const float dz = sqrtf(z1*z1 + d*d);
         const float rpz = sqrtf(z0*z0 + rp*rp);
         sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
@@ -2170,7 +2160,7 @@ __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
 __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
         float *dorigin, float rotation, float ref_phase, float r0, float dr,
         float theta0, float dtheta, int Nr, int Ntheta, float r1, float dr1,
-        float theta1, float dtheta1, int Nr1, int Ntheta1, float z0, const complex64_t
+        float theta1, float dtheta1, int Nr1, int Ntheta1, float z1, const complex64_t
         *grad, complex64_t *img_grad, float *dorigin_grad) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
@@ -2220,7 +2210,7 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
-        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float z0 = z1 + dorigin[idbatch * 3 + 2];
         const float dz = sqrtf(z1*z1 + d*d);
         const float rpz = sqrtf(z0*z0 + rp*rp);
         sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
@@ -2278,7 +2268,7 @@ __global__ void polar_interp_kernel_bicubic(const complex64_t *img,
         const complex64_t *img_gxy, complex64_t *out, const float *dorigin,
         float rotation, float ref_phase, float r0, float dr, float theta0,
         float dtheta, int Nr, int Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z0) {
+        float dtheta1, int Nr1, int Ntheta1, float z1) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -2321,7 +2311,7 @@ __global__ void polar_interp_kernel_bicubic(const complex64_t *img,
                 &img_gxy[idbatch * Nr * Ntheta],
                 Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
-        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float z0 = z1 + dorigin[idbatch * 3 + 2];
         const float dz = sqrtf(z1*z1 + d*d);
         const float rpz = sqrtf(z0*z0 + rp*rp);
         sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
@@ -2336,7 +2326,7 @@ __global__ void polar_interp_kernel_lanczos(const complex64_t *img,
         complex64_t *out, const float *dorigin,
         float rotation, float ref_phase, float r0, float dr, float theta0,
         float dtheta, int Nr, int Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z0, int order) {
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -2370,7 +2360,7 @@ __global__ void polar_interp_kernel_lanczos(const complex64_t *img,
         complex64_t v = lanczos_interp_2d<complex64_t>(
                 &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
         float ref_sin, ref_cos;
-        const float z1 = z0 + dorigin[idbatch * 3 + 2];
+        const float z0 = z1 + dorigin[idbatch * 3 + 2];
         const float dz = sqrtf(z1*z1 + d*d);
         const float rpz = sqrtf(z0*z0 + rp*rp);
         sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
@@ -3168,7 +3158,7 @@ at::Tensor polar_interp_linear_cuda(
           double dtheta1,
           int64_t Nr1,
           int64_t Ntheta1,
-          double z0) {
+          double z1) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
@@ -3207,7 +3197,7 @@ at::Tensor polar_interp_linear_cuda(
                   dtheta1,
                   Nr1,
                   Ntheta1,
-                  z0
+                  z1
                   );
 	return out;
 }
@@ -3231,7 +3221,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cuda(
           double dtheta1,
           int64_t Nr1,
           int64_t Ntheta1,
-          double z0) {
+          double z1) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -3288,7 +3278,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cuda(
                   dtheta1,
                   Nr1,
                   Ntheta1,
-                  z0,
+                  z1,
                   (complex64_t*)grad_ptr,
                   (complex64_t*)img_grad_ptr,
                   dorigin_grad_ptr
@@ -3320,7 +3310,7 @@ at::Tensor polar_interp_bicubic_cuda(
           double dtheta1,
           int64_t Nr1,
           int64_t Ntheta1,
-          double z0) {
+          double z1) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img_gx.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img_gy.dtype() == at::kComplexFloat);
@@ -3374,7 +3364,7 @@ at::Tensor polar_interp_bicubic_cuda(
                   dtheta1,
                   Nr1,
                   Ntheta1,
-                  z0
+                  z1
                   );
 	return out;
 }
@@ -3397,7 +3387,7 @@ at::Tensor polar_interp_lanczos_cuda(
           double dtheta1,
           int64_t Nr1,
           int64_t Ntheta1,
-          double z0,
+          double z1,
           int64_t order) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -3437,7 +3427,7 @@ at::Tensor polar_interp_lanczos_cuda(
                   dtheta1,
                   Nr1,
                   Ntheta1,
-                  z0,
+                  z1,
                   order
                   );
 	return out;

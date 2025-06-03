@@ -48,6 +48,10 @@ if __name__ == "__main__":
     # but is faster.
     ffbp = False
 
+    # Bistatic radar not supported at the moment with ffbp
+    if ffbp:
+        ant_tx_dy = 0
+
     c0 = 299792458
 
     # Load the input data
@@ -87,6 +91,10 @@ if __name__ == "__main__":
     # Critically spaced array would be 0.25 wavelengths apart
     ntheta = int(1 + nsweeps * spacing * theta_limit / 0.25)
     nr = int((x1 - x0) / res)
+    if ffbp:
+        # Needed to avoid aliasing with ffbp
+        nr *= 2
+
     az = att[:, 2]
     mean_az = np.angle(np.mean(np.exp(1j * az)))
     grid_polar = make_polar_grid(
@@ -186,12 +194,10 @@ if __name__ == "__main__":
     tstart = time.time()
     if ffbp:
         sar_img = torchbp.ops.ffbp(fsweeps, grid_polar, fc, r_res, pos_centered,
-                vel, att, stages=1, divisions=4, d0=d0, ant_tx_dy=ant_tx_dy,
-                interp_method=("lanczos", 4))
+                vel, att, stages=3, divisions=2, d0=d0)
     else:
         sar_img = torchbp.ops.backprojection_polar_2d(
-            fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0,
-            ant_tx_dy)[0]
+            fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0)[0]
     torch.cuda.synchronize()
     print(f"Final image created in {time.time() - tstart:.3g} s")
     print("Entropy", torchbp.util.entropy(sar_img).item())

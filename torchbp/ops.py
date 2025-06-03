@@ -166,7 +166,7 @@ def polar_interp_linear(
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
     z0 : float
-        Height of the antenna phase center.
+        Height of the antenna phase center in the new image.
 
     Returns
     ----------
@@ -263,7 +263,7 @@ def polar_interp_bicubic(
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
     z0 : float
-        Height of the antenna phase center.
+        Height of the antenna phase center in the new image.
 
     Returns
     ----------
@@ -367,7 +367,7 @@ def polar_interp_lanczos(
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
     z0 : float
-        Height of the antenna phase center.
+        Height of the antenna phase center in the new image.
 
     Returns
     ----------
@@ -1274,13 +1274,12 @@ def ffbp(
     stages: int,
     divisions: int = 2,
     d0: float = 0.0,
-    ant_tx_dy: float = 0.0,
     interp_method: str | tuple = ("lanczos", 3),
 ) -> Tensor:
     """
     Fast factorized backprojection.
 
-    Large Z-axis movements likely not handled correctly.
+    Large Z-axis movements not handled correctly.
 
     Parameters
     ----------
@@ -1311,8 +1310,6 @@ def ffbp(
         Number of subapertures divisions per stage. Default is 2.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        RX antenna Y-position (along the track) distance from TX antenna.
     interp_method : str or tuple
         Interpolation method. See `polar_interp` function.
     """
@@ -1350,7 +1347,6 @@ def ffbp(
                 stages=stages - 1,
                 divisions=divisions,
                 d0=d0,
-                ant_tx_dy=ant_tx_dy,
             )
         else:
             img = backprojection_polar_2d(
@@ -1362,13 +1358,14 @@ def ffbp(
                 vel_local,
                 att_local,
                 d0=d0,
-                ant_tx_dy=ant_tx_dy,
+                dealias=True
             )[0]
         imgs.append((origin_local[0], grid_local, img, z0))
     while len(imgs) > 1:
         img1 = imgs[0]
         img2 = imgs[1]
         new_origin = 0.5 * img1[0] + 0.5 * img2[0]
+        new_z = 0.5 * (img1[3] + img2[3])
         if len(imgs) == 2:
             # Interpolate the final image to the desired grid.
             grid_polar_new = grid
@@ -1377,24 +1374,28 @@ def ffbp(
             grid_polar_new["ntheta"] += img2[1]["ntheta"]
         i1 = img1[2]
         i2 = img2[2]
+        dorigin1 = new_origin - img1[0]
+        dorigin1[2] = -(new_z - img1[3])
         img_interpolated1 = polar_interp(
             i1,
-            new_origin - img1[0],
+            dorigin1,
             img1[1],
             fc,
             0,
             grid_polar_new,
-            z0=img1[3],
+            z0=new_z,
             method=interp_method,
         ).squeeze()
+        dorigin2 = new_origin - img2[0]
+        dorigin2[2] = -(new_z - img2[3])
         img_interpolated2 = polar_interp(
             i2,
-            new_origin - img2[0],
+            dorigin2,
             img2[1],
             fc,
             0,
             grid_polar_new,
-            z0=img2[3],
+            z0=new_z,
             method=interp_method,
         ).squeeze()
         img_sum = img_interpolated1 + img_interpolated2
