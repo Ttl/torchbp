@@ -129,10 +129,11 @@ class TestPolarToCartLinear(TestCase):
         nbatch = 2
         grid_polar = {"r": (10, 20), "theta": (-1, 1), "nr": 2, "ntheta": 2}
         grid_cart = {"x": (12, 18), "y": (-5, 5), "nx": 3, "ny": 3}
-        dorigin = 0.1*make_tensor((nbatch, 2), dtype=dtype)
+        #TODO: make origin differentiable
+        origin = 0.1*make_nondiff_tensor((nbatch, 3), dtype=dtype)
         args = {
             'img': make_tensor((nbatch, grid_polar["nr"], grid_polar["ntheta"]), dtype=complex_dtype),
-            'dorigin': dorigin,
+            'origin': origin,
             'grid_polar': grid_polar,
             'grid_cart': grid_cart,
             'fc': 6e9,
@@ -206,11 +207,11 @@ class TestPolarToCartBicubic(TestCase):
         nbatch = 2
         grid_polar = {"r": (10, 20), "theta": (-1, 1), "nr": 3, "ntheta": 3}
         grid_cart = {"x": (12, 18), "y": (-5, 5), "nx": 3, "ny": 3}
-        #TODO: make dorigin differentiable
-        dorigin = 0.1*make_nondiff_tensor((nbatch, 2), dtype=dtype)
+        #TODO: make origin differentiable
+        origin = 0.1*make_nondiff_tensor((nbatch, 3), dtype=dtype)
         args = {
             'img': make_tensor((nbatch, grid_polar["nr"], grid_polar["ntheta"]), dtype=complex_dtype),
-            'dorigin': dorigin,
+            'origin': origin,
             'grid_polar': grid_polar,
             'grid_cart': grid_cart,
             'fc': 6e9,

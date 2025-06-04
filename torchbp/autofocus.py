@@ -398,7 +398,7 @@ def gpga_ml_bp_polar(
         d = d - torch.mean(d)
 
         pos_new[:, 0] = pos[:, 0] + d
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)
         img = img.squeeze()
         window_width = int(window_width**window_exp)
         if window_width < min_window:

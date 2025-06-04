@@ -340,7 +340,7 @@ __global__ void backprojection_polar_2d_kernel(
         float pz2 = pos_z * pos_z;
 
         // Calculate distance to the pixel.
-        const float d = sqrtf(px * px + py * py + pz2) - d0;
+        const float d = sqrtf(px * px + py * py + pz2) + d0;
 
         float sx = delta_r * d;
 
@@ -437,7 +437,7 @@ __global__ void backprojection_polar_2d_grad_kernel(
         float pz2 = pos_z * pos_z;
 
         // Calculate distance to the pixel.
-        const float d = sqrtf(px * px + py * py + pz2) - d0;
+        const float d = sqrtf(px * px + py * py + pz2) + d0;
 
         float sx = delta_r * d;
 
@@ -567,7 +567,7 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
         float pz2 = pos_z * pos_z;
 
         // Calculate distance to the pixel.
-        const float d = sqrtf(px * px + py * py + pz2) - d0;
+        const float d = sqrtf(px * px + py * py + pz2) + d0;
 
         float sx = delta_r * d;
 
@@ -627,7 +627,7 @@ __global__ void gpga_backprojection_2d_kernel(
     float pz = (z - pos_z);
 
     // Calculate distance to the pixel.
-    const float d = sqrtf(px * px + py * py + pz * pz) - d0;
+    const float d = sqrtf(px * px + py * py + pz * pz) + d0;
 
     float sx = delta_r * d;
 
@@ -845,7 +845,7 @@ __global__ void backprojection_cart_2d_kernel(
         //}
         // Calculate distance to the pixel.
 
-        float d = sqrtf(px * px + py * py + pz2) - d0;
+        float d = sqrtf(px * px + py * py + pz2) + d0;
 
         float sx = delta_r * d;
 
@@ -921,7 +921,7 @@ __global__ void backprojection_cart_2d_grad_kernel(
         //}
         // Calculate distance to the pixel.
 
-        float d = sqrtf(px * px + py * py + pz2) - d0;
+        float d = sqrtf(px * px + py * py + pz2) + d0;
 
         float sx = delta_r * d;
 
@@ -2130,7 +2130,7 @@ __global__ void polar_interp_kernel_lanczos(const complex64_t *img,
 
 template<typename T>
 __global__ void polar_to_cart_kernel_linear(const T *img, T
-        *out, const float *dorigin, float rotation, float ref_phase, float r0,
+        *out, const float *origin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
         float dx, float y0, float dy, int Nx, int Ny, int polar_interp) {
     const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2142,13 +2142,15 @@ __global__ void polar_to_cart_kernel_linear(const T *img, T
         return;
     }
 
-    const float dorig0 = dorigin[idbatch * 2 + 0];
-    const float dorig1 = dorigin[idbatch * 2 + 1];
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
     const float x = x0 + dx * idx;
     const float y = y0 + dy * idy;
-    const float d = sqrtf((x-dorig0)*(x-dorig0) + (y-dorig1)*(y-dorig1));
-    float t = (y - dorig1) / d; // Sin of angle
-    float tc = (x - dorig0) / d; // Cos of angle
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    const float dz = sqrtf(d*d + orig2*orig2);
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
     float rs = sinf(rotation);
     float rc = cosf(rotation);
     float cosa = t*rs  + tc*rc;
@@ -2173,7 +2175,7 @@ __global__ void polar_to_cart_kernel_linear(const T *img, T
                 v = absv * v / abs(v);
             }
             float ref_sin, ref_cos;
-            sincospif(ref_phase * d, &ref_sin, &ref_cos);
+            sincospif(ref_phase * dz, &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
             out[idbatch * Nx * Ny + idx*Ny + idy] = v * ref;
         } else {
@@ -2189,22 +2191,24 @@ __global__ void polar_to_cart_kernel_linear(const T *img, T
 }
 
 __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
-        const float *dorigin, float rotation, float ref_phase,
+        const float *origin, float rotation, float ref_phase,
         float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta,
         float x0, float dx, float y0, float dy, int Nx, int Ny,
-        const complex64_t *grad, complex64_t *img_grad, float *dorigin_grad) {
+        const complex64_t *grad, complex64_t *img_grad, float *origin_grad) {
     const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
     const int idy = id1 % Ny;
     const int idx = id1 / Ny;
     const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
 
-    const float dorig0 = dorigin[idbatch * 2 + 0];
-    const float dorig1 = dorigin[idbatch * 2 + 1];
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
     const float x = x0 + dx * idx;
     const float y = y0 + dy * idy;
-    const float d = sqrtf((x-dorig0)*(x-dorig0) + (y-dorig1)*(y-dorig1));
-    float t = (y - dorig1) / d; // Sin of angle
-    float tc = (x - dorig0) / d; // Cos of angle
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    const float dz = sqrtf(d*d + orig2*orig2);
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
     float rs = sinf(rotation);
     float rc = cosf(rotation);
     float cosa = t*rs  + tc*rc;
@@ -2233,29 +2237,33 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
         //float absv = interp2d_abs<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         //v = absv * v / abs(v);
         float ref_sin, ref_cos;
-        sincospif(ref_phase * d, &ref_sin, &ref_cos);
+        sincospif(ref_phase * dz, &ref_sin, &ref_cos);
         ref = {ref_cos, ref_sin};
     }
 
     // FIXME: Doesn't consider absv (polar_interp)
-    if (dorigin_grad != nullptr) {
+    if (origin_grad != nullptr) {
         const complex64_t I = {0.0f, 1.0f};
-        complex64_t dout_drp = I * kPI * ref_phase * ref * v;
+        // FIXME: Missing derivative of v
+        complex64_t dout_drp = I * kPI * ref_phase * ref * v * (d / dz);
 
         complex64_t drp_conj = cuda::std::conj(dout_drp);
         complex64_t gdrp = grad[idbatch * Nx * Ny + idx*Ny + idy] * drp_conj;
         float gd = cuda::std::real(gdrp);
-        float dd_dorigin0 = gd * (dorig0 - x) / d;
-        float dd_dorigin1 = gd * (dorig1 - y) / d;
+        float dd_origin0 = gd * (orig0 - x) / d;
+        float dd_origin1 = gd * (orig1 - y) / d;
+        float dd_origin2 = (gd / d) * orig2;
 
         for (int offset = 16; offset > 0; offset /= 2) {
-            dd_dorigin0 += __shfl_down_sync(mask, dd_dorigin0, offset);
-            dd_dorigin1 += __shfl_down_sync(mask, dd_dorigin1, offset);
+            dd_origin0 += __shfl_down_sync(mask, dd_origin0, offset);
+            dd_origin1 += __shfl_down_sync(mask, dd_origin1, offset);
+            dd_origin2 += __shfl_down_sync(mask, dd_origin2, offset);
         }
 
         if (threadIdx.x % 32 == 0) {
-            atomicAdd(&(dorigin_grad[idbatch * 2 + 0]), dd_dorigin0);
-            atomicAdd(&(dorigin_grad[idbatch * 2 + 1]), dd_dorigin1);
+            atomicAdd(&(origin_grad[idbatch * 3 + 0]), dd_origin0);
+            atomicAdd(&(origin_grad[idbatch * 3 + 1]), dd_origin1);
+            atomicAdd(&(origin_grad[idbatch * 3 + 2]), dd_origin2);
         }
     }
 
@@ -2285,7 +2293,7 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
 
 at::Tensor polar_to_cart_linear_cuda(
           const at::Tensor &img,
-          const at::Tensor &dorigin,
+          const at::Tensor &origin,
           int64_t nbatch,
           double rotation,
           double fc,
@@ -2303,13 +2311,13 @@ at::Tensor polar_to_cart_linear_cuda(
           int64_t Ny,
           int64_t polar_interp) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
-	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
-	at::Tensor dorigin_contig = dorigin.contiguous();
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
+	at::Tensor origin_contig = origin.contiguous();
 	at::Tensor img_contig = img.contiguous();
 	at::Tensor out = torch::empty({nbatch, Nx, Ny}, img_contig.options());
-	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+	const float* origin_ptr = origin_contig.data_ptr<float>();
 
 	dim3 thread_per_block = {256, 1};
 	// Up-rounding division.
@@ -2326,7 +2334,7 @@ at::Tensor polar_to_cart_linear_cuda(
               <<<block_count, thread_per_block>>>(
                       (const complex64_t*)img_ptr,
                       (complex64_t*)out_ptr,
-                      dorigin_ptr,
+                      origin_ptr,
                       rotation,
                       ref_phase,
                       r0,
@@ -2350,7 +2358,7 @@ at::Tensor polar_to_cart_linear_cuda(
               <<<block_count, thread_per_block>>>(
                       img_ptr,
                       out_ptr,
-                      dorigin_ptr,
+                      origin_ptr,
                       rotation,
                       ref_phase,
                       r0,
@@ -2374,7 +2382,7 @@ at::Tensor polar_to_cart_linear_cuda(
 std::vector<at::Tensor> polar_to_cart_linear_grad_cuda(
           const at::Tensor &grad,
           const at::Tensor &img,
-          const at::Tensor &dorigin,
+          const at::Tensor &origin,
           int64_t nbatch,
           double rotation,
           double fc,
@@ -2392,12 +2400,12 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cuda(
           int64_t Ny) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
-	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CUDA);
-	at::Tensor dorigin_contig = dorigin.contiguous();
-	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+	at::Tensor origin_contig = origin.contiguous();
+	const float* origin_ptr = origin_contig.data_ptr<float>();
 	at::Tensor img_contig = img.contiguous();
 	at::Tensor grad_contig = grad.contiguous();
     c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
@@ -2411,13 +2419,13 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cuda(
         img_grad = torch::Tensor();
     }
 
-    at::Tensor dorigin_grad;
-	float* dorigin_grad_ptr = nullptr;
-    if (dorigin.requires_grad()) {
-        dorigin_grad = torch::zeros_like(dorigin);
-        dorigin_grad_ptr = dorigin_grad.data_ptr<float>();
+    at::Tensor origin_grad;
+	float* origin_grad_ptr = nullptr;
+    if (origin.requires_grad()) {
+        origin_grad = torch::zeros_like(origin);
+        origin_grad_ptr = origin_grad.data_ptr<float>();
     } else {
-        dorigin_grad = torch::Tensor();
+        origin_grad = torch::Tensor();
     }
 
 	dim3 thread_per_block = {256, 1};
@@ -2431,7 +2439,7 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cuda(
     polar_to_cart_kernel_linear_grad
           <<<block_count, thread_per_block>>>(
                   (const complex64_t*)img_ptr,
-                  dorigin_ptr,
+                  origin_ptr,
                   rotation,
                   ref_phase,
                   r0,
@@ -2448,18 +2456,18 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cuda(
                   Ny,
                   (const complex64_t*)grad_ptr,
                   (complex64_t*)img_grad_ptr,
-                  dorigin_grad_ptr
+                  origin_grad_ptr
                   );
     std::vector<at::Tensor> ret;
     ret.push_back(img_grad);
-    ret.push_back(dorigin_grad);
+    ret.push_back(origin_grad);
 	return ret;
 }
 
 template<typename T>
 __global__ void polar_to_cart_kernel_bicubic(const T *img,
         const T *img_gx, const T *img_gy, const T *img_gxy,
-        T *out, const float *dorigin, float rotation, float ref_phase, float r0,
+        T *out, const float *origin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
         float dx, float y0, float dy, int Nx, int Ny, int polar_interp) {
     const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2471,13 +2479,14 @@ __global__ void polar_to_cart_kernel_bicubic(const T *img,
         return;
     }
 
-    const float dorig0 = dorigin[idbatch * 2 + 0];
-    const float dorig1 = dorigin[idbatch * 2 + 1];
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
     const float x = x0 + dx * idx;
     const float y = y0 + dy * idy;
-    const float d = sqrtf((x-dorig0)*(x-dorig0) + (y-dorig1)*(y-dorig1));
-    float t = (y - dorig1) / d; // Sin of angle
-    float tc = (x - dorig0) / d; // Cos of angle
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
     float rs = sinf(rotation);
     float rc = cosf(rotation);
     float cosa = t*rs  + tc*rc;
@@ -2506,7 +2515,7 @@ __global__ void polar_to_cart_kernel_bicubic(const T *img,
                 v = absv * v / abs(v);
             }
             float ref_sin, ref_cos;
-            sincospif(ref_phase * d, &ref_sin, &ref_cos);
+            sincospif(ref_phase * sqrtf(d*d + orig2*orig2), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
             out[idbatch * Nx * Ny + idx*Ny + idy] = v * ref;
         } else {
@@ -2523,23 +2532,25 @@ __global__ void polar_to_cart_kernel_bicubic(const T *img,
 
 __global__ void polar_to_cart_kernel_bicubic_grad(const complex64_t *img,
         const complex64_t *img_gx, const complex64_t *img_gy, const complex64_t *img_gxy,
-        const float *dorigin, float rotation, float ref_phase,
+        const float *origin, float rotation, float ref_phase,
         float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta,
         float x0, float dx, float y0, float dy, int Nx, int Ny,
         const complex64_t *grad, complex64_t *img_grad, complex64_t *img_gx_grad,
-        complex64_t *img_gy_grad, complex64_t *img_gxy_grad, float *dorigin_grad) {
+        complex64_t *img_gy_grad, complex64_t *img_gxy_grad, float *origin_grad) {
     const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
     const int idy = id1 % Ny;
     const int idx = id1 / Ny;
     const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
 
-    const float dorig0 = dorigin[idbatch * 2 + 0];
-    const float dorig1 = dorigin[idbatch * 2 + 1];
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
     const float x = x0 + dx * idx;
     const float y = y0 + dy * idy;
-    const float d = sqrtf((x-dorig0)*(x-dorig0) + (y-dorig1)*(y-dorig1));
-    float t = (y - dorig1) / d; // Sin of angle
-    float tc = (x - dorig0) / d; // Cos of angle
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    const float dz = sqrtf(d*d + orig2*orig2);
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
     float rs = sinf(rotation);
     float rc = cosf(rotation);
     float cosa = t*rs  + tc*rc;
@@ -2573,29 +2584,33 @@ __global__ void polar_to_cart_kernel_bicubic_grad(const complex64_t *img,
         //float absv = interp2d_abs<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         //v = absv * v / abs(v);
         float ref_sin, ref_cos;
-        sincospif(ref_phase * d, &ref_sin, &ref_cos);
+        sincospif(ref_phase * dz, &ref_sin, &ref_cos);
         ref = {ref_cos, ref_sin};
     }
 
     // FIXME: Doesn't consider absv
-    if (dorigin_grad != nullptr) {
+    if (origin_grad != nullptr) {
         const complex64_t I = {0.0f, 1.0f};
-        complex64_t dout_drp = I * kPI * ref_phase * ref * v;
+        // FIXME: Missing derivative of v
+        complex64_t dout_drp = I * kPI * ref_phase * ref * v * (d / dz);
 
         complex64_t drp_conj = cuda::std::conj(dout_drp);
         complex64_t gdrp = grad[idbatch * Nx * Ny + idx*Ny + idy] * drp_conj;
         float gd = cuda::std::real(gdrp);
-        float dd_dorigin0 = gd * (dorig0 - x) / d;
-        float dd_dorigin1 = gd * (dorig1 - y) / d;
+        float dd_origin0 = gd * (orig0 - x) / d;
+        float dd_origin1 = gd * (orig1 - y) / d;
+        float dd_origin2 = (gd / d) * orig2;
 
         for (int offset = 16; offset > 0; offset /= 2) {
-            dd_dorigin0 += __shfl_down_sync(mask, dd_dorigin0, offset);
-            dd_dorigin1 += __shfl_down_sync(mask, dd_dorigin1, offset);
+            dd_origin0 += __shfl_down_sync(mask, dd_origin0, offset);
+            dd_origin1 += __shfl_down_sync(mask, dd_origin1, offset);
+            dd_origin2 += __shfl_down_sync(mask, dd_origin2, offset);
         }
 
         if (threadIdx.x % 32 == 0) {
-            atomicAdd(&(dorigin_grad[idbatch * 2 + 0]), dd_dorigin0);
-            atomicAdd(&(dorigin_grad[idbatch * 2 + 1]), dd_dorigin1);
+            atomicAdd(&(origin_grad[idbatch * 3 + 0]), dd_origin0);
+            atomicAdd(&(origin_grad[idbatch * 3 + 1]), dd_origin1);
+            atomicAdd(&(origin_grad[idbatch * 3 + 2]), dd_origin2);
         }
     }
 
@@ -2670,7 +2685,7 @@ at::Tensor polar_to_cart_bicubic_cuda(
           const at::Tensor &img_gx,
           const at::Tensor &img_gy,
           const at::Tensor &img_gxy,
-          const at::Tensor &dorigin,
+          const at::Tensor &origin,
           int64_t nbatch,
           double rotation,
           double fc,
@@ -2691,19 +2706,19 @@ at::Tensor polar_to_cart_bicubic_cuda(
 	TORCH_CHECK(img_gx.dtype() == img.dtype());
 	TORCH_CHECK(img_gy.dtype() == img.dtype());
 	TORCH_CHECK(img_gxy.dtype() == img.dtype());
-	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(img_gx.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(img_gy.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(img_gxy.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
-	at::Tensor dorigin_contig = dorigin.contiguous();
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
+	at::Tensor origin_contig = origin.contiguous();
 	at::Tensor img_contig = img.contiguous();
 	at::Tensor img_gx_contig = img_gx.contiguous();
 	at::Tensor img_gy_contig = img_gy.contiguous();
 	at::Tensor img_gxy_contig = img_gxy.contiguous();
 	at::Tensor out = torch::empty({nbatch, Nx, Ny}, img_contig.options());
-	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+	const float* origin_ptr = origin_contig.data_ptr<float>();
 
 	dim3 thread_per_block = {256, 1};
 	// Up-rounding division.
@@ -2726,7 +2741,7 @@ at::Tensor polar_to_cart_bicubic_cuda(
                       (const complex64_t*)img_gy_ptr,
                       (const complex64_t*)img_gxy_ptr,
                       (complex64_t*)out_ptr,
-                      dorigin_ptr,
+                      origin_ptr,
                       rotation,
                       ref_phase,
                       r0,
@@ -2756,7 +2771,7 @@ at::Tensor polar_to_cart_bicubic_cuda(
                       img_gy_ptr,
                       img_gxy_ptr,
                       out_ptr,
-                      dorigin_ptr,
+                      origin_ptr,
                       rotation,
                       ref_phase,
                       r0,
@@ -2783,7 +2798,7 @@ std::vector<at::Tensor> polar_to_cart_bicubic_grad_cuda(
           const at::Tensor &img_gx,
           const at::Tensor &img_gy,
           const at::Tensor &img_gxy,
-          const at::Tensor &dorigin,
+          const at::Tensor &origin,
           int64_t nbatch,
           double rotation,
           double fc,
@@ -2803,12 +2818,12 @@ std::vector<at::Tensor> polar_to_cart_bicubic_grad_cuda(
 	TORCH_CHECK(img_gx.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img_gy.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img_gxy.dtype() == at::kComplexFloat);
-	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CUDA);
-	at::Tensor dorigin_contig = dorigin.contiguous();
-	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+	at::Tensor origin_contig = origin.contiguous();
+	const float* origin_ptr = origin_contig.data_ptr<float>();
 	at::Tensor img_contig = img.contiguous();
 	at::Tensor img_gx_contig = img_gx.contiguous();
 	at::Tensor img_gy_contig = img_gy.contiguous();
@@ -2843,13 +2858,13 @@ std::vector<at::Tensor> polar_to_cart_bicubic_grad_cuda(
         img_gxy_grad = torch::Tensor();
     }
 
-    at::Tensor dorigin_grad;
-	float* dorigin_grad_ptr = nullptr;
-    if (dorigin.requires_grad()) {
-        dorigin_grad = torch::zeros_like(dorigin);
-        dorigin_grad_ptr = dorigin_grad.data_ptr<float>();
+    at::Tensor origin_grad;
+	float* origin_grad_ptr = nullptr;
+    if (origin.requires_grad()) {
+        origin_grad = torch::zeros_like(origin);
+        origin_grad_ptr = origin_grad.data_ptr<float>();
     } else {
-        dorigin_grad = torch::Tensor();
+        origin_grad = torch::Tensor();
     }
 
 	dim3 thread_per_block = {256, 1};
@@ -2866,7 +2881,7 @@ std::vector<at::Tensor> polar_to_cart_bicubic_grad_cuda(
                   (const complex64_t*)img_gx_ptr,
                   (const complex64_t*)img_gy_ptr,
                   (const complex64_t*)img_gxy_ptr,
-                  dorigin_ptr,
+                  origin_ptr,
                   rotation,
                   ref_phase,
                   r0,
@@ -2886,14 +2901,14 @@ std::vector<at::Tensor> polar_to_cart_bicubic_grad_cuda(
                   (complex64_t*)img_gx_grad_ptr,
                   (complex64_t*)img_gy_grad_ptr,
                   (complex64_t*)img_gxy_grad_ptr,
-                  dorigin_grad_ptr
+                  origin_grad_ptr
                   );
     std::vector<at::Tensor> ret;
     ret.push_back(img_grad);
     ret.push_back(img_gx_grad);
     ret.push_back(img_gy_grad);
     ret.push_back(img_gxy_grad);
-    ret.push_back(dorigin_grad);
+    ret.push_back(origin_grad);
 	return ret;
 }
 

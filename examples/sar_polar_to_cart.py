@@ -30,7 +30,7 @@ if __name__ == "__main__":
     grid["ny"] = int(oversample * grid["ny"] * multilook)
 
     plt.figure()
-    origin = torch.from_numpy(origin[:2]).to(dtype=torch.float32, device=dev)
+    origin = torch.from_numpy(origin).to(dtype=torch.float32, device=dev)
     # Amplitude scaling in image
     m = 20 * torch.log10(torch.median(torch.abs(sar_img))) - 3
     m = m.cpu().numpy()

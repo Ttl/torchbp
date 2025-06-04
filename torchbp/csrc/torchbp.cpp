@@ -394,7 +394,7 @@ static void backprojection_polar_2d_kernel_cpu(
         float pz2 = pos_z * pos_z;
 
         // Calculate distance to the pixel.
-        float d = sqrtf(px * px + py * py + pz2) - d0;
+        float d = sqrtf(px * px + py * py + pz2) + d0;
 
         float sx = delta_r * d;
 
@@ -542,7 +542,7 @@ static void backprojection_polar_2d_grad_kernel_cpu(
         float pz2 = pos_z * pos_z;
 
         // Calculate distance to the pixel.
-        float d = sqrtf(px * px + py * py + pz2) - d0;
+        float d = sqrtf(px * px + py * py + pz2) + d0;
 
         float sx = delta_r * d;
 
@@ -697,7 +697,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
 
 template<typename T>
 static void polar_to_cart_kernel_linear_cpu(const T *img, T
-        *out, const float *dorigin, float rotation, float ref_phase, float r0,
+        *out, const float *origin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
         float dx, float y0, float dy, int Nx, int Ny, int polar_interp,
         int id1, int idbatch) {
@@ -708,13 +708,15 @@ static void polar_to_cart_kernel_linear_cpu(const T *img, T
         return;
     }
 
-    const float dorig0 = dorigin[idbatch * 2 + 0];
-    const float dorig1 = dorigin[idbatch * 2 + 1];
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
     const float x = x0 + dx * idx;
     const float y = y0 + dy * idy;
-    const float d = sqrtf((x-dorig0)*(x-dorig0) + (y-dorig1)*(y-dorig1));
-    float t = (y - dorig1) / d; // Sin of angle
-    float tc = (x - dorig0) / d; // Cos of angle
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    const float dz = sqrtf(d*d + orig2*orig2);
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
     float rs = sinf(rotation);
     float rc = cosf(rotation);
     float cosa = t*rs  + tc*rc;
@@ -739,7 +741,7 @@ static void polar_to_cart_kernel_linear_cpu(const T *img, T
                 v = absv * v / abs(v);
             }
             float ref_sin, ref_cos;
-            sincospi(ref_phase * d, &ref_sin, &ref_cos);
+            sincospi(ref_phase * dz, &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
             out[idbatch * Nx * Ny + idx*Ny + idy] = v * ref;
         } else {
@@ -756,7 +758,7 @@ static void polar_to_cart_kernel_linear_cpu(const T *img, T
 
 at::Tensor polar_to_cart_linear_cpu(
           const at::Tensor &img,
-          const at::Tensor &dorigin,
+          const at::Tensor &origin,
           int64_t nbatch,
           double rotation,
           double fc,
@@ -774,13 +776,13 @@ at::Tensor polar_to_cart_linear_cpu(
           int64_t Ny,
           int64_t polar_interp) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
-	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
-	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CPU);
-	at::Tensor dorigin_contig = dorigin.contiguous();
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CPU);
+	at::Tensor origin_contig = origin.contiguous();
 	at::Tensor img_contig = img.contiguous();
 	at::Tensor out = torch::empty({nbatch, Nx, Ny}, img_contig.options());
-	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+	const float* origin_ptr = origin_contig.data_ptr<float>();
 
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -793,7 +795,7 @@ at::Tensor polar_to_cart_linear_cpu(
                 polar_to_cart_kernel_linear_cpu<complex64_t>(
                               (const complex64_t*)img_ptr,
                               (complex64_t*)out_ptr,
-                              dorigin_ptr,
+                              origin_ptr,
                               rotation,
                               ref_phase,
                               r0,
@@ -818,7 +820,7 @@ at::Tensor polar_to_cart_linear_cpu(
                 polar_to_cart_kernel_linear_cpu<float>(
                               img_ptr,
                               out_ptr,
-                              dorigin_ptr,
+                              origin_ptr,
                               rotation,
                               ref_phase,
                               r0,
@@ -856,10 +858,10 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("polar_interp_linear_grad(Tensor grad, Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1) -> Tensor[]");
   m.def("polar_interp_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1) -> Tensor");
   m.def("polar_interp_lanczos(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1, int order) -> Tensor");
-  m.def("polar_to_cart_linear(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");
-  m.def("polar_to_cart_linear_grad(Tensor grad, Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor[]");
-  m.def("polar_to_cart_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");
-  m.def("polar_to_cart_bicubic_grad(Tensor grad, Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor[]");
+  m.def("polar_to_cart_linear(Tensor img, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");
+  m.def("polar_to_cart_linear_grad(Tensor grad, Tensor img, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor[]");
+  m.def("polar_to_cart_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");
+  m.def("polar_to_cart_bicubic_grad(Tensor grad, Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor[]");
   m.def("backprojection_polar_2d_tx_power(Tensor wa, Tensor pos, Tensor att, Tensor gtx, Tensor grx, int nbatch, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel, int nsweeps, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, int sin_look_angle) -> Tensor");
   m.def("entropy(Tensor data, Tensor norm, int nbatch) -> Tensor");
   m.def("entropy_grad(Tensor data, Tensor norm, Tensor grad, int nbatch) -> Tensor[]");

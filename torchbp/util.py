@@ -288,6 +288,7 @@ def generate_fmcw_data(
     bw: float,
     tsweep: float,
     fs: float,
+    d0: float = 0,
     rvp: bool = True,
 ) -> Tensor:
     """
@@ -309,6 +310,8 @@ def generate_fmcw_data(
         Length of one sweep in seconds.
     fs : float
         Sampling frequency in Hz.
+    d0 : float
+        Zero range.
     rvp : bool
         True to include residual video phase term.
 
@@ -335,7 +338,7 @@ def generate_fmcw_data(
 
     t = t[None, :]
     for e, target in enumerate(target_pos):
-        d = torch.linalg.vector_norm(pos - target[None, :], dim=-1)[:, None]
+        d = torch.linalg.vector_norm(pos - target[None, :], dim=-1)[:, None] + d0
         tau = 2 * d / c0
         data += (target_rcs[e] / d**4) * torch.exp(
             -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
@@ -409,7 +412,8 @@ def fft_lowpass_filter_window(
         Width of the window in samples. If None or larger than signal, returns
         the input unchanged.
 
-    Returns:
+    Returns
+    ----------
         Filtered tensor (same shape as input)
     """
     fdata = torch.fft.fft(target_data, dim=-1)
@@ -429,3 +433,34 @@ def fft_lowpass_filter_window(
     w = torch.tensor(w).to(target_data.device)
     filtered_data = torch.fft.ifft(fdata * w, dim=-1)
     return filtered_data
+
+def center_pos(pos: Tensor):
+    """
+    Center position to origin. Centers X and Y coordinates, but doesn't modify Z.
+    Useful for preparing positions for polar backprojection
+
+    Parameters
+    ----------
+    pos : Tensor
+        3D positions. Shape should be [N, 3].
+
+    Returns
+    ----------
+    pos_local : Tensor
+        Centered positions.
+    origin : Tensor
+        Position subtracted from the pos.
+    h : Tensor
+        Mean height.
+    """
+    origin = torch.tensor(
+        [
+            torch.mean(pos[:, 0]),
+            torch.mean(pos[:, 1]),
+            0
+        ],
+        device=pos.device,
+        dtype=torch.float32,
+    )[None, :]
+    pos_local = pos - origin
+    return pos_local, origin

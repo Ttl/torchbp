@@ -2,7 +2,7 @@ import torch
 from math import pi
 from torch import Tensor
 from copy import deepcopy
-from .util import bp_polar_range_dealias
+from .util import bp_polar_range_dealias, center_pos
 
 cart_2d_nargs = 15
 polar_2d_nargs = 16
@@ -429,7 +429,7 @@ def polar_interp_lanczos(
 
 def polar_to_cart_linear(
     img: Tensor,
-    dorigin: Tensor,
+    origin: Tensor,
     grid_polar: dict,
     grid_cart: dict,
     fc: float,
@@ -439,14 +439,17 @@ def polar_to_cart_linear(
     """
     Interpolate polar radar image to cartesian grid with linear interpolation.
 
+    The input image should be either generated with `dealias=True` or call
+    `torchbp.util.bp_polar_range_dealias` first.
+
     Parameters
     ----------
     img : Tensor
         2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
         [nbatch, range, angle] if interpolating multiple images at the same time.
-    dorigin : Tensor
-        2D origin of the old image in with respect to new image. Units in meters
-        [nbatch, 2] if img shape is 3D.
+    origin : Tensor
+        3D antenna phase center of the old image in with respect to new image.
+        Units in meters [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
         "r": (r0, r1), tuple of min and max range,
@@ -474,10 +477,10 @@ def polar_to_cart_linear(
 
     if img.dim() == 3:
         nbatch = img.shape[0]
-        assert dorigin.shape == (nbatch, 2)
+        assert origin.shape == (nbatch, 3)
     else:
         nbatch = 1
-        assert dorigin.shape == (2,)
+        assert origin.shape == (3,)
 
     r0, r1 = grid_polar["r"]
     theta0, theta1 = grid_polar["theta"]
@@ -495,7 +498,7 @@ def polar_to_cart_linear(
 
     return torch.ops.torchbp.polar_to_cart_linear.default(
         img,
-        dorigin,
+        origin,
         nbatch,
         rotation,
         fc,
@@ -517,7 +520,7 @@ def polar_to_cart_linear(
 
 def polar_to_cart_bicubic(
     img: Tensor,
-    dorigin: Tensor,
+    origin: Tensor,
     grid_polar: dict,
     grid_cart: dict,
     fc: float,
@@ -527,14 +530,17 @@ def polar_to_cart_bicubic(
     """
     Interpolate polar radar image to cartesian grid with bicubic interpolation.
 
+    The input image should be either generated with `dealias=True` or call
+    `torchbp.util.bp_polar_range_dealias` first.
+
     Parameters
     ----------
     img : Tensor
         2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
         [nbatch, range, angle] if interpolating multiple images at the same time.
-    dorigin : Tensor
-        2D origin of the old image in with respect to new image. Units in meters
-        [nbatch, 2] if img shape is 3D.
+    origin : Tensor
+        3D antenna phase center of the old image in with respect to new image.
+        Units in meters [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
         "r": (r0, r1), tuple of min and max range,
@@ -562,10 +568,10 @@ def polar_to_cart_bicubic(
 
     if img.dim() == 3:
         nbatch = img.shape[0]
-        assert dorigin.shape == (nbatch, 2)
+        assert origin.shape == (nbatch, 3)
     else:
         nbatch = 1
-        assert dorigin.shape == (2,)
+        assert origin.shape == (3,)
 
     img_gx, img_gy = torch.gradient(img, dim=(-2, -1), edge_order=2)
     img_gxy = torch.gradient(img_gx, dim=-1)[0]
@@ -575,7 +581,7 @@ def polar_to_cart_bicubic(
         img_gx,
         img_gy,
         img_gxy,
-        dorigin,
+        origin,
         grid_polar,
         grid_cart,
         fc,
@@ -589,7 +595,7 @@ def _polar_to_cart_bicubic(
     img_gx: Tensor,
     img_gy: Tensor,
     img_gxy: Tensor,
-    dorigin: Tensor,
+    origin: Tensor,
     grid_polar: dict,
     grid_cart: dict,
     fc: float,
@@ -598,6 +604,9 @@ def _polar_to_cart_bicubic(
 ) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid.
+
+    The input image should be either generated with `dealias=True` or call
+    `torchbp.util.bp_polar_range_dealias` first.
 
     Parameters
     ----------
@@ -610,8 +619,8 @@ def _polar_to_cart_bicubic(
         Y-axis gradient of img.
     img_gxy : Tensor
         XY-axis gradient of img.
-    dorigin : Tensor
-        2D origin of the old image in with respect to new image. Units in meters
+    origin : Tensor
+        3D origin of the old image in with respect to new image. Units in meters
         [nbatch, 2] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
@@ -640,10 +649,10 @@ def _polar_to_cart_bicubic(
 
     if img.dim() == 3:
         nbatch = img.shape[0]
-        assert dorigin.shape == (nbatch, 2)
+        assert origin.shape == (nbatch, 3)
     else:
         nbatch = 1
-        assert dorigin.shape == (2,)
+        assert origin.shape == (3,)
 
     assert img.shape == img_gx.shape
     assert img.shape == img_gy.shape
@@ -668,7 +677,7 @@ def _polar_to_cart_bicubic(
         img_gx,
         img_gy,
         img_gxy,
-        dorigin,
+        origin,
         nbatch,
         rotation,
         fc,
@@ -1006,7 +1015,7 @@ def gpga_backprojection_2d_core(
         fc,
         r_res,
         ntargets,
-        d0,
+        d0
     )
 
 
@@ -1246,16 +1255,7 @@ def ffbp(
     imgs = []
     n = nsweeps // divisions
     for d in range(divisions):
-        origin_local = torch.tensor(
-            [
-                torch.mean(pos[d * n : (d + 1) * n, 0]),
-                torch.mean(pos[d * n : (d + 1) * n, 1]),
-                0,
-            ],
-            device=device,
-            dtype=torch.float32,
-        )[None, :]
-        pos_local = pos[d * n : (d + 1) * n] - origin_local
+        pos_local, origin_local = center_pos(pos[d * n : (d + 1) * n])
         z0 = torch.mean(pos_local[:, 2])
         grid_local = deepcopy(grid)
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
@@ -1620,7 +1620,16 @@ def _fake_cart_2d_grad(
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64)
     torch._check(grad.dtype == torch.complex64)
-    return torch.empty_like(pos)
+    ret = []
+    if data.requires_grad:
+        ret.append(torch.empty_like(data))
+    else:
+        ret.append(None)
+    if pos.requires_grad:
+        ret.append(torch.empty_like(pos))
+    else:
+        ret.append(None)
+    return ret
 
 
 def _setup_context_polar_2d(ctx, inputs, output):
@@ -1707,22 +1716,24 @@ def _backward_polar_to_cart_linear(ctx, grad):
 
 
 def _setup_context_polar_to_cart_linear(ctx, inputs, output):
-    img, dorigin, *rest = inputs
+    img, origin, *rest = inputs
     for i in range(len(ctx.needs_input_grad)):
         if ctx.needs_input_grad[i]:
+            if i == 1:
+                raise NotImplementedError("origin grad not supported")
             if i <= 1:
                 continue
-            raise NotImplementedError("Only img and dorigin gradient supported")
+            raise NotImplementedError("Only img gradient supported")
     ctx.saved = rest
-    ctx.save_for_backward(img, dorigin)
+    ctx.save_for_backward(img, origin)
 
 
 def _backward_polar_to_cart_bicubic(ctx, grad):
-    img, img_gx, img_gy, img_gxy, dorigin = ctx.saved_tensors
+    img, img_gx, img_gy, img_gxy, origin = ctx.saved_tensors
     if ctx.saved[-1]:
         raise NotImplementedError("polar_interp gradient not supported")
     ret = torch.ops.torchbp.polar_to_cart_bicubic_grad.default(
-        grad, img, img_gx, img_gy, img_gxy, dorigin, *ctx.saved[:-1]
+        grad, img, img_gx, img_gy, img_gxy, origin, *ctx.saved[:-1]
     )
     grads = [None] * polar_to_cart_bicubic_args
     grads[: len(ret)] = ret
@@ -1730,18 +1741,18 @@ def _backward_polar_to_cart_bicubic(ctx, grad):
 
 
 def _setup_context_polar_to_cart_bicubic(ctx, inputs, output):
-    img, img_gx, img_gy, img_gxy, dorigin, *rest = inputs
+    img, img_gx, img_gy, img_gxy, origin, *rest = inputs
     for i in range(len(ctx.needs_input_grad)):
         if ctx.needs_input_grad[i]:
             if i == 4:
-                raise NotImplementedError("dorigin grad not supported")
+                raise NotImplementedError("origin grad not supported")
             if i <= 4:
                 continue
             raise NotImplementedError(
-                "Only img, img_gx, img_gy, img_gxy and dorigin gradient supported"
+                "Only img, img_gx, img_gy, img_gxy gradient supported"
             )
     ctx.saved = rest
-    ctx.save_for_backward(img, img_gx, img_gy, img_gxy, dorigin)
+    ctx.save_for_backward(img, img_gx, img_gy, img_gxy, origin)
 
 
 def _backward_entropy(ctx, grad):
