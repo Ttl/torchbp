@@ -356,7 +356,6 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
 static void backprojection_polar_2d_kernel_cpu(
           const complex64_t* data,
           const float* pos,
-          const float* att,
           complex64_t* img,
           int sweep_samples,
           int nsweeps,
@@ -369,7 +368,6 @@ static void backprojection_polar_2d_kernel_cpu(
           int Nr,
           int Ntheta,
           float d0,
-          float ant_tx_dy,
           bool dealias, float z0,
           int idx,
           int idbatch) {
@@ -395,14 +393,8 @@ static void backprojection_polar_2d_kernel_cpu(
         float py = (y - pos_y);
         float pz2 = pos_z * pos_z;
 
-        float tx_dx = sinf(att[idbatch * nsweeps * 3 + i * 3 + 2]) * ant_tx_dy;
-        float tx_dy = cosf(att[idbatch * nsweeps * 3 + i * 3 + 2]) * ant_tx_dy;
-
         // Calculate distance to the pixel.
-
-        float dtx = sqrtf(px * px + py * py + pz2);
-        float drx = sqrt((px + tx_dx) * (px + tx_dx) + (py + tx_dy) * (py + tx_dy) + pz2);
-        float d = drx + dtx - d0;
+        float d = sqrtf(px * px + py * py + pz2) - d0;
 
         float sx = delta_r * d;
 
@@ -424,7 +416,7 @@ static void backprojection_polar_2d_kernel_cpu(
         pixel += s * ref;
     }
     if (dealias) {
-        const float d = 2.0f * sqrtf(x*x + y*y + z0*z0);
+        const float d = sqrtf(x*x + y*y + z0*z0);
         float ref_sin, ref_cos;
         sincospi(-ref_phase * d, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
@@ -436,8 +428,6 @@ static void backprojection_polar_2d_kernel_cpu(
 at::Tensor backprojection_polar_2d_cpu(
           const at::Tensor &data,
           const at::Tensor &pos,
-          const at::Tensor &vel,
-          const at::Tensor &att,
           int64_t nbatch,
           int64_t sweep_samples,
           int64_t nsweeps,
@@ -450,18 +440,14 @@ at::Tensor backprojection_polar_2d_cpu(
           int64_t Nr,
           int64_t Ntheta,
           double d0,
-          double ant_tx_dy,
           int64_t dealias,
           double z0) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(att.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
-	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
 
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
     auto options =
       torch::TensorOptions()
@@ -470,14 +456,11 @@ at::Tensor backprojection_polar_2d_cpu(
         .device(torch::kCPU, 1);
 	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* att_ptr = att_contig.data_ptr<float>();
 	const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
-    // delta_r, ref_phase, d0 are bistatic, 2x monostatic
-	const float delta_r = 0.5f / r_res;
-    const float ref_phase = 2.0f * fc / kC0;
-    d0 *= 2.0f;
+	const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
 
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
@@ -485,7 +468,6 @@ at::Tensor backprojection_polar_2d_cpu(
             backprojection_polar_2d_kernel_cpu(
                           data_ptr,
                           pos_ptr,
-                          att_ptr,
                           img_ptr,
                           sweep_samples,
                           nsweeps,
@@ -494,7 +476,7 @@ at::Tensor backprojection_polar_2d_cpu(
                           r0, dr,
                           theta0, dtheta,
                           Nr, Ntheta,
-                          d0, ant_tx_dy,
+                          d0,
                           dealias, z0,
                           idx, idbatch);
         }
@@ -505,7 +487,6 @@ at::Tensor backprojection_polar_2d_cpu(
 static void backprojection_polar_2d_grad_kernel_cpu(
           const complex64_t* data,
           const float* pos,
-          const float* att,
           int sweep_samples,
           int nsweeps,
           float ref_phase,
@@ -517,7 +498,6 @@ static void backprojection_polar_2d_grad_kernel_cpu(
           int Nr,
           int Ntheta,
           float d0,
-          float ant_tx_dy,
           bool dealias,
           float z0,
           const complex64_t* grad,
@@ -542,7 +522,7 @@ static void backprojection_polar_2d_grad_kernel_cpu(
     complex64_t g = grad[idbatch * Nr * Ntheta + idr * Ntheta + idtheta];
 
     if (dealias) {
-        const float d = 2.0f * sqrtf(x*x + y*y + z0*z0);
+        const float d = sqrtf(x*x + y*y + z0*z0);
         float ref_sin, ref_cos;
         sincospi(-ref_phase * d, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
@@ -561,14 +541,8 @@ static void backprojection_polar_2d_grad_kernel_cpu(
         // Image plane is assumed to be at z=0
         float pz2 = pos_z * pos_z;
 
-        float tx_dx = sinf(att[idbatch * nsweeps * 3 + i * 3 + 2]) * ant_tx_dy;
-        float tx_dy = cosf(att[idbatch * nsweeps * 3 + i * 3 + 2]) * ant_tx_dy;
-
         // Calculate distance to the pixel.
-
-        float dtx = sqrtf(px * px + py * py + pz2);
-        float drx = sqrt((px + tx_dx) * (px + tx_dx) + (py + tx_dy) * (py + tx_dy) + pz2);
-        float d = drx + dtx - d0;
+        float d = sqrtf(px * px + py * py + pz2) - d0;
 
         float sx = delta_r * d;
 
@@ -599,10 +573,10 @@ static void backprojection_polar_2d_grad_kernel_cpu(
                 // Take real part
                 float gd = std::real(gdout);
 
-                dx = -px / dtx - (px + tx_dx) / drx;
-                dy = -py / dtx - (py + tx_dy) / drx;
+                dx = -px / d;
+                dy = -py / d;
                 // Different from x,y because pos_z is handled differently.
-                dz = pos_z / dtx + pos_z / drx;
+                dz = pos_z / d;
                 dx *= gd;
                 dy *= gd;
                 dz *= gd;
@@ -644,8 +618,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
           const at::Tensor &grad,
           const at::Tensor &data,
           const at::Tensor &pos,
-          const at::Tensor &vel,
-          const at::Tensor &att,
           int64_t nbatch,
           int64_t sweep_samples,
           int64_t nsweeps,
@@ -658,23 +630,18 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
           int64_t Nr,
           int64_t Ntheta,
           double d0,
-          double ant_tx_dy,
           int64_t dealias,
           double z0) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(att.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
-	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
 	at::Tensor grad_contig = grad.contiguous();
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* att_ptr = att_contig.data_ptr<float>();
 	const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 	const c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
 
@@ -696,10 +663,8 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
         data_grad = torch::Tensor();
     }
 
-    // delta_r, ref_phase, d0 are bistatic, 2x monostatic
-	const float delta_r = 0.5f / r_res;
-    const float ref_phase = 2.0f * fc / kC0;
-    d0 *= 2.0f;
+	const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
 
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
@@ -707,7 +672,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
             backprojection_polar_2d_grad_kernel_cpu(
                           data_ptr,
                           pos_ptr,
-                          att_ptr,
                           sweep_samples,
                           nsweeps,
                           ref_phase,
@@ -715,7 +679,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
                           r0, dr,
                           theta0, dtheta,
                           Nr, Ntheta,
-                          d0, ant_tx_dy,
+                          d0,
                           dealias, z0,
                           grad_ptr,
                           pos_grad_ptr,
@@ -881,12 +845,12 @@ at::Tensor polar_to_cart_linear_cpu(
 
 // Defines the operators
 TORCH_LIBRARY(torchbp, m) {
-  m.def("backprojection_polar_2d(Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy, int dealias, float z0) -> Tensor");
-  m.def("backprojection_polar_2d_grad(Tensor grad, Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy, int dealias, float z0) -> Tensor[]");
-  m.def("backprojection_polar_2d_lanczos(Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, float ant_tx_dy, int dealias, float z0, int order) -> Tensor");
-  m.def("backprojection_cart_2d(Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0, float ant_tx_dy) -> Tensor");
-  m.def("backprojection_cart_2d_grad(Tensor grad, Tensor data, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0, float ant_tx_dy) -> Tensor[]");
-  m.def("gpga_backprojection_2d(Tensor target_pos, Tensor data, Tensor pos, Tensor vel, Tensor att, int sweep_samples, int nsweeps, float fc, float r_res, int Ntarget, float d0, float ant_tx_dy) -> Tensor");
+  m.def("backprojection_polar_2d(Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0) -> Tensor");
+  m.def("backprojection_polar_2d_grad(Tensor grad, Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0) -> Tensor[]");
+  m.def("backprojection_polar_2d_lanczos(Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0, int order) -> Tensor");
+  m.def("backprojection_cart_2d(Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0) -> Tensor");
+  m.def("backprojection_cart_2d_grad(Tensor grad, Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0) -> Tensor[]");
+  m.def("gpga_backprojection_2d(Tensor target_pos, Tensor data, Tensor pos, int sweep_samples, int nsweeps, float fc, float r_res, int Ntarget, float d0) -> Tensor");
   m.def("cfar_2d(Tensor img, int nbatch, int N0, int N1, int Navg0, int Navg1, int Nguard0, int Nguard1, float threshold, int peaks_only) -> Tensor");
   m.def("polar_interp_linear(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1) -> Tensor");
   m.def("polar_interp_linear_grad(Tensor grad, Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1) -> Tensor[]");

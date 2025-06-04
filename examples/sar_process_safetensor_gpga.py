@@ -41,16 +41,10 @@ if __name__ == "__main__":
     # Distance in radar data corresponding to zero actual distance
     # Slightly higher than zero due to antenna feedlines and other delays.
     d0 = 0.5
-    # TX antenna distance to RX antenna
-    ant_tx_dy = -96.6e-3
     data_dtype = torch.complex64  # Can be `torch.complex32` to save VRAM
     # Use fast factorized backprojection, slightly reduces the image quality
     # but is faster.
     ffbp = False
-
-    # Bistatic radar not supported at the moment with ffbp
-    if ffbp:
-        ant_tx_dy = 0
 
     c0 = 299792458
 
@@ -120,8 +114,6 @@ if __name__ == "__main__":
     print("grid autofocus", grid_polar_autofocus)
 
     pos = torch.from_numpy(pos).to(dtype=torch.float32, device=dev)
-    vel = torch.zeros_like(pos)  # Velocity is not used in the current implementation
-    att = torch.from_numpy(att).to(dtype=torch.float32, device=dev)
 
     # Generate window functions
     nsamples = sweeps.shape[-1]
@@ -165,8 +157,6 @@ if __name__ == "__main__":
     del fsw
 
     pos = pos.to(device=dev)
-    vel = vel.to(device=dev)
-    att = att.to(device=dev)
     data_time = data_time.to(device=dev)
 
     print("Calculating autofocus. This might take a while.")
@@ -175,9 +165,8 @@ if __name__ == "__main__":
             device=dev, dtype=torch.float32)[None,:]
     pos_centered = pos - origin
     sar_img, phi = torchbp.autofocus.gpga_ml_bp_polar(None, fsweeps,
-            pos_centered, vel, att, fc, r_res, grid_polar_autofocus,
-            window_width=nsweeps, d0=d0, target_threshold_db=15,
-            ant_tx_dy=ant_tx_dy)
+            pos_centered, fc, r_res, grid_polar_autofocus,
+            window_width=nsweeps, d0=d0, target_threshold_db=15)
 
     d = torchbp.util.phase_to_distance(phi, fc)
     d -= torch.mean(d)
@@ -194,10 +183,10 @@ if __name__ == "__main__":
     tstart = time.time()
     if ffbp:
         sar_img = torchbp.ops.ffbp(fsweeps, grid_polar, fc, r_res, pos_centered,
-                vel, att, stages=3, divisions=2, d0=d0)
+                stages=3, divisions=2, d0=d0)
     else:
         sar_img = torchbp.ops.backprojection_polar_2d(
-            fsweeps, grid_polar, fc, r_res, pos_centered, vel, att, d0)[0]
+            fsweeps, grid_polar, fc, r_res, pos_centered, d0)[0]
     torch.cuda.synchronize()
     print(f"Final image created in {time.time() - tstart:.3g} s")
     print("Entropy", torchbp.util.entropy(sar_img).item())

@@ -4,8 +4,8 @@ from torch import Tensor
 from copy import deepcopy
 from .util import bp_polar_range_dealias
 
-cart_2d_nargs = 18
-polar_2d_nargs = 19
+cart_2d_nargs = 15
+polar_2d_nargs = 16
 polar_interp_linear_args = 18
 polar_to_cart_linear_args = 18
 polar_to_cart_bicubic_args = 21
@@ -694,10 +694,7 @@ def backprojection_polar_2d(
     fc: float,
     r_res: float,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     d0: float = 0.0,
-    ant_tx_dy: float = 0.0,
     dealias: bool = False,
 ) -> Tensor:
     """
@@ -726,15 +723,8 @@ def backprojection_polar_2d(
         and oversample is FFT oversampling factor.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
-    vel : Tensor
-        Velocity of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3]. Unused.
-    att : Tensor
-        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
-        [Roll, pitch, yaw]. Only the yaw is used at the moment.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        RX antenna Y-position (along the track) distance from TX antenna.
     dealias : bool
         If True removes the range spectrum aliasing. Equivalent to applying
         `torchbp.util.bp_polar_range_dealias` on the SAR image.
@@ -758,15 +748,11 @@ def backprojection_polar_2d(
         nsweeps = data.shape[0]
         sweep_samples = data.shape[1]
         assert pos.shape == (nsweeps, 3)
-        assert vel.shape == (nsweeps, 3)
-        assert att.shape == (nsweeps, 3)
     else:
         nbatch = data.shape[0]
         nsweeps = data.shape[1]
         sweep_samples = data.shape[2]
         assert pos.shape == (nbatch, nsweeps, 3)
-        assert vel.shape == (nbatch, nsweeps, 3)
-        assert att.shape == (nbatch, nsweeps, 3)
 
     z0 = 0
     if dealias:
@@ -775,8 +761,6 @@ def backprojection_polar_2d(
     return torch.ops.torchbp.backprojection_polar_2d.default(
         data,
         pos,
-        vel,
-        att,
         nbatch,
         sweep_samples,
         nsweeps,
@@ -789,7 +773,6 @@ def backprojection_polar_2d(
         nr,
         ntheta,
         d0,
-        ant_tx_dy,
         dealias,
         z0,
     )
@@ -801,10 +784,7 @@ def backprojection_polar_2d_lanczos(
     fc: float,
     r_res: float,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     d0: float = 0.0,
-    ant_tx_dy: float = 0.0,
     dealias: bool = False,
     order: int = 4,
 ) -> Tensor:
@@ -835,15 +815,8 @@ def backprojection_polar_2d_lanczos(
         and oversample is FFT oversampling factor.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
-    vel : Tensor
-        Velocity of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3]. Unused.
-    att : Tensor
-        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
-        [Roll, pitch, yaw]. Only the yaw is used at the moment.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        RX antenna Y-position (along the track) distance from TX antenna.
     dealias : bool
         If True removes the range spectrum aliasing. Equivalent to applying
         `torchbp.util.bp_polar_range_dealias` on the SAR image.
@@ -869,15 +842,11 @@ def backprojection_polar_2d_lanczos(
         nsweeps = data.shape[0]
         sweep_samples = data.shape[1]
         assert pos.shape == (nsweeps, 3)
-        assert vel.shape == (nsweeps, 3)
-        assert att.shape == (nsweeps, 3)
     else:
         nbatch = data.shape[0]
         nsweeps = data.shape[1]
         sweep_samples = data.shape[2]
         assert pos.shape == (nbatch, nsweeps, 3)
-        assert vel.shape == (nbatch, nsweeps, 3)
-        assert att.shape == (nbatch, nsweeps, 3)
 
     z0 = 0
     if dealias:
@@ -886,8 +855,6 @@ def backprojection_polar_2d_lanczos(
     return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(
         data,
         pos,
-        vel,
-        att,
         nbatch,
         sweep_samples,
         nsweeps,
@@ -900,7 +867,6 @@ def backprojection_polar_2d_lanczos(
         nr,
         ntheta,
         d0,
-        ant_tx_dy,
         dealias,
         z0,
         order,
@@ -913,10 +879,7 @@ def backprojection_cart_2d(
     fc: float,
     r_res: float,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     d0: float = 0.0,
-    ant_tx_dy: float = 0.0,
     beamwidth: float = pi,
 ) -> Tensor:
     """
@@ -945,17 +908,10 @@ def backprojection_cart_2d(
         and oversample is FFT oversampling factor.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
-    vel : Tensor
-        Velocity of the platform at each data point. Shape should be [nsweeps, 3]. Unused.
-    att : Tensor
-        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
-        [Roll, pitch, yaw]. Only the yaw is used at the moment.
     beamwidth : float
         Beamwidth of the antenna in radians. Points outside the beam are not calculated.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        RX antenna Y-position (along the track) distance from TX antenna.
 
     Returns
     ----------
@@ -975,21 +931,15 @@ def backprojection_cart_2d(
         nsweeps = data.shape[0]
         sweep_samples = data.shape[1]
         assert pos.shape == (nsweeps, 3)
-        assert vel.shape == (nsweeps, 3)
-        assert att.shape == (nsweeps, 3)
     else:
         nbatch = data.shape[0]
         nsweeps = data.shape[1]
         sweep_samples = data.shape[2]
         assert pos.shape == (nbatch, nsweeps, 3)
-        assert vel.shape == (nbatch, nsweeps, 3)
-        assert att.shape == (nbatch, nsweeps, 3)
 
     return torch.ops.torchbp.backprojection_cart_2d.default(
         data,
         pos,
-        vel,
-        att,
         nbatch,
         sweep_samples,
         nsweeps,
@@ -1002,8 +952,7 @@ def backprojection_cart_2d(
         nx,
         ny,
         beamwidth,
-        d0,
-        ant_tx_dy,
+        d0
     )
 
 
@@ -1011,12 +960,9 @@ def gpga_backprojection_2d_core(
     target_pos: Tensor,
     data: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     fc: float,
     r_res: float,
     d0: float = 0.0,
-    ant_tx_dy: float = 0.0,
 ) -> Tensor:
     """
     Generalized phase gradient autofocus.
@@ -1030,11 +976,6 @@ def gpga_backprojection_2d_core(
         Range compressed input data. Shape should be [nsweeps, samples].
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
-    vel : Tensor
-        Velocity of the platform at each data point. Shape should be [nsweeps, 3].
-    att : Tensor
-        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
-        [Roll, pitch, yaw]. Only the yaw is used at the moment.
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -1043,8 +984,6 @@ def gpga_backprojection_2d_core(
         and oversample is FFT oversampling factor.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        RX antenna Y-position (along the track) distance from TX antenna.
 
     Returns
     ----------
@@ -1057,22 +996,17 @@ def gpga_backprojection_2d_core(
     sweep_samples = data.shape[1]
     assert target_pos.shape == (ntargets, 3)
     assert pos.shape == (nsweeps, 3)
-    assert vel.shape == (nsweeps, 3)
-    assert att.shape == (nsweeps, 3)
 
     return torch.ops.torchbp.gpga_backprojection_2d.default(
         target_pos,
         data,
         pos,
-        vel,
-        att,
         sweep_samples,
         nsweeps,
         fc,
         r_res,
         ntargets,
         d0,
-        ant_tx_dy,
     )
 
 
@@ -1269,8 +1203,6 @@ def ffbp(
     fc: float,
     r_res: float,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     stages: int,
     divisions: int = 2,
     d0: float = 0.0,
@@ -1299,11 +1231,6 @@ def ffbp(
         and oversample is FFT oversampling factor.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
-    vel : Tensor
-        Velocity of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3]. Unused.
-    att : Tensor
-        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
-        [Roll, pitch, yaw]. Only the yaw is used at the moment.
     stages : int
         Number of recursions.
     divisions : int
@@ -1330,8 +1257,6 @@ def ffbp(
         )[None, :]
         pos_local = pos[d * n : (d + 1) * n] - origin_local
         z0 = torch.mean(pos_local[:, 2])
-        vel_local = vel[d * n : (d + 1) * n]
-        att_local = att[d * n : (d + 1) * n]
         grid_local = deepcopy(grid)
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
         data_local = data[d * n : (d + 1) * n]
@@ -1342,8 +1267,6 @@ def ffbp(
                 fc,
                 r_res,
                 pos_local,
-                vel_local,
-                att_local,
                 stages=stages - 1,
                 divisions=divisions,
                 d0=d0,
@@ -1355,8 +1278,6 @@ def ffbp(
                 fc,
                 r_res,
                 pos_local,
-                vel_local,
-                att_local,
                 d0=d0,
                 dealias=True
             )[0]
@@ -1427,7 +1348,7 @@ def _fake_polar_interp_linear(
     Nr1: float,
     Ntheta1: float,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float)
+    torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
     return torch.empty((Nr1, Ntheta1), dtype=torch.complex64, device=img.device)
 
@@ -1452,7 +1373,7 @@ def _fake_polar_interp_linear_grad(
     Nr1: float,
     Ntheta1: float,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float)
+    torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
     ret = []
     if img.requires_grad:
@@ -1488,7 +1409,7 @@ def _fake_polar_to_cart_linear(
     nx: int,
     ny: int,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float)
+    torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
     return torch.empty((Nx, Ny), dtype=torch.complex64, device=img.device)
 
@@ -1513,7 +1434,7 @@ def _fake_polar_interp_linear_grad(
     Nx: float,
     Ny: float,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float)
+    torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
     ret = []
     if img.requires_grad:
@@ -1550,7 +1471,7 @@ def _fake_polar_to_cart_bicubic(
     nx: int,
     ny: int,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float)
+    torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
     return torch.empty((Nx, Ny), dtype=torch.complex64, device=img.device)
 
@@ -1578,7 +1499,7 @@ def _fake_polar_interp_bicubic_grad(
     Nx: float,
     Ny: float,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float)
+    torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
     torch._check(img_gx.dtype == torch.complex64)
     torch._check(img_gy.dtype == torch.complex64)
@@ -1602,11 +1523,9 @@ def _fake_polar_interp_bicubic_grad(
 
 
 @torch.library.register_fake("torchbp::backprojection_polar_2d")
-def _fake_cart_2d(
+def _fake_polar_2d(
     data: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     nbatch: int,
     sweep_samples: int,
     nsweeps: int,
@@ -1619,22 +1538,17 @@ def _fake_cart_2d(
     Nr: int,
     Ntheta: int,
     d0: float,
-    ant_tx_dy: float,
 ):
-    torch._check(pos.dtype == torch.float)
-    torch._check(vel.dtype == torch.float)
-    torch._check(att.dtype == torch.float)
+    torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
     return torch.empty((nbatch, Nr, Ntheta), dtype=torch.complex64, device=data.device)
 
 
 @torch.library.register_fake("torchbp::backprojection_polar_2d_grad")
-def _fake_cart_2d_grad(
+def _fake_polar_2d_grad(
     grad: Tensor,
     data: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     nbatch: int,
     sweep_samples: int,
     nsweeps: int,
@@ -1647,11 +1561,8 @@ def _fake_cart_2d_grad(
     Nr: int,
     Ntheta: int,
     d0: float,
-    ant_tx_dy: float,
 ):
-    torch._check(pos.dtype == torch.float)
-    torch._check(vel.dtype == torch.float)
-    torch._check(att.dtype == torch.float)
+    torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
     torch._check(grad.dtype == torch.complex64)
     ret = []
@@ -1670,8 +1581,6 @@ def _fake_cart_2d_grad(
 def _fake_cart_2d(
     data: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     sweep_samples: int,
     nsweeps: int,
     fc: float,
@@ -1684,11 +1593,8 @@ def _fake_cart_2d(
     Ny: int,
     beamwidth: float,
     d0: float,
-    ant_tx_dy: float,
 ):
-    torch._check(pos.dtype == torch.float)
-    torch._check(vel.dtype == torch.float)
-    torch._check(att.dtype == torch.float)
+    torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64)
     return torch.empty((Nx, Ny), dtype=torch.complex64, device=data.device)
 
@@ -1698,8 +1604,6 @@ def _fake_cart_2d_grad(
     grad: Tensor,
     data: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     sweep_samples: int,
     nsweeps: int,
     fc: float,
@@ -1712,11 +1616,8 @@ def _fake_cart_2d_grad(
     Ny: int,
     beamwidth: float,
     d0: float,
-    ant_tx_dy: float,
 ):
-    torch._check(pos.dtype == torch.float)
-    torch._check(vel.dtype == torch.float)
-    torch._check(att.dtype == torch.float)
+    torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64)
     torch._check(grad.dtype == torch.complex64)
     return torch.empty_like(pos)

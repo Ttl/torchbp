@@ -201,13 +201,10 @@ def gpga_2d_iter(
     target_pos: Tensor,
     data: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     fc: float,
     r_res: float,
     window_width: int | None = None,
     d0: float = 0.0,
-    ant_tx_dy: float = 0.0,
     estimator: str = "ml",
     lowpass_window="boxcar",
 ) -> Tensor:
@@ -223,11 +220,6 @@ def gpga_2d_iter(
         Range compressed input data. Shape should be [nsweeps, samples].
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
-    vel : Tensor
-        Velocity of the platform at each data point. Shape should be [nsweeps, 3].
-    att : Tensor
-        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
-        [Roll, pitch, yaw]. Only the yaw is used at the moment.
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -239,8 +231,6 @@ def gpga_2d_iter(
         no low-pass filtering.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        RX antenna Y-position (along the track) distance from TX antenna.
     estimator : str
         Estimator to use.
         "ml": Maximum likelihood.
@@ -256,7 +246,7 @@ def gpga_2d_iter(
     """
     # Get range profile samples for each target
     target_data = gpga_backprojection_2d_core(
-        target_pos, data, pos, vel, att, fc, r_res, d0, ant_tx_dy
+        target_pos, data, pos, fc, r_res, d0
     )
     # Filter samples
     if window_width is not None and window_width < target_data.shape[1]:
@@ -280,8 +270,6 @@ def gpga_ml_bp_polar(
     img: Tensor | None,
     data: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     fc: float,
     r_res: float,
     grid_polar: dict,
@@ -290,7 +278,6 @@ def gpga_ml_bp_polar(
     window_exp: float = 0.8,
     min_window: int = 5,
     d0: float = 0.0,
-    ant_tx_dy: float = 0.0,
     target_threshold_db: float = 20,
     remove_trend: bool = True,
     estimator: str = "pd",
@@ -309,11 +296,6 @@ def gpga_ml_bp_polar(
         Range compressed input data. Shape should be [nsweeps, samples].
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
-    vel : Tensor
-        Velocity of the platform at each data point. Shape should be [nsweeps, 3].
-    att : Tensor
-        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
-        [Roll, pitch, yaw]. Only the yaw is used at the moment.
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -337,8 +319,6 @@ def gpga_ml_bp_polar(
         Minimum window size.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        RX antenna Y-position (along the track) distance from TX antenna.
     target_threshold_db : float
         Filter out targets that are this many dB below the maximum amplitude
         target.
@@ -382,7 +362,7 @@ def gpga_ml_bp_polar(
         window_width = data.shape[0]
 
     if img is None:
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, vel, att)
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)
         img = img.squeeze()
 
     for i in range(max_iters):
@@ -403,13 +383,10 @@ def gpga_ml_bp_polar(
             target_pos,
             data,
             pos_new,
-            vel,
-            att,
             fc,
             r_res,
             window_width,
             d0,
-            ant_tx_dy,
             estimator=estimator,
             lowpass_window=lowpass_window,
         )
@@ -421,7 +398,7 @@ def gpga_ml_bp_polar(
         d = d - torch.mean(d)
 
         pos_new[:, 0] = pos[:, 0] + d
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, vel, att)
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)
         img = img.squeeze()
         window_width = int(window_width**window_exp)
         if window_width < min_window:
@@ -444,8 +421,6 @@ def minimum_entropy_grad_autofocus(
     data: Tensor,
     data_time: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     fc: float,
     r_res: float,
     grid: dict,
@@ -454,7 +429,6 @@ def minimum_entropy_grad_autofocus(
     max_steps: float = 100,
     lr_max: float = 10000,
     d0: float = 0,
-    ant_tx_dy: float = 0,
     pos_reg: float = 1,
     lr_reduce: float = 0.8,
     verbose: bool = True,
@@ -478,10 +452,6 @@ def minimum_entropy_grad_autofocus(
         Recording time of each data sample.
     pos : Tensor
         Position at each data sample.
-    vel : Tensor
-        Velocity at each data sample.
-    att : Tensor
-        Antenna attitude at each data sample.
     fc : float
         RF frequency in Hz.
     r_res : float
@@ -503,8 +473,6 @@ def minimum_entropy_grad_autofocus(
         Too large learning rate is scaled automatically.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        TX antenna distance from RX antenna in cross-range direction.
     pos_reg : float
         Position regularization value.
     lr_reduce : float
@@ -586,9 +554,7 @@ def minimum_entropy_grad_autofocus(
             )[None, :]
             pos_centered = pos - origin
 
-            sar_img = f(
-                data, grid, fc, r_res, pos_centered, vel, att, d0, ant_tx_dy
-            ).squeeze()
+            sar_img = f(data, grid, fc, r_res, pos_centered, d0).squeeze()
             if tx_norm is not None:
                 entr = entropy(sar_img / tx_norm)
             else:
@@ -642,8 +608,6 @@ def bp_polar_grad_minimum_entropy(
     data: Tensor,
     data_time: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     fc: float,
     r_res: float,
     grid: dict,
@@ -652,7 +616,6 @@ def bp_polar_grad_minimum_entropy(
     max_steps: float = 100,
     lr_max: float = 10000,
     d0: float = 0,
-    ant_tx_dy: float = 0,
     pos_reg: float = 1,
     lr_reduce: float = 0.8,
     verbose: bool = True,
@@ -674,10 +637,6 @@ def bp_polar_grad_minimum_entropy(
         Recording time of each data sample.
     pos : Tensor
         Position at each data sample.
-    vel : Tensor
-        Velocity at each data sample.
-    att : Tensor
-        Antenna attitude at each data sample.
     fc : float
         RF frequency in Hz.
     r_res : float
@@ -699,8 +658,6 @@ def bp_polar_grad_minimum_entropy(
         Too large learning rate is scaled automatically.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        TX antenna distance from RX antenna in cross-range direction.
     pos_reg : float
         Position regularization value.
     lr_reduce : float
@@ -737,8 +694,6 @@ def bp_cart_grad_minimum_entropy(
     data: Tensor,
     data_time: Tensor,
     pos: Tensor,
-    vel: Tensor,
-    att: Tensor,
     fc: float,
     r_res: float,
     grid: dict,
@@ -747,7 +702,6 @@ def bp_cart_grad_minimum_entropy(
     max_steps: float = 100,
     lr_max: float = 10000,
     d0: float = 0,
-    ant_tx_dy: float = 0,
     pos_reg: float = 1,
     lr_reduce: float = 0.8,
     verbose: bool = True,
@@ -769,10 +723,6 @@ def bp_cart_grad_minimum_entropy(
         Recording time of each data sample.
     pos : Tensor
         Position at each data sample.
-    vel : Tensor
-        Velocity at each data sample.
-    att : Tensor
-        Antenna attitude at each data sample.
     fc : float
         RF frequency in Hz.
     r_res : float
@@ -794,8 +744,6 @@ def bp_cart_grad_minimum_entropy(
         Too large learning rate is scaled automatically.
     d0 : float
         Zero range correction.
-    ant_tx_dy : float
-        TX antenna distance from RX antenna in cross-range direction.
     pos_reg : float
         Position regularization value.
     lr_reduce : float

@@ -104,8 +104,6 @@ if __name__ == "__main__":
     # Distance in radar data corresponding to zero actual distance
     # Slightly higher than zero due to antenna feedlines and other delays.
     d0 = 0.5
-    # TX antenna distance to RX antenna
-    ant_tx_dy = -96.6e-3
 
     # Calculate initial estimate using PGA
     initial_pga = False
@@ -174,8 +172,6 @@ if __name__ == "__main__":
     print("grid autofocus", grid_polar_autofocus)
 
     pos = torch.from_numpy(pos).to(dtype=torch.float32, device=dev)
-    vel = torch.zeros_like(pos)  # Velocity is not used in the current implementation
-    att = torch.from_numpy(att).to(dtype=torch.float32, device=dev)
 
     # Generate window functions
     nsamples = sweeps.shape[-1]
@@ -223,8 +219,6 @@ if __name__ == "__main__":
     del fsw
 
     pos = pos.to(device=dev)
-    vel = vel.to(device=dev)
-    att = att.to(device=dev)
     data_time = data_time.to(device=dev)
 
     if max_steps > 1:
@@ -234,9 +228,8 @@ if __name__ == "__main__":
                     device=dev, dtype=torch.float32)[None,:]
             pos_centered = pos - origin
             sar_img, phi = torchbp.autofocus.gpga_ml_bp_polar(None, fsweeps,
-                    pos_centered, vel, att, fc, r_res, grid_polar_autofocus,
-                    window_width=nsweeps//8, d0=d0, target_threshold_db=20,
-                    ant_tx_dy=ant_tx_dy)
+                    pos_centered, fc, r_res, grid_polar_autofocus,
+                    window_width=nsweeps//8, d0=d0, target_threshold_db=20)
 
             d = torchbp.util.phase_to_distance(phi, fc)
             d -= torch.mean(d)
@@ -247,8 +240,6 @@ if __name__ == "__main__":
             fsweeps,
             data_time,
             pos,
-            vel,
-            att,
             fc,
             r_res,
             grid_polar_autofocus,
@@ -257,7 +248,6 @@ if __name__ == "__main__":
             max_steps=max_steps,
             lr_max=10000,
             d0=d0,
-            ant_tx_dy=ant_tx_dy,
             pos_reg=0.1,
             lr_reduce=0.8,
             verbose=True,
@@ -290,7 +280,7 @@ if __name__ == "__main__":
     pos_centered = pos - origin
     print("Focusing final image")
     sar_img = torchbp.ops.backprojection_polar_2d( fsweeps, grid_polar, fc,
-            r_res, pos_centered, vel, att, d0, ant_tx_dy).squeeze()
+            r_res, pos_centered, d0).squeeze()
     print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()
 

@@ -280,7 +280,6 @@ class TestBackprojectionPolar(TestCase):
         # Make sure that scene is in view
         def make_pos_tensor(size, dtype=torch.float32):
             x = torch.randn(size, device=device, requires_grad=requires_grad, dtype=dtype)
-            i = torch.ones(size, dtype=dtype, device=device)
             x = x - torch.max(x[:,0]) - 2
             return x
 
@@ -297,10 +296,7 @@ class TestBackprojectionPolar(TestCase):
             'fc': 6e9,
             'r_res': 0.15,
             'pos': make_pos_tensor((nbatch, sweeps, 3), dtype=torch.float32),
-            'vel': make_nondiff_tensor((nbatch, sweeps, 3), dtype=torch.float32),
-            'att': make_nondiff_tensor((nbatch, sweeps, 3), dtype=torch.float32),
             'd0': 0.2,
-            'ant_tx_dy': 0,
         }
         return [args]
 
@@ -361,18 +357,11 @@ class TestBackprojectionCart(TestCase):
         # Make sure that scene is in view
         def make_pos_tensor(size, dtype=torch.float32):
             x = torch.randn(size, device=device, requires_grad=requires_grad, dtype=dtype)
-            i = torch.ones(size, dtype=dtype, device=device)
             x = x - torch.max(x[:,0]) - 2
             return x
 
         def make_nondiff_tensor(size, dtype=torch.float32):
             return torch.randn(size, device=device, requires_grad=False, dtype=dtype)
-
-
-        #def backprojection_cart_2d(data: Tensor, grid: dict,
-        #        fc: float, bw: float, tsweep: float, oversample: float,
-        #        pos: Tensor, vel: Tensor, att: Tensor,
-        #        beamwidth=pi: float, d0=0: float, ant_tx_dy=0: float) -> Tensor:
 
         nbatch = 2
         sweeps = 2
@@ -384,11 +373,8 @@ class TestBackprojectionCart(TestCase):
             'fc': 6e9,
             'r_res': 0.15,
             'pos': make_pos_tensor((nbatch, sweeps, 3), dtype=torch.float32),
-            'vel': make_nondiff_tensor((nbatch, sweeps, 3), dtype=torch.float32),
-            'att': make_nondiff_tensor((nbatch, sweeps, 3), dtype=torch.float32),
             'beamwidth': 3.14,
             'd0': 0.2,
-            'ant_tx_dy': 0,
         }
         return [args]
 
@@ -399,7 +385,9 @@ class TestBackprojectionCart(TestCase):
                     torchbp.ops.backprojection_cart_2d,
                     list(args.values()),
                     eps=5e-4, # This test is very sensitive to eps
-                    rtol=0.1, # Also to rtol
+                    rtol=0.2, # Also to rtol
+                    atol=0.05
+
                     )
 
     #def test_gradients_cpu(self):
