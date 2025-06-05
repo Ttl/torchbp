@@ -476,10 +476,10 @@ __global__ void backprojection_polar_2d_grad_kernel(
                 // Take real part
                 float gd = cuda::std::real(gdout);
 
-                dx = -px / d;
-                dy = -py / d;
+                dx = -px / (d - d0);
+                dy = -py / (d - d0);
                 // Different from x,y because pos_z is handled differently.
-                dz = pos_z / d;
+                dz = pos_z / (d - d0);
                 dx *= gd;
                 dy *= gd;
                 dz *= gd;
@@ -951,10 +951,10 @@ __global__ void backprojection_cart_2d_grad_kernel(
 
                 float gd = cuda::std::real(gdout);
 
-                dx = -px / d;
-                dy = -py / d;
+                dx = -px / (d - d0);
+                dy = -py / (d - d0);
                 // Different from x,y because pos_z is handled differently.
-                dz = pos_z / d;
+                dz = pos_z / (d - d0);
                 dx *= gd;
                 dy *= gd;
                 dz *= gd;
