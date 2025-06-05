@@ -71,6 +71,24 @@ static __device__ T interp2d(const T *img, int nx, int ny,
 }
 
 template<class T>
+static __device__ T interp2d_gradx(const T *img, int nx, int ny,
+        int x_int, float x_frac, int y_int, float y_frac) {
+    return -img[x_int*ny + y_int]*(1.0f-y_frac) +
+           -img[x_int*ny + y_int+1]*y_frac +
+           img[(x_int+1)*ny + y_int]*(1.0f-y_frac) +
+           img[(x_int+1)*ny + y_int+1]*y_frac;
+}
+
+template<class T>
+static __device__ T interp2d_grady(const T *img, int nx, int ny,
+        int x_int, float x_frac, int y_int, float y_frac) {
+    return -img[x_int*ny + y_int]*(1.0f-x_frac)*(-1.0f) +
+           img[x_int*ny + y_int+1]*(1.0f-x_frac) +
+           -img[(x_int+1)*ny + y_int]*x_frac +
+           img[(x_int+1)*ny + y_int+1]*x_frac;
+}
+
+template<class T>
 static __device__ float interp2d_abs(const T *img, int nx, int ny,
         int x_int, float x_frac, int y_int, float y_frac) {
     return abs(img[x_int*ny + y_int])*(1.0f-x_frac)*(1.0f-y_frac) +
@@ -109,6 +127,82 @@ static __device__ T bicubic_interp2d(const T *img, const T *gx, const T *gy,
     const float y3 = y*y*y;
     const float xb[] = {1.0f - 3.0f*x2 + 2.0f*x3, 3.0f*x2-2.0f*x3, x-2.0f*x2+x3, -x2+x3};
     const float by[] = {1.0f - 3.0f*y2 + 2.0f*y3, 3.0f*y2-2.0f*y3, y-2.0f*y2+y3, -y2+y3};
+    T v = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            v += xb[i] * by[j] * f[i*4 + j];
+        }
+    }
+    return v;
+}
+
+template<class T>
+static __device__ T bicubic_interp2d_gradx(const T *img, const T *gx, const T *gy,
+        const T *gxy, int nx, int ny, int xi, float x,
+        int yi, float y) {
+
+    const T f[16] = {
+        img[xi*ny + yi],
+        img[xi*ny + yi + 1],
+        gy[xi*ny + yi],
+        gy[xi*ny + yi + 1],
+        img[(xi+1)*ny + yi],
+        img[(xi+1)*ny + yi + 1],
+        gy[(xi+1)*ny + yi],
+        gy[(xi+1)*ny + yi + 1],
+        gx[xi*ny + yi],
+        gx[xi*ny + yi + 1],
+        gxy[xi*ny + yi],
+        gxy[xi*ny + yi + 1],
+        gx[(xi+1)*ny + yi],
+        gx[(xi+1)*ny + yi + 1],
+        gxy[(xi+1)*ny + yi],
+        gxy[(xi+1)*ny + yi + 1]
+    };
+
+    const float x2 = x*x;
+    const float y2 = y*y;
+    const float y3 = y*y*y;
+    const float xb[] = {-6.0f*x + 6.0f*x2, 6.0f*x-6.0f*x2, 1-4.0f*x+3.0f*x2, -2.0f*x+3.0f*x2};
+    const float by[] = {1.0f - 3.0f*y2 + 2.0f*y3, 3.0f*y2-2.0f*y3, y-2.0f*y2+y3, -y2+y3};
+    T v = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            v += xb[i] * by[j] * f[i*4 + j];
+        }
+    }
+    return v;
+}
+
+template<class T>
+static __device__ T bicubic_interp2d_grady(const T *img, const T *gx, const T *gy,
+        const T *gxy, int nx, int ny, int xi, float x,
+        int yi, float y) {
+
+    const T f[16] = {
+        img[xi*ny + yi],
+        img[xi*ny + yi + 1],
+        gy[xi*ny + yi],
+        gy[xi*ny + yi + 1],
+        img[(xi+1)*ny + yi],
+        img[(xi+1)*ny + yi + 1],
+        gy[(xi+1)*ny + yi],
+        gy[(xi+1)*ny + yi + 1],
+        gx[xi*ny + yi],
+        gx[xi*ny + yi + 1],
+        gxy[xi*ny + yi],
+        gxy[xi*ny + yi + 1],
+        gx[(xi+1)*ny + yi],
+        gx[(xi+1)*ny + yi + 1],
+        gxy[(xi+1)*ny + yi],
+        gxy[(xi+1)*ny + yi + 1]
+    };
+
+    const float x2 = x*x;
+    const float x3 = x*x*x;
+    const float y2 = y*y;
+    const float xb[] = {1.0f - 3.0f*x2 + 2.0f*x3, 3.0f*x2-2.0f*x3, x-2.0f*x2+x3, -x2+x3};
+    const float by[] = {-6.0f*y + 6.0f*y2, 6.0f*y-6.0f*y2, 1-4.0f*y+3.0f*y2, -2.0f*y+3.0f*y2};
     T v = 0.0f;
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
@@ -2206,7 +2300,7 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
     const float x = x0 + dx * idx;
     const float y = y0 + dy * idy;
     const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
-    const float dz = sqrtf(d*d + orig2*orig2);
+    const float dz = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1) + orig2*orig2);
     float t = (y - orig1) / d; // Sin of angle
     float tc = (x - orig0) / d; // Cos of angle
     float rs = sinf(rotation);
@@ -2230,63 +2324,81 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
     const int dti_int = dti;
     const float dti_frac = dti - dti_int;
 
-    complex64_t v = {0.0f, 0.0f};
-    complex64_t ref = {0.0f, 0.0f};
     if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
-        v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-        //float absv = interp2d_abs<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-        //v = absv * v / abs(v);
+        complex64_t v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
         sincospif(ref_phase * dz, &ref_sin, &ref_cos);
-        ref = {ref_cos, ref_sin};
-    }
+        complex64_t ref = {ref_cos, ref_sin};
 
-    // FIXME: Doesn't consider absv (polar_interp)
-    if (origin_grad != nullptr) {
-        const complex64_t I = {0.0f, 1.0f};
-        // FIXME: Missing derivative of v
-        complex64_t dout_drp = I * kPI * ref_phase * ref * v * (d / dz);
+        if (origin_grad != nullptr) {
+            const complex64_t I = {0.0f, 1.0f};
 
-        complex64_t drp_conj = cuda::std::conj(dout_drp);
-        complex64_t gdrp = grad[idbatch * Nx * Ny + idx*Ny + idy] * drp_conj;
-        float gd = cuda::std::real(gdrp);
-        float dd_origin0 = gd * (orig0 - x) / d;
-        float dd_origin1 = gd * (orig1 - y) / d;
-        float dd_origin2 = (gd / d) * orig2;
+            const complex64_t dref_dz = I * kPI * ref_phase * ref;
+            const complex64_t dv_dd = interp2d_gradx<complex64_t>(
+                    &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                    dti_int, dti_frac) / dr;
+            const complex64_t dv_dt = interp2d_grady<complex64_t>(
+                    &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                    dti_int, dti_frac) / dtheta;
+            const float dt1_dorig0 = rc * ((x - orig0) * (y - orig1) / (d*d*d));
+            const float dt1_dorig1 = rc * ((y - orig1) * (y - orig1) / (d*d*d) - 1.0f / d);
+            const float dt2_dorig0 = -rs * ((x - orig0) * (x - orig0) / (d*d*d) - 1.0f / d);
+            const float dt2_dorig1 = -rs * ((x - orig0) * (y - orig1) / (d*d*d));
+            const float dt_dorig0 = dt1_dorig0 + dt2_dorig0;
+            const float dt_dorig1 = dt1_dorig1 + dt2_dorig1;
+            const float dd_dorig0 = (orig0 - x) / d;
+            const float dd_dorig1 = (orig1 - y) / d;
+            const complex64_t dv_dorig0 = dv_dd * dd_dorig0 + dv_dt * dt_dorig0;
+            const complex64_t dv_dorig1 = dv_dd * dd_dorig1 + dv_dt * dt_dorig1;
+            const float dz_dorig0 = (orig0 - x) / dz;
+            const float dz_dorig1 = (orig1 - y) / dz;
+            const float dz_dorig2 = orig2 / dz;
+            const complex64_t dref_dorig0 = dref_dz * dz_dorig0;
+            const complex64_t dref_dorig1 = dref_dz * dz_dorig1;
+            const complex64_t dref_dorig2 = dref_dz * dz_dorig2;
+            const complex64_t dout_dorig0 = dv_dorig0 * ref + v * dref_dorig0;
+            const complex64_t dout_dorig1 = dv_dorig1 * ref + v * dref_dorig1;
+            const complex64_t dout_dorig2 = v * dref_dorig2;
 
-        for (int offset = 16; offset > 0; offset /= 2) {
-            dd_origin0 += __shfl_down_sync(mask, dd_origin0, offset);
-            dd_origin1 += __shfl_down_sync(mask, dd_origin1, offset);
-            dd_origin2 += __shfl_down_sync(mask, dd_origin2, offset);
+            const complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy];
+            float g_origin0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
+            float g_origin1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
+            float g_origin2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
+
+            for (int offset = 16; offset > 0; offset /= 2) {
+                g_origin0 += __shfl_down_sync(mask, g_origin0, offset);
+                g_origin1 += __shfl_down_sync(mask, g_origin1, offset);
+                g_origin2 += __shfl_down_sync(mask, g_origin2, offset);
+            }
+
+            if (threadIdx.x % 32 == 0) {
+                atomicAdd(&(origin_grad[idbatch * 3 + 0]), g_origin0);
+                atomicAdd(&(origin_grad[idbatch * 3 + 1]), g_origin1);
+                atomicAdd(&(origin_grad[idbatch * 3 + 2]), g_origin2);
+            }
         }
 
-        if (threadIdx.x % 32 == 0) {
-            atomicAdd(&(origin_grad[idbatch * 3 + 0]), dd_origin0);
-            atomicAdd(&(origin_grad[idbatch * 3 + 1]), dd_origin1);
-            atomicAdd(&(origin_grad[idbatch * 3 + 2]), dd_origin2);
-        }
-    }
+        if (img_grad != nullptr) {
+            if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+                complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy] * cuda::std::conj(ref);
 
-    if (img_grad != nullptr) {
-        if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
-            complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy] * cuda::std::conj(ref);
-
-            complex64_t g11 = g * (1.0f-dri_frac)*(1.0f-dti_frac);
-            complex64_t g12 = g * (1.0f-dri_frac)*dti_frac;
-            complex64_t g21 = g * dri_frac*(1.0f-dti_frac);
-            complex64_t g22 = g * dri_frac*dti_frac;
-            float2 *x11 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
-            float2 *x12 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
-            float2 *x21 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
-            float2 *x22 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
-            atomicAdd(&x11->x, g11.real());
-            atomicAdd(&x11->y, g11.imag());
-            atomicAdd(&x12->x, g12.real());
-            atomicAdd(&x12->y, g12.imag());
-            atomicAdd(&x21->x, g21.real());
-            atomicAdd(&x21->y, g21.imag());
-            atomicAdd(&x22->x, g22.real());
-            atomicAdd(&x22->y, g22.imag());
+                complex64_t g11 = g * (1.0f-dri_frac)*(1.0f-dti_frac);
+                complex64_t g12 = g * (1.0f-dri_frac)*dti_frac;
+                complex64_t g21 = g * dri_frac*(1.0f-dti_frac);
+                complex64_t g22 = g * dri_frac*dti_frac;
+                float2 *x11 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
+                float2 *x12 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
+                float2 *x21 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
+                float2 *x22 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
+                atomicAdd(&x11->x, g11.real());
+                atomicAdd(&x11->y, g11.imag());
+                atomicAdd(&x12->x, g12.real());
+                atomicAdd(&x12->y, g12.imag());
+                atomicAdd(&x21->x, g21.real());
+                atomicAdd(&x21->y, g21.imag());
+                atomicAdd(&x22->x, g22.real());
+                atomicAdd(&x22->y, g22.imag());
+            }
         }
     }
 }
@@ -2572,8 +2684,6 @@ __global__ void polar_to_cart_kernel_bicubic_grad(const complex64_t *img,
     const int dti_int = dti;
     const float dti_frac = dti - dti_int;
 
-    complex64_t v = {0.0f, 0.0f};
-    complex64_t ref = {0.0f, 0.0f};
     if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         complex64_t v = bicubic_interp2d<complex64_t>(
                 &img[idbatch * Nr * Ntheta],
@@ -2581,101 +2691,128 @@ __global__ void polar_to_cart_kernel_bicubic_grad(const complex64_t *img,
                 &img_gy[idbatch * Nr * Ntheta],
                 &img_gxy[idbatch * Nr * Ntheta],
                 Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-        //float absv = interp2d_abs<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-        //v = absv * v / abs(v);
         float ref_sin, ref_cos;
         sincospif(ref_phase * dz, &ref_sin, &ref_cos);
-        ref = {ref_cos, ref_sin};
-    }
+        complex64_t ref = {ref_cos, ref_sin};
 
-    // FIXME: Doesn't consider absv
-    if (origin_grad != nullptr) {
-        const complex64_t I = {0.0f, 1.0f};
-        // FIXME: Missing derivative of v
-        complex64_t dout_drp = I * kPI * ref_phase * ref * v * (d / dz);
+        if (origin_grad != nullptr) {
+            const complex64_t I = {0.0f, 1.0f};
 
-        complex64_t drp_conj = cuda::std::conj(dout_drp);
-        complex64_t gdrp = grad[idbatch * Nx * Ny + idx*Ny + idy] * drp_conj;
-        float gd = cuda::std::real(gdrp);
-        float dd_origin0 = gd * (orig0 - x) / d;
-        float dd_origin1 = gd * (orig1 - y) / d;
-        float dd_origin2 = (gd / d) * orig2;
+            const complex64_t dref_dz = I * kPI * ref_phase * ref;
+            const complex64_t dv_dd = bicubic_interp2d_gradx<complex64_t>(
+                    &img[idbatch * Nr * Ntheta],
+                    &img_gx[idbatch * Nr * Ntheta],
+                    &img_gy[idbatch * Nr * Ntheta],
+                    &img_gxy[idbatch * Nr * Ntheta],
+                    Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac) / dr;
+            const complex64_t dv_dt = bicubic_interp2d_grady<complex64_t>(
+                    &img[idbatch * Nr * Ntheta],
+                    &img_gx[idbatch * Nr * Ntheta],
+                    &img_gy[idbatch * Nr * Ntheta],
+                    &img_gxy[idbatch * Nr * Ntheta],
+                    Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac) / dtheta;
 
-        for (int offset = 16; offset > 0; offset /= 2) {
-            dd_origin0 += __shfl_down_sync(mask, dd_origin0, offset);
-            dd_origin1 += __shfl_down_sync(mask, dd_origin1, offset);
-            dd_origin2 += __shfl_down_sync(mask, dd_origin2, offset);
+            const float dt1_dorig0 = rc * ((x - orig0) * (y - orig1) / (d*d*d));
+            const float dt1_dorig1 = rc * ((y - orig1) * (y - orig1) / (d*d*d) - 1.0f / d);
+            const float dt2_dorig0 = -rs * ((x - orig0) * (x - orig0) / (d*d*d) - 1.0f / d);
+            const float dt2_dorig1 = -rs * ((x - orig0) * (y - orig1) / (d*d*d));
+            const float dt_dorig0 = dt1_dorig0 + dt2_dorig0;
+            const float dt_dorig1 = dt1_dorig1 + dt2_dorig1;
+            const float dd_dorig0 = (orig0 - x) / d;
+            const float dd_dorig1 = (orig1 - y) / d;
+            const complex64_t dv_dorig0 = dv_dd * dd_dorig0 + dv_dt * dt_dorig0;
+            const complex64_t dv_dorig1 = dv_dd * dd_dorig1 + dv_dt * dt_dorig1;
+            const float dz_dorig0 = (orig0 - x) / dz;
+            const float dz_dorig1 = (orig1 - y) / dz;
+            const float dz_dorig2 = orig2 / dz;
+            const complex64_t dref_dorig0 = dref_dz * dz_dorig0;
+            const complex64_t dref_dorig1 = dref_dz * dz_dorig1;
+            const complex64_t dref_dorig2 = dref_dz * dz_dorig2;
+            const complex64_t dout_dorig0 = dv_dorig0 * ref + v * dref_dorig0;
+            const complex64_t dout_dorig1 = dv_dorig1 * ref + v * dref_dorig1;
+            const complex64_t dout_dorig2 = v * dref_dorig2;
+
+            const complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy];
+            float g_origin0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
+            float g_origin1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
+            float g_origin2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
+
+            for (int offset = 16; offset > 0; offset /= 2) {
+                g_origin0 += __shfl_down_sync(mask, g_origin0, offset);
+                g_origin1 += __shfl_down_sync(mask, g_origin1, offset);
+                g_origin2 += __shfl_down_sync(mask, g_origin2, offset);
+            }
+
+            if (threadIdx.x % 32 == 0) {
+                atomicAdd(&(origin_grad[idbatch * 3 + 0]), g_origin0);
+                atomicAdd(&(origin_grad[idbatch * 3 + 1]), g_origin1);
+                atomicAdd(&(origin_grad[idbatch * 3 + 2]), g_origin2);
+            }
         }
 
-        if (threadIdx.x % 32 == 0) {
-            atomicAdd(&(origin_grad[idbatch * 3 + 0]), dd_origin0);
-            atomicAdd(&(origin_grad[idbatch * 3 + 1]), dd_origin1);
-            atomicAdd(&(origin_grad[idbatch * 3 + 2]), dd_origin2);
-        }
-    }
+        if (img_grad != nullptr) {
+            if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+                complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy] * cuda::std::conj(ref);
 
-    if (img_grad != nullptr) {
-        if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
-            complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy] * cuda::std::conj(ref);
-
-            complex64_t img_grad_tmp[4];
-            complex64_t img_gx_grad_tmp[4];
-            complex64_t img_gy_grad_tmp[4];
-            complex64_t img_gxy_grad_tmp[4];
-            bicubic_interp2d_grad<complex64_t>(
-                    (complex64_t*)&img_grad_tmp,
-                    (complex64_t*)&img_gx_grad_tmp,
-                    (complex64_t*)&img_gy_grad_tmp,
-                    (complex64_t*)&img_gxy_grad_tmp,
-                    dri_frac, dti_frac, g);
-            float2 *g11 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
-            float2 *g12 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
-            float2 *g21 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
-            float2 *g22 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
-            atomicAdd(&g11->x, img_grad_tmp[0].real());
-            atomicAdd(&g11->y, img_grad_tmp[0].imag());
-            atomicAdd(&g12->x, img_grad_tmp[1].real());
-            atomicAdd(&g12->y, img_grad_tmp[1].imag());
-            atomicAdd(&g21->x, img_grad_tmp[2].real());
-            atomicAdd(&g21->y, img_grad_tmp[2].imag());
-            atomicAdd(&g22->x, img_grad_tmp[3].real());
-            atomicAdd(&g22->y, img_grad_tmp[3].imag());
-            float2 *gx11 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
-            float2 *gx12 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
-            float2 *gx21 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
-            float2 *gx22 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
-            atomicAdd(&gx11->x, img_gx_grad_tmp[0].real());
-            atomicAdd(&gx11->y, img_gx_grad_tmp[0].imag());
-            atomicAdd(&gx12->x, img_gx_grad_tmp[1].real());
-            atomicAdd(&gx12->y, img_gx_grad_tmp[1].imag());
-            atomicAdd(&gx21->x, img_gx_grad_tmp[2].real());
-            atomicAdd(&gx21->y, img_gx_grad_tmp[2].imag());
-            atomicAdd(&gx22->x, img_gx_grad_tmp[3].real());
-            atomicAdd(&gx22->y, img_gx_grad_tmp[3].imag());
-            float2 *gy11 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
-            float2 *gy12 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
-            float2 *gy21 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
-            float2 *gy22 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
-            atomicAdd(&gy11->x, img_gy_grad_tmp[0].real());
-            atomicAdd(&gy11->y, img_gy_grad_tmp[0].imag());
-            atomicAdd(&gy12->x, img_gy_grad_tmp[1].real());
-            atomicAdd(&gy12->y, img_gy_grad_tmp[1].imag());
-            atomicAdd(&gy21->x, img_gy_grad_tmp[2].real());
-            atomicAdd(&gy21->y, img_gy_grad_tmp[2].imag());
-            atomicAdd(&gy22->x, img_gy_grad_tmp[3].real());
-            atomicAdd(&gy22->y, img_gy_grad_tmp[3].imag());
-            float2 *gxy11 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
-            float2 *gxy12 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
-            float2 *gxy21 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
-            float2 *gxy22 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
-            atomicAdd(&gxy11->x, img_gxy_grad_tmp[0].real());
-            atomicAdd(&gxy11->y, img_gxy_grad_tmp[0].imag());
-            atomicAdd(&gxy12->x, img_gxy_grad_tmp[1].real());
-            atomicAdd(&gxy12->y, img_gxy_grad_tmp[1].imag());
-            atomicAdd(&gxy21->x, img_gxy_grad_tmp[2].real());
-            atomicAdd(&gxy21->y, img_gxy_grad_tmp[2].imag());
-            atomicAdd(&gxy22->x, img_gxy_grad_tmp[3].real());
-            atomicAdd(&gxy22->y, img_gxy_grad_tmp[3].imag());
+                complex64_t img_grad_tmp[4];
+                complex64_t img_gx_grad_tmp[4];
+                complex64_t img_gy_grad_tmp[4];
+                complex64_t img_gxy_grad_tmp[4];
+                bicubic_interp2d_grad<complex64_t>(
+                        (complex64_t*)&img_grad_tmp,
+                        (complex64_t*)&img_gx_grad_tmp,
+                        (complex64_t*)&img_gy_grad_tmp,
+                        (complex64_t*)&img_gxy_grad_tmp,
+                        dri_frac, dti_frac, g);
+                float2 *g11 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
+                float2 *g12 = (float2*)&img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
+                float2 *g21 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
+                float2 *g22 = (float2*)&img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
+                atomicAdd(&g11->x, img_grad_tmp[0].real());
+                atomicAdd(&g11->y, img_grad_tmp[0].imag());
+                atomicAdd(&g12->x, img_grad_tmp[1].real());
+                atomicAdd(&g12->y, img_grad_tmp[1].imag());
+                atomicAdd(&g21->x, img_grad_tmp[2].real());
+                atomicAdd(&g21->y, img_grad_tmp[2].imag());
+                atomicAdd(&g22->x, img_grad_tmp[3].real());
+                atomicAdd(&g22->y, img_grad_tmp[3].imag());
+                float2 *gx11 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
+                float2 *gx12 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
+                float2 *gx21 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
+                float2 *gx22 = (float2*)&img_gx_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
+                atomicAdd(&gx11->x, img_gx_grad_tmp[0].real());
+                atomicAdd(&gx11->y, img_gx_grad_tmp[0].imag());
+                atomicAdd(&gx12->x, img_gx_grad_tmp[1].real());
+                atomicAdd(&gx12->y, img_gx_grad_tmp[1].imag());
+                atomicAdd(&gx21->x, img_gx_grad_tmp[2].real());
+                atomicAdd(&gx21->y, img_gx_grad_tmp[2].imag());
+                atomicAdd(&gx22->x, img_gx_grad_tmp[3].real());
+                atomicAdd(&gx22->y, img_gx_grad_tmp[3].imag());
+                float2 *gy11 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
+                float2 *gy12 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
+                float2 *gy21 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
+                float2 *gy22 = (float2*)&img_gy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
+                atomicAdd(&gy11->x, img_gy_grad_tmp[0].real());
+                atomicAdd(&gy11->y, img_gy_grad_tmp[0].imag());
+                atomicAdd(&gy12->x, img_gy_grad_tmp[1].real());
+                atomicAdd(&gy12->y, img_gy_grad_tmp[1].imag());
+                atomicAdd(&gy21->x, img_gy_grad_tmp[2].real());
+                atomicAdd(&gy21->y, img_gy_grad_tmp[2].imag());
+                atomicAdd(&gy22->x, img_gy_grad_tmp[3].real());
+                atomicAdd(&gy22->y, img_gy_grad_tmp[3].imag());
+                float2 *gxy11 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int];
+                float2 *gxy12 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1];
+                float2 *gxy21 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int];
+                float2 *gxy22 = (float2*)&img_gxy_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1];
+                atomicAdd(&gxy11->x, img_gxy_grad_tmp[0].real());
+                atomicAdd(&gxy11->y, img_gxy_grad_tmp[0].imag());
+                atomicAdd(&gxy12->x, img_gxy_grad_tmp[1].real());
+                atomicAdd(&gxy12->y, img_gxy_grad_tmp[1].imag());
+                atomicAdd(&gxy21->x, img_gxy_grad_tmp[2].real());
+                atomicAdd(&gxy21->y, img_gxy_grad_tmp[2].imag());
+                atomicAdd(&gxy22->x, img_gxy_grad_tmp[3].real());
+                atomicAdd(&gxy22->y, img_gxy_grad_tmp[3].imag());
+            }
         }
     }
 }

@@ -1719,8 +1719,6 @@ def _setup_context_polar_to_cart_linear(ctx, inputs, output):
     img, origin, *rest = inputs
     for i in range(len(ctx.needs_input_grad)):
         if ctx.needs_input_grad[i]:
-            if i == 1:
-                raise NotImplementedError("origin grad not supported")
             if i <= 1:
                 continue
             raise NotImplementedError("Only img gradient supported")
@@ -1744,8 +1742,6 @@ def _setup_context_polar_to_cart_bicubic(ctx, inputs, output):
     img, img_gx, img_gy, img_gxy, origin, *rest = inputs
     for i in range(len(ctx.needs_input_grad)):
         if ctx.needs_input_grad[i]:
-            if i == 4:
-                raise NotImplementedError("origin grad not supported")
             if i <= 4:
                 continue
             raise NotImplementedError(
