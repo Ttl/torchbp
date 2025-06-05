@@ -7,8 +7,8 @@ from .util import bp_polar_range_dealias, center_pos
 cart_2d_nargs = 15
 polar_2d_nargs = 16
 polar_interp_linear_args = 18
-polar_to_cart_linear_args = 18
-polar_to_cart_bicubic_args = 21
+polar_to_cart_linear_args = 17
+polar_to_cart_bicubic_args = 20
 entropy_args = 3
 abs_sum_args = 2
 
@@ -434,7 +434,6 @@ def polar_to_cart_linear(
     grid_cart: dict,
     fc: float,
     rotation: float = 0,
-    polar_interp: bool = False,
 ) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid with linear interpolation.
@@ -466,8 +465,6 @@ def polar_to_cart_linear(
         RF center frequency in Hz.
     rotation : float
         Polar origin rotation angle.
-    polar_interp : bool
-        Interpolate in polar coordinates.
 
     Returns
     ----------
@@ -513,8 +510,7 @@ def polar_to_cart_linear(
         dx,
         dy,
         nx,
-        ny,
-        polar_interp,
+        ny
     )
 
 
@@ -525,7 +521,6 @@ def polar_to_cart_bicubic(
     grid_cart: dict,
     fc: float,
     rotation: float = 0,
-    polar_interp: bool = False,
 ) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid with bicubic interpolation.
@@ -557,8 +552,6 @@ def polar_to_cart_bicubic(
         RF center frequency in Hz.
     rotation : float
         Polar origin rotation angle.
-    polar_interp : bool
-        Interpolate in polar coordinates.
 
     Returns
     ----------
@@ -585,8 +578,7 @@ def polar_to_cart_bicubic(
         grid_polar,
         grid_cart,
         fc,
-        rotation,
-        polar_interp,
+        rotation
     )
 
 
@@ -600,7 +592,6 @@ def _polar_to_cart_bicubic(
     grid_cart: dict,
     fc: float,
     rotation: float = 0,
-    polar_interp: bool = False,
 ) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid.
@@ -638,8 +629,6 @@ def _polar_to_cart_bicubic(
         RF center frequency in Hz.
     rotation : float
         Polar origin rotation angle.
-    polar_interp : bool
-        Interpolate in polar coordinates.
 
     Returns
     ----------
@@ -692,8 +681,7 @@ def _polar_to_cart_bicubic(
         dx,
         dy,
         nx,
-        ny,
-        polar_interp,
+        ny
     )
 
 
@@ -1703,11 +1691,9 @@ def _setup_context_polar_interp_linear(ctx, inputs, output):
 
 def _backward_polar_to_cart_linear(ctx, grad):
     img = ctx.saved_tensors[0]
-    dorigin = ctx.saved_tensors[1]
-    if ctx.saved[-1]:
-        raise NotImplementedError("polar_interp gradient not supported")
+    origin = ctx.saved_tensors[1]
     ret = torch.ops.torchbp.polar_to_cart_linear_grad.default(
-        grad, img, dorigin, *ctx.saved[:-1]
+        grad, img, origin, *ctx.saved
     )
     grads = [None] * polar_to_cart_linear_args
     grads[0] = ret[0]
@@ -1728,10 +1714,8 @@ def _setup_context_polar_to_cart_linear(ctx, inputs, output):
 
 def _backward_polar_to_cart_bicubic(ctx, grad):
     img, img_gx, img_gy, img_gxy, origin = ctx.saved_tensors
-    if ctx.saved[-1]:
-        raise NotImplementedError("polar_interp gradient not supported")
     ret = torch.ops.torchbp.polar_to_cart_bicubic_grad.default(
-        grad, img, img_gx, img_gy, img_gxy, origin, *ctx.saved[:-1]
+        grad, img, img_gx, img_gy, img_gxy, origin, *ctx.saved
     )
     grads = [None] * polar_to_cart_bicubic_args
     grads[: len(ret)] = ret

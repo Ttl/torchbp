@@ -2226,7 +2226,7 @@ template<typename T>
 __global__ void polar_to_cart_kernel_linear(const T *img, T
         *out, const float *origin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
-        float dx, float y0, float dy, int Nx, int Ny, int polar_interp) {
+        float dx, float y0, float dy, int Nx, int Ny) {
     const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
     const int idy = id1 % Ny;
     const int idx = id1 / Ny;
@@ -2261,13 +2261,7 @@ __global__ void polar_to_cart_kernel_linear(const T *img, T
 
     if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         T v = interp2d<T>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-        // This is needed to avoid artifacts in amplitude when
-        // range dimension spectrum is not band limited
         if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
-            if (polar_interp) {
-                float absv = interp2d_abs<T>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-                v = absv * v / abs(v);
-            }
             float ref_sin, ref_cos;
             sincospif(ref_phase * dz, &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
@@ -2420,8 +2414,7 @@ at::Tensor polar_to_cart_linear_cuda(
           double dx,
           double dy,
           int64_t Nx,
-          int64_t Ny,
-          int64_t polar_interp) {
+          int64_t Ny) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
 	TORCH_CHECK(origin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
@@ -2460,8 +2453,7 @@ at::Tensor polar_to_cart_linear_cuda(
                       y0,
                       dy,
                       Nx,
-                      Ny,
-                      polar_interp
+                      Ny
                       );
     } else {
         float* img_ptr = img_contig.data_ptr<float>();
@@ -2484,8 +2476,7 @@ at::Tensor polar_to_cart_linear_cuda(
                       y0,
                       dy,
                       Nx,
-                      Ny,
-                      polar_interp
+                      Ny
                       );
     }
 	return out;
@@ -2581,7 +2572,7 @@ __global__ void polar_to_cart_kernel_bicubic(const T *img,
         const T *img_gx, const T *img_gy, const T *img_gxy,
         T *out, const float *origin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
-        float dx, float y0, float dy, int Nx, int Ny, int polar_interp) {
+        float dx, float y0, float dy, int Nx, int Ny) {
     const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
     const int idy = id1 % Ny;
     const int idx = id1 / Ny;
@@ -2622,10 +2613,6 @@ __global__ void polar_to_cart_kernel_bicubic(const T *img,
                 &img_gxy[idbatch * Nr * Ntheta],
                 Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
-            if (polar_interp) {
-                float absv = interp2d_abs<T>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-                v = absv * v / abs(v);
-            }
             float ref_sin, ref_cos;
             sincospif(ref_phase * sqrtf(d*d + orig2*orig2), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
@@ -2837,8 +2824,7 @@ at::Tensor polar_to_cart_bicubic_cuda(
           double dx,
           double dy,
           int64_t Nx,
-          int64_t Ny,
-          int64_t polar_interp) {
+          int64_t Ny) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
 	TORCH_CHECK(img_gx.dtype() == img.dtype());
 	TORCH_CHECK(img_gy.dtype() == img.dtype());
@@ -2892,8 +2878,7 @@ at::Tensor polar_to_cart_bicubic_cuda(
                       y0,
                       dy,
                       Nx,
-                      Ny,
-                      polar_interp
+                      Ny
                       );
     } else {
         float* img_ptr = img_contig.data_ptr<float>();
@@ -2922,8 +2907,7 @@ at::Tensor polar_to_cart_bicubic_cuda(
                       y0,
                       dy,
                       Nx,
-                      Ny,
-                      polar_interp
+                      Ny
                       );
     }
 	return out;

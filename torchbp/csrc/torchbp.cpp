@@ -699,7 +699,7 @@ template<typename T>
 static void polar_to_cart_kernel_linear_cpu(const T *img, T
         *out, const float *origin, float rotation, float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
-        float dx, float y0, float dy, int Nx, int Ny, int polar_interp,
+        float dx, float y0, float dy, int Nx, int Ny,
         int id1, int idbatch) {
     const int idy = id1 % Ny;
     const int idx = id1 / Ny;
@@ -734,12 +734,6 @@ static void polar_to_cart_kernel_linear_cpu(const T *img, T
     if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         T v = interp2d<T>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         if constexpr (std::is_same_v<T, complex64_t>) {
-            // This is needed to avoid artifacts in amplitude when
-            // range dimension spectrum is not band limited
-            if (polar_interp) {
-                float absv = interp2d_abs<T>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
-                v = absv * v / abs(v);
-            }
             float ref_sin, ref_cos;
             sincospi(ref_phase * dz, &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
@@ -773,8 +767,7 @@ at::Tensor polar_to_cart_linear_cpu(
           double dx,
           double dy,
           int64_t Nx,
-          int64_t Ny,
-          int64_t polar_interp) {
+          int64_t Ny) {
 	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
 	TORCH_CHECK(origin.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
@@ -810,7 +803,6 @@ at::Tensor polar_to_cart_linear_cpu(
                               dy,
                               Nx,
                               Ny,
-                              polar_interp,
                               id1,
                               idbatch
                               );
@@ -835,7 +827,6 @@ at::Tensor polar_to_cart_linear_cpu(
                               dy,
                               Nx,
                               Ny,
-                              polar_interp,
                               id1,
                               idbatch
                               );
@@ -858,9 +849,9 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("polar_interp_linear_grad(Tensor grad, Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1) -> Tensor[]");
   m.def("polar_interp_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1) -> Tensor");
   m.def("polar_interp_lanczos(Tensor img, Tensor dorigin, int nbatch, float rotation, float fc, float r0, float dr0, float theta0, float dtheta0, int Nr0, int Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float z1, int order) -> Tensor");
-  m.def("polar_to_cart_linear(Tensor img, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");
+  m.def("polar_to_cart_linear(Tensor img, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor");
   m.def("polar_to_cart_linear_grad(Tensor grad, Tensor img, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor[]");
-  m.def("polar_to_cart_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny, int polar_interp) -> Tensor");
+  m.def("polar_to_cart_bicubic(Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor");
   m.def("polar_to_cart_bicubic_grad(Tensor grad, Tensor img, Tensor img_gx, Tensor img_gy, Tensor img_gxy, Tensor origin, int nbatch, float rotation, float fc, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0, float y0, float dx, float dy, int Nx, int Ny) -> Tensor[]");
   m.def("backprojection_polar_2d_tx_power(Tensor wa, Tensor pos, Tensor att, Tensor gtx, Tensor grx, int nbatch, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel, int nsweeps, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, int sin_look_angle) -> Tensor");
   m.def("entropy(Tensor data, Tensor norm, int nbatch) -> Tensor");

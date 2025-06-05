@@ -42,8 +42,7 @@ if __name__ == "__main__":
         grid_polar,
         grid,
         fc,
-        origin_angle,
-        polar_interp=False,
+        origin_angle
     )
     extent = [grid["x"][0], grid["x"][1], grid["y"][0], grid["y"][1]]
     img_db = torch.abs(sar_img_cart) + 1e-10

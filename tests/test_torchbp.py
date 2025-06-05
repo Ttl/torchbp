@@ -138,7 +138,6 @@ class TestPolarToCartLinear(TestCase):
             'grid_cart': grid_cart,
             'fc': 6e9,
             'rotation': 0.1,
-            'polar_interp': False
         }
         return [args]
 
