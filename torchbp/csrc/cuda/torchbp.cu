@@ -82,7 +82,7 @@ static __device__ T interp2d_gradx(const T *img, int nx, int ny,
 template<class T>
 static __device__ T interp2d_grady(const T *img, int nx, int ny,
         int x_int, float x_frac, int y_int, float y_frac) {
-    return -img[x_int*ny + y_int]*(1.0f-x_frac)*(-1.0f) +
+    return -img[x_int*ny + y_int]*(1.0f-x_frac) +
            img[x_int*ny + y_int+1]*(1.0f-x_frac) +
            -img[(x_int+1)*ny + y_int]*x_frac +
            img[(x_int+1)*ny + y_int+1]*x_frac;
@@ -2039,12 +2039,14 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
     }
     const float dorig0 = dorigin[idbatch * 3 + 0];
     const float dorig1 = dorigin[idbatch * 3 + 1];
+    const float dorig2 = dorigin[idbatch * 3 + 2];
     const float sint = t;
     const float cost = sqrtf(1.0f - t*t);
     // TODO: Add dorig2
     const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
     const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-    const float tp = arg / sqrtf(1.0f + arg*arg);
+    const float cosarg = sqrtf(1.0f + arg*arg);
+    const float tp = arg / cosarg;
 
     const float dri = (rp - r0) / dr;
     const float dti = (tp - theta0) / dtheta;
@@ -2058,35 +2060,51 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
     complex64_t v = {0.0f, 0.0f};
     complex64_t ref = {0.0f, 0.0f};
 
+    const float z0 = z1 + dorig2;
+    const float rpz = sqrtf(z0*z0 + rp*rp);
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
-        const float z0 = z1 + dorigin[idbatch * 3 + 2];
         const float dz = sqrtf(z1*z1 + d*d);
-        const float rpz = sqrtf(z0*z0 + rp*rp);
         sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
         ref = {ref_cos, ref_sin};
     }
 
     if (dorigin_grad != nullptr) {
-        complex64_t dout_drp = I * kPI * ref_phase * ref * v;
-        float drp_dorigin0 = 0.50f * (2.0f*d*cost + 2.0f*dorig0) / rp;
-        float drp_dorigin1 = 0.50f * (2.0f*d*sint + 2.0f*dorig1) / rp;
+        const complex64_t dref_drpz = I * kPI * ref_phase * ref;
+        const complex64_t dv_drp = interp2d_gradx<complex64_t>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                dti_int, dti_frac) / dr;
+        const complex64_t dv_dt = interp2d_grady<complex64_t>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                dti_int, dti_frac) / dtheta;
+        const float drp_dorig0 = (cost*d + dorig0) / rp;
+        const float drp_dorig1 = (sint*d + dorig1) / rp;
+        const float drpz_dorig0 = (cost*d + dorig0) / rpz;
+        const float drpz_dorig1 = (sint*d + dorig1) / rpz;
+        const float drpz_dorig2 = (dorig2 + z1) / rpz;
+        const float dt_darg = -arg*arg/(cosarg*cosarg*cosarg) + 1.0f / cosarg;
+        const float darg_dorig0 = -(d*sint + dorig1) / ((dorig0 + d*cost)*(dorig0 + d*cost));
+        const float darg_dorig1 = 1.0f / (cost*d + dorig0);
 
-        complex64_t drp_conj = cuda::std::conj(dout_drp);
-        complex64_t gdrp = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] * drp_conj;
-        float gd = cuda::std::real(gdrp);
-        drp_dorigin0 *= gd;
-        drp_dorigin1 *= gd;
+        const complex64_t g = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta];
+        const complex64_t dout_dorig0 = ref * (dv_drp * drp_dorig0 + dv_dt * dt_darg * darg_dorig0) + v * dref_drpz * drpz_dorig0;
+        const complex64_t dout_dorig1 = ref * (dv_drp * drp_dorig1 + dv_dt * dt_darg * darg_dorig1) + v * dref_drpz * drpz_dorig1;
+        const complex64_t dout_dorig2 = v * dref_drpz * drpz_dorig2;
+        float g_dorig0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
+        float g_dorig1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
+        float g_dorig2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
 
         for (int offset = 16; offset > 0; offset /= 2) {
-            drp_dorigin0 += __shfl_down_sync(mask, drp_dorigin0, offset);
-            drp_dorigin1 += __shfl_down_sync(mask, drp_dorigin1, offset);
+            g_dorig0 += __shfl_down_sync(mask, g_dorig0, offset);
+            g_dorig1 += __shfl_down_sync(mask, g_dorig1, offset);
+            g_dorig2 += __shfl_down_sync(mask, g_dorig2, offset);
         }
 
         if (threadIdx.x % 32 == 0) {
-            atomicAdd(&(dorigin_grad[idbatch * 3 + 0]), drp_dorigin0);
-            atomicAdd(&(dorigin_grad[idbatch * 3 + 1]), drp_dorigin1);
+            atomicAdd(&(dorigin_grad[idbatch * 3 + 0]), g_dorig0);
+            atomicAdd(&(dorigin_grad[idbatch * 3 + 1]), g_dorig1);
+            atomicAdd(&(dorigin_grad[idbatch * 3 + 2]), g_dorig2);
         }
     }
 

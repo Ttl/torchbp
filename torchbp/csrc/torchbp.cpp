@@ -29,12 +29,21 @@ static T interp2d(const T *img, int nx, int ny,
 }
 
 template<class T>
-static float interp2d_abs(const T *img, int nx, int ny,
+static T interp2d_gradx(const T *img, int nx, int ny,
         int x_int, float x_frac, int y_int, float y_frac) {
-    return abs(img[x_int*ny + y_int])*(1.0f-x_frac)*(1.0f-y_frac) +
-           abs(img[x_int*ny + y_int+1])*(1.0f-x_frac)*y_frac +
-           abs(img[(x_int+1)*ny + y_int])*x_frac*(1.0f-y_frac) +
-           abs(img[(x_int+1)*ny + y_int+1])*x_frac*y_frac;
+    return -img[x_int*ny + y_int]*(1.0f-y_frac) +
+           -img[x_int*ny + y_int+1]*y_frac +
+           img[(x_int+1)*ny + y_int]*(1.0f-y_frac) +
+           img[(x_int+1)*ny + y_int+1]*y_frac;
+}
+
+template<class T>
+static T interp2d_grady(const T *img, int nx, int ny,
+        int x_int, float x_frac, int y_int, float y_frac) {
+    return -img[x_int*ny + y_int]*(1.0f-x_frac) +
+           img[x_int*ny + y_int+1]*(1.0f-x_frac) +
+           -img[(x_int+1)*ny + y_int]*x_frac +
+           img[(x_int+1)*ny + y_int+1]*x_frac;
 }
 
 template <typename T>
@@ -46,7 +55,7 @@ static void sincospi(T x, T *sinx, T *cosx) {
 template <typename T>
 static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::complex<T> *out, const T *dorigin, T rotation,
                   T ref_phase, T r0, T dr, T theta0, T dtheta, int Nr, int Ntheta,
-                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1, T z0, int idx, int idbatch) {
+                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1, T z1, int idx, int idbatch) {
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
 
@@ -57,7 +66,7 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
     const T d = r1 + dr1 * idr;
     T t = theta1 + dtheta1 * idtheta;
     if (rotation != 0.0f) {
-        t = sinf(asinf(t) + rotation);
+        t = sinf(asinf(t) - rotation);
     }
     if (t < -1.0f || t > 1.0f) {
         return;
@@ -65,10 +74,10 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
     const T dorig0 = dorigin[idbatch * 3 + 0];
     const T dorig1 = dorigin[idbatch * 3 + 1];
     const T sint = t;
-    const T cost = sqrtf(1.0f - t*t);
-    const T rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+    const T cost = sqrt(1.0f - t*t);
+    const T rp = sqrt(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
     const T arg = (d*sint + dorig1) / (d*cost + dorig0);
-    const T tp = arg / sqrtf(1.0f + arg*arg);
+    const T tp = arg / sqrt(1.0f + arg*arg);
 
     const T dri = (rp - r0) / dr;
     const T dti = (tp - theta0) / dtheta;
@@ -81,9 +90,9 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         c10::complex<T> v = interp2d<c10::complex<T>>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         T ref_sin, ref_cos;
-        const T z1 = z0 + dorigin[idbatch * 3 + 2];
-        const T dz = sqrtf(z1*z1 + d*d);
-        const T rpz = sqrtf(z0*z0 + rp*rp);
+        const T z0 = z1 + dorigin[idbatch * 3 + 2];
+        const T dz = sqrt(z1*z1 + d*d);
+        const T rpz = sqrt(z0*z0 + rp*rp);
         sincospi<T>(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
         c10::complex<T> ref = {ref_cos, ref_sin};
         out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = v * ref;
@@ -95,7 +104,7 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
 template <typename T>
 static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, const T *dorigin, T rotation,
                   T ref_phase, T r0, T dr, T theta0, T dtheta, int Nr, int Ntheta,
-                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1, T z0,
+                  T r1, T dr1, T theta1, T dtheta1, int Nr1, int Ntheta1, T z1,
                   const c10::complex<T> *grad, c10::complex<T> *img_grad, T *dorigin_grad,
                   int idx, int idbatch) {
     const int idtheta = idx % Ntheta1;
@@ -108,7 +117,7 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
         t = 1.0f;
     }
     if (rotation != 0.0f) {
-        t = sinf(asinf(t) + rotation);
+        t = sinf(asinf(t) - rotation);
     }
 
     if (idx >= Nr1 * Ntheta1) {
@@ -119,11 +128,14 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
     }
     const T dorig0 = dorigin[idbatch * 3 + 0];
     const T dorig1 = dorigin[idbatch * 3 + 1];
+    const T dorig2 = dorigin[idbatch * 3 + 2];
     const T sint = t;
-    const T cost = sqrtf(1.0f - t*t);
-    const T rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+    const T cost = sqrt(1.0f - t*t);
+    // TODO: Add dorig2
+    const T rp = sqrt(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
     const T arg = (d*sint + dorig1) / (d*cost + dorig0);
-    const T tp = arg / sqrtf(1.0f + arg*arg);
+    const T cosarg = sqrt(1.0f + arg*arg);
+    const T tp = arg / cosarg;
 
     const T dri = (rp - r0) / dr;
     const T dti = (tp - theta0) / dtheta;
@@ -137,31 +149,47 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
     c10::complex<T> v = {0.0f, 0.0f};
     c10::complex<T> ref = {0.0f, 0.0f};
 
+    const T z0 = z1 + dorig2;
+    const T rpz = sqrt(z0*z0 + rp*rp);
     if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         v = interp2d<c10::complex<T>>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         T ref_sin, ref_cos;
-        const T z1 = z0 + dorigin[idbatch * 3 + 2];
-        const T dz = sqrtf(z1*z1 + d*d);
-        const T rpz = sqrtf(z0*z0 + rp*rp);
+        const T dz = sqrt(z1*z1 + d*d);
         sincospi<T>(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
         ref = {ref_cos, ref_sin};
     }
 
     if (dorigin_grad != nullptr) {
-        c10::complex<T> dout_drp = I * static_cast<T>(kPI) * ref_phase * ref * v;
-        T drp_dorigin0 = 0.50f * (2.0f*d*cost + 2.0f*dorig0) / rp;
-        T drp_dorigin1 = 0.50f * (2.0f*d*sint + 2.0f*dorig1) / rp;
+        const c10::complex<T> dref_drpz = I * kPI * ref_phase * ref;
+        const c10::complex<T> dv_drp = interp2d_gradx<c10::complex<T>>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                dti_int, dti_frac) / dr;
+        const c10::complex<T> dv_dt = interp2d_grady<c10::complex<T>>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                dti_int, dti_frac) / dtheta;
+        const T drp_dorig0 = (cost*d + dorig0) / rp;
+        const T drp_dorig1 = (sint*d + dorig1) / rp;
+        const T drpz_dorig0 = (cost*d + dorig0) / rpz;
+        const T drpz_dorig1 = (sint*d + dorig1) / rpz;
+        const T drpz_dorig2 = (dorig2 + z1) / rpz;
+        const T dt_darg = -arg*arg/(cosarg*cosarg*cosarg) + 1.0f / cosarg;
+        const T darg_dorig0 = -(d*sint + dorig1) / ((dorig0 + d*cost)*(dorig0 + d*cost));
+        const T darg_dorig1 = 1.0f / (cost*d + dorig0);
 
-        c10::complex<T> drp_conj = std::conj(dout_drp);
-        c10::complex<T> gdrp = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] * drp_conj;
-        T gd = std::real(gdrp);
-        drp_dorigin0 *= gd;
-        drp_dorigin1 *= gd;
+        const c10::complex<T> g = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta];
+        const c10::complex<T> dout_dorig0 = ref * (dv_drp * drp_dorig0 + dv_dt * dt_darg * darg_dorig0) + v * dref_drpz * drpz_dorig0;
+        const c10::complex<T> dout_dorig1 = ref * (dv_drp * drp_dorig1 + dv_dt * dt_darg * darg_dorig1) + v * dref_drpz * drpz_dorig1;
+        const c10::complex<T> dout_dorig2 = v * dref_drpz * drpz_dorig2;
+        T g_dorig0 = std::real(g * std::conj(dout_dorig0));
+        T g_dorig1 = std::real(g * std::conj(dout_dorig1));
+        T g_dorig2 = std::real(g * std::conj(dout_dorig2));
 
 #pragma omp atomic
-        dorigin_grad[idbatch * 3 + 0] += drp_dorigin0;
+        dorigin_grad[idbatch * 3 + 0] += g_dorig0;
 #pragma omp atomic
-        dorigin_grad[idbatch * 3 + 1] += drp_dorigin1;
+        dorigin_grad[idbatch * 3 + 1] += g_dorig1;
+#pragma omp atomic
+        dorigin_grad[idbatch * 3 + 2] += g_dorig2;
     }
 
     if (img_grad != nullptr) {
@@ -202,7 +230,7 @@ at::Tensor polar_interp_linear_cpu(
           double dtheta1,
           int64_t nr1,
           int64_t ntheta1,
-          double z0) {
+          double z1) {
     TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kComplexDouble);
     TORCH_CHECK(dorigin.dtype() == at::kFloat || dorigin.dtype() == at::kDouble);
     TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
@@ -223,7 +251,7 @@ at::Tensor polar_interp_linear_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_cpu<float>(img_ptr, out_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0, idx, idbatch);
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z1, idx, idbatch);
             }
         }
     } else {
@@ -238,7 +266,7 @@ at::Tensor polar_interp_linear_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_cpu<double>(img_ptr, out_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0, idx, idbatch);
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z1, idx, idbatch);
             }
         }
     }
@@ -264,7 +292,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
           double dtheta1,
           int64_t nr1,
           int64_t ntheta1,
-          double z0) {
+          double z1) {
     TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kComplexDouble);
     TORCH_CHECK(dorigin.dtype() == at::kFloat || dorigin.dtype() == at::kDouble);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat || grad.dtype() == at::kComplexDouble);
@@ -306,7 +334,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_grad_cpu<float>(img_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0,
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z1,
                       grad_ptr, img_grad_ptr, dorigin_grad_ptr,
                       idx, idbatch);
             }
@@ -340,7 +368,7 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
             for(int idx = 0; idx < nr1 * ntheta1; idx++) {
                 polar_interp_kernel_linear_grad_cpu<double>(img_ptr, dorigin_ptr, rotation,
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
-                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z0,
+                      r1, dr1, theta1, dtheta1, nr1, ntheta1, z1,
                       grad_ptr, img_grad_ptr, dorigin_grad_ptr,
                       idx, idbatch);
             }

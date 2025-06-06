@@ -55,15 +55,14 @@ class TestPolarInterpLinear(TestCase):
         grid_polar = {"r": (10, 20), "theta": (-1, 1), "nr": 2, "ntheta": 2}
         grid_polar_new = {"r": (12, 18), "theta": (-0.8, 0.8), "nr": 3, "ntheta": 3}
         dorigin = 0.1*make_tensor((nbatch, 3), dtype=dtype)
-        # TODO: Remove this when Z-axis interpolation is supported.
-        dorigin[:,2] = 0
         args = {
             'img': make_tensor((nbatch, grid_polar["nr"], grid_polar["ntheta"]), dtype=complex_dtype),
             'dorigin': dorigin,
             'grid_polar': grid_polar,
             'fc': 6e9,
-            'rotation': 0,
+            'rotation': 0.3,
             'grid_polar_new': grid_polar_new,
+            'z0': 2
         }
         return [args]
 
@@ -98,7 +97,7 @@ class TestPolarInterpLinear(TestCase):
 
     def _test_gradients(self, device, dtype=torch.float32):
         samples = self.sample_inputs(device, requires_grad=True, dtype=dtype)
-        eps = 5e-4 if dtype == torch.float32 else 1e-4
+        eps = 1e-3 if dtype == torch.float32 else 1e-4
         rtol = 0.15 if dtype == torch.float32 else 0.05
         for args in samples:
             torch.autograd.gradcheck(

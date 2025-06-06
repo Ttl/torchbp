@@ -601,7 +601,7 @@ def minimum_entropy_grad_autofocus(
         print("Interrupted")
         pass
 
-    return sar_img.detach(), origin, pos.detach(), step
+    return sar_img.detach(), origin.detach(), pos.detach(), step
 
 
 def bp_polar_grad_minimum_entropy(
