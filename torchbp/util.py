@@ -206,7 +206,7 @@ def detrend(x: Tensor) -> Tensor:
     n = x.shape[0]
     k = np.arange(n) / n
     a, b = np.polyfit(k, x.cpu().numpy(), 1)
-    return x - (a * torch.arange(n, device=x.device) / n + b)
+    return x - (a * torch.arange(n, device=x.device, dtype=x.dtype) / n + b)
 
 
 def entropy(x: Tensor) -> Tensor:
@@ -426,7 +426,7 @@ def fft_lowpass_filter_window(
     # Window needs to be centered at DC in FFT
     half_width = (window_width + 1) // 2
     half_window = get_window(window, 2 * half_width - 1, fftbins=True)[half_width - 1 :]
-    w = np.zeros(n)
+    w = np.zeros(n, dtype=np.float32)
     w[:half_width] = half_window
     w[-half_width + 1 :] = np.flip(half_window[1:])
 

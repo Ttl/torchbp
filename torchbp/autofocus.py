@@ -20,6 +20,8 @@ def pga_pd(
     min_window: int = 5,
     remove_trend: bool = True,
     offload: bool = False,
+    weighted=False,
+    eps=1e-2
 ) -> (Tensor, Tensor):
     """
     Phase gradient autofocus
@@ -43,6 +45,10 @@ def pga_pd(
     offload : bool
         Offload some variable to CPU to save VRAM on GPU at
         the expense of longer running time.
+    weighted : bool
+        Use weighted PGA [1]_.
+    eps : float
+        Minimum weight for weighted PGA.
 
     References
     ----------
@@ -50,6 +56,9 @@ def pga_pd(
     gradient autofocus - A robust tool for high resolution SAR phase
     correction," in IEEE Transactions on Aerospace and Electronic Systems, vol.
     30, no. 3, pp. 827-835, July 1994.
+    .. [1] Wei Ye, Tat Soon Yeo and Zheng Bao, "Weighted least-squares
+    estimation of phase errors for SAR/ISAR autofocus," in IEEE Transactions on
+    Geoscience and Remote Sensing, vol. 37, no. 5, pp. 2487-2494, Sept. 1999.
 
     Returns
     ----------
@@ -86,7 +95,14 @@ def pga_pd(
         g[:, 1 + window // 2 : 1 - window // 2] = 0
         # IFFT across theta
         g = torch.fft.fft(g, axis=-1)
-        gdot = torch.diff(g, prepend=g[:, 0][:, None], axis=-1)
+        if weighted:
+            c = torch.mean(torch.abs(g), dim=1, keepdim=True)
+            d = torch.mean(torch.abs(g)**2, dim=1, keepdim=True)
+            w = torch.nan_to_num(d / (4*(2*c**2 - d) - 4*c*torch.sqrt(4*c**2 - 3*d)))
+            w = w / (torch.max(w) + 1e-6) + eps
+            g = w * g
+        z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
+        gdot = torch.diff(g, prepend=z, axis=-1)
         # Weighted sum over range
         phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
             torch.abs(g) ** 2, axis=0
@@ -206,7 +222,8 @@ def gpga_2d_iter(
     window_width: int | None = None,
     d0: float = 0.0,
     estimator: str = "ml",
-    lowpass_window="boxcar",
+    lowpass_window: str="boxcar",
+    eps: float =1e-2
 ) -> Tensor:
     """
     Single generalized phase gradient iteration.
@@ -235,9 +252,12 @@ def gpga_2d_iter(
         Estimator to use.
         "ml": Maximum likelihood.
         "pd": Phase difference.
+        "wpd": Weighted phase difference.
     lowpass_window : str
         FFT window to use for lowpass filtering.
         See `scipy.get_window` for syntax.
+    eps : float
+        Minimum weight.
 
     Returns
     ----------
@@ -256,9 +276,23 @@ def gpga_2d_iter(
     if estimator == "ml":
         u, s, v = torch.linalg.svd(target_data)
         phi = torch.angle(v[0, :])
-    else:
+    elif estimator == "wpd":
         g = target_data
-        gdot = torch.diff(g, prepend=g[:, 0][:, None], axis=-1)
+        z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
+        c = torch.mean(torch.abs(g), dim=1, keepdim=True)
+        d = torch.mean(torch.abs(g)**2, dim=1, keepdim=True)
+        w = torch.nan_to_num(d / (4*(2*c**2 - d) - 4*c*torch.sqrt(4*c**2 - 3*d)))
+        w = w / (torch.max(w) + 1e-6) + eps
+        g = w * g
+        gdot = torch.diff(g, prepend=z, axis=-1)
+        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
+            torch.abs(g) ** 2, axis=0
+        )
+        phi = torch.cumsum(phidot, dim=0)
+    elif estimator == "pd":
+        g = target_data
+        z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
+        gdot = torch.diff(g, prepend=z, axis=-1)
         phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
             torch.abs(g) ** 2, axis=0
         )
@@ -266,7 +300,7 @@ def gpga_2d_iter(
     return phi
 
 
-def gpga_ml_bp_polar(
+def gpga_bp_polar(
     img: Tensor | None,
     data: Tensor,
     pos: Tensor,
@@ -328,6 +362,7 @@ def gpga_ml_bp_polar(
         Estimator to use.
         "ml": Maximum likelihood.
         "pd": Phase difference.
+        "wpd": Weighted phase difference.
     lowpass_window : str
         FFT window to use for lowpass filtering.
         See `scipy.get_window` for syntax.
@@ -354,16 +389,15 @@ def gpga_ml_bp_polar(
 
     phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
 
-    r = r0 + dr * torch.arange(nr, device=data.device)
-    theta = theta0 + dtheta * torch.arange(ntheta, device=data.device)
+    r = r0 + dr * torch.arange(nr, device=data.device, dtype=torch.float32)
+    theta = theta0 + dtheta * torch.arange(ntheta, device=data.device, dtype=torch.float32)
     pos_new = pos.clone()
 
     if window_width is None:
         window_width = data.shape[0]
 
     if img is None:
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)
-        img = img.squeeze()
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)[0]
 
     for i in range(max_iters):
         rpeaks = torch.argmax(torch.abs(img), axis=1)
@@ -371,7 +405,7 @@ def gpga_ml_bp_polar(
         max_a = torch.max(a)
 
         target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
-        target_theta = theta0 + dtheta * rpeaks[target_idx]
+        target_theta = theta0 + dtheta * rpeaks[target_idx].to(torch.float32)
         target_r = r[target_idx]
 
         x = target_r * torch.sqrt(1 - target_theta**2)
@@ -396,10 +430,9 @@ def gpga_ml_bp_polar(
         # Phase to distance
         d = phi_sum * 3e8 / (4 * torch.pi * fc)
         d = d - torch.mean(d)
-
         pos_new[:, 0] = pos[:, 0] + d
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)
-        img = img.squeeze()
+
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[0]
         window_width = int(window_width**window_exp)
         if window_width < min_window:
             break
