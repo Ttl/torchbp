@@ -12,119 +12,69 @@ import inspect
 from scipy import signal
 
 
-def pga_pd(
-    img: Tensor,
-    window_width: int | None = None,
-    max_iters: int = 10,
-    window_exp: float = 0.5,
-    min_window: int = 5,
-    remove_trend: bool = True,
-    offload: bool = False,
-    weighted=False,
-    eps=1e-2
-) -> (Tensor, Tensor):
+def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3) -> Tensor:
     """
-    Phase gradient autofocus
-
-    Phase difference estimator.
+    Estimate phase error from set of measurements.
 
     Parameters
     ----------
-    img : Tensor
-        Complex input image. Shape should be: [Range, azimuth].
-    window_width : int
-        Initial window width. Default is None which uses full image size.
-    max_iter : int
-        Maximum number of iterations.
-    window_exp : float
-        Exponent for decreasing the window size for each iteration.
-    min_window : int
-        Minimum window size.
-    remove_trend : bool
-        Remove linear trend that shifts the image.
-    offload : bool
-        Offload some variable to CPU to save VRAM on GPU at
-        the expense of longer running time.
-    weighted : bool
-        Use weighted PGA [1]_.
+    g : Tensor
+        Demodulated phase from each target. Shape [Ntargets, Nazimuth].
+    estimator : str
+        Estimator to use.
+        "pd": Phase difference. [1]_
+        "ml": Maximum likelihood. [2]_
+        "wls": Weighted least squares using estimated signal-to-clutter weighting. [3]_
     eps : float
         Minimum weight for weighted PGA.
+        Normalized to the maximum weight.
 
     References
     ----------
-    .. [#] D. E. Wahl, P. H. Eichel, D. C. Ghiglia and C. V. Jakowatz, "Phase
+    .. [1] D. E. Wahl, P. H. Eichel, D. C. Ghiglia and C. V. Jakowatz, "Phase
     gradient autofocus - A robust tool for high resolution SAR phase
     correction," in IEEE Transactions on Aerospace and Electronic Systems, vol.
     30, no. 3, pp. 827-835, July 1994.
-    .. [1] Wei Ye, Tat Soon Yeo and Zheng Bao, "Weighted least-squares
+
+    .. [2] Charles V. Jakowatz and Daniel E. Wahl, "Eigenvector method for
+    maximum-likelihood estimation of phase errors in synthetic-aperture-radar
+    imagery," J. Opt. Soc. Am. A 10, 2539-2546 (1993).
+
+    .. [3] Wei Ye, Tat Soon Yeo and Zheng Bao, "Weighted least-squares
     estimation of phase errors for SAR/ISAR autofocus," in IEEE Transactions on
     Geoscience and Remote Sensing, vol. 37, no. 5, pp. 2487-2494, Sept. 1999.
 
     Returns
     ----------
-    img : Tensor
-        Focused image.
     phi : Tensor
         Solved phase error.
     """
-    if img.ndim != 2:
-        raise ValueError("Input image should be 2D.")
-    if window_exp > 1 or window_exp < 0:
-        raise ValueError(f"Invalid window_exp {window_exp}")
-    nr, ntheta = img.shape
-    phi_sum = torch.zeros(ntheta, device=img.device)
-    if window_width is None:
-        window_width = ntheta
-    if window_width > ntheta:
-        window_width = ntheta
-    x = np.arange(ntheta)
-    dev = img.device
-    for i in range(max_iters):
-        window = int(window_width * window_exp**i)
-        if window < min_window:
-            break
-        # Peak for each range bin
-        g = img.clone()
-        if offload:
-            img = img.to(device="cpu")
-        rpeaks = torch.argmax(torch.abs(g), axis=1)
-        # Roll theta axis so that peak is at 0 bin
-        for j in range(nr):
-            g[j, :] = torch.roll(g[j, :], -rpeaks[j].item())
-        # Apply window
-        g[:, 1 + window // 2 : 1 - window // 2] = 0
-        # IFFT across theta
-        g = torch.fft.fft(g, axis=-1)
-        if weighted:
-            c = torch.mean(torch.abs(g), dim=1, keepdim=True)
-            d = torch.mean(torch.abs(g)**2, dim=1, keepdim=True)
-            w = torch.nan_to_num(d / (4*(2*c**2 - d) - 4*c*torch.sqrt(4*c**2 - 3*d)))
-            w = w / (torch.max(w) + 1e-6) + eps
-            g = w * g
+    if estimator == "ml":
+        u, s, v = torch.linalg.svd(g)
+        phi = torch.angle(v[0, :])
+    elif estimator == "wls":
+        c = torch.mean(torch.abs(g), dim=1, keepdim=True)
+        d = torch.mean(torch.abs(g) ** 2, dim=1, keepdim=True)
+        w = torch.nan_to_num(
+            d / (4 * (2 * c**2 - d) - 4 * c * torch.sqrt(4 * c**2 - 3 * d))
+        )
+        w = w / (torch.max(w) + 1e-6) + eps
+        gshift = torch.nn.functional.pad(g[..., 1:], (0, 1))
+        phidot = torch.angle(torch.sum(w * (torch.conj(g) * gshift), axis=0))
+        phi = torch.cumsum(phidot, dim=0)
+    elif estimator == "pd":
         z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
         gdot = torch.diff(g, prepend=z, axis=-1)
-        # Weighted sum over range
         phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
             torch.abs(g) ** 2, axis=0
         )
         phi = torch.cumsum(phidot, dim=0)
-        if remove_trend:
-            phi = detrend(unwrap(phi))
-        phi_sum += phi
-
-        del phidot
-        del gdot
-        del g
-        if offload:
-            img = img.to(device=dev)
-        img_ifft = torch.fft.fft(img, axis=-1)
-        img_ifft *= torch.exp(-1j * phi[None, :])
-        img = torch.fft.ifft(img_ifft, axis=-1)
-
-    return img, phi_sum
+    else:
+        raise ValueError(f"Unknown estimator {estimator}")
+    return phi
 
 
-def pga_ml(
+def pga(
     img: Tensor,
     window_width: int | None = None,
     max_iters: int = 10,
@@ -132,11 +82,11 @@ def pga_ml(
     min_window: int = 5,
     remove_trend: bool = True,
     offload: bool = False,
+    estimator: str = "wls",
+    eps=1e-2,
 ) -> (Tensor, Tensor):
     """
     Phase gradient autofocus
-
-    Maximum likelihood estimator.
 
     Parameters
     ----------
@@ -155,12 +105,11 @@ def pga_ml(
     offload : bool
         Offload some variable to CPU to save VRAM on GPU at
         the expense of longer running time.
-
-    References
-    ----------
-    .. [#] Charles V. Jakowatz and Daniel E. Wahl, "Eigenvector method for
-    maximum-likelihood estimation of phase errors in synthetic-aperture-radar
-    imagery," J. Opt. Soc. Am. A 10, 2539-2546 (1993).
+    estimator : str
+        Estimator to use.
+        See `pga_estimator` function for possible choices.
+    eps : float
+        Minimum weight for weighted PGA.
 
     Returns
     ----------
@@ -197,13 +146,12 @@ def pga_ml(
         g[:, 1 + window // 2 : 1 - window // 2] = 0
         # IFFT across theta
         g = torch.fft.fft(g, axis=-1)
-        u, s, v = torch.linalg.svd(g)
-        phi = torch.angle(v[0, :])
+        phi = pga_estimator(g, estimator, eps)
+        del g
         if remove_trend:
             phi = detrend(unwrap(phi))
         phi_sum += phi
 
-        del g
         if offload:
             img = img.to(device=dev)
         img_ifft = torch.fft.fft(img, axis=-1)
@@ -211,93 +159,6 @@ def pga_ml(
         img = torch.fft.ifft(img_ifft, axis=-1)
 
     return img, phi_sum
-
-
-def gpga_2d_iter(
-    target_pos: Tensor,
-    data: Tensor,
-    pos: Tensor,
-    fc: float,
-    r_res: float,
-    window_width: int | None = None,
-    d0: float = 0.0,
-    estimator: str = "ml",
-    lowpass_window: str="boxcar",
-    eps: float =1e-2
-) -> Tensor:
-    """
-    Single generalized phase gradient iteration.
-
-    Parameters
-    ----------
-    target_pos : Tensor
-        Positions of point-like targets to use to focus the image.
-        3D Cartesian coordinates (x, y, z). Dimensions: [ntargets, 3].
-    data : Tensor
-        Range compressed input data. Shape should be [nsweeps, samples].
-    pos : Tensor
-        Position of the platform at each data point. Shape should be [nsweeps, 3].
-    fc : float
-        RF center frequency in Hz.
-    r_res : float
-        Range bin resolution in data (meters).
-        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
-        and oversample is FFT oversampling factor.
-    window_width : int or None
-        Low-pass filter window width in samples. None or more than nsweeps for
-        no low-pass filtering.
-    d0 : float
-        Zero range correction.
-    estimator : str
-        Estimator to use.
-        "ml": Maximum likelihood.
-        "pd": Phase difference.
-        "wpd": Weighted phase difference.
-    lowpass_window : str
-        FFT window to use for lowpass filtering.
-        See `scipy.get_window` for syntax.
-    eps : float
-        Minimum weight.
-
-    Returns
-    ----------
-    phi : Tensor
-        Solved phase error.
-    """
-    # Get range profile samples for each target
-    target_data = gpga_backprojection_2d_core(
-        target_pos, data, pos, fc, r_res, d0
-    )
-    # Filter samples
-    if window_width is not None and window_width < target_data.shape[1]:
-        target_data = fft_lowpass_filter_window(
-            target_data, window=lowpass_window, window_width=window_width
-        )
-    if estimator == "ml":
-        u, s, v = torch.linalg.svd(target_data)
-        phi = torch.angle(v[0, :])
-    elif estimator == "wpd":
-        g = target_data
-        z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
-        c = torch.mean(torch.abs(g), dim=1, keepdim=True)
-        d = torch.mean(torch.abs(g)**2, dim=1, keepdim=True)
-        w = torch.nan_to_num(d / (4*(2*c**2 - d) - 4*c*torch.sqrt(4*c**2 - 3*d)))
-        w = w / (torch.max(w) + 1e-6) + eps
-        g = w * g
-        gdot = torch.diff(g, prepend=z, axis=-1)
-        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
-            torch.abs(g) ** 2, axis=0
-        )
-        phi = torch.cumsum(phidot, dim=0)
-    elif estimator == "pd":
-        g = target_data
-        z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
-        gdot = torch.diff(g, prepend=z, axis=-1)
-        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
-            torch.abs(g) ** 2, axis=0
-        )
-        phi = torch.cumsum(phidot, dim=0)
-    return phi
 
 
 def gpga_bp_polar(
@@ -316,6 +177,7 @@ def gpga_bp_polar(
     remove_trend: bool = True,
     estimator: str = "pd",
     lowpass_window: str = "boxcar",
+    eps: float = 1e-3,
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
@@ -366,6 +228,8 @@ def gpga_bp_polar(
     lowpass_window : str
         FFT window to use for lowpass filtering.
         See `scipy.get_window` for syntax.
+    eps : float
+        Minimum weight for weighted PGA.
 
     References
     ----------
@@ -390,7 +254,9 @@ def gpga_bp_polar(
     phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
 
     r = r0 + dr * torch.arange(nr, device=data.device, dtype=torch.float32)
-    theta = theta0 + dtheta * torch.arange(ntheta, device=data.device, dtype=torch.float32)
+    theta = theta0 + dtheta * torch.arange(
+        ntheta, device=data.device, dtype=torch.float32
+    )
     pos_new = pos.clone()
 
     if window_width is None:
@@ -413,22 +279,22 @@ def gpga_bp_polar(
         z = torch.zeros_like(target_r)
         target_pos = torch.stack([x, y, z], dim=1)
 
-        phi = gpga_2d_iter(
-            target_pos,
-            data,
-            pos_new,
-            fc,
-            r_res,
-            window_width,
-            d0,
-            estimator=estimator,
-            lowpass_window=lowpass_window,
+        # Get range profile samples for each target
+        target_data = gpga_backprojection_2d_core(
+            target_pos, data, pos_new, fc, r_res, d0
         )
+        # Filter samples
+        if window_width is not None and window_width < target_data.shape[1]:
+            target_data = fft_lowpass_filter_window(
+                target_data, window=lowpass_window, window_width=window_width
+            )
+        phi = pga_estimator(target_data, estimator, eps)
         phi_sum = unwrap(phi_sum + phi)
         if remove_trend:
             phi_sum = detrend(phi_sum)
         # Phase to distance
-        d = phi_sum * 3e8 / (4 * torch.pi * fc)
+        c0 = 299792458
+        d = phi_sum * c0 / (4 * torch.pi * fc)
         d = d - torch.mean(d)
         pos_new[:, 0] = pos[:, 0] + d
 
