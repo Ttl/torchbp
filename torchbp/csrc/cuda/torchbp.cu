@@ -774,9 +774,9 @@ __global__ void cfar_2d_kernel(
     if (peaks_only) {
         float v = img[idbatch * N0 * N1 + idy * N1 + idx];
         float v00 = img[idbatch * N0 * N1 + idy * N1 + max(0, idx - 1)];
-        float v01 = img[idbatch * N0 * N1 + idy * N1 + min(N1, idx + 1)];
+        float v01 = img[idbatch * N0 * N1 + idy * N1 + min(N1-1, idx + 1)];
         float v10 = img[idbatch * N0 * N1 + max(0, idy - 1) * N1 + idx];
-        float v11 = img[idbatch * N0 * N1 + min(N0, idy + 1) * N1 + idx];
+        float v11 = img[idbatch * N0 * N1 + min(N0-1, idy + 1) * N1 + idx];
         if (v < v00 || v < v01 || v < v10 || v < v11) {
             detections[idbatch * N0 * N1 + idy * N1 + idx] = 0.0f;
             return;
