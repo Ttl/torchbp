@@ -59,8 +59,8 @@ def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3) -> Tenso
             d / (4 * (2 * c**2 - d) - 4 * c * torch.sqrt(4 * c**2 - 3 * d))
         )
         w = w / (torch.max(w) + 1e-6) + eps
-        gshift = torch.nn.functional.pad(g[..., 1:], (0, 1))
-        phidot = torch.angle(torch.sum(w * (torch.conj(g) * gshift), axis=0))
+        gshift = torch.nn.functional.pad(g[..., :-1], (1, 0))
+        phidot = torch.angle(torch.sum(w * (g * torch.conj(gshift)), axis=0))
         phi = torch.cumsum(phidot, dim=0)
     elif estimator == "pd":
         z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
@@ -222,9 +222,7 @@ def gpga_bp_polar(
         Remove linear trend in phase correction.
     estimator : str
         Estimator to use.
-        "ml": Maximum likelihood.
-        "pd": Phase difference.
-        "wpd": Weighted phase difference.
+        See `pga_estimator` function for possible choices.
     lowpass_window : str
         FFT window to use for lowpass filtering.
         See `scipy.get_window` for syntax.
