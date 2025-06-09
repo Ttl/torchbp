@@ -960,6 +960,7 @@ def gpga_backprojection_2d_core(
     fc: float,
     r_res: float,
     d0: float = 0.0,
+    interp_method: str="linear"
 ) -> Tensor:
     """
     Generalized phase gradient autofocus.
@@ -981,6 +982,10 @@ def gpga_backprojection_2d_core(
         and oversample is FFT oversampling factor.
     d0 : float
         Zero range correction.
+    interp_method : str
+        Interpolation method
+        "linear": linear interpolation.
+        ("lanczos", N): Lanczos interpolation with order 2*N+1.
 
     Returns
     ----------
@@ -994,17 +999,39 @@ def gpga_backprojection_2d_core(
     assert target_pos.shape == (ntargets, 3)
     assert pos.shape == (nsweeps, 3)
 
-    return torch.ops.torchbp.gpga_backprojection_2d.default(
-        target_pos,
-        data,
-        pos,
-        sweep_samples,
-        nsweeps,
-        fc,
-        r_res,
-        ntargets,
-        d0
-    )
+    if type(interp_method) in (list, tuple):
+        method_params = interp_method[1]
+        interp_method = interp_method[0]
+    else:
+        method_params = None
+
+    if interp_method == "linear":
+        return torch.ops.torchbp.gpga_backprojection_2d.default(
+            target_pos,
+            data,
+            pos,
+            sweep_samples,
+            nsweeps,
+            fc,
+            r_res,
+            ntargets,
+            d0
+        )
+    elif interp_method == "lanczos":
+        return torch.ops.torchbp.gpga_backprojection_2d_lanczos.default(
+            target_pos,
+            data,
+            pos,
+            sweep_samples,
+            nsweeps,
+            fc,
+            r_res,
+            ntargets,
+            d0,
+            method_params
+        )
+    else:
+        raise ValueError(f"Unknown interp_method f{interp_method}")
 
 
 def cfar_2d(

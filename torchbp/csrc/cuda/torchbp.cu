@@ -250,33 +250,40 @@ static __device__ float lanczos_kernel(float x, int a) {
     return sinpif(x) / (kPI * x) * sinpif(x/a) / (kPI * x / a);
 }
 
-template<class T>
-static __device__ T lanczos_interp_1d(const T *img, int n, float pos, int a) {
+template<class T, class T2>
+static __device__ T lanczos_interp_1d(const T2 *img, int n, float pos, int a) {
     int start = max(0, (int)ceilf(pos - a));
     int end = min(n-1, (int)floorf(pos + a));
     T sum{};
     for (int i = start; i <= end; i++) {
         float dx = pos - i;
         float w = lanczos_kernel(dx, a);
-        T val = img[i];
+        T val;
+        if constexpr (::cuda::std::is_same_v<T2, complex32_t> || ::cuda::std::is_same_v<T2, half2>) {
+            half2 val_h = ((half2*)img)[i];
+            val = {__half2float(val_h.x), __half2float(val_h.y)};
+        } else {
+            val = ((T*)img)[i];
+        }
         sum += w * val;
     }
     return sum;
 }
 
-template<class T>
-static __device__ T lanczos_interp_2d(const T *img, int nx, int ny, float x, float y, int a) {
+template<class T, class T2>
+static __device__ T lanczos_interp_2d(const T2 *img, int nx, int ny, float x, float y, int a) {
     int start_x = max(0, (int)ceilf(x - a));
     int end_x = min(nx-1, (int)floorf(x + a));
     T sum{};
     for (int i = start_x; i <= end_x; i++) {
         float dx = x - i;
         float wx = lanczos_kernel(dx, a);
-        T row_val = lanczos_interp_1d<T>(img + i * ny, ny, y, a);
+        T row_val = lanczos_interp_1d<T, T2>(img + i * ny, ny, y, a);
         sum += wx * row_val;
     }
     return sum;
 }
+
 template<typename T>
 __global__ void abs_sum_kernel(
           const T *data,
@@ -669,7 +676,7 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
             continue;
         }
 
-        complex64_t s = lanczos_interp_1d<complex64_t>(
+        complex64_t s = lanczos_interp_1d<complex64_t, T>(
                 &data[idbatch * sweep_samples * nsweeps + i * sweep_samples],
                 sweep_samples, sx, order);
 
@@ -750,6 +757,62 @@ __global__ void gpga_backprojection_2d_kernel(
         data_out[idtarget * nsweeps + idsweep] = s * ref;
     }
 }
+
+template<typename T>
+__global__ void gpga_backprojection_2d_lanczos_kernel(
+          const float* target_pos,
+          const T* data,
+          const float* pos,
+          complex64_t* data_out,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          int Ntarget,
+          float d0,
+          int order) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idsweep = idx % nsweeps;
+    const int idtarget = idx / nsweeps;
+
+    if (idtarget >= Ntarget || idsweep >= nsweeps) {
+        return;
+    }
+
+    const float x = target_pos[idtarget * 3 + 0];
+    const float y = target_pos[idtarget * 3 + 1];
+    const float z = target_pos[idtarget * 3 + 2];
+
+    // Sweep reference position.
+    float pos_x = pos[idsweep * 3 + 0];
+    float pos_y = pos[idsweep * 3 + 1];
+    float pos_z = pos[idsweep * 3 + 2];
+    float px = (x - pos_x);
+    float py = (y - pos_y);
+    float pz = (z - pos_z);
+
+    // Calculate distance to the pixel.
+    const float d = sqrtf(px * px + py * py + pz * pz) + d0;
+
+    float sx = delta_r * d;
+
+    // Linear interpolation.
+    int id0 = sx;
+    int id1 = id0 + 1;
+    if (id0 < 0 || id1 >= sweep_samples) {
+        data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
+    } else {
+        complex64_t s = lanczos_interp_1d<complex64_t, T>(
+                &data[idsweep * sweep_samples],
+                sweep_samples, sx, order);
+
+        float ref_sin, ref_cos;
+        sincospif(ref_phase * d, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        data_out[idtarget * nsweeps + idsweep] = s * ref;
+    }
+}
+
 
 __global__ void cfar_2d_kernel(
           const float* img,
@@ -1541,7 +1604,7 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
           double z0,
           int64_t order) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(data.dtype() == at::kComplexFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 
@@ -1566,20 +1629,40 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
-    backprojection_polar_2d_lanczos_kernel<complex64_t>
-          <<<block_count, thread_per_block>>>(
-                  (complex64_t*)data_ptr,
-                  pos_ptr,
-                  (complex64_t*)img_ptr,
-                  sweep_samples,
-                  nsweeps,
-                  ref_phase,
-                  delta_r,
-                  r0, dr,
-                  theta0, dtheta,
-                  Nr, Ntheta,
-                  d0,
-                  dealias, z0, order);
+	if (data.dtype() == at::kComplexFloat) {
+        const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+        backprojection_polar_2d_lanczos_kernel<complex64_t>
+              <<<block_count, thread_per_block>>>(
+                      (complex64_t*)data_ptr,
+                      pos_ptr,
+                      (complex64_t*)img_ptr,
+                      sweep_samples,
+                      nsweeps,
+                      ref_phase,
+                      delta_r,
+                      r0, dr,
+                      theta0, dtheta,
+                      Nr, Ntheta,
+                      d0,
+                      dealias, z0, order);
+    } else if (data.dtype() == at::kComplexHalf) {
+        const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
+        backprojection_polar_2d_lanczos_kernel<half2>
+              <<<block_count, thread_per_block>>>(
+                      (half2*)data_ptr,
+                      pos_ptr,
+                      (complex64_t*)img_ptr,
+                      sweep_samples,
+                      nsweeps,
+                      ref_phase,
+                      delta_r,
+                      r0, dr,
+                      theta0, dtheta,
+                      Nr, Ntheta,
+                      d0,
+                      dealias, z0, order);
+    }
+
 	return img;
 }
 
@@ -1650,6 +1733,80 @@ at::Tensor gpga_backprojection_2d_cuda(
                       delta_r,
                       Ntarget,
                       d0);
+    }
+	return data_out;
+}
+
+at::Tensor gpga_backprojection_2d_lanczos_cuda(
+          const at::Tensor &target_pos,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          int64_t Ntarget,
+          double d0,
+          int64_t order) {
+	TORCH_CHECK(target_pos.dtype() == at::kFloat);
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
+	TORCH_INTERNAL_ASSERT(target_pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
+
+	at::Tensor target_pos_contig = target_pos.contiguous();
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor data_contig = data.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+	at::Tensor data_out = torch::zeros({Ntarget, nsweeps}, options);
+	const float* target_pos_ptr = target_pos_contig.data_ptr<float>();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+    c10::complex<float>* data_out_ptr = data_out.data_ptr<c10::complex<float>>();
+
+	const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+
+	dim3 thread_per_block = {256};
+	// Up-rounding division.
+    int blocks = Ntarget * nsweeps;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x};
+
+	if (data.dtype() == at::kComplexFloat) {
+        const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+        gpga_backprojection_2d_lanczos_kernel<complex64_t>
+              <<<block_count, thread_per_block>>>(
+                      target_pos_ptr,
+                      (complex64_t*)data_ptr,
+                      pos_ptr,
+                      (complex64_t*)data_out_ptr,
+                      sweep_samples,
+                      nsweeps,
+                      ref_phase,
+                      delta_r,
+                      Ntarget,
+                      d0,
+                      order);
+    } else if (data.dtype() == at::kComplexHalf) {
+        const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
+        gpga_backprojection_2d_lanczos_kernel<half2>
+              <<<block_count, thread_per_block>>>(
+                      target_pos_ptr,
+                      (half2*)data_ptr,
+                      pos_ptr,
+                      (complex64_t*)data_out_ptr,
+                      sweep_samples,
+                      nsweeps,
+                      ref_phase,
+                      delta_r,
+                      Ntarget,
+                      d0,
+                      order);
     }
 	return data_out;
 }
@@ -2226,7 +2383,7 @@ __global__ void polar_interp_kernel_lanczos(const complex64_t *img,
     const float dti = (tp - theta0) / dtheta;
 
     if (dri >= 0 && dri < Nr-1 && dti >= 0 && dti < Ntheta-1) {
-        complex64_t v = lanczos_interp_2d<complex64_t>(
+        complex64_t v = lanczos_interp_2d<complex64_t, complex64_t>(
                 &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
         float ref_sin, ref_cos;
         const float z0 = z1 + dorigin[idbatch * 3 + 2];
@@ -3351,6 +3508,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_cart_2d", &backprojection_cart_2d_cuda);
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cuda);
   m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cuda);
+  m.impl("gpga_backprojection_2d_lanczos", &gpga_backprojection_2d_lanczos_cuda);
   m.impl("cfar_2d", &cfar_2d_cuda);
   m.impl("polar_interp_linear", &polar_interp_linear_cuda);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cuda);

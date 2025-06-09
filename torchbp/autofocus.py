@@ -178,6 +178,7 @@ def gpga_bp_polar(
     estimator: str = "pd",
     lowpass_window: str = "boxcar",
     eps: float = 1e-3,
+    interp_method: str="linear"
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
@@ -228,6 +229,10 @@ def gpga_bp_polar(
         See `scipy.get_window` for syntax.
     eps : float
         Minimum weight for weighted PGA.
+    interp_method : str
+        Interpolation method
+        "linear": linear interpolation.
+        ("lanczos", N): Lanczos interpolation with order 2*N+1.
 
     References
     ----------
@@ -279,7 +284,7 @@ def gpga_bp_polar(
 
         # Get range profile samples for each target
         target_data = gpga_backprojection_2d_core(
-            target_pos, data, pos_new, fc, r_res, d0
+            target_pos, data, pos_new, fc, r_res, d0, interp_method=interp_method
         )
         # Filter samples
         if window_width is not None and window_width < target_data.shape[1]:
