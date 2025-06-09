@@ -1628,7 +1628,6 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
-    const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         backprojection_polar_2d_lanczos_kernel<complex64_t>
