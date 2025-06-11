@@ -12,7 +12,7 @@ import inspect
 from scipy import signal
 
 
-def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3) -> Tensor:
+def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3, return_weight: bool=False) -> Tensor:
     """
     Estimate phase error from set of measurements.
 
@@ -27,7 +27,6 @@ def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3) -> Tenso
         "wls": Weighted least squares using estimated signal-to-clutter weighting. [3]_
     eps : float
         Minimum weight for weighted PGA.
-        Normalized to the maximum weight.
 
     References
     ----------
@@ -56,12 +55,13 @@ def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3) -> Tenso
         c = torch.mean(torch.abs(g), dim=1, keepdim=True)
         d = torch.mean(torch.abs(g) ** 2, dim=1, keepdim=True)
         w = torch.nan_to_num(
-            d / (4 * (2 * c**2 - d) - 4 * c * torch.sqrt(4 * c**2 - 3 * d))
-        )
-        w = w / (torch.max(w) + 1e-6) + eps
+            d / (2 * (2 * c**2 - d) - 2 * c * torch.sqrt(4 * c**2 - 3 * d))
+        ) + eps
         gshift = torch.nn.functional.pad(g[..., :-1], (1, 0))
-        phidot = torch.angle(torch.sum(w * (g * torch.conj(gshift)), axis=0))
+        phidot = torch.angle(torch.sum((w / torch.max(w)) * (g * torch.conj(gshift)), axis=0))
         phi = torch.cumsum(phidot, dim=0)
+        if return_weight:
+            return phi, w
     elif estimator == "pd":
         z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
         gdot = torch.diff(g, prepend=z, axis=-1)
@@ -256,7 +256,6 @@ def gpga_bp_polar(
 
     phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
 
-    r = r0 + dr * torch.arange(nr, device=data.device, dtype=torch.float32)
     theta = theta0 + dtheta * torch.arange(
         ntheta, device=data.device, dtype=torch.float32
     )
@@ -275,7 +274,7 @@ def gpga_bp_polar(
 
         target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
         target_theta = theta0 + dtheta * rpeaks[target_idx].to(torch.float32)
-        target_r = r[target_idx]
+        target_r = r0 + dr * target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
 
         x = target_r * torch.sqrt(1 - target_theta**2)
         y = target_r * target_theta
@@ -298,7 +297,6 @@ def gpga_bp_polar(
         # Phase to distance
         c0 = 299792458
         d = phi_sum * c0 / (4 * torch.pi * fc)
-        d = d - torch.mean(d)
         pos_new[:, 0] = pos[:, 0] + d
 
         img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[0]
@@ -306,6 +304,206 @@ def gpga_bp_polar(
         if window_width < min_window:
             break
     return img, phi_sum
+
+
+def gpga_bp_polar_tde(
+    img: Tensor | None,
+    data: Tensor,
+    pos: Tensor,
+    fc: float,
+    r_res: float,
+    grid_polar: dict,
+    azimuth_divisions: int,
+    range_divisions: int,
+    window_width: int | None = None,
+    max_iters: int = 20,
+    window_exp: float = 0.9,
+    min_window: int = 5,
+    d0: float = 0.0,
+    target_threshold_db: float = 20,
+    remove_trend: bool = True,
+    lowpass_window: str = "boxcar",
+    eps: float = 1e-3,
+    interp_method: str = "linear",
+    estimate_z: bool = True
+) -> (Tensor, Tensor):
+    """
+    Generalized phase gradient autofocus using 2D polar coordinate
+    backprojection image formation.
+
+    Estimates 3D position error by dividing the image into subimages, estimating
+    slant range error to each subimage, and then solving for 3D position error
+    from slant range errors.
+
+    Z-axis estimation requires variable look angles in the image. Set
+    `estimate_z` to False if this is not the case, for example ground based
+    radar.
+
+    Parameters
+    ----------
+    img : Tensor or None
+        Complex input image. Shape should be: [Range, azimuth].
+        If None image is generated from the data.
+    data : Tensor
+        Range compressed input data. Shape should be [nsweeps, samples].
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3].
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
+        and oversample is FFT oversampling factor.
+    grid_polar : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    azimuth_divisions : int
+        Number of divisions for local images in azimuth direction.
+    range_divisions : int
+        Number of divisions for local images in range direction.
+    window_width : int or None
+        Initial low-pass filter window width in samples. None for initial
+        maximum size.
+    max_iters : int
+        Maximum number of iterations.
+    window_exp : float
+        Exponent on window_width decrease for each iteration.
+    min_window : int
+        Minimum window size.
+    d0 : float
+        Zero range correction.
+    target_threshold_db : float
+        Filter out targets that are this many dB below the maximum amplitude
+        target.
+    remove_trend : bool
+        Remove linear trend in phase correction.
+    lowpass_window : str
+        FFT window to use for lowpass filtering.
+        See `scipy.get_window` for syntax.
+    eps : float
+        Minimum weight for weighted PGA.
+    interp_method : str
+        Interpolation method
+        "linear": linear interpolation.
+        ("lanczos", N): Lanczos interpolation with order 2*N+1.
+    estimate_z : bool
+        Estimate Z-axis position error. Default is True.
+
+    References
+    ----------
+    .. [#] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
+    Algorithm," in IEEE Transactions on Computational Imaging, vol. 5, no. 4,
+    pp. 606-619, Dec. 2019.
+
+    Returns
+    ----------
+    img : Tensor
+        Focused SAR image.
+    pos_new : Tensor
+        Solved 3D position error.
+    """
+    r0, r1 = grid_polar["r"]
+    theta0, theta1 = grid_polar["theta"]
+    ntheta = grid_polar["ntheta"]
+    nr = grid_polar["nr"]
+    dtheta = (theta1 - theta0) / ntheta
+    dr = (r1 - r0) / nr
+
+    r = r0 + dr * torch.arange(nr, device=data.device, dtype=torch.float32)
+    theta = theta0 + dtheta * torch.arange(
+        ntheta, device=data.device, dtype=torch.float32
+    )
+    pos_new = pos.clone()
+
+    if window_width is None:
+        window_width = data.shape[0] // azimuth_divisions
+
+    if img is None:
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)[0]
+
+    rdiv = img.shape[0] // range_divisions
+    azdiv = img.shape[1] // azimuth_divisions
+
+    local_d = torch.zeros((range_divisions * azimuth_divisions, data.shape[0]),
+            dtype=torch.float32, device=data.device)
+    local_centers = torch.zeros((range_divisions * azimuth_divisions, 2),
+            dtype=torch.float32, device=data.device)
+    local_w = torch.zeros((range_divisions * azimuth_divisions, 1),
+            dtype=torch.float32, device=data.device)
+    h = torch.mean(pos[:, 2])
+
+    if h == 0:
+        estimate_z = False
+
+    for i in range(max_iters):
+        for ir in range(range_divisions):
+            for jr in range(azimuth_divisions):
+                ir1 = (ir+1)*rdiv if ir < range_divisions-1 else -1
+                jr1 = (jr+1)*azdiv if jr < azimuth_divisions-1 else -1
+                local_img = img[ir*rdiv:ir1,jr*azdiv:jr1]
+
+                rpeaks = torch.argmax(torch.abs(local_img), axis=1)
+                a = torch.abs(local_img[torch.arange(local_img.size(0)), rpeaks])
+                max_a = torch.max(a)
+
+                target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
+                target_theta = theta0 + dtheta * jr * azdiv + dtheta * rpeaks[target_idx].to(torch.float32)
+                target_r = r0 + dr * ir * rdiv + dr * target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
+
+                x = target_r * torch.sqrt(1 - target_theta**2)
+                y = target_r * target_theta
+                z = torch.zeros_like(target_r)
+                target_pos = torch.stack([x, y, z], dim=1)
+
+                # Get range profile samples for each target
+                target_data = gpga_backprojection_2d_core(
+                    target_pos, data, pos_new, fc, r_res, d0, interp_method=interp_method
+                )
+                # Filter samples
+                if window_width is not None and window_width < target_data.shape[1]:
+                    target_data = fft_lowpass_filter_window(
+                        target_data, window=lowpass_window, window_width=window_width
+                    )
+                phi, w = pga_estimator(target_data, "wls", eps, return_weight=True)
+                local_w[ir*azimuth_divisions + jr] = 1 / torch.sum(1 / w)
+                phi = unwrap(phi)
+                phi = detrend(phi)
+                # Phase to distance
+                c0 = 299792458
+                d = phi * c0 / (4 * torch.pi * fc)
+                local_d[ir*azimuth_divisions + jr, :] = d
+
+                local_centers[ir*azimuth_divisions + jr, 0] = torch.mean(w*target_r) / torch.mean(w)
+                local_centers[ir*azimuth_divisions + jr, 1] = torch.mean(w*target_theta) / torch.mean(w)
+
+        target_el = torch.arctan(h / local_centers[:,0])
+        sin_az = local_centers[:,1]
+        cos_az = torch.sqrt(1 - sin_az**2)
+        cos_el = torch.cos(target_el)
+        sin_el = torch.sin(target_el)
+        if estimate_z:
+            m = torch.stack([cos_az * cos_el, sin_az * cos_el, -sin_el], dim=-1)
+        else:
+            m = torch.stack([cos_az * cos_el, sin_az * cos_el], dim=-1)
+
+        w = torch.sqrt(local_w)
+        w = w / torch.max(w)
+        d_solved = (torch.linalg.lstsq(w * m, w * local_d).solution)
+        if remove_trend:
+            d_solved[0] = detrend(d_solved[0])
+        pos_new[:, 0] = pos_new[:, 0] + d_solved[0]
+        pos_new[:, 1] = pos_new[:, 1] + d_solved[1]
+        if estimate_z:
+            pos_new[:, 2] = pos_new[:, 2] + d_solved[2]
+
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[0]
+        window_width = int(window_width**window_exp)
+        if window_width < min_window:
+            break
+    return img, pos_new
 
 
 def _get_kwargs() -> dict:

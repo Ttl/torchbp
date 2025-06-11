@@ -227,7 +227,7 @@ if __name__ == "__main__":
             origin = torch.tensor([torch.mean(pos[:,0]), torch.mean(pos[:,1]), 0],
                     device=dev, dtype=torch.float32)[None,:]
             pos_centered = pos - origin
-            sar_img, phi = torchbp.autofocus.gpga_ml_bp_polar(None, fsweeps,
+            sar_img, phi = torchbp.autofocus.gpga_bp_polar(None, fsweeps,
                     pos_centered, fc, r_res, grid_polar_autofocus,
                     window_width=nsweeps//8, d0=d0, target_threshold_db=20)
 

@@ -161,19 +161,20 @@ if __name__ == "__main__":
     origin = torch.tensor([torch.mean(pos[:,0]), torch.mean(pos[:,1]), 0],
             device=dev, dtype=torch.float32)[None,:]
     pos_centered = pos - origin
-    sar_img, phi = torchbp.autofocus.gpga_ml_bp_polar(None, fsweeps,
-            pos_centered, fc, r_res, grid_polar_autofocus,
-            window_width=nsweeps, d0=d0, target_threshold_db=15)
 
-    d = torchbp.util.phase_to_distance(phi, fc)
-    d -= torch.mean(d)
+    sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
+            pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
+            azimuth_divisions=8, range_divisions=8)
 
     plt.figure()
-    plt.plot(d.cpu().numpy())
+    plt.plot((pos_new[:,0] - pos_centered[:,0]).cpu().numpy(), label="x")
+    plt.plot((pos_new[:,1] - pos_centered[:,1]).cpu().numpy(), label="y")
+    plt.plot((pos_new[:,2] - pos_centered[:,2]).cpu().numpy(), label="z")
     plt.xlabel("Sweep index")
     plt.ylabel("Solved position error (m)")
+    plt.legend(loc="best")
 
-    pos_centered[:,0] = pos_centered[:,0] + d
+    pos_centered = pos_new
 
     print("Focusing final image")
     torch.cuda.synchronize()
