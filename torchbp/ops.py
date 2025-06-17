@@ -5,7 +5,7 @@ from copy import deepcopy
 from .util import bp_polar_range_dealias, center_pos
 
 cart_2d_nargs = 15
-polar_2d_nargs = 16
+polar_2d_nargs = 25
 polar_interp_linear_args = 18
 polar_to_cart_linear_args = 17
 polar_to_cart_bicubic_args = 20
@@ -693,6 +693,12 @@ def backprojection_polar_2d(
     pos: Tensor,
     d0: float = 0.0,
     dealias: bool = False,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_az0: float = 0,
+    g_el0: float = 0,
+    g_az1: float = 0,
+    g_el1: float = 0,
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
@@ -726,6 +732,26 @@ def backprojection_polar_2d(
         If True removes the range spectrum aliasing. Equivalent to applying
         `torchbp.util.bp_polar_range_dealias` on the SAR image.
         Default is False.
+    att : Tensor
+        Antenna rotation tensor.
+        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
+        out data outside the antenna beam.
+    g : Tensor
+        Two-way antenna radiation pattern in spherical coordinates, shape:
+        [elevation, azimuth].
+        (0, 0) angle is at the beam center.
+    g_az0 : float
+        g azimuth axis starting value. Units in radians. -pi if
+        including data over the whole sphere.
+    g_el0 : float
+        g elevation axis starting value. Units in radians. -pi/2 if
+        including data over the whole sphere.
+    g_az1 : float
+        g azimuth axis end value. Units in radians. +pi if
+        including data over the whole sphere.
+    g_el1 : float
+        g elevation axis end value. Units in radians. +pi/2 if
+        including data over the whole sphere.
 
     Returns
     ----------
@@ -751,6 +777,20 @@ def backprojection_polar_2d(
         sweep_samples = data.shape[2]
         assert pos.shape == (nbatch, nsweeps, 3)
 
+    if att is None or g is None:
+        att = torch.zeros(1, dtype=torch.float32, device=data.device)
+        g = att
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
     z0 = 0
     if dealias:
         z0 = torch.mean(pos[:, 2])
@@ -758,6 +798,7 @@ def backprojection_polar_2d(
     return torch.ops.torchbp.backprojection_polar_2d.default(
         data,
         pos,
+        att,
         nbatch,
         sweep_samples,
         nsweeps,
@@ -772,6 +813,13 @@ def backprojection_polar_2d(
         d0,
         dealias,
         z0,
+        g,
+        g_az0,
+        g_el0,
+        g_daz,
+        g_del,
+        g_naz,
+        g_nel,
     )
 
 
@@ -784,6 +832,12 @@ def backprojection_polar_2d_lanczos(
     d0: float = 0.0,
     dealias: bool = False,
     order: int = 4,
+    att: Tensor | None = None,
+    g: Tensor = None,
+    g_az0: float = 0,
+    g_el0: float = 0,
+    g_az1: float = 0,
+    g_el1: float = 0,
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
@@ -820,6 +874,27 @@ def backprojection_polar_2d_lanczos(
         Default is False.
     order : int
         Lanczos interpolation order. The default is 4.
+    att : Tensor
+        Antenna rotation tensor.
+        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
+        out data outside the antenna beam.
+    g : Tensor
+        Two-way antenna radiation pattern in spherical coordinates, shape:
+        [elevation, azimuth].
+        (0, 0) angle is at the beam center.
+    g_az0 : float
+        g azimuth axis starting value. Units in radians. -pi if
+        including data over the whole sphere.
+    g_el0 : float
+        g elevation axis starting value. Units in radians. -pi/2 if
+        including data over the whole sphere.
+    g_az1 : float
+        g azimuth axis end value. Units in radians. +pi if
+        including data over the whole sphere.
+    g_el1 : float
+        g elevation axis end value. Units in radians. +pi/2 if
+        including data over the whole sphere.
+
 
     Returns
     ----------
@@ -845,6 +920,20 @@ def backprojection_polar_2d_lanczos(
         sweep_samples = data.shape[2]
         assert pos.shape == (nbatch, nsweeps, 3)
 
+    if att is None or g is None:
+        att = torch.zeros(1, dtype=torch.float32, device=data.device)
+        g = att
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
     z0 = 0
     if dealias:
         z0 = torch.mean(pos[:, 2])
@@ -852,6 +941,7 @@ def backprojection_polar_2d_lanczos(
     return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(
         data,
         pos,
+        att,
         nbatch,
         sweep_samples,
         nsweeps,
@@ -867,6 +957,13 @@ def backprojection_polar_2d_lanczos(
         dealias,
         z0,
         order,
+        g,
+        g_az0,
+        g_el0,
+        g_daz,
+        g_del,
+        g_naz,
+        g_nel,
     )
 
 
@@ -1231,6 +1328,8 @@ def ffbp(
     divisions: int = 2,
     d0: float = 0.0,
     interp_method: str | tuple = ("lanczos", 3),
+    oversample_r: float = 1,
+    oversample_theta: float = 1
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -1263,6 +1362,10 @@ def ffbp(
         Zero range correction.
     interp_method : str or tuple
         Interpolation method. See `polar_interp` function.
+    oversample_r : float
+        Internally oversample range by this amount to avoid aliasing.
+    oversample_theta : float
+        Internally oversample theta by this amount to avoid aliasing.
     """
     nsweeps = data.shape[0]
     device = data.device
@@ -1276,6 +1379,8 @@ def ffbp(
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
         data_local = data[d * n : (d + 1) * n]
         if stages > 1 and len(data_local) > 4 * divisions:
+            grid_local["nr"] = int(oversample_r * grid_local["nr"])
+            grid_local["ntheta"] = int(oversample_theta * grid_local["ntheta"])
             img = ffbp(
                 data_local,
                 grid_local,

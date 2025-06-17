@@ -401,6 +401,7 @@ template<typename T>
 __global__ void backprojection_polar_2d_kernel(
           const T* data,
           const float* pos,
+          const float* att,
           complex64_t* img,
           int sweep_samples,
           int nsweeps,
@@ -414,7 +415,15 @@ __global__ void backprojection_polar_2d_kernel(
           int Ntheta,
           float d0,
           bool dealias,
-          float z0) {
+          float z0,
+          const float *g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel) {
+
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
     const int idr = idx / Ntheta;
@@ -430,6 +439,7 @@ __global__ void backprojection_polar_2d_kernel(
     const float y = r * theta;
 
     complex64_t pixel = {0.0f, 0.0f};
+    float w_sum = 0.0f;
 
     for(int i = 0; i < nsweeps; i++) {
         // Sweep reference position.
@@ -467,7 +477,38 @@ __global__ void backprojection_polar_2d_kernel(
         float ref_sin, ref_cos;
         sincospif(ref_phase * d, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
-        pixel += s * ref;
+
+        if (g_naz > 0) {
+            const float look_angle = atan2f(pos_z, d);
+            const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+
+            const float el_idx = (el_deg - g_el0) / g_del;
+            const float az_idx = (az_deg - g_az0) / g_daz;
+
+            const int el_int = el_idx;
+            const int az_int = az_idx;
+            const float el_frac = el_idx - el_int;
+            const float az_frac = az_idx - az_int;
+
+            if (el_int < 0 || el_int+1 >= g_nel) {
+                continue;
+            }
+            if (az_int < 0 || az_int+1 >= g_naz) {
+                continue;
+            }
+            const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+
+            pixel += w * s * ref;
+            w_sum += w;
+        } else {
+            pixel += s * ref;
+        }
+    }
+    if (g_naz > 0) {
+        if (w_sum > 0.0f) {
+            pixel /= w_sum;
+        }
     }
     if (dealias) {
         const float d = sqrtf(x*x + y*y + z0*z0);
@@ -627,6 +668,7 @@ template<typename T>
 __global__ void backprojection_polar_2d_lanczos_kernel(
           const T* data,
           const float* pos,
+          const float* att,
           complex64_t* img,
           int sweep_samples,
           int nsweeps,
@@ -641,7 +683,14 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
           float d0,
           bool dealias,
           float z0,
-          int order) {
+          int order,
+          const float *g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
     const int idr = idx / Ntheta;
@@ -657,6 +706,7 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
     const float y = r * theta;
 
     complex64_t pixel = {0.0f, 0.0f};
+    float w_sum = 0.0f;
 
     for(int i = 0; i < nsweeps; i++) {
         // Sweep reference position.
@@ -684,6 +734,38 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
         sincospif(ref_phase * d, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
         pixel += s * ref;
+
+        if (g_naz > 0) {
+            const float look_angle = atan2f(pos_z, d);
+            const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+
+            const float el_idx = (el_deg - g_el0) / g_del;
+            const float az_idx = (az_deg - g_az0) / g_daz;
+
+            const int el_int = el_idx;
+            const int az_int = az_idx;
+            const float el_frac = el_idx - el_int;
+            const float az_frac = az_idx - az_int;
+
+            if (el_int < 0 || el_int+1 >= g_nel) {
+                continue;
+            }
+            if (az_int < 0 || az_int+1 >= g_naz) {
+                continue;
+            }
+            const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+
+            pixel += w * s * ref;
+            w_sum += w;
+        } else {
+            pixel += s * ref;
+        }
+    }
+    if (g_naz > 0) {
+        if (w_sum > 0.0f) {
+            pixel /= w_sum;
+        }
     }
     if (dealias) {
         const float d = sqrtf(x*x + y*y + z0*z0);
@@ -1315,6 +1397,7 @@ std::vector<at::Tensor> entropy_grad_cuda(
 at::Tensor backprojection_polar_2d_cuda(
           const at::Tensor &data,
           const at::Tensor &pos,
+          const at::Tensor &att,
           int64_t nbatch,
           int64_t sweep_samples,
           int64_t nsweeps,
@@ -1328,14 +1411,27 @@ at::Tensor backprojection_polar_2d_cuda(
           int64_t Ntheta,
           double d0,
           int64_t dealias,
-          double z0) {
+          double z0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 
 	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
+	at::Tensor g_contig = g.contiguous();
     auto options =
       torch::TensorOptions()
         .dtype(torch::kComplexFloat)
@@ -1343,6 +1439,8 @@ at::Tensor backprojection_polar_2d_cuda(
         .device(data.device());
 	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
 	const float delta_r = 1.0f / r_res;
@@ -1360,6 +1458,7 @@ at::Tensor backprojection_polar_2d_cuda(
               <<<block_count, thread_per_block>>>(
                       (complex64_t*)data_ptr,
                       pos_ptr,
+                      att_ptr,
                       (complex64_t*)img_ptr,
                       sweep_samples,
                       nsweeps,
@@ -1369,13 +1468,21 @@ at::Tensor backprojection_polar_2d_cuda(
                       theta0, dtheta,
                       Nr, Ntheta,
                       d0,
-                      dealias, z0);
+                      dealias, z0,
+                      g_ptr,
+                      g_az0,
+                      g_el0,
+                      g_daz,
+                      g_del,
+                      g_naz,
+                      g_nel);
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         backprojection_polar_2d_kernel<half2>
               <<<block_count, thread_per_block>>>(
                       (half2*)data_ptr,
                       pos_ptr,
+                      att_ptr,
                       (complex64_t*)img_ptr,
                       sweep_samples,
                       nsweeps,
@@ -1385,7 +1492,14 @@ at::Tensor backprojection_polar_2d_cuda(
                       theta0, dtheta,
                       Nr, Ntheta,
                       d0,
-                      dealias, z0);
+                      dealias, z0,
+                      g_ptr,
+                      g_az0,
+                      g_el0,
+                      g_daz,
+                      g_del,
+                      g_naz,
+                      g_nel);
     }
 	return img;
 }
@@ -1394,6 +1508,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
           const at::Tensor &grad,
           const at::Tensor &data,
           const at::Tensor &pos,
+          const at::Tensor &att,
           int64_t nbatch,
           int64_t sweep_samples,
           int64_t nsweeps,
@@ -1407,7 +1522,14 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
           int64_t Ntheta,
           double d0,
           int64_t dealias,
-          double z0) {
+          double z0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
@@ -1419,6 +1541,8 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
 	at::Tensor grad_contig = grad.contiguous();
 	const float* pos_ptr = pos_contig.data_ptr<float>();
 	const c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
+
+    //TODO: Handle antenna pattern
 
     const bool have_pos_grad = pos.requires_grad();
     const bool have_data_grad = data.requires_grad();
@@ -1588,6 +1712,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
 at::Tensor backprojection_polar_2d_lanczos_cuda(
           const at::Tensor &data,
           const at::Tensor &pos,
+          const at::Tensor &att,
           int64_t nbatch,
           int64_t sweep_samples,
           int64_t nsweeps,
@@ -1602,13 +1727,24 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
           double d0,
           int64_t dealias,
           double z0,
-          int64_t order) {
+          int64_t order,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 
 	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor g_contig = g.contiguous();
 	at::Tensor data_contig = data.contiguous();
     auto options =
       torch::TensorOptions()
@@ -1617,6 +1753,8 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
         .device(data.device());
 	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
 	const float delta_r = 1.0f / r_res;
@@ -1634,6 +1772,7 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
               <<<block_count, thread_per_block>>>(
                       (complex64_t*)data_ptr,
                       pos_ptr,
+                      att_ptr,
                       (complex64_t*)img_ptr,
                       sweep_samples,
                       nsweeps,
@@ -1643,13 +1782,21 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
                       theta0, dtheta,
                       Nr, Ntheta,
                       d0,
-                      dealias, z0, order);
+                      dealias, z0, order,
+                      g_ptr,
+                      g_az0,
+                      g_el0,
+                      g_daz,
+                      g_del,
+                      g_naz,
+                      g_nel);
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         backprojection_polar_2d_lanczos_kernel<half2>
               <<<block_count, thread_per_block>>>(
                       (half2*)data_ptr,
                       pos_ptr,
+                      att_ptr,
                       (complex64_t*)img_ptr,
                       sweep_samples,
                       nsweeps,
@@ -1659,7 +1806,14 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
                       theta0, dtheta,
                       Nr, Ntheta,
                       d0,
-                      dealias, z0, order);
+                      dealias, z0, order,
+                      g_ptr,
+                      g_az0,
+                      g_el0,
+                      g_daz,
+                      g_del,
+                      g_naz,
+                      g_nel);
     }
 
 	return img;

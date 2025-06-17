@@ -866,9 +866,9 @@ at::Tensor polar_to_cart_linear_cpu(
 
 // Defines the operators
 TORCH_LIBRARY(torchbp, m) {
-  m.def("backprojection_polar_2d(Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0) -> Tensor");
-  m.def("backprojection_polar_2d_grad(Tensor grad, Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0) -> Tensor[]");
-  m.def("backprojection_polar_2d_lanczos(Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0, int order) -> Tensor");
+  m.def("backprojection_polar_2d(Tensor data, Tensor pos, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel) -> Tensor");
+  m.def("backprojection_polar_2d_grad(Tensor grad, Tensor data, Tensor pos, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel) -> Tensor[]");
+  m.def("backprojection_polar_2d_lanczos(Tensor data, Tensor pos, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0, int order, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel) -> Tensor");
   m.def("backprojection_cart_2d(Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0) -> Tensor");
   m.def("backprojection_cart_2d_grad(Tensor grad, Tensor data, Tensor pos, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float x0, float dx, float y0, float dy, int Nx, int Ny, float beamwidth, float d0) -> Tensor[]");
   m.def("gpga_backprojection_2d(Tensor target_pos, Tensor data, Tensor pos, int sweep_samples, int nsweeps, float fc, float r_res, int Ntarget, float d0) -> Tensor");
@@ -890,8 +890,8 @@ TORCH_LIBRARY(torchbp, m) {
 }
 
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
-  m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
-  m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cpu);
+  //m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
+  //m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cpu);
   m.impl("polar_interp_linear", &polar_interp_linear_cpu);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cpu);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cpu);

@@ -83,8 +83,8 @@ if __name__ == "__main__":
     wl = c0 / fc
     spacing = d / wl / nsweeps
     # Critically spaced array would be 0.25 wavelengths apart
-    ntheta = int(1 + 2 * nsweeps * spacing * theta_limit / 0.25)
-    nr = int(2 * (x1 - x0) / res)
+    ntheta = int(1 + nsweeps * spacing * theta_limit / 0.25)
+    nr = int((x1 - x0) / res)
 
     az = att[:, 2]
     mean_az = np.angle(np.mean(np.exp(1j * az)))
@@ -181,7 +181,7 @@ if __name__ == "__main__":
     tstart = time.time()
     if ffbp:
         sar_img = torchbp.ops.ffbp(fsweeps, grid_polar, fc, r_res, pos_centered,
-                stages=5, divisions=2, d0=d0)
+                stages=5, divisions=2, d0=d0, oversample_r=2, oversample_theta=2)
     else:
         sar_img = torchbp.ops.backprojection_polar_2d(
             fsweeps, grid_polar, fc, r_res, pos_centered, d0)[0]
