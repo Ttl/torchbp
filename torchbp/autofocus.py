@@ -12,7 +12,9 @@ import inspect
 from scipy import signal
 
 
-def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3, return_weight: bool=False) -> Tensor:
+def pga_estimator(
+    g: Tensor, estimator: str = "wls", eps: float = 1e-6, return_weight: bool = False
+) -> Tensor:
     """
     Estimate phase error from set of measurements.
 
@@ -54,11 +56,16 @@ def pga_estimator(g: Tensor, estimator: str = "wls", eps: float = 1e-3, return_w
     elif estimator == "wls":
         c = torch.mean(torch.abs(g), dim=1, keepdim=True)
         d = torch.mean(torch.abs(g) ** 2, dim=1, keepdim=True)
-        w = torch.nan_to_num(
-            d / (2 * (2 * c**2 - d) - 2 * c * torch.sqrt(4 * c**2 - 3 * d))
-        ) + eps
+        w = (
+            torch.nan_to_num(
+                d / (2 * (2 * c**2 - d) - 2 * c * torch.sqrt(4 * c**2 - 3 * d))
+            )
+            + eps
+        )
         gshift = torch.nn.functional.pad(g[..., :-1], (1, 0))
-        phidot = torch.angle(torch.sum((w / torch.max(w)) * (g * torch.conj(gshift)), axis=0))
+        phidot = torch.angle(
+            torch.sum((w / torch.max(w)) * (g * torch.conj(gshift)), axis=0)
+        )
         phi = torch.cumsum(phidot, dim=0)
         if return_weight:
             return phi, w
@@ -83,7 +90,7 @@ def pga(
     remove_trend: bool = True,
     offload: bool = False,
     estimator: str = "wls",
-    eps=1e-2,
+    eps=1e-6,
 ) -> (Tensor, Tensor):
     """
     Phase gradient autofocus
@@ -177,8 +184,8 @@ def gpga_bp_polar(
     remove_trend: bool = True,
     estimator: str = "pd",
     lowpass_window: str = "boxcar",
-    eps: float = 1e-3,
-    interp_method: str="linear"
+    eps: float = 1e-6,
+    interp_method: str = "linear",
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
@@ -323,9 +330,9 @@ def gpga_bp_polar_tde(
     target_threshold_db: float = 20,
     remove_trend: bool = True,
     lowpass_window: str = "boxcar",
-    eps: float = 1e-3,
+    eps: float = 1e-6,
     interp_method: str = "linear",
-    estimate_z: bool = True
+    estimate_z: bool = True,
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
@@ -427,12 +434,21 @@ def gpga_bp_polar_tde(
     rdiv = img.shape[0] // range_divisions
     azdiv = img.shape[1] // azimuth_divisions
 
-    local_d = torch.zeros((range_divisions * azimuth_divisions, data.shape[0]),
-            dtype=torch.float32, device=data.device)
-    local_centers = torch.zeros((range_divisions * azimuth_divisions, 2),
-            dtype=torch.float32, device=data.device)
-    local_w = torch.zeros((range_divisions * azimuth_divisions, 1),
-            dtype=torch.float32, device=data.device)
+    local_d = torch.zeros(
+        (range_divisions * azimuth_divisions, data.shape[0]),
+        dtype=torch.float32,
+        device=data.device,
+    )
+    local_centers = torch.zeros(
+        (range_divisions * azimuth_divisions, 2),
+        dtype=torch.float32,
+        device=data.device,
+    )
+    local_w = torch.zeros(
+        (range_divisions * azimuth_divisions, 1),
+        dtype=torch.float32,
+        device=data.device,
+    )
     h = torch.mean(pos[:, 2])
 
     if h == 0:
@@ -441,17 +457,25 @@ def gpga_bp_polar_tde(
     for i in range(max_iters):
         for ir in range(range_divisions):
             for jr in range(azimuth_divisions):
-                ir1 = (ir+1)*rdiv if ir < range_divisions-1 else -1
-                jr1 = (jr+1)*azdiv if jr < azimuth_divisions-1 else -1
-                local_img = img[ir*rdiv:ir1,jr*azdiv:jr1]
+                ir1 = (ir + 1) * rdiv if ir < range_divisions - 1 else -1
+                jr1 = (jr + 1) * azdiv if jr < azimuth_divisions - 1 else -1
+                local_img = img[ir * rdiv : ir1, jr * azdiv : jr1]
 
                 rpeaks = torch.argmax(torch.abs(local_img), axis=1)
                 a = torch.abs(local_img[torch.arange(local_img.size(0)), rpeaks])
                 max_a = torch.max(a)
 
                 target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
-                target_theta = theta0 + dtheta * jr * azdiv + dtheta * rpeaks[target_idx].to(torch.float32)
-                target_r = r0 + dr * ir * rdiv + dr * target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
+                target_theta = (
+                    theta0
+                    + dtheta * jr * azdiv
+                    + dtheta * rpeaks[target_idx].to(torch.float32)
+                )
+                target_r = (
+                    r0
+                    + dr * ir * rdiv
+                    + dr * target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
+                )
 
                 x = target_r * torch.sqrt(1 - target_theta**2)
                 y = target_r * target_theta
@@ -460,7 +484,13 @@ def gpga_bp_polar_tde(
 
                 # Get range profile samples for each target
                 target_data = gpga_backprojection_2d_core(
-                    target_pos, data, pos_new, fc, r_res, d0, interp_method=interp_method
+                    target_pos,
+                    data,
+                    pos_new,
+                    fc,
+                    r_res,
+                    d0,
+                    interp_method=interp_method,
                 )
                 # Filter samples
                 if window_width is not None and window_width < target_data.shape[1]:
@@ -468,19 +498,23 @@ def gpga_bp_polar_tde(
                         target_data, window=lowpass_window, window_width=window_width
                     )
                 phi, w = pga_estimator(target_data, "wls", eps, return_weight=True)
-                local_w[ir*azimuth_divisions + jr] = 1 / torch.sum(1 / w)
+                local_w[ir * azimuth_divisions + jr] = 1 / torch.sum(1 / w)
                 phi = unwrap(phi)
                 phi = detrend(phi)
                 # Phase to distance
                 c0 = 299792458
                 d = phi * c0 / (4 * torch.pi * fc)
-                local_d[ir*azimuth_divisions + jr, :] = d
+                local_d[ir * azimuth_divisions + jr, :] = d
 
-                local_centers[ir*azimuth_divisions + jr, 0] = torch.mean(w*target_r) / torch.mean(w)
-                local_centers[ir*azimuth_divisions + jr, 1] = torch.mean(w*target_theta) / torch.mean(w)
+                local_centers[ir * azimuth_divisions + jr, 0] = torch.mean(
+                    w * target_r
+                ) / torch.mean(w)
+                local_centers[ir * azimuth_divisions + jr, 1] = torch.mean(
+                    w * target_theta
+                ) / torch.mean(w)
 
-        target_el = torch.arctan(h / local_centers[:,0])
-        sin_az = local_centers[:,1]
+        target_el = torch.arctan(h / local_centers[:, 0])
+        sin_az = local_centers[:, 1]
         cos_az = torch.sqrt(1 - sin_az**2)
         cos_el = torch.cos(target_el)
         sin_el = torch.sin(target_el)
@@ -491,7 +525,7 @@ def gpga_bp_polar_tde(
 
         w = torch.sqrt(local_w)
         w = w / torch.max(w)
-        d_solved = (torch.linalg.lstsq(w * m, w * local_d).solution)
+        d_solved = torch.linalg.lstsq(w * m, w * local_d).solution
         if remove_trend:
             d_solved[0] = detrend(d_solved[0])
         pos_new[:, 0] = pos_new[:, 0] + d_solved[0]
