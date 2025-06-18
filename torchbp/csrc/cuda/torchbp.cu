@@ -263,7 +263,7 @@ static __device__ T lanczos_interp_1d(const T2 *img, int n, float pos, int a) {
             half2 val_h = ((half2*)img)[i];
             val = {__half2float(val_h.x), __half2float(val_h.y)};
         } else {
-            val = ((T*)img)[i];
+            val = img[i];
         }
         sum += w * val;
     }
@@ -3353,6 +3353,151 @@ std::vector<at::Tensor> polar_to_cart_bicubic_grad_cuda(
 	return ret;
 }
 
+template<typename T>
+__global__ void polar_to_cart_kernel_lanczos(const T *img, T
+        *out, const float *origin, float rotation, float ref_phase, float r0,
+        float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
+        float dx, float y0, float dy, int Nx, int Ny, int order) {
+    const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idy = id1 % Ny;
+    const int idx = id1 / Ny;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (id1 >= Nx * Ny) {
+        return;
+    }
+
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
+    const float x = x0 + dx * idx;
+    const float y = y0 + dy * idy;
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    const float dz = sqrtf(d*d + orig2*orig2);
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
+    float rs = sinf(rotation);
+    float rc = cosf(rotation);
+    float cosa = t*rs  + tc*rc;
+    if (rotation != 0.0f) {
+        t = rc * t - rs * tc;
+    }
+    const float dri = (d - r0) / dr;
+    const float dti = (t - theta0) / dtheta;
+
+    const int dri_int = dri;
+    const float dri_frac = dri - dri_int;
+    const int dti_int = dti;
+    const float dti_frac = dti - dti_int;
+
+    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+        T v = lanczos_interp_2d<T, T>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
+        if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+            float ref_sin, ref_cos;
+            sincospif(ref_phase * dz, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            out[idbatch * Nx * Ny + idx*Ny + idy] = v * ref;
+        } else {
+            out[idbatch * Nx * Ny + idx*Ny + idy] = v;
+        }
+    } else {
+        if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+            out[idbatch * Nx * Ny + idx*Ny + idy] = {0.0f, 0.0f};
+        } else {
+            out[idbatch * Nx * Ny + idx*Ny + idy] = 0.0f;
+        }
+    }
+}
+
+at::Tensor polar_to_cart_lanczos_cuda(
+          const at::Tensor &img,
+          const at::Tensor &origin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double x0,
+          double y0,
+          double dx,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          int64_t order) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
+	at::Tensor origin_contig = origin.contiguous();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor out = torch::empty({nbatch, Nx, Ny}, img_contig.options());
+	const float* origin_ptr = origin_contig.data_ptr<float>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nx * Ny;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+	if (img.dtype() == at::kComplexFloat) {
+        c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+        c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+        polar_to_cart_kernel_lanczos<complex64_t>
+              <<<block_count, thread_per_block>>>(
+                      (const complex64_t*)img_ptr,
+                      (complex64_t*)out_ptr,
+                      origin_ptr,
+                      rotation,
+                      ref_phase,
+                      r0,
+                      dr,
+                      theta0,
+                      dtheta,
+                      Nr,
+                      Ntheta,
+                      x0,
+                      dx,
+                      y0,
+                      dy,
+                      Nx,
+                      Ny,
+                      order
+                      );
+    } else {
+        float* img_ptr = img_contig.data_ptr<float>();
+        float* out_ptr = out.data_ptr<float>();
+        polar_to_cart_kernel_lanczos<float>
+              <<<block_count, thread_per_block>>>(
+                      img_ptr,
+                      out_ptr,
+                      origin_ptr,
+                      rotation,
+                      ref_phase,
+                      r0,
+                      dr,
+                      theta0,
+                      dtheta,
+                      Nr,
+                      Ntheta,
+                      x0,
+                      dx,
+                      y0,
+                      dy,
+                      Nx,
+                      Ny,
+                      order
+                      );
+    }
+	return out;
+}
+
 at::Tensor polar_interp_linear_cuda(
           const at::Tensor &img,
           const at::Tensor &dorigin,
@@ -3663,6 +3808,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cuda);
   m.impl("polar_to_cart_bicubic", &polar_to_cart_bicubic_cuda);
   m.impl("polar_to_cart_bicubic_grad", &polar_to_cart_bicubic_grad_cuda);
+  m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cuda);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
   m.impl("entropy", &entropy_cuda);
   m.impl("entropy_grad", &entropy_grad_cuda);

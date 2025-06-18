@@ -427,6 +427,74 @@ def polar_interp_lanczos(
     )
 
 
+def polar_to_cart(
+    img: Tensor,
+    origin: Tensor,
+    grid_polar: dict,
+    grid_cart: dict,
+    fc: float,
+    rotation: float = 0,
+    method: str | tuple = "linear",
+) -> Tensor:
+    """
+    Interpolate polar radar image to cartesian grid.
+
+    The input image should be either generated with `dealias=True` or call
+    `torchbp.util.bp_polar_range_dealias` first.
+
+    Parameters
+    ----------
+    img : Tensor
+        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
+        [nbatch, range, angle] if interpolating multiple images at the same time.
+    origin : Tensor
+        3D antenna phase center of the old image in with respect to new image.
+        Units in meters [nbatch, 3] if img shape is 3D.
+    grid_polar : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    grid_cart : dict
+        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
+        "x": (x0, x1), tuple of min and max x-axis (range),
+        "y": (y0, y1), tuple of min and max y-axis (cross-range),
+        "nx": number of x-axis pixels.
+        "ny": number of y-axis pixels.
+    fc : float
+        RF center frequency in Hz.
+    rotation : float
+        Polar origin rotation angle.
+    method : str or tuple
+        Interpolation method. Valid choices are:
+        - "linear": Linear interpolation.
+        - "cubic": Cubic interpolation.
+        - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+    if type(method) in (list, tuple):
+        method_params = method[1]
+        method = method[0]
+    else:
+        method_params = None
+
+    if method == "linear":
+        return polar_to_cart_linear(img, origin, grid_polar, grid_cart, fc, rotation)
+    elif method == "cubic":
+        return polar_to_cart_bicubic(img, origin, grid_polar, grid_cart, fc, rotation)
+    elif method == "lanczos":
+        return polar_to_cart_lanczos(
+            img, origin, grid_polar, grid_cart, fc, rotation, order=method_params
+        )
+    else:
+        raise ValueError(f"Unknown interp_method: {interp_method}")
+
+
 def polar_to_cart_linear(
     img: Tensor,
     origin: Tensor,
@@ -510,7 +578,7 @@ def polar_to_cart_linear(
         dx,
         dy,
         nx,
-        ny
+        ny,
     )
 
 
@@ -570,15 +638,7 @@ def polar_to_cart_bicubic(
     img_gxy = torch.gradient(img_gx, dim=-1)[0]
 
     return _polar_to_cart_bicubic(
-        img,
-        img_gx,
-        img_gy,
-        img_gxy,
-        origin,
-        grid_polar,
-        grid_cart,
-        fc,
-        rotation
+        img, img_gx, img_gy, img_gxy, origin, grid_polar, grid_cart, fc, rotation
     )
 
 
@@ -681,7 +741,98 @@ def _polar_to_cart_bicubic(
         dx,
         dy,
         nx,
-        ny
+        ny,
+    )
+
+
+def polar_to_cart_lanczos(
+    img: Tensor,
+    origin: Tensor,
+    grid_polar: dict,
+    grid_cart: dict,
+    fc: float,
+    rotation: float = 0,
+    order: int = 2,
+) -> Tensor:
+    """
+    Interpolate polar radar image to cartesian grid with linear interpolation.
+
+    The input image should be either generated with `dealias=True` or call
+    `torchbp.util.bp_polar_range_dealias` first.
+
+    Parameters
+    ----------
+    img : Tensor
+        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
+        [nbatch, range, angle] if interpolating multiple images at the same time.
+    origin : Tensor
+        3D antenna phase center of the old image in with respect to new image.
+        Units in meters [nbatch, 3] if img shape is 3D.
+    grid_polar : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    grid_cart : dict
+        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
+        "x": (x0, x1), tuple of min and max x-axis (range),
+        "y": (y0, y1), tuple of min and max y-axis (cross-range),
+        "nx": number of x-axis pixels.
+        "ny": number of y-axis pixels.
+    fc : float
+        RF center frequency in Hz.
+    rotation : float
+        Polar origin rotation angle.
+    order : int
+        Lanczos interpolation order.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+
+    if img.dim() == 3:
+        nbatch = img.shape[0]
+        assert origin.shape == (nbatch, 3)
+    else:
+        nbatch = 1
+        assert origin.shape == (3,)
+
+    r0, r1 = grid_polar["r"]
+    theta0, theta1 = grid_polar["theta"]
+    ntheta = grid_polar["ntheta"]
+    nr = grid_polar["nr"]
+    dtheta = (theta1 - theta0) / ntheta
+    dr = (r1 - r0) / nr
+
+    x0, x1 = grid_cart["x"]
+    y0, y1 = grid_cart["y"]
+    nx = grid_cart["nx"]
+    ny = grid_cart["ny"]
+    dx = (x1 - x0) / nx
+    dy = (y1 - y0) / ny
+
+    return torch.ops.torchbp.polar_to_cart_lanczos.default(
+        img,
+        origin,
+        nbatch,
+        rotation,
+        fc,
+        r0,
+        dr,
+        theta0,
+        dtheta,
+        nr,
+        ntheta,
+        x0,
+        y0,
+        dx,
+        dy,
+        nx,
+        ny,
+        order,
     )
 
 
@@ -1046,7 +1197,7 @@ def backprojection_cart_2d(
         nx,
         ny,
         beamwidth,
-        d0
+        d0,
     )
 
 
@@ -1057,7 +1208,7 @@ def gpga_backprojection_2d_core(
     fc: float,
     r_res: float,
     d0: float = 0.0,
-    interp_method: str="linear"
+    interp_method: str = "linear",
 ) -> Tensor:
     """
     Generalized phase gradient autofocus.
@@ -1104,15 +1255,7 @@ def gpga_backprojection_2d_core(
 
     if interp_method == "linear":
         return torch.ops.torchbp.gpga_backprojection_2d.default(
-            target_pos,
-            data,
-            pos,
-            sweep_samples,
-            nsweeps,
-            fc,
-            r_res,
-            ntargets,
-            d0
+            target_pos, data, pos, sweep_samples, nsweeps, fc, r_res, ntargets, d0
         )
     elif interp_method == "lanczos":
         return torch.ops.torchbp.gpga_backprojection_2d_lanczos.default(
@@ -1125,7 +1268,7 @@ def gpga_backprojection_2d_core(
             r_res,
             ntargets,
             d0,
-            method_params
+            method_params,
         )
     else:
         raise ValueError(f"Unknown interp_method f{interp_method}")
@@ -1322,7 +1465,7 @@ def ffbp(
     d0: float = 0.0,
     interp_method: str | tuple = ("lanczos", 3),
     oversample_r: float = 1,
-    oversample_theta: float = 1
+    oversample_theta: float = 1,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -1386,13 +1529,7 @@ def ffbp(
             )
         else:
             img = backprojection_polar_2d(
-                data_local,
-                grid_local,
-                fc,
-                r_res,
-                pos_local,
-                d0=d0,
-                dealias=True
+                data_local, grid_local, fc, r_res, pos_local, d0=d0, dealias=True
             )[0]
         imgs.append((origin_local[0], grid_local, img, z0))
     while len(imgs) > 1:
