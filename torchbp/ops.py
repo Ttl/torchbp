@@ -737,8 +737,8 @@ def backprojection_polar_2d(
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
         out data outside the antenna beam.
     g : Tensor
-        Two-way antenna radiation pattern in spherical coordinates, shape:
-        [elevation, azimuth].
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
     g_az0 : float
         g azimuth axis starting value. Units in radians. -pi if
@@ -879,8 +879,8 @@ def backprojection_polar_2d_lanczos(
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
         out data outside the antenna beam.
     g : Tensor
-        Two-way antenna radiation pattern in spherical coordinates, shape:
-        [elevation, azimuth].
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
     g_az0 : float
         g azimuth axis starting value. Units in radians. -pi if
@@ -1204,8 +1204,7 @@ def cfar_2d(
 
 def backprojection_polar_2d_tx_power(
     wa: Tensor,
-    gtx: Tensor,
-    grx: Tensor,
+    g: Tensor,
     g_az0: float,
     g_el0: float,
     g_az1: float,
@@ -1217,21 +1216,17 @@ def backprojection_polar_2d_tx_power(
     sin_look_angle: bool = False,
 ) -> Tensor:
     """
-    Calculate transmitted power to image plane. Can be used to correct for
-    antenna pattern and distance effect on the radar image.
+    Calculate square root of transmitted power to image plane. Can be used to
+    correct for antenna pattern and distance effect on the radar image.
 
     Parameters
     ----------
     wa : Tensor
         Weighting coefficient for each pulse. Should include window function and
         transmit power variation if known, shape: [nsweeps] or [nbatch, nsweeps].
-    gtx : Tensor
-        Transmit antenna gain in spherical coordinates, shape: [elevation, azimuth].
-        Should have same dimensions as grx.
-        (0, 0) angle is at the beam center.
-    grx : Tensor
-        Receive antenna gain in spherical coordinates, shape: [elevation, azimuth].
-        Should have same dimensions as gtx.
+    g : Tensor
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
     g_az0 : float
         grx and gtx azimuth axis starting value. Units in radians. -pi if
@@ -1265,8 +1260,8 @@ def backprojection_polar_2d_tx_power(
 
     Returns
     ----------
-    img : Tensor
-        Pseudo-polar format radar image.
+    tx_power : Tensor
+        Pseudo-polar format image of square root of power hitting that pixel.
     """
 
     r0, r1 = grid["r"]
@@ -1287,9 +1282,8 @@ def backprojection_polar_2d_tx_power(
         assert pos.shape == (nbatch, nsweeps, 3)
         assert att.shape == (nbatch, nsweeps, 3)
 
-    g_nel = gtx.shape[0]
-    g_naz = gtx.shape[1]
-    assert gtx.shape == grx.shape == torch.Size([g_nel, g_naz])
+    g_nel = g.shape[0]
+    g_naz = g.shape[1]
     g_daz = (g_az1 - g_az0) / g_naz
     g_del = (g_el1 - g_el0) / g_nel
 
@@ -1297,8 +1291,7 @@ def backprojection_polar_2d_tx_power(
         wa,
         pos,
         att,
-        gtx,
-        grx,
+        g,
         nbatch,
         g_az0,
         g_el0,

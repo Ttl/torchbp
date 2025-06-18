@@ -954,8 +954,7 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
           const float* wa,
           const float* pos,
           const float* att,
-          const float* gtx,
-          const float* grx,
+          const float* g,
           float g_az0,
           float g_el0,
           float g_daz,
@@ -1022,18 +1021,17 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         if (az_int < 0 || az_int+1 >= g_naz) {
             continue;
         }
-        float gtx_i = interp2d<float>(gtx, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
-        float grx_i = interp2d<float>(grx, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
-        const float g2 = gtx_i * grx_i;
+        float g_i = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
         float sinl = 1.0f;
 
         if (sin_look_angle) {
             sinl = pos_z / d;
             if (sinl < 0.0f) sinl = 0.0f;
             if (sinl > 1.0f) sinl = 1.0f;
+            sinl = sqrtf(sinl);
         }
 
-        pixel += sinl * g2 * wa[idbatch * nsweeps + i] / (d*d*d*d);
+        pixel += sinl * g_i * wa[idbatch * nsweeps + i] / (d*d);
     }
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
 }
@@ -1968,8 +1966,7 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
           const at::Tensor &wa,
           const at::Tensor &pos,
           const at::Tensor &att,
-          const at::Tensor &gtx,
-          const at::Tensor &grx,
+          const at::Tensor &g,
           int64_t nbatch,
           double g_az0,
           double g_el0,
@@ -1989,19 +1986,16 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
 	TORCH_CHECK(wa.dtype() == at::kFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
-	TORCH_CHECK(gtx.dtype() == at::kFloat);
-	TORCH_CHECK(grx.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(wa.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(gtx.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(grx.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
 
 	at::Tensor wa_contig = wa.contiguous();
 	at::Tensor pos_contig = pos.contiguous();
 	at::Tensor att_contig = att.contiguous();
-	at::Tensor gtx_contig = gtx.contiguous();
-	at::Tensor grx_contig = grx.contiguous();
+	at::Tensor g_contig = g.contiguous();
     auto options =
       torch::TensorOptions()
         .dtype(torch::kFloat)
@@ -2011,8 +2005,7 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
 	const float* wa_ptr = wa_contig.data_ptr<float>();
 	const float* pos_ptr = pos_contig.data_ptr<float>();
 	const float* att_ptr = att_contig.data_ptr<float>();
-	const float* gtx_ptr = gtx_contig.data_ptr<float>();
-	const float* grx_ptr = grx_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
 	float* img_ptr = img.data_ptr<float>();
 
 	const float delta_r = 1.0f / r_res;
@@ -2028,8 +2021,7 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
                   wa_ptr,
                   pos_ptr,
                   att_ptr,
-                  gtx_ptr,
-                  grx_ptr,
+                  g_ptr,
                   g_az0,
                   g_el0,
                   g_daz,
