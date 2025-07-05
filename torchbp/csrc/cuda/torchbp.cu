@@ -479,7 +479,7 @@ __global__ void backprojection_polar_2d_kernel(
         complex64_t ref = {ref_cos, ref_sin};
 
         if (g_naz > 0) {
-            const float look_angle = atan2f(pos_z, d);
+            const float look_angle = asinf(pos_z / d);
             const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
             const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
 
@@ -736,7 +736,7 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
         pixel += s * ref;
 
         if (g_naz > 0) {
-            const float look_angle = atan2f(pos_z, d);
+            const float look_angle = asinf(pos_z / d);
             const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
             const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
 
@@ -1002,7 +1002,7 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
 
         // Elevation angle.
         // Add roll to elevation.
-        const float look_angle = atan2f(pos_z, d);
+        const float look_angle = asinf(pos_z / d);
         const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
         const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
         // TODO: consider platform pitch
