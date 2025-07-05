@@ -500,14 +500,14 @@ __global__ void backprojection_polar_2d_kernel(
             const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
 
             pixel += w * s * ref;
-            w_sum += w;
+            w_sum += w*w;
         } else {
             pixel += s * ref;
         }
     }
     if (g_naz > 0) {
         if (w_sum > 0.0f) {
-            pixel /= w_sum;
+            pixel *= nsweeps / sqrtf(w_sum);
         }
     }
     if (dealias) {
@@ -757,14 +757,14 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
             const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
 
             pixel += w * s * ref;
-            w_sum += w;
+            w_sum += w*w;
         } else {
             pixel += s * ref;
         }
     }
     if (g_naz > 0) {
         if (w_sum > 0.0f) {
-            pixel /= w_sum;
+            pixel *= nsweeps / sqrtf(w_sum);
         }
     }
     if (dealias) {
