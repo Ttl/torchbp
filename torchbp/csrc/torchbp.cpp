@@ -888,6 +888,7 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("entropy_grad(Tensor data, Tensor norm, Tensor grad, int nbatch) -> Tensor[]");
   m.def("abs_sum(Tensor data, int nbatch) -> Tensor");
   m.def("abs_sum_grad(Tensor data, Tensor grad, int nbatch) -> Tensor");
+  m.def("lee_filter(Tensor img, int nbatch, int Nx, int Ny, int wx, int wy, float cu) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
