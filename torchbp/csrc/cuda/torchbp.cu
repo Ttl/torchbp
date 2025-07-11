@@ -733,7 +733,6 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
         float ref_sin, ref_cos;
         sincospif(ref_phase * d, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
-        pixel += s * ref;
 
         if (g_naz > 0) {
             const float look_angle = asinf(fminf(pos_z / d, 1.0f));
