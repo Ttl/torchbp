@@ -1344,6 +1344,56 @@ def cfar_2d(
         peaks_only,
     )
 
+def coherence_2d(
+        img0: Tensor, img1: Tensor, Navg: tuple) -> Tensor:
+    """
+    Coherence of two complex images over moving window `Navg`.
+
+    Parameters
+    ----------
+    img0 : Tensor
+        Complex valued 2D image. If 3D then the first dimension is batch dimension.
+    img1 : Tensor
+        Complex valued 2D image. If 3D then the first dimension is batch dimension.
+    Navg : tuple
+        Number of averaged cells in 2D (N1, N0).
+
+    Returns
+    ----------
+    out : Tensor
+        Real valued coherence image with same shape as input calculated over the
+        moving window.
+    """
+    if img0.shape != img1.shape:
+        raise ValueError(f"img0.shape != img1.shape. {img0.shape} != {img1.shape}")
+    if img0.dim() == 3:
+        nbatch = img0.shape[0]
+        N0 = img0.shape[1]
+        N1 = img0.shape[2]
+    elif img0.dim() == 2:
+        nbatch = 1
+        N0 = img0.shape[0]
+        N1 = img0.shape[1]
+    else:
+        raise ValueError(f"Invalid image shape: {img0.shape}")
+
+    if len(Navg) != 2:
+        raise ValueError("Navg dimension should be 2")
+    if Navg[0] < 0:
+        raise ValueError("Navg[0] < 0")
+    if Navg[1] < 0:
+        raise ValueError("Navg[1] < 0")
+
+    return torch.ops.torchbp.coherence_2d.default(
+        img0,
+        img1,
+        nbatch,
+        N0,
+        N1,
+        Navg[0],
+        Navg[1],
+    )
+
 
 def backprojection_polar_2d_tx_power(
     wa: Tensor,

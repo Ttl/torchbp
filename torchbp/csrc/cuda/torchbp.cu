@@ -2715,6 +2715,98 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
     }
 }
 
+__global__ void coherence_2d_kernel(
+          const complex64_t* img0,
+          const complex64_t* img1,
+          float *out,
+          int N0,
+          int N1,
+          int w0,
+          int w1) {
+    const int id0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx = id0 % N1;
+    const int idy = id0 / N1;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (id0 >= N0 * N1) {
+        return;
+    }
+
+    complex64_t corr{};
+    float p0 = 0.0f;
+    float p1 = 0.0f;
+    int Navg = 0;
+    for (int i=-w0; i <= w0; i++) {
+        int x = idx + i;
+        if (x < 0 || x >= N1) continue;
+        for (int j=-w1; j <= w1; j++) {
+            int y = idy + j;
+            if (y < 0 || y >= N0) continue;
+            complex64_t v0 = img0[idbatch * N0 * N1 + y * N1 + x];
+            complex64_t v1 = img1[idbatch * N0 * N1 + y * N1 + x];
+            p0 += v0.real() * v0.real() + v0.imag() * v0.imag();
+            p1 += v1.real() * v1.real() + v1.imag() * v1.imag();
+            corr += v0 * cuda::std::conj(v1);
+            Navg += 1;
+        }
+    }
+    float v;
+    if (Navg == 0) {
+        v = 0.0f;
+    } else {
+        corr /= Navg;
+        p0 /= Navg;
+        p1 /= Navg;
+        v = abs(corr) / sqrtf(p0 * p1);
+    }
+    out[idbatch * N0 * N1 + idy * N1 + idx] = v;
+}
+
+
+at::Tensor coherence_2d_cuda(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          int64_t nbatch,
+          int64_t N0,
+          int64_t N1,
+          int64_t w0,
+          int64_t w1) {
+	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+	TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CUDA);
+	at::Tensor img0_contig = img0.contiguous();
+	at::Tensor img1_contig = img1.contiguous();
+	c10::complex<float>* img0_ptr = img0_contig.data_ptr<c10::complex<float>>();
+	c10::complex<float>* img1_ptr = img1_contig.data_ptr<c10::complex<float>>();
+
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(img0.device());
+	at::Tensor out = torch::empty({nbatch, N0, N1}, options);
+
+	float* out_ptr = out.data_ptr<float>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+	unsigned int block_x = (N0 * N1 + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+
+    coherence_2d_kernel<<<block_count, thread_per_block>>>(
+          (complex64_t*)img0_ptr,
+          (complex64_t*)img1_ptr,
+          out_ptr,
+          N0,
+          N1,
+          w0,
+          w1);
+
+	return out;
+}
+
+
 at::Tensor polar_to_cart_linear_cuda(
           const at::Tensor &img,
           const at::Tensor &origin,
@@ -3927,6 +4019,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("abs_sum", &abs_sum_cuda);
   m.impl("abs_sum_grad", &abs_sum_grad_cuda);
   m.impl("lee_filter", &lee_filter_cuda);
+  m.impl("coherence_2d", &coherence_2d_cuda);
 }
 
 }
