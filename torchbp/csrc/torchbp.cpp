@@ -890,6 +890,7 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("abs_sum_grad(Tensor data, Tensor grad, int nbatch) -> Tensor");
   m.def("lee_filter(Tensor img, int nbatch, int Nx, int Ny, int wx, int wy, float cu) -> Tensor");
   m.def("coherence_2d(Tensor img0, Tensor img1, int nbatch, int N0, int N1, int w0, int w1) -> Tensor");
+  m.def("coherence_2d_grad(Tensor grad, Tensor img0, Tensor img1, int nbatch, int N0, int N1, int w0, int w1) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {

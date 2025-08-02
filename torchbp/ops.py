@@ -11,6 +11,7 @@ polar_to_cart_linear_args = 17
 polar_to_cart_bicubic_args = 20
 entropy_args = 3
 abs_sum_args = 2
+coherence_2d_args = 7
 
 
 def entropy(img: Tensor) -> Tensor:
@@ -1344,6 +1345,7 @@ def cfar_2d(
         peaks_only,
     )
 
+
 def coherence_2d(
         img0: Tensor, img1: Tensor, Navg: tuple) -> Tensor:
     """
@@ -1677,6 +1679,12 @@ def ffbp(
         merged = (new_origin, grid_polar_new, img_sum, img1[3])
         imgs = imgs[2:] + [merged]
     return imgs[0][2]
+
+
+def multilook_polar(sar_img: Tensor, kernel: tuple, grid_polar: dict) -> (Tensor, dict):
+    sar_img = torch.nn.functional.avg_pool2d(sar_img.real, kernel, stride=None) + 1j*torch.nn.functional.avg_pool2d(sar_img.imag, kernel, stride=None)
+    grid_out = {"r": grid_polar["r"], "theta": grid_polar["theta"], "nr": sar_img.shape[-2], "ntheta": sar_img.shape[-1]}
+    return sar_img, grid_out
 
 
 # Registers a FakeTensor kernel (aka "meta kernel", "abstract impl")
@@ -2129,6 +2137,20 @@ def _setup_context_abs_sum(ctx, inputs, output):
     ctx.save_for_backward(data)
 
 
+def _backward_coherence_2d(ctx, grad):
+    img0, img1 = ctx.saved_tensors
+    ret = torch.ops.torchbp.coherence_2d_grad.default(grad, img0, img1, *ctx.saved)
+    grads = [None] * coherence_2d_args
+    grads[:len(ret)] = ret
+    return tuple(grads)
+
+
+def _setup_context_coherence_2d(ctx, inputs, output):
+    img0, img1, *rest = inputs
+    ctx.saved = rest
+    ctx.save_for_backward(img0, img1)
+
+
 torch.library.register_autograd(
     "torchbp::backprojection_polar_2d",
     _backward_polar_2d,
@@ -2159,4 +2181,7 @@ torch.library.register_autograd(
 )
 torch.library.register_autograd(
     "torchbp::abs_sum", _backward_abs_sum, setup_context=_setup_context_abs_sum
+)
+torch.library.register_autograd(
+    "torchbp::coherence_2d", _backward_coherence_2d, setup_context=_setup_context_coherence_2d
 )
