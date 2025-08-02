@@ -1024,14 +1024,12 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
 
         if (sin_look_angle) {
             sinl = pos_z / d;
-            if (sinl < 0.0f) sinl = 0.0f;
-            if (sinl > 1.0f) sinl = 1.0f;
-            sinl = sqrtf(sinl);
         }
 
-        pixel += sinl * g_i * wa[idbatch * nsweeps + i] / (d*d);
+        float w = wa[idbatch * nsweeps + i];
+        pixel += sinl * g_i * g_i * w * w / (d*d*d*d);
     }
-    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
+    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = sqrtf(pixel);
 }
 
 __global__ void backprojection_cart_2d_kernel(

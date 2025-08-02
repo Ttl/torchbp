@@ -1415,8 +1415,9 @@ def backprojection_polar_2d_tx_power(
     Parameters
     ----------
     wa : Tensor
-        Weighting coefficient for each pulse. Should include window function and
-        transmit power variation if known, shape: [nsweeps] or [nbatch, nsweeps].
+        Weighting coefficient for amplitude of each pulse. Should include window
+        function and transmit power variation if known, shape: [nsweeps] or
+        [nbatch, nsweeps].
     g : Tensor
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
@@ -1454,7 +1455,8 @@ def backprojection_polar_2d_tx_power(
     Returns
     ----------
     tx_power : Tensor
-        Pseudo-polar format image of square root of power hitting that pixel.
+        Pseudo-polar format image of square root of power returned from each
+        pixel assuming constant reflectivity.
     """
 
     r0, r1 = grid["r"]
