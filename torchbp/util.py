@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 from math import pi
 import numpy as np
 from scipy.signal import get_window
@@ -132,6 +133,18 @@ def quad_interp(a: Tensor, v: int) -> Tensor:
     return 0.5 * (a1 - a3) / (a1 - 2 * a2 + a3)
 
 
+def argmax_nd(x: Tensor):
+    """
+    `torch.argmax` but returns N-dimensional index of the peak
+    """
+    d = torch.argmax(x).item()
+    res = []
+    for s in x.shape[::-1]:
+        d, m = divmod(d, s)
+        res.append(m)
+    return tuple(res)[::-1]
+
+
 def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
     """
     Find shift between images that maximizes correlation.
@@ -142,6 +155,8 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
         Input tensor.
     y : int
         Input tensor. Should have same shape as x.
+    dim : int
+        Dimensions to shift.
 
     Returns
     ----------
@@ -160,6 +175,158 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
     if len(other_dims) > 0:
         c = torch.mean(c, dim=other_dims)
     return torch.argmax(c)
+
+
+def subset_cart(img: Tensor, grid_cart: dict, x0: float, x1: float, y0: float, y1: float) -> (Tensor, dict):
+    """Cartesian image subset.
+
+    Parameters
+    ----------
+    img : Tensor
+        Input image.
+    grid_cart : dict
+        Cartesian grid dictionary.
+    x0 : float
+        Subset x0.
+    x1 : float
+        Subset x1.
+    y0 : float
+        Subset y0.
+    y1 : float
+        Subset y1.
+
+    Returns
+    ----------
+    img : Tensor
+        Subset of input image.
+    grid : dict
+        Grid
+    """
+    gx0, gx1 = grid_cart["x"]
+    gy0, gy1 = grid_cart["y"]
+    nx = grid_cart["nx"]
+    ny = grid_cart["ny"]
+    dx = (gx1 - gx0) / nx
+    dy = (gy1 - gy0) / ny
+
+    nx0 = max(0, min(nx, int((x0 - gx0) / dx)))
+    nx1 = max(0, min(nx, int((x1 - gx0) / dx)))
+    ny0 = max(0, min(ny, int((y0 - gy0) / dy)))
+    ny1 = max(0, min(ny, int((y1 - gy0) / dy)))
+
+    out = img[..., nx0:nx1, ny0:ny1]
+
+    grid_new = {"x": (gx0 + dx*nx0, gx0 + dx*nx1), "y": (gy0 + ny0*dy, gy0 + ny1* dy), "nr": out.shape[-2], "ntheta": out.shape[-1]}
+
+    return out, grid_new
+
+
+def subset_polar(img: Tensor, grid_polar: dict, r0: float, r1: float, theta0: float, theta1: float) -> (Tensor, dict):
+    """Polar image subset.
+
+    Parameters
+    ----------
+    img : Tensor
+        Input image.
+    grid_cart : dict
+        Cartesian grid dictionary.
+    r0 : float
+        Subset r0.
+    r1 : float
+        Subset r1.
+    theta0 : float
+        Subset theta0.
+    theta1 : float
+        Subset tehta1.
+
+    Returns
+    ----------
+    img : Tensor
+        Subset of input image.
+    grid_new : dict
+        Grid.
+    """
+    gr0, gr1 = grid_polar["r"]
+    gtheta0, gtheta1 = grid_polar["theta"]
+    nr = grid_polar["nr"]
+    ntheta = grid_polar["ntheta"]
+    dr = (gr1 - gr0) / nr
+    dtheta = (gtheta1 - gtheta0) / ntheta
+
+    nr0 = max(0, min(nr, int((r0 - gr0) / dr)))
+    nr1 = max(0, min(nr, int((r1 - gr0) / dr)))
+    ntheta0 = max(0, min(ntheta, int((theta0 - gtheta0) / dtheta)))
+    ntheta1 = max(0, min(ntheta, int((theta1 - gtheta0) / dtheta)))
+
+    out = img[..., nr0:nr1, ntheta0:ntheta1]
+    grid_new = {"r": (gr0 + dr*nr0, gr0 + dr*nr1), "theta": (gtheta0 + ntheta0 * dtheta, gtheta0 + ntheta1 * dtheta), "nr": out.shape[-2], "ntheta": out.shape[-1]}
+
+    return out, grid_new
+
+
+def find_image_shift_2d(x: Tensor, y: Tensor, dim: tuple = (-2, -1), interpolate=False) -> tuple:
+    """
+    Find shift between images that maximizes correlation.
+
+    Parameters
+    ----------
+    x : Tensor
+        Input tensor.
+    y : int
+        Input tensor. Should have same shape as x.
+    dim : tuple
+        Dimension.
+
+    Returns
+    ----------
+    c : tuple
+        Estimated shift.
+    a : float
+        Peak of correlation.
+    """
+    if x.shape != y.shape:
+        raise ValueError("Input shapes should be identical")
+    if dim != (-2, -1):
+        raise NotImplentedError("dim must be (-2, -1)")
+    d2 = []
+    for i in dim:
+        if i < 0:
+            d2.append(x.dim() + i)
+        else:
+            d2.append(i)
+    dims = d2
+    fx = torch.fft.fft2(x, dim=dim)
+    fy = torch.fft.fft2(y, dim=dim)
+    c = (fx * fy.conj()) / (torch.abs(fx) * torch.abs(fy))
+    other_dims = [i for i in range(x.dim()) if i not in dim]
+    c = torch.abs(torch.fft.ifft2(c, dim=dim))
+    idx = argmax_nd(torch.abs(c))
+    a = c[idx].item()
+    if interpolate:
+        # Apply quad_interp to each spatial dimension
+        interp_idx = list(idx)
+
+        dim_idx = dims[0]
+        # Extract 1D slice along this dimension at the peak location
+        slice_indices = list(idx)
+        slice_indices[dim_idx] = slice(None)  # Replace with slice for this dimension
+        c_slice = c[tuple(slice_indices)]
+
+        delta_0 = quad_interp(c_slice, idx[dim_idx])
+        interp_idx[dim_idx] = idx[dim_idx] + delta_0
+
+        # Interpolate along the second spatial dimension (dim[-1])
+        dim_idx = dims[1]
+        slice_indices = list(idx)
+        slice_indices[dim_idx] = slice(None)
+        c_slice = c[tuple(slice_indices)]
+
+        delta_1 = quad_interp(c_slice, idx[dim_idx])
+        interp_idx[dim_idx] = idx[dim_idx] + delta_1
+
+        idx = tuple([i.item() for i in interp_idx])
+    idx = [idx[i] - c.shape[i] if idx[i] > c.shape[i]//2 else idx[i] for i in range(len(idx))]
+    return idx, a
 
 
 def fft_peak_1d(x: Tensor, dim: int = -1, fractional: bool = True) -> Tensor:
@@ -434,6 +601,7 @@ def fft_lowpass_filter_window(
     filtered_data = torch.fft.ifft(fdata * w, dim=-1)
     return filtered_data
 
+
 def center_pos(pos: Tensor):
     """
     Center position to origin. Centers X and Y coordinates, but doesn't modify Z.
@@ -464,3 +632,286 @@ def center_pos(pos: Tensor):
     )[None, :]
     pos_local = pos - origin
     return pos_local, origin
+
+
+def bounding_cart_grid(
+    grid_polar: dict,
+    origin: tuple,
+    origin_angle: float,
+    ) -> dict:
+    """
+    Return the bounding Cartesian grid for polar input grid.
+
+    Parameters
+    ----------
+    grid_polar : dict
+        {
+          "r":      (r0, r1),              # range
+          "theta":  (s0, s1),              # sine of azimuth angle
+          "nr":     nr,                    # number of samples in r
+          "ntheta": ntheta                 # number of samples in theta
+        }
+
+    origin : tuple
+        Origin coordinates of grid_polar in the Cartesian grid.
+    origin_angle : float
+        Reference direction (radians) that corresponds to s = 0.
+
+    Returns
+    -------
+    (xmin, ymin, xmax, ymax) : tuple[float, float, float, float]
+        Coordinates of the smallest axis‑aligned rectangle containing the grid.
+    """
+    (r0, r1) = grid_polar["r"]
+    (s0, s1) = grid_polar["theta"]
+
+    # Convert the stored sine values back to angles and shift by the origin.
+    a0 = origin_angle + np.arcsin(s0)
+    a1 = origin_angle + np.arcsin(s1)
+    a_min, a_max = (a0, a1) if a0 <= a1 else (a1, a0)
+
+    # Quadrantal angles where x or y may reach an extremum.
+    candidate_angles = np.linspace(a_min, a_max, 20, endpoint=True)
+
+    xmin = ymin =  float("inf")
+    xmax = ymax = -float("inf")
+
+    for r in (r0, r1):
+        for a in candidate_angles:
+            x = r * np.cos(a) + origin[0]
+            y = r * np.sin(a) + origin[1]
+            xmin = min(xmin, x)
+            xmax = max(xmax, x)
+            ymin = min(ymin, y)
+            ymax = max(ymax, y)
+
+    dr = (grid_polar["r"][1] - grid_polar["r"][0]) / grid_polar["nr"]
+    nx = int((xmax - xmin) / dr)
+    ny = int((ymax - ymin) / dr)
+    grid_cart = {"x":(xmin, xmax), "y":(ymin,ymax), "nx": nx, "ny": ny}
+    return grid_cart
+
+
+def create_triangular_weights(patch_size, overlap, device="cpu"):
+    """
+    Create triangular weights for smooth blending of overlapping patches.
+
+    Parameters
+    ----------
+    patch_size : int
+        Side length of patches.
+    overlap : int
+        Overlap between patches.
+    device : str
+        Pytorch device.
+
+    Returns
+    ----------
+    weights_2d : Tensor
+        Weight tensor of [patch_size, patch_size] with triangular weighting
+    """
+    K = patch_size
+    O = overlap
+
+    if O == 0:
+        # No overlap - use uniform weights
+        return torch.ones(K, K, device=device)
+
+    # Create 1D triangular weights
+    weights_1d = torch.ones(K, device=device)
+
+    # Apply triangular weighting at the edges
+    fade_length = O
+
+    # Left edge: linear fade-in
+    for i in range(min(fade_length, K)):
+        weights_1d[i] = (i + 1) / (fade_length + 1)
+
+    # Right edge: linear fade-out
+    for i in range(max(0, K - fade_length), K):
+        weights_1d[i] = (K - i) / (fade_length + 1)
+
+    # Create 2D triangular weights using outer product
+    weights_2d = torch.outer(weights_1d, weights_1d)
+
+    return weights_2d
+
+
+def extract_overlapping_patches(img, patch_size, overlap):
+    """
+    Extract overlapping patches from a tensor.
+
+    Parameters
+    ----------
+    img : Tensor
+        Input tensor of shape [C, N, M].
+    patch_size : int
+        Side length of square patches (K).
+    overlap : int
+        Overlap between patches.
+
+    Returns
+    ----------
+    patches : Tensor
+        Tensor of shape [C, P, K, K] where P is the number of patches.
+    dim : tuple
+        Original image dimensions.
+    """
+    C, N, M = img.shape
+    K = patch_size
+    O = overlap
+
+    # Calculate stride (distance between patch centers)
+    stride = K - O
+
+    pad_height = (K - N % stride) % stride
+    pad_width = (K - M % stride) % stride
+
+    if pad_height > 0 or pad_width > 0:
+        # Pad with reflection to avoid edge artifacts
+        img_padded = F.pad(img, (0, pad_width, 0, pad_height), mode='reflect')
+    else:
+        img_padded = img
+
+    # Add batch dimension
+    img_batch = img_padded.unsqueeze(0)
+
+    # Extract patches
+    patches = F.unfold(img_batch, kernel_size=K, stride=stride)
+    patches = patches.squeeze(0)
+    patches = patches.view(C, K*K, -1)
+    P = patches.shape[2]
+    patches = patches.transpose(1, 2).contiguous().view(C, P, K, K)
+
+    return patches, img_padded.shape[1:] # Return padded dimensions
+
+
+def merge_patches_with_triangular_weights(patches, original_shape, patch_size, overlap, padded_shape=None):
+    """
+    Merge overlapping patches back into an image using triangular weighting.
+
+    Parameters
+    ----------
+    patches : Tensor
+        Tensor of shape [C, P, K, K] containing patches
+    original_shape : tuple
+        Original shape of the image (N, M).
+    overlap : int
+        Overlap between patches.
+    padded_shape : tuple
+        Tuple (N_pad, M_pad) of padded dimensions.
+
+    Returns
+    ----------
+    img : Tensor
+        Reconstructed image tensor of shape [C, N, M].
+    """
+    C, P, K, K_check = patches.shape
+    assert K == K_check, "Patches must be square"
+
+    N, M = original_shape
+    stride = K - overlap
+
+    # Determine reconstruction dimensions
+    if padded_shape is not None:
+        N_recon, M_recon = padded_shape
+    else:
+        N_recon, M_recon = N, M
+
+    if overlap == 0:
+        # No overlap case - use uniform weights and simple reconstruction
+        weights = torch.ones(K, K, device=patches.device)
+        weighted_patches = patches * weights.unsqueeze(0).unsqueeze(0)
+
+        # Reshape patches for fold operation
+        weighted_patches_flat = weighted_patches.view(C, P, K*K).transpose(1, 2).contiguous()
+        weighted_patches_flat = weighted_patches_flat.view(C*K*K, P)
+
+        # Add batch dimension for fold
+        weighted_patches_batch = weighted_patches_flat.unsqueeze(0)
+
+        # Reconstruct using fold
+        reconstructed = F.fold(weighted_patches_batch, output_size=(N_recon, M_recon),
+                              kernel_size=K, stride=stride)
+
+        # Remove batch dimension
+        reconstructed = reconstructed.squeeze(0)
+
+        # Crop back to original size if padding was used
+        if padded_shape is not None:
+            reconstructed = reconstructed[:, :N, :M]
+
+        return reconstructed
+
+    # Overlapping case - use triangular weights
+    weights = create_triangular_weights(patch_size, overlap, device=patches.device)
+
+    # Apply weights to patches
+    weighted_patches = patches * weights.unsqueeze(0).unsqueeze(0)
+
+    # Reshape patches for fold operation
+    weighted_patches_flat = weighted_patches.view(C, P, K*K).transpose(1, 2).contiguous()
+    weighted_patches_flat = weighted_patches_flat.view(C*K*K, P)
+
+    # Also create weight patches for normalization
+    weight_patches = weights.unsqueeze(0).expand(P, -1, -1).unsqueeze(0)
+    weight_patches_flat = weight_patches.view(1, P, K*K).transpose(1, 2).contiguous()
+    weight_patches_flat = weight_patches_flat.view(K*K, P)
+
+    # Add batch dimension for fold
+    weighted_patches_batch = weighted_patches_flat.unsqueeze(0)
+    weight_patches_batch = weight_patches_flat.unsqueeze(0)
+
+    # Reconstruct using fold
+    reconstructed = F.fold(weighted_patches_batch, output_size=(N_recon, M_recon),
+                          kernel_size=K, stride=stride)
+    weight_sum = F.fold(weight_patches_batch, output_size=(N_recon, M_recon),
+                       kernel_size=K, stride=stride)
+
+    # Remove batch dimension
+    reconstructed = reconstructed.squeeze(0)
+    weight_sum = weight_sum.squeeze(0)
+
+    # Normalize by weight sum to handle overlaps
+    epsilon = 1e-8
+    reconstructed = reconstructed / (weight_sum + epsilon)
+
+    if padded_shape is not None:
+        reconstructed = reconstructed[:, :N, :M]
+
+    return reconstructed
+
+
+def process_image_with_patches(img, patch_size, overlap, process_fn):
+    """
+    Process an image by extracting patches, applying a function, and merging back.
+
+    Parameters
+    ----------
+    img : Tensor
+        Input tensor of shape [C, N, M] or [N, M].
+    patch_size : int
+        Side length of square patches.
+    overlap : float
+        Overlap between patches as fraction.
+    process_fn : function
+        Function to apply to patches.
+
+    Returns
+    ----------
+    img : Tensor
+        Processed image with same shape as the input.
+    """
+    N, M = img.shape[1], img.shape[2]
+
+    # Extract patches
+    patches, padded_shape = extract_overlapping_patches(img, patch_size, overlap)
+
+    # Apply processing function
+    processed_patches = process_fn(patches)
+
+    # Merge back
+    result = merge_patches_with_triangular_weights(processed_patches, (N, M), patch_size, overlap,
+                                                 padded_shape)
+
+    return result
