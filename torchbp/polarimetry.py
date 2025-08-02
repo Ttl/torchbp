@@ -2,9 +2,128 @@ import torch
 from torch import Tensor
 
 
+def correlation_matrix(
+    sar_img: Tensor,
+    pol_order: list = ["VV", "VH", "HV", "HH"],
+    output_order: list = ["HH", "HV", "VH", "VV"],
+    device=None,
+    dtype=None,
+) -> Tensor:
+    """
+    Calculate polarimatric correlation matrix.
+
+    Parameters
+    ----------
+    sar_img : Tensor
+        Input SAR image. Shape should be [4, M, N].
+    pol_order : list
+        Order of polarizations in the SAR image.
+    output_order : list
+        Order of polarizations in the correlation matrix.
+    device : str
+        Pytorch device.
+    dtype : torch.dtype
+        Correlation matrix dtype. Normally either `torch.complex64` or `torch.complex128`.
+
+    Returns
+    ----------
+    Minv : Tensor
+        Normalized polarimetric calibration matrix.
+    """
+    if device is None:
+        device = sar_img.device
+    if dtype is None:
+        dtype = sar_img.dtype
+    # Correlation matrix
+    permutation = []
+    for i in range(4):
+        permutation.append(pol_order.index(output_order[i]))
+
+    c = torch.zeros((4, 4), dtype=dtype, device=device)
+    for i in range(4):
+        for j in range(4):
+            v = sar_img[permutation[i]] * sar_img[permutation[j]].conj()
+            c[i, j] = torch.nanmean(v).to(device=device, dtype=dtype)
+    return c
+
+
+def k_alpha_cal(
+    sar_img: Tensor,
+    alpha: complex = None,
+    k: complex = 1,
+    pol_order: list = ["VV", "VH", "HV", "HH"],
+    corner_hh_vv: complex | None = None,
+) -> Tensor:
+    """
+    Polarimetric calibration assuming zero crosstalk.
+
+    Parameters
+    ----------
+    sar_img : Tensor
+        Input SAR image. Shape should be [4, M, N].
+    alpha : complex or None
+      `sqrt(RXVV * TXHH / (RXHH * TXVV))`. Estimated from the data if `alpha` is None.
+    k : complex
+        RXHH/RXVV calibration factor.
+    pol_order : list
+        Order of polarizations in the SAR image.
+    corner_hh_vv : complex or None
+        Measured HH/VV ratio of corner reflector.
+        Used to solve for k if not None.
+
+    Returns
+    ----------
+    Minv : Tensor
+        Normalized polarimetric calibration matrix.
+    """
+    order = ["HH", "HV", "VH", "VV"]
+    permutation = []
+    for i in range(4):
+        permutation.append(pol_order.index(order[i]))
+
+    if alpha is None:
+        # Correlation matrix
+        c = correlation_matrix(sar_img, pol_order=pol_order, output_order=order)
+
+        # Derivation assumes this polarization ordering
+        hv = 1
+        vh = 2
+
+        alpha = torch.abs(c[vh, vh] / c[hv, hv]) ** 0.25 * torch.exp(
+            1j * torch.angle(c[vh, hv]) / 2
+        )
+        alpha = alpha.item()
+
+    if corner_hh_vv is not None:
+        k = (corner_hh_vv / alpha**2) ** 0.5
+
+    M = torch.tensor(
+        [
+            [k * alpha, 0, 0, 0],
+            [0, 1 / alpha, 0, 0],
+            [0, 0, alpha, 0],
+            [0, 0, 0, 1 / (k * alpha)],
+        ],
+        device=sar_img.device,
+    )
+
+    # Normalize M
+    M = M / torch.linalg.det(M) ** 0.25
+    # Permutate to original channel order
+    M = M[permutation, :][:, permutation]
+
+    Minv = torch.linalg.inv(M).to(dtype=torch.complex64, device=sar_img.device)
+    return Minv
+
+
 def ainsworth(
-    sar_img: Tensor, k: complex = 1, pol_order: list = ["VV", "VH", "HV", "HH"],
-    max_iters: int = 50, epsilon: float = 1e-6) -> Tensor:
+    sar_img: Tensor,
+    k: complex = 1,
+    pol_order: list = ["VV", "VH", "HV", "HH"],
+    max_iters: int = 50,
+    epsilon: float = 1e-6,
+    corner_hh_vv: complex | None = None,
+) -> Tensor:
     """
     Solve for polarimetric calibration from fully-polarimetric data. [1]_
 
@@ -20,6 +139,9 @@ def ainsworth(
         Maximum number of optimization iterations.
     epsilon: float
         Optimization termination threshold.
+    corner_hh_vv : complex or None
+        Measured HH/VV ratio of corner reflector.
+        Used to solve for k if not None.
 
     References
     ----------
@@ -38,11 +160,7 @@ def ainsworth(
         permutation.append(pol_order.index(order[i]))
 
     # Correlation matrix
-    c = torch.zeros((4, 4), dtype=torch.complex128, device="cpu")
-    for i in range(4):
-        for j in range(4):
-            v = sar_img[permutation[i]] * sar_img[permutation[j]].conj()
-            c[i, j] = torch.nanmean(v).to(device="cpu", dtype=torch.complex128)
+    c = correlation_matrix(sar_img, pol_order=pol_order, output_order=order)
 
     # Derivation assumes this polarization ordering
     hh = 0
@@ -53,11 +171,12 @@ def ainsworth(
     alpha = torch.abs(c[vh, vh] / c[hv, hv]) ** 0.25 * torch.exp(
         1j * torch.angle(c[vh, hv]) / 2
     )
-    alpha = alpha.to(torch.complex128)
+    alpha = alpha.to(dtype=c.dtype)
 
-    k = torch.ones_like(alpha)
-    uvwz = torch.zeros(4, dtype=torch.complex128, device=c.device)
-    epsilon = 1e-6
+    if corner_hh_vv is not None:
+        k = (corner_hh_vv / alpha**2) ** 0.5
+    k = k * torch.ones_like(alpha)
+    uvwz = torch.zeros(4, dtype=c.dtype, device=c.device)
 
     sigma = torch.tensor(
         [
@@ -147,9 +266,9 @@ def ainsworth(
             device=c.device,
         )
 
-        # sigma2 = torch.linalg.inv(crosstalk) @ sigma @ torch.linalg.inv(crosstalk.conj())
+        # sigma2 = torch.linalg.inv(crosstalk) @ sigma @ torch.linalg.inv(crosstalk.conj().T)
         sigma2 = torch.linalg.solve(
-            crosstalk, torch.linalg.solve(crosstalk.conj().T, sigma.T).T
+            crosstalk, torch.linalg.solve(crosstalk.conj(), sigma.T).T
         )
 
         alpha2 = torch.abs(sigma2[vh, vh] / sigma2[hv, hv]) ** 0.25 * torch.exp(
@@ -167,12 +286,30 @@ def ainsworth(
 
         alpha = alpha * alpha2
 
-        # c = M @ sigma @ M.conj(), solve for sigma
-        sigma = torch.linalg.solve(M, torch.linalg.solve(M.conj().T, c.T).T)
-        # sigma = torch.linalg.inv(M) @ c @ torch.linalg.inv(M.conj())
+        # c = M @ sigma @ M.conj().T, solve for sigma
+        sigma = torch.linalg.solve(M, torch.linalg.solve(M.conj(), c.T).T)
+        # sigma = torch.linalg.inv(M) @ c @ torch.linalg.inv(M.conj().transpose())
 
         if torch.abs(alpha2 - 1) < epsilon:
             break
+
+    u = uvwz[0]
+    v = uvwz[1]
+    w = uvwz[2]
+    z = uvwz[3]
+
+    if corner_hh_vv is not None:
+        k = ((-corner_hh_vv + v * w) / (alpha**2 * (corner_hh_vv * u * z - 1))) ** 0.5
+
+    M = torch.tensor(
+        [
+            [k * alpha, v / alpha, w * alpha, v * w / (k * alpha)],
+            [z * k * alpha, 1 / alpha, w * z * alpha, w / (k * alpha)],
+            [u * k * alpha, u * v / alpha, alpha, v / (k * alpha)],
+            [u * z * k * alpha, u / alpha, z * alpha, 1 / (k * alpha)],
+        ],
+        device=c.device,
+    )
 
     # Normalize M
     M = M / torch.linalg.det(M) ** 0.25
@@ -192,7 +329,7 @@ def apply_cal(sar_img: Tensor, cal: Tensor) -> Tensor:
     sar_img : Tensor
         Input SAR image. Shape should be [4, M, N].
     cal : Tensor
-        4x4 polarimetric calibration matrix.
+        4x4 polarimetric calibration correction matrix.
 
     Returns
     ----------
