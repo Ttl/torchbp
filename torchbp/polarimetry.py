@@ -4,6 +4,7 @@ from torch import Tensor
 
 def correlation_matrix(
     sar_img: Tensor,
+    weight: Tensor | None = None,
     pol_order: list = ["VV", "VH", "HV", "HH"],
     output_order: list = ["HH", "HV", "VH", "VV"],
     device=None,
@@ -16,6 +17,8 @@ def correlation_matrix(
     ----------
     sar_img : Tensor
         Input SAR image. Shape should be [4, M, N].
+    weight : Tensor or None
+        Weight for correlation matrix calculation, should have shape [M, N].
     pol_order : list
         Order of polarizations in the SAR image.
     output_order : list
@@ -40,15 +43,23 @@ def correlation_matrix(
         permutation.append(pol_order.index(output_order[i]))
 
     c = torch.zeros((4, 4), dtype=dtype, device=device)
+    if weight is not None:
+        if weight.shape != sar_img.shape[1:]:
+            raise ValueError(f"Invalid weight shape {weight.shape}, expected {sar_img.shape[1:]}")
+        weight_mean = torch.mean(weight).item()
     for i in range(4):
         for j in range(4):
             v = sar_img[permutation[i]] * sar_img[permutation[j]].conj()
+            if weight is not None:
+                v *= weight / weight_mean
+                v *= weight / weight_mean
             c[i, j] = torch.nanmean(v).to(device=device, dtype=dtype)
     return c
 
 
 def k_alpha_cal(
     sar_img: Tensor,
+    weight: Tensor | None = None,
     alpha: complex = None,
     k: complex = 1,
     pol_order: list = ["VV", "VH", "HV", "HH"],
@@ -61,6 +72,8 @@ def k_alpha_cal(
     ----------
     sar_img : Tensor
         Input SAR image. Shape should be [4, M, N].
+    weight : Tensor or None
+        Weight for correlation matrix calculation, should have shape [M, N].
     alpha : complex or None
       `sqrt(RXVV * TXHH / (RXHH * TXVV))`. Estimated from the data if `alpha` is None.
     k : complex
@@ -118,6 +131,7 @@ def k_alpha_cal(
 
 def ainsworth(
     sar_img: Tensor,
+    weight: Tensor | None = None,
     k: complex = 1,
     pol_order: list = ["VV", "VH", "HV", "HH"],
     max_iters: int = 50,
@@ -131,6 +145,8 @@ def ainsworth(
     ----------
     sar_img : Tensor
         Input SAR image. Shape should be [4, M, N].
+    weight : Tensor or None
+        Weight for correlation matrix calculation, should have shape [M, N].
     k : complex
         HH/VV calibration factor.
     pol_order : list
@@ -160,7 +176,7 @@ def ainsworth(
         permutation.append(pol_order.index(order[i]))
 
     # Correlation matrix
-    c = correlation_matrix(sar_img, pol_order=pol_order, output_order=order)
+    c = correlation_matrix(sar_img, weight=weight, pol_order=pol_order, output_order=order)
 
     # Derivation assumes this polarization ordering
     hh = 0
