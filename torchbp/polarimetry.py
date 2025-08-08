@@ -11,12 +11,12 @@ def correlation_matrix(
     dtype=None,
 ) -> Tensor:
     """
-    Calculate polarimatric correlation matrix.
+    Calculate polarimetric correlation matrix.
 
     Parameters
     ----------
     sar_img : Tensor
-        Input SAR image. Shape should be [4, M, N].
+        Input SAR image. Shape should be [C, M, N], where C is the number of polarizations.
     weight : Tensor or None
         Weight for correlation matrix calculation, should have shape [M, N].
     pol_order : list
@@ -30,25 +30,29 @@ def correlation_matrix(
 
     Returns
     ----------
-    Minv : Tensor
-        Normalized polarimetric calibration matrix.
+    c : Tensor
+        Correlation matrix.
     """
     if device is None:
         device = sar_img.device
     if dtype is None:
         dtype = sar_img.dtype
-    # Correlation matrix
+
     permutation = []
-    for i in range(4):
+    ch = sar_img.shape[0]
+    if ch != len(pol_order) != len(output_order):
+        raise ValueError(f"SAR image has {ch} channels which doesn't match pol_order and output_order parameters.")
+
+    for i in range(ch):
         permutation.append(pol_order.index(output_order[i]))
 
-    c = torch.zeros((4, 4), dtype=dtype, device=device)
+    c = torch.zeros((ch, ch), dtype=dtype, device=device)
     if weight is not None:
         if weight.shape != sar_img.shape[1:]:
             raise ValueError(f"Invalid weight shape {weight.shape}, expected {sar_img.shape[1:]}")
         weight_mean = torch.mean(weight).item()
-    for i in range(4):
-        for j in range(4):
+    for i in range(ch):
+        for j in range(ch):
             v = sar_img[permutation[i]] * sar_img[permutation[j]].conj()
             if weight is not None:
                 v *= weight / weight_mean
