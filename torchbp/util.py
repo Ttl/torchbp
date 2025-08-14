@@ -177,7 +177,9 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
     return torch.argmax(c)
 
 
-def subset_cart(img: Tensor, grid_cart: dict, x0: float, x1: float, y0: float, y1: float) -> (Tensor, dict):
+def subset_cart(
+    img: Tensor, grid_cart: dict, x0: float, x1: float, y0: float, y1: float
+) -> (Tensor, dict):
     """Cartesian image subset.
 
     Parameters
@@ -216,12 +218,19 @@ def subset_cart(img: Tensor, grid_cart: dict, x0: float, x1: float, y0: float, y
 
     out = img[..., nx0:nx1, ny0:ny1]
 
-    grid_new = {"x": (gx0 + dx*nx0, gx0 + dx*nx1), "y": (gy0 + ny0*dy, gy0 + ny1* dy), "nr": out.shape[-2], "ntheta": out.shape[-1]}
+    grid_new = {
+        "x": (gx0 + dx * nx0, gx0 + dx * nx1),
+        "y": (gy0 + ny0 * dy, gy0 + ny1 * dy),
+        "nr": out.shape[-2],
+        "ntheta": out.shape[-1],
+    }
 
     return out, grid_new
 
 
-def subset_polar(img: Tensor, grid_polar: dict, r0: float, r1: float, theta0: float, theta1: float) -> (Tensor, dict):
+def subset_polar(
+    img: Tensor, grid_polar: dict, r0: float, r1: float, theta0: float, theta1: float
+) -> (Tensor, dict):
     """Polar image subset.
 
     Parameters
@@ -259,12 +268,19 @@ def subset_polar(img: Tensor, grid_polar: dict, r0: float, r1: float, theta0: fl
     ntheta1 = max(0, min(ntheta, int((theta1 - gtheta0) / dtheta)))
 
     out = img[..., nr0:nr1, ntheta0:ntheta1]
-    grid_new = {"r": (gr0 + dr*nr0, gr0 + dr*nr1), "theta": (gtheta0 + ntheta0 * dtheta, gtheta0 + ntheta1 * dtheta), "nr": out.shape[-2], "ntheta": out.shape[-1]}
+    grid_new = {
+        "r": (gr0 + dr * nr0, gr0 + dr * nr1),
+        "theta": (gtheta0 + ntheta0 * dtheta, gtheta0 + ntheta1 * dtheta),
+        "nr": out.shape[-2],
+        "ntheta": out.shape[-1],
+    }
 
     return out, grid_new
 
 
-def find_image_shift_2d(x: Tensor, y: Tensor, dim: tuple = (-2, -1), interpolate=False) -> tuple:
+def find_image_shift_2d(
+    x: Tensor, y: Tensor, dim: tuple = (-2, -1), interpolate=False
+) -> tuple:
     """
     Find shift between images that maximizes correlation.
 
@@ -325,7 +341,10 @@ def find_image_shift_2d(x: Tensor, y: Tensor, dim: tuple = (-2, -1), interpolate
         interp_idx[dim_idx] = idx[dim_idx] + delta_1
 
         idx = tuple([i.item() for i in interp_idx])
-    idx = [idx[i] - c.shape[i] if idx[i] > c.shape[i]//2 else idx[i] for i in range(len(idx))]
+    idx = [
+        idx[i] - c.shape[i] if idx[i] > c.shape[i] // 2 else idx[i]
+        for i in range(len(idx))
+    ]
     return idx, a
 
 
@@ -457,7 +476,7 @@ def generate_fmcw_data(
     fs: float,
     d0: float = 0,
     g: Tensor | None = None,
-    g_extent : list | None = None,
+    g_extent: list | None = None,
     att: Tensor = None,
     rvp: bool = True,
 ) -> Tensor:
@@ -544,9 +563,11 @@ def generate_fmcw_data(
         d = torch.linalg.vector_norm(pos - target[None, :], dim=-1)[:, None] + d0
         tau = 2 * d / c0
         if antenna_gain:
-            look_angle = torch.asin(pos[:,2] / d[:,0])
-            el_deg = -look_angle - att[:,0]
-            az_deg = torch.atan2(target[1] - pos[:,1], target[0] - pos[:,0]) - att[:,2]
+            look_angle = torch.asin(pos[:, 2] / d[:, 0])
+            el_deg = -look_angle - att[:, 0]
+            az_deg = (
+                torch.atan2(target[1] - pos[:, 1], target[0] - pos[:, 0]) - att[:, 2]
+            )
 
             az_norm = 2.0 * (az_deg - g_az0) / (g_az1 - g_az0) - 1.0
             el_norm = 2.0 * (el_deg - g_el0) / (g_el1 - g_el0) - 1.0
@@ -557,9 +578,9 @@ def generate_fmcw_data(
             g_a = F.grid_sample(
                 g_batch,
                 grid,
-                mode='bilinear',
-                padding_mode='zeros',
-                align_corners=False
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
             )
 
             g_a = g_a.reshape(d.shape)
@@ -681,11 +702,7 @@ def center_pos(pos: Tensor):
         Mean height.
     """
     origin = torch.tensor(
-        [
-            torch.mean(pos[:, 0]),
-            torch.mean(pos[:, 1]),
-            0
-        ],
+        [torch.mean(pos[:, 0]), torch.mean(pos[:, 1]), 0],
         device=pos.device,
         dtype=torch.float32,
     )[None, :]
@@ -697,7 +714,7 @@ def bounding_cart_grid(
     grid_polar: dict,
     origin: tuple,
     origin_angle: float,
-    ) -> dict:
+) -> dict:
     """
     Return the bounding Cartesian grid for polar input grid.
 
@@ -732,7 +749,7 @@ def bounding_cart_grid(
     # Quadrantal angles where x or y may reach an extremum.
     candidate_angles = np.linspace(a_min, a_max, 20, endpoint=True)
 
-    xmin = ymin =  float("inf")
+    xmin = ymin = float("inf")
     xmax = ymax = -float("inf")
 
     for r in (r0, r1):
@@ -747,7 +764,7 @@ def bounding_cart_grid(
     dr = (grid_polar["r"][1] - grid_polar["r"][0]) / grid_polar["nr"]
     nx = int((xmax - xmin) / dr)
     ny = int((ymax - ymin) / dr)
-    grid_cart = {"x":(xmin, xmax), "y":(ymin,ymax), "nx": nx, "ny": ny}
+    grid_cart = {"x": (xmin, xmax), "y": (ymin, ymax), "nx": nx, "ny": ny}
     return grid_cart
 
 
@@ -828,7 +845,7 @@ def extract_overlapping_patches(img, patch_size, overlap):
 
     if pad_height > 0 or pad_width > 0:
         # Pad with reflection to avoid edge artifacts
-        img_padded = F.pad(img, (0, pad_width, 0, pad_height), mode='reflect')
+        img_padded = F.pad(img, (0, pad_width, 0, pad_height), mode="reflect")
     else:
         img_padded = img
 
@@ -838,14 +855,16 @@ def extract_overlapping_patches(img, patch_size, overlap):
     # Extract patches
     patches = F.unfold(img_batch, kernel_size=K, stride=stride)
     patches = patches.squeeze(0)
-    patches = patches.view(C, K*K, -1)
+    patches = patches.view(C, K * K, -1)
     P = patches.shape[2]
     patches = patches.transpose(1, 2).contiguous().view(C, P, K, K)
 
-    return patches, img_padded.shape[1:] # Return padded dimensions
+    return patches, img_padded.shape[1:]  # Return padded dimensions
 
 
-def merge_patches_with_triangular_weights(patches, original_shape, patch_size, overlap, padded_shape=None):
+def merge_patches_with_triangular_weights(
+    patches, original_shape, patch_size, overlap, padded_shape=None
+):
     """
     Merge overlapping patches back into an image using triangular weighting.
 
@@ -883,15 +902,21 @@ def merge_patches_with_triangular_weights(patches, original_shape, patch_size, o
         weighted_patches = patches * weights.unsqueeze(0).unsqueeze(0)
 
         # Reshape patches for fold operation
-        weighted_patches_flat = weighted_patches.view(C, P, K*K).transpose(1, 2).contiguous()
-        weighted_patches_flat = weighted_patches_flat.view(C*K*K, P)
+        weighted_patches_flat = (
+            weighted_patches.view(C, P, K * K).transpose(1, 2).contiguous()
+        )
+        weighted_patches_flat = weighted_patches_flat.view(C * K * K, P)
 
         # Add batch dimension for fold
         weighted_patches_batch = weighted_patches_flat.unsqueeze(0)
 
         # Reconstruct using fold
-        reconstructed = F.fold(weighted_patches_batch, output_size=(N_recon, M_recon),
-                              kernel_size=K, stride=stride)
+        reconstructed = F.fold(
+            weighted_patches_batch,
+            output_size=(N_recon, M_recon),
+            kernel_size=K,
+            stride=stride,
+        )
 
         # Remove batch dimension
         reconstructed = reconstructed.squeeze(0)
@@ -909,23 +934,33 @@ def merge_patches_with_triangular_weights(patches, original_shape, patch_size, o
     weighted_patches = patches * weights.unsqueeze(0).unsqueeze(0)
 
     # Reshape patches for fold operation
-    weighted_patches_flat = weighted_patches.view(C, P, K*K).transpose(1, 2).contiguous()
-    weighted_patches_flat = weighted_patches_flat.view(C*K*K, P)
+    weighted_patches_flat = (
+        weighted_patches.view(C, P, K * K).transpose(1, 2).contiguous()
+    )
+    weighted_patches_flat = weighted_patches_flat.view(C * K * K, P)
 
     # Also create weight patches for normalization
     weight_patches = weights.unsqueeze(0).expand(P, -1, -1).unsqueeze(0)
-    weight_patches_flat = weight_patches.view(1, P, K*K).transpose(1, 2).contiguous()
-    weight_patches_flat = weight_patches_flat.view(K*K, P)
+    weight_patches_flat = weight_patches.view(1, P, K * K).transpose(1, 2).contiguous()
+    weight_patches_flat = weight_patches_flat.view(K * K, P)
 
     # Add batch dimension for fold
     weighted_patches_batch = weighted_patches_flat.unsqueeze(0)
     weight_patches_batch = weight_patches_flat.unsqueeze(0)
 
     # Reconstruct using fold
-    reconstructed = F.fold(weighted_patches_batch, output_size=(N_recon, M_recon),
-                          kernel_size=K, stride=stride)
-    weight_sum = F.fold(weight_patches_batch, output_size=(N_recon, M_recon),
-                       kernel_size=K, stride=stride)
+    reconstructed = F.fold(
+        weighted_patches_batch,
+        output_size=(N_recon, M_recon),
+        kernel_size=K,
+        stride=stride,
+    )
+    weight_sum = F.fold(
+        weight_patches_batch,
+        output_size=(N_recon, M_recon),
+        kernel_size=K,
+        stride=stride,
+    )
 
     # Remove batch dimension
     reconstructed = reconstructed.squeeze(0)
@@ -970,7 +1005,8 @@ def process_image_with_patches(img, patch_size, overlap, process_fn):
     processed_patches = process_fn(patches)
 
     # Merge back
-    result = merge_patches_with_triangular_weights(processed_patches, (N, M), patch_size, overlap,
-                                                 padded_shape)
+    result = merge_patches_with_triangular_weights(
+        processed_patches, (N, M), patch_size, overlap, padded_shape
+    )
 
     return result
