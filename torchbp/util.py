@@ -456,6 +456,9 @@ def generate_fmcw_data(
     tsweep: float,
     fs: float,
     d0: float = 0,
+    g: Tensor | None = None,
+    g_extent : list | None = None,
+    att: Tensor = None,
     rvp: bool = True,
 ) -> Tensor:
     """
@@ -479,6 +482,27 @@ def generate_fmcw_data(
         Sampling frequency in Hz.
     d0 : float
         Zero range.
+    g : Tensor or None
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center.
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1]
+        g_el0 : float
+            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
+            including data over the whole sphere.
+        g_az0 : float
+            grx and gtx azimuth axis starting value. Units in radians. -pi if
+            including data over the whole sphere.
+        g_el1 : float
+            grx and gtx elevation axis end value. Units in radians. +pi/2 if
+            including data over the whole sphere.
+        g_az1 : float
+            grx and gtx azimuth axis end value. Units in radians. +pi if
+            including data over the whole sphere.
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
+        [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
     rvp : bool
         True to include residual video phase term.
 
@@ -503,11 +527,46 @@ def generate_fmcw_data(
 
     use_rvp = 1 if rvp else 0
 
+    antenna_gain = g is not None and att is not None
+    if antenna_gain:
+        if g_extent is None:
+            raise ValueError("g_extent is None, but g is not None")
+        if len(g_extent) != 4:
+            raise ValueError("g_extent should be a 4 element list")
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        nelevation, nazimuth = g.shape
+
+        # Add batch and channel dimensions to g
+        g_batch = g.unsqueeze(0).unsqueeze(0)
+
     t = t[None, :]
     for e, target in enumerate(target_pos):
         d = torch.linalg.vector_norm(pos - target[None, :], dim=-1)[:, None] + d0
         tau = 2 * d / c0
-        data += (target_rcs[e] / d**4) * torch.exp(
+        if antenna_gain:
+            look_angle = torch.asin(pos[:,2] / d[:,0])
+            el_deg = -look_angle - att[:,0]
+            az_deg = torch.atan2(target[1] - pos[:,1], target[0] - pos[:,0]) - att[:,2]
+
+            az_norm = 2.0 * (az_deg - g_az0) / (g_az1 - g_az0) - 1.0
+            el_norm = 2.0 * (el_deg - g_el0) / (g_el1 - g_el0) - 1.0
+
+            grid = torch.stack([el_norm, az_norm], dim=-1)
+            grid = grid.unsqueeze(0).unsqueeze(0)  # [1, 1, N, 2]
+
+            g_a = F.grid_sample(
+                g_batch,
+                grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=False
+            )
+
+            g_a = g_a.reshape(d.shape)
+        else:
+            g_a = 1
+
+        data += (g_a * torch.sqrt(target_rcs[e]) / d**2) * torch.exp(
             -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
         )
     return data
