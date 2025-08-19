@@ -1023,11 +1023,12 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         float sinl = 1.0f;
 
         if (sin_look_angle) {
-            sinl = pos_z / d;
+            // Local incidence angle
+            sinl = sqrtf(fmaxf(0.001f, 1.0f - (pos_z * pos_z) / (d * d)));
         }
 
         float w = wa[idbatch * nsweeps + i];
-        pixel += sinl * g_i * g_i * w * w / (d*d*d*d);
+        pixel += g_i * g_i * w * w / (d*d*d*d * sinl);
     }
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = sqrtf(pixel);
 }
