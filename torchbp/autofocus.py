@@ -323,6 +323,7 @@ def gpga_bp_polar_tde(
     azimuth_divisions: int,
     range_divisions: int,
     window_width: int | None = None,
+    rms_error_limit: float = 0.1,
     max_iters: int = 20,
     window_exp: float = 0.9,
     min_window: int = 5,
@@ -335,12 +336,12 @@ def gpga_bp_polar_tde(
     estimate_z: bool = True,
 ) -> (Tensor, Tensor):
     """
-    Generalized phase gradient autofocus using 2D polar coordinate
+    Generalized phase gradient autofocus [0]_ using 2D polar coordinate
     backprojection image formation.
 
     Estimates 3D position error by dividing the image into subimages, estimating
     slant range error to each subimage, and then solving for 3D position error
-    from slant range errors.
+    from slant range errors. [1]_
 
     Z-axis estimation requires variable look angles in the image. Set
     `estimate_z` to False if this is not the case, for example ground based
@@ -374,6 +375,8 @@ def gpga_bp_polar_tde(
     window_width : int or None
         Initial low-pass filter window width in samples. None for initial
         maximum size.
+    rms_error_limit : float
+        Phase RMS error limit in radians for stopping the optimization iteration.
     max_iters : int
         Maximum number of iterations.
     window_exp : float
@@ -401,9 +404,13 @@ def gpga_bp_polar_tde(
 
     References
     ----------
-    .. [#] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
+    .. [0] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
     Algorithm," in IEEE Transactions on Computational Imaging, vol. 5, no. 4,
     pp. 606-619, Dec. 2019.
+    .. [1] Z. Ding et al., "An Autofocus Approach for UAV-Based Ultrawideband
+    Ultrawidebeam SAR Data With Frequency-Dependent and 2-D Space-Variant
+    Motion Errors," in IEEE Transactions on Geoscience and Remote Sensing, vol.
+    60, pp. 1-18, 2022, Art no. 5203518.
 
     Returns
     ----------
@@ -453,6 +460,8 @@ def gpga_bp_polar_tde(
 
     if h == 0:
         estimate_z = False
+
+    wl = 3e8 / fc
 
     for i in range(max_iters):
         for ir in range(range_divisions):
@@ -513,9 +522,22 @@ def gpga_bp_polar_tde(
                     w * target_theta
                 ) / torch.mean(w)
 
-        target_el = torch.arctan(h / local_centers[:, 0])
-        sin_az = local_centers[:, 1]
-        cos_az = torch.sqrt(1 - sin_az**2)
+        # Local image centers in Cartesian coordinates
+        local_y = local_centers[:, 0] * local_centers[:, 1]
+        local_x = local_centers[:, 0] * torch.sqrt(1 - local_centers[:, 1] ** 2)
+        # Range from each position to local image centers
+        local_r = torch.sqrt(
+            (pos[:, 0][:, None] - local_x[None, :]) ** 2
+            + (pos[:, 1][:, None] - local_y[None, :]) ** 2
+        )
+
+        # Local image center azimuth and elevation angles from each data position
+        target_el = torch.arctan(pos[:, 2][:, None] / local_r)
+        target_az = torch.arctan2(
+            local_y[None, :] - pos[:, 1][:, None], local_x[None, :] - pos[:, 0][:, None]
+        )
+        sin_az = torch.sin(target_az)
+        cos_az = torch.cos(target_az)
         cos_el = torch.cos(target_el)
         sin_el = torch.sin(target_el)
         if estimate_z:
@@ -523,11 +545,22 @@ def gpga_bp_polar_tde(
         else:
             m = torch.stack([cos_az * cos_el, sin_az * cos_el], dim=-1)
 
-        w = torch.sqrt(local_w)
+        w = torch.sqrt(local_w).unsqueeze(0)
         w = w / torch.max(w)
-        d_solved = torch.linalg.lstsq(w * m, w * local_d).solution
+        s = local_d.unsqueeze(0).transpose(0, 2)
+
+        # Solve for 2D/3D position change for each data position from
+        # distances from each position to local image centers
+        d_solved = torch.linalg.lstsq(w * m, w * s).solution
+        d_solved = d_solved.squeeze().transpose(0, 1)
+
         if remove_trend:
             d_solved[0] = detrend(d_solved[0])
+        rms_error = (
+            4 * torch.pi * torch.sqrt(torch.mean(torch.square(d_solved / wl))).item()
+        )
+        if rms_error < rms_error_limit:
+            break
         pos_new[:, 0] = pos_new[:, 0] + d_solved[0]
         pos_new[:, 1] = pos_new[:, 1] + d_solved[1]
         if estimate_z:
