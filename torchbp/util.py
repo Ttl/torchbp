@@ -591,7 +591,8 @@ def generate_fmcw_data(
             g_a = 1
 
         data += (g_a * rcs_abs / d**2) * torch.exp(
-            -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2) + 1j * rcs_phase
+            -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
+            + 1j * rcs_phase
         )
     return data
 
@@ -646,7 +647,10 @@ def phase_to_distance(p: Tensor, fc: float) -> Tensor:
 
 
 def fft_lowpass_filter_window(
-    target_data: Tensor, window: str | tuple = "hamming", window_width: int = None
+    target_data: Tensor,
+    window: str | tuple = "hamming",
+    window_width: int = None,
+    circular_conv: bool = False,
 ) -> Tensor:
     """
     FFT low-pass filtering with a configurable window function.
@@ -661,27 +665,36 @@ def fft_lowpass_filter_window(
     window_width : int
         Width of the window in samples. If None or larger than signal, returns
         the input unchanged.
+    circular_conv : bool
+        Circular convolution if True, otherwise zero pad.
 
     Returns
     ----------
         Filtered tensor (same shape as input)
     """
-    fdata = torch.fft.fft(target_data, dim=-1)
-    n = target_data.size(-1)
 
     # If window_width is None, do nothing
-    if window_width is None or window_width > n:
+    if window_width is None or window_width > target_data.shape[-1]:
         return target_data
 
-    # Window needs to be centered at DC in FFT
     half_width = (window_width + 1) // 2
+
+    if not circular_conv:
+        target_data = F.pad(target_data, (half_width, half_width))
+
+    fdata = torch.fft.fft(target_data, dim=-1)
+
+    # Window needs to be centered at DC in FFT
     half_window = get_window(window, 2 * half_width - 1, fftbins=True)[half_width - 1 :]
-    w = np.zeros(n, dtype=np.float32)
+    w = np.zeros(target_data.shape[-1], dtype=np.float32)
     w[:half_width] = half_window
     w[-half_width + 1 :] = np.flip(half_window[1:])
 
     w = torch.tensor(w).to(target_data.device)
     filtered_data = torch.fft.ifft(fdata * w, dim=-1)
+    if not circular_conv:
+        filtered_data = filtered_data[..., half_width:-half_width]
+
     return filtered_data
 
 
