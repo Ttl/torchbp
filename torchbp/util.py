@@ -560,6 +560,9 @@ def generate_fmcw_data(
 
     t = t[None, :]
     for e, target in enumerate(target_pos):
+        rcs_phase = torch.angle(target_rcs[e])
+        rcs_abs = torch.sqrt(torch.abs(target_rcs[e]))
+
         d = torch.linalg.vector_norm(pos - target[None, :], dim=-1)[:, None] + d0
         tau = 2 * d / c0
         if antenna_gain:
@@ -587,8 +590,8 @@ def generate_fmcw_data(
         else:
             g_a = 1
 
-        data += (g_a * torch.sqrt(target_rcs[e]) / d**2) * torch.exp(
-            -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
+        data += (g_a * rcs_abs / d**2) * torch.exp(
+            -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2) + 1j * rcs_phase
         )
     return data
 
