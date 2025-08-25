@@ -1725,6 +1725,9 @@ def ffbp(
             z0=new_z,
             method=interp_method,
         ).squeeze()
+        del i1
+        del img1
+        imgs[0] = None
         dorigin2 = new_origin - img2[0]
         dorigin2[2] = -(new_z - img2[3])
         img_interpolated2 = polar_interp(
@@ -1737,8 +1740,11 @@ def ffbp(
             z0=new_z,
             method=interp_method,
         ).squeeze()
+        del i2
+        del img2
+        imgs[1] = None
         img_sum = img_interpolated1 + img_interpolated2
-        merged = (new_origin, grid_polar_new, img_sum, img1[3])
+        merged = (new_origin, grid_polar_new, img_sum, new_z)
         imgs = imgs[2:] + [merged]
     return imgs[0][2]
 
