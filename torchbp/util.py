@@ -75,8 +75,16 @@ def diff(x: Tensor, dim: int = -1, same_size: bool = False) -> Tensor:
     d : Tensor
         Difference tensor.
     """
+    if dim == 0:
+        if same_size:
+            padding = [0 for i in range(2*len(x.shape))]
+            padding[-2] = 1
+            padding = tuple(padding)
+            return torch.nn.functional.pad(x[1:] - x[:-1], padding)
+        else:
+            return x[1:] - x[:-1]
     if dim != -1:
-        raise NotImplementedError("Only dim=-1 is implemented")
+        raise NotImplementedError("Only dim=0 and dim=-1 is implemented")
     if same_size:
         return torch.nn.functional.pad(x[..., 1:] - x[..., :-1], (1, 0))
     else:
