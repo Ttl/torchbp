@@ -532,7 +532,7 @@ def gpga_bp_polar_tde(
         )
 
         # Local image center azimuth and elevation angles from each data position
-        target_el = torch.arctan(pos[:, 2][:, None] / local_r)
+        target_el = torch.arcsin(torch.clamp(-pos[:, 2][:, None] / local_r, -1, 1))
         target_az = torch.arctan2(
             local_y[None, :] - pos[:, 1][:, None], local_x[None, :] - pos[:, 0][:, None]
         )
@@ -541,7 +541,7 @@ def gpga_bp_polar_tde(
         cos_el = torch.cos(target_el)
         sin_el = torch.sin(target_el)
         if estimate_z:
-            m = torch.stack([cos_az * cos_el, sin_az * cos_el, -sin_el], dim=-1)
+            m = torch.stack([cos_az * cos_el, sin_az * cos_el, sin_el], dim=-1)
         else:
             m = torch.stack([cos_az * cos_el, sin_az * cos_el], dim=-1)
 

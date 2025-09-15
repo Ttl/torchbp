@@ -479,8 +479,8 @@ __global__ void backprojection_polar_2d_kernel(
         complex64_t ref = {ref_cos, ref_sin};
 
         if (g_naz > 0) {
-            const float look_angle = asinf(fminf(pos_z / d, 1.0f));
-            const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+            const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
             const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
 
             const float el_idx = (el_deg - g_el0) / g_del;
@@ -735,8 +735,8 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
         complex64_t ref = {ref_cos, ref_sin};
 
         if (g_naz > 0) {
-            const float look_angle = asinf(fminf(pos_z / d, 1.0f));
-            const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+            const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
             const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
 
             const float el_idx = (el_deg - g_el0) / g_del;
@@ -1000,8 +1000,8 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         float d = sqrtf(px * px + py * py + pz2);
 
         // Avoid nans due to numerical precision by clamping to valid range.
-        const float look_angle = asinf(fminf(pos_z / d, 1.0f));
-        const float el_deg = -look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+        const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+        const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
         const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
         // TODO: consider platform pitch
 
