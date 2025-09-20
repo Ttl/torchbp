@@ -162,9 +162,14 @@ if __name__ == "__main__":
             device=dev, dtype=torch.float32)[None,:]
     pos_centered = pos - origin
 
+    torch.cuda.synchronize()
+    tstart = time.time()
     sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
             pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
-            azimuth_divisions=8, range_divisions=8)
+            azimuth_divisions=8, range_divisions=8,
+            use_ffbp=ffbp)
+    torch.cuda.synchronize()
+    print(f"Autofocus done in {time.time() - tstart:.3g} s")
 
     plt.figure()
     plt.plot((pos_new[:,0] - pos_centered[:,0]).cpu().numpy(), label="x")

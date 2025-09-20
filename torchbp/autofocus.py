@@ -5,11 +5,20 @@ from .ops import (
     backprojection_polar_2d,
     backprojection_cart_2d,
     gpga_backprojection_2d_core,
+    ffbp,
 )
 from .ops import entropy
-from .util import unwrap, detrend, fft_lowpass_filter_window
+from .util import (
+    unwrap,
+    unwrap_ref,
+    detrend,
+    fft_lowpass_filter_precalculate_window,
+    fft_lowpass_filter_window,
+    diff,
+)
 import inspect
 from scipy import signal
+from copy import deepcopy
 
 
 def pga_estimator(
@@ -323,7 +332,7 @@ def gpga_bp_polar_tde(
     azimuth_divisions: int,
     range_divisions: int,
     window_width: int | None = None,
-    rms_error_limit: float = 0.1,
+    rms_error_limit: float = 0.05,
     max_iters: int = 20,
     window_exp: float = 0.9,
     min_window: int = 5,
@@ -334,6 +343,9 @@ def gpga_bp_polar_tde(
     eps: float = 1e-6,
     interp_method: str = "linear",
     estimate_z: bool = True,
+    use_ffbp: bool = False,
+    ffbp_opts: dict | None = None,
+    verbose: bool = False,
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus [0]_ using 2D polar coordinate
@@ -401,6 +413,12 @@ def gpga_bp_polar_tde(
         ("lanczos", N): Lanczos interpolation with order 2*N+1.
     estimate_z : bool
         Estimate Z-axis position error. Default is True.
+    use_ffbp : bool
+        Use fast factorized backprojection for image formation.
+    ffbp_opts : dict
+        Dictionary of options for ffbp.
+    verbose : bool
+        Print progress stats.
 
     References
     ----------
@@ -463,7 +481,13 @@ def gpga_bp_polar_tde(
 
     wl = 3e8 / fc
 
+    if verbose:
+        print("Iteration, Window width, RMS error")
+
     for i in range(max_iters):
+        lp_w = fft_lowpass_filter_precalculate_window(
+            pos_new.shape[0], window_width, img.device, lowpass_window
+        )
         for ir in range(range_divisions):
             for jr in range(azimuth_divisions):
                 ir1 = (ir + 1) * rdiv if ir < range_divisions - 1 else -1
@@ -504,7 +528,7 @@ def gpga_bp_polar_tde(
                 # Filter samples
                 if window_width is not None and window_width < target_data.shape[1]:
                     target_data = fft_lowpass_filter_window(
-                        target_data, window=lowpass_window, window_width=window_width
+                        target_data, window=lp_w, window_width=window_width
                     )
                 phi, w = pga_estimator(target_data, "wls", eps, return_weight=True)
                 local_w[ir * azimuth_divisions + jr] = 1 / torch.sum(1 / w)
@@ -527,14 +551,15 @@ def gpga_bp_polar_tde(
         local_x = local_centers[:, 0] * torch.sqrt(1 - local_centers[:, 1] ** 2)
         # Range from each position to local image centers
         local_r = torch.sqrt(
-            (pos[:, 0][:, None] - local_x[None, :]) ** 2
-            + (pos[:, 1][:, None] - local_y[None, :]) ** 2
+            (pos_new[:, 0][:, None] - local_x[None, :]) ** 2
+            + (pos_new[:, 1][:, None] - local_y[None, :]) ** 2
         )
 
         # Local image center azimuth and elevation angles from each data position
-        target_el = torch.arcsin(torch.clamp(-pos[:, 2][:, None] / local_r, -1, 1))
+        target_el = torch.arcsin(torch.clamp(-pos_new[:, 2][:, None] / local_r, -1, 1))
         target_az = torch.arctan2(
-            local_y[None, :] - pos[:, 1][:, None], local_x[None, :] - pos[:, 0][:, None]
+            local_y[None, :] - pos_new[:, 1][:, None],
+            local_x[None, :] - pos_new[:, 0][:, None],
         )
         sin_az = torch.sin(target_az)
         cos_az = torch.cos(target_az)
@@ -559,16 +584,30 @@ def gpga_bp_polar_tde(
         rms_error = (
             4 * torch.pi * torch.sqrt(torch.mean(torch.square(d_solved / wl))).item()
         )
+        if verbose:
+            print(f"{i+1}, {window_width}, {rms_error}")
         if rms_error < rms_error_limit:
+            if verbose:
+                print("RMS error limit reached")
             break
         pos_new[:, 0] = pos_new[:, 0] + d_solved[0]
         pos_new[:, 1] = pos_new[:, 1] + d_solved[1]
         if estimate_z:
             pos_new[:, 2] = pos_new[:, 2] + d_solved[2]
 
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[0]
+        if use_ffbp:
+            opts = {"stages": 5, "oversample_r": 1.6, "oversample_theta": 1.6}
+            if ffbp_opts is not None:
+                opts.update(ffbp_opts)
+            img = ffbp(data, grid_polar, fc, r_res, pos_new, d0=d0, **opts)
+        else:
+            img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[
+                0
+            ]
         window_width = int(window_width**window_exp)
         if window_width < min_window:
+            if verbose:
+                print("Window width below the minimum size")
             break
     return img, pos_new
 

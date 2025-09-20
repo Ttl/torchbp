@@ -118,6 +118,29 @@ def unwrap(phi: Tensor, dim: int = -1) -> Tensor:
     return phi_wrap + phi_adj.cumsum(dim)
 
 
+def unwrap_ref(x: Tensor, y: Tensor):
+    """
+    Solve for integer array k such that x + k*2pi is closest to y.
+    `k = round((y - x) / (2pi))`.
+
+    Parameters
+    ----------
+    x : Tensor
+        Phase wrapped signal.
+    y : Tensor
+        Reference signal.
+
+    Returns
+    ----------
+    unwrapped_x : Tensor
+        Phase unwrapped x
+    """
+    k = torch.round((y - x) / (2 * torch.pi))
+    unwrapped_x = x + k * 2 * torch.pi
+
+    return unwrapped_x
+
+
 def quad_interp(a: Tensor, v: int) -> Tensor:
     """
     Quadractic peak interpolation.
@@ -398,9 +421,18 @@ def detrend(x: Tensor) -> Tensor:
         x with linear trend removed.
     """
     n = x.shape[0]
-    k = np.arange(n) / n
-    a, b = np.polyfit(k, x.cpu().numpy(), 1)
-    return x - (a * torch.arange(n, device=x.device, dtype=x.dtype) / n + b)
+
+    k = torch.arange(n, device=x.device, dtype=x.dtype) / n
+
+    # Solve least squares problem: k * a + b = x
+    ones = torch.ones(n, device=x.device, dtype=x.dtype)
+
+    A = torch.stack([k, ones], dim=1)
+    params = torch.linalg.lstsq(A, x).solution
+    a, b = params[0], params[1]
+
+    # Remove linear trend
+    return x - (a * k + b)
 
 
 def entropy(x: Tensor) -> Tensor:
@@ -653,10 +685,53 @@ def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     c0 = 299792458
     return c0 * p / (4 * torch.pi * fc)
 
+def fft_lowpass_filter_precalculate_window(
+        data_length: int,
+        window_width: int,
+        device: str,
+        window: str | tuple,
+        circular_conv: bool = False) -> Tensor:
+    """
+    Precompute window to be used with `fft_lowpass_filter_window`.
+
+    Parameters
+    ----------
+    data_length : int
+        Data size.
+    window_width : int
+        Width of the window in samples. If None or larger than signal, returns
+        the input unchanged.
+    device : str
+        Pytorch device for output tensor.
+    window_type : str
+        Window to apply. See scipy.get_window for syntax.
+        e.g., 'hann', 'hamming', 'blackman'.
+    circular_conv : bool
+        Circular convolution if True, otherwise zero pad.
+
+    Returns
+    ----------
+    w : Tensor
+        Windowing Tensor.
+    """
+    half_width = (window_width + 1) // 2
+
+    if not circular_conv:
+        data_length += 2*half_width
+
+    # Window needs to be centered at DC in FFT
+    half_window = get_window(window, 2 * half_width - 1, fftbins=True)[half_width - 1 :]
+    w = np.zeros(data_length, dtype=np.float32)
+    w[:half_width] = half_window
+    w[-half_width + 1 :] = np.flip(half_window[1:])
+    w = torch.tensor(w).to(device)
+
+    return w
+
 
 def fft_lowpass_filter_window(
     target_data: Tensor,
-    window: str | tuple = "hamming",
+    window: str | tuple | Tensor = "hamming",
     window_width: int = None,
     circular_conv: bool = False,
 ) -> Tensor:
@@ -678,6 +753,7 @@ def fft_lowpass_filter_window(
 
     Returns
     ----------
+    filtered_data : Tensor
         Filtered tensor (same shape as input)
     """
 
@@ -688,20 +764,25 @@ def fft_lowpass_filter_window(
     half_width = (window_width + 1) // 2
 
     if not circular_conv:
-        target_data = F.pad(target_data, (half_width, half_width))
+        target_data = F.pad(target_data, (0, 2*half_width))
 
     fdata = torch.fft.fft(target_data, dim=-1)
 
-    # Window needs to be centered at DC in FFT
-    half_window = get_window(window, 2 * half_width - 1, fftbins=True)[half_width - 1 :]
-    w = np.zeros(target_data.shape[-1], dtype=np.float32)
-    w[:half_width] = half_window
-    w[-half_width + 1 :] = np.flip(half_window[1:])
+    if type(window) == Tensor:
+        w = window
+        if w.shape != torch.Size([target_data.shape[-1]]):
+            raise ValueError(f"Invalid shape for window tensor {w.shape}, expected [{target_data.shape[-1]}]")
+    else:
+        w = fft_lowpass_filter_precalculate_window(
+            target_data.shape[-1],
+            window_width,
+            target_data.device,
+            window,
+            circular_conv)
 
-    w = torch.tensor(w).to(target_data.device)
     filtered_data = torch.fft.ifft(fdata * w, dim=-1)
     if not circular_conv:
-        filtered_data = filtered_data[..., half_width:-half_width]
+        filtered_data = filtered_data[..., :-2*half_width]
 
     return filtered_data
 

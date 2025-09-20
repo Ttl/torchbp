@@ -428,6 +428,174 @@ def polar_interp_lanczos(
     )
 
 
+def ffbp_merge2_lanczos(
+    img0: Tensor,
+    img1: Tensor,
+    dorigin0: Tensor,
+    dorigin1: Tensor,
+    grid_polars: list,
+    fc: float,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+    order: int = 3,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+) -> Tensor:
+    """
+    Interpolate two pseudo-polar radar images to new grid and change origin
+    position by `dorigin`.
+
+    Gradient not supported.
+
+    Note: Z-axis interpolation likely incorrect.
+
+    Parameters
+    ----------
+    img0 : Tensor
+        2D radar image in [range, angle] format. Dimensions should
+        match with grid_polars grid. Image dimension can be different for each
+        element in the list.
+    img1 : Tensor
+        Same format as img0.
+    dorigin0 : Tensor
+        Difference between the origin of the old image to the new image. Units in meters.
+        Shape: [3].
+    dorigin1 : Tensor
+        Same format as dorigin0.
+    grid_polar : list of dict
+        List of grid definitions for each input image.
+        Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    grid_polar_new : dict, optional
+        Grid definition of the new image.
+        If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center in the new image.
+    order : int
+        Interpolation order.
+    att : Tensor
+        Antenna rotation tensor.
+        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
+        out data outside the antenna beam.
+    g : Tensor or None
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1]
+        g_el0 : float
+            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
+            including data over the whole sphere.
+        g_az0 : float
+            grx and gtx azimuth axis starting value. Units in radians. -pi if
+            including data over the whole sphere.
+        g_el1 : float
+            grx and gtx elevation axis end value. Units in radians. +pi/2 if
+            including data over the whole sphere.
+        g_az1 : float
+            grx and gtx azimuth axis end value. Units in radians. +pi if
+            including data over the whole sphere.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+
+    device = img0.device
+    nimages = 2
+
+    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dr0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dtheta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    for i in range(nimages):
+        r1_0, r1_1 = grid_polars[i]["r"]
+        theta1_0, theta1_1 = grid_polars[i]["theta"]
+        ntheta1 = grid_polars[i]["ntheta"]
+        nr1 = grid_polars[i]["nr"]
+        dtheta1 = (theta1_1 - theta1_0) / ntheta1
+        dr1 = (r1_1 - r1_0) / nr1
+        r0[i] = r1_0
+        dr0[i] = dr1
+        theta0[i] = theta1_0
+        dtheta0[i] = dtheta1
+        Nr0[i] = nr1
+        Ntheta0[i] = ntheta1
+
+    if grid_polar_new is None:
+        r3_0 = r1_0
+        r3_1 = r1_1
+        theta3_0 = theta1_0
+        theta3_1 = theta1_1
+        nr3 = nr1
+        ntheta3 = 2 * ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    assert dorigin0.shape == (3,)
+    assert dorigin1.shape == (3,)
+    dorigin = torch.stack((dorigin0, dorigin1), dim=0)
+
+    if att is None or g is None:
+        att = torch.zeros(1, dtype=torch.float32, device=img0.device)
+        g = att
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
+    return torch.ops.torchbp.ffbp_merge2_lanczos.default(
+        img0,
+        img1,
+        dorigin,
+        fc,
+        r0,
+        dr0,
+        theta0,
+        dtheta0,
+        Nr0,
+        Ntheta0,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        z0,
+        order,
+        att,
+        g,
+        g_az0,
+        g_el0,
+        g_daz,
+        g_del,
+        g_naz,
+        g_nel,
+    )
+
+
 def polar_to_cart(
     img: Tensor,
     origin: Tensor,
@@ -847,10 +1015,7 @@ def backprojection_polar_2d(
     dealias: bool = False,
     att: Tensor | None = None,
     g: Tensor | None = None,
-    g_az0: float = 0,
-    g_el0: float = 0,
-    g_az1: float = 0,
-    g_el1: float = 0,
+    g_extent: list | None = None,
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
@@ -888,22 +1053,24 @@ def backprojection_polar_2d(
         Antenna rotation tensor.
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
         out data outside the antenna beam.
-    g : Tensor
+    g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
-        (0, 0) angle is at the beam center.
-    g_az0 : float
-        g azimuth axis starting value. Units in radians. -pi if
-        including data over the whole sphere.
-    g_el0 : float
-        g elevation axis starting value. Units in radians. -pi/2 if
-        including data over the whole sphere.
-    g_az1 : float
-        g azimuth axis end value. Units in radians. +pi if
-        including data over the whole sphere.
-    g_el1 : float
-        g elevation axis end value. Units in radians. +pi/2 if
-        including data over the whole sphere.
+        (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1]
+        g_el0 : float
+            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
+            including data over the whole sphere.
+        g_az0 : float
+            grx and gtx azimuth axis starting value. Units in radians. -pi if
+            including data over the whole sphere.
+        g_el1 : float
+            grx and gtx elevation axis end value. Units in radians. +pi/2 if
+            including data over the whole sphere.
+        g_az1 : float
+            grx and gtx azimuth axis end value. Units in radians. +pi if
+            including data over the whole sphere.
 
     Returns
     ----------
@@ -936,10 +1103,12 @@ def backprojection_polar_2d(
         g_naz = 0
         g_daz = 0
         g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
     else:
         g_nel = g.shape[0]
         g_naz = g.shape[1]
         assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
         g_daz = (g_az1 - g_az0) / g_naz
         g_del = (g_el1 - g_el0) / g_nel
 
@@ -986,10 +1155,7 @@ def backprojection_polar_2d_lanczos(
     order: int = 4,
     att: Tensor | None = None,
     g: Tensor = None,
-    g_az0: float = 0,
-    g_el0: float = 0,
-    g_az1: float = 0,
-    g_el1: float = 0,
+    g_extent: list | None = None,
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
@@ -1034,19 +1200,20 @@ def backprojection_polar_2d_lanczos(
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
-    g_az0 : float
-        g azimuth axis starting value. Units in radians. -pi if
-        including data over the whole sphere.
-    g_el0 : float
-        g elevation axis starting value. Units in radians. -pi/2 if
-        including data over the whole sphere.
-    g_az1 : float
-        g azimuth axis end value. Units in radians. +pi if
-        including data over the whole sphere.
-    g_el1 : float
-        g elevation axis end value. Units in radians. +pi/2 if
-        including data over the whole sphere.
-
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1]
+        g_el0 : float
+            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
+            including data over the whole sphere.
+        g_az0 : float
+            grx and gtx azimuth axis starting value. Units in radians. -pi if
+            including data over the whole sphere.
+        g_el1 : float
+            grx and gtx elevation axis end value. Units in radians. +pi/2 if
+            including data over the whole sphere.
+        g_az1 : float
+            grx and gtx azimuth axis end value. Units in radians. +pi if
+            including data over the whole sphere.
 
     Returns
     ----------
@@ -1079,10 +1246,12 @@ def backprojection_polar_2d_lanczos(
         g_naz = 0
         g_daz = 0
         g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
     else:
         g_nel = g.shape[0]
         g_naz = g.shape[1]
         assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
         g_daz = (g_az1 - g_az0) / g_naz
         g_del = (g_el1 - g_el0) / g_nel
 
@@ -1346,8 +1515,7 @@ def cfar_2d(
     )
 
 
-def coherence_2d(
-        img0: Tensor, img1: Tensor, Navg: tuple) -> Tensor:
+def coherence_2d(img0: Tensor, img1: Tensor, Navg: tuple) -> Tensor:
     """
     Coherence of two complex images over moving window `Navg`.
 
@@ -1398,7 +1566,8 @@ def coherence_2d(
 
 
 def power_coherence_2d(
-        img0: Tensor, img1: Tensor, Navg: tuple, corr_output: bool=True) -> Tensor:
+    img0: Tensor, img1: Tensor, Navg: tuple, corr_output: bool = True
+) -> Tensor:
     """
     Coherence of two complex images over moving window `Navg`. Calculated from
     squared absolute value of the images. [1]_
@@ -1448,24 +1617,14 @@ def power_coherence_2d(
         raise ValueError("Navg[1] < 0")
 
     return torch.ops.torchbp.power_coherence_2d.default(
-        img0,
-        img1,
-        nbatch,
-        N0,
-        N1,
-        Navg[0],
-        Navg[1],
-        corr_output
+        img0, img1, nbatch, N0, N1, Navg[0], Navg[1], corr_output
     )
 
 
 def backprojection_polar_2d_tx_power(
     wa: Tensor,
     g: Tensor,
-    g_az0: float,
-    g_el0: float,
-    g_az1: float,
-    g_el1: float,
+    g_extent: list,
     grid: dict,
     r_res: float,
     pos: Tensor,
@@ -1543,6 +1702,7 @@ def backprojection_polar_2d_tx_power(
 
     g_nel = g.shape[0]
     g_naz = g.shape[1]
+    g_el0, g_az0, g_el1, g_az1 = g_extent
     g_daz = (g_az1 - g_az0) / g_naz
     g_del = (g_el1 - g_el0) / g_nel
 
@@ -1570,12 +1730,7 @@ def backprojection_polar_2d_tx_power(
     )
 
 
-def lee_filter(
-    img: Tensor,
-    wx: int,
-    wy: int,
-    cu: float
-) -> Tensor:
+def lee_filter(img: Tensor, wx: int, wy: int, cu: float) -> Tensor:
     """
     Lee filter for speckle noise reduction.
 
@@ -1608,18 +1763,10 @@ def lee_filter(
         raise ValueError(f"Invalid image shape: {img.shape}")
 
     # Half-window size in C++
-    wx = wx//2
-    wy = wy//2
+    wx = wx // 2
+    wy = wy // 2
 
-    return torch.ops.torchbp.lee_filter.default(
-        img,
-        nbatch,
-        Nx,
-        Ny,
-        wx,
-        wy,
-        cu
-    )
+    return torch.ops.torchbp.lee_filter.default(img, nbatch, Nx, Ny, wx, wy, cu)
 
 
 def ffbp(
@@ -1632,8 +1779,8 @@ def ffbp(
     divisions: int = 2,
     d0: float = 0.0,
     interp_method: str | tuple = ("lanczos", 3),
-    oversample_r: float = 1,
-    oversample_theta: float = 1,
+    oversample_r: float = 1.6,
+    oversample_theta: float = 1.6,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -1674,6 +1821,14 @@ def ffbp(
     nsweeps = data.shape[0]
     device = data.device
 
+    try:
+        if interp_method[0] != "lanczos":
+            raise ValueError(
+                "interp_method should be ('lanczos', N) for some integer N"
+            )
+    except IndexError:
+        raise ValueError("interp_method should be ('lanczos', N) for some integer N")
+    interp_order = interp_method[1]
     imgs = []
     n = nsweeps // divisions
     for d in range(divisions):
@@ -1694,6 +1849,9 @@ def ffbp(
                 stages=stages - 1,
                 divisions=divisions,
                 d0=d0,
+                interp_method=interp_method,
+                oversample_r=1,  # Grid is already increased
+                oversample_theta=1,
             )
         else:
             img = backprojection_polar_2d(
@@ -1715,43 +1873,42 @@ def ffbp(
         i2 = img2[2]
         dorigin1 = new_origin - img1[0]
         dorigin1[2] = -(new_z - img1[3])
-        img_interpolated1 = polar_interp(
-            i1,
-            dorigin1,
-            img1[1],
-            fc,
-            0,
-            grid_polar_new,
-            z0=new_z,
-            method=interp_method,
-        ).squeeze()
-        del i1
-        del img1
-        imgs[0] = None
         dorigin2 = new_origin - img2[0]
         dorigin2[2] = -(new_z - img2[3])
-        img_interpolated2 = polar_interp(
+
+        img_sum = ffbp_merge2_lanczos(
+            i1,
             i2,
+            dorigin1,
             dorigin2,
-            img2[1],
+            [img1[1], img2[1]],
             fc,
-            0,
             grid_polar_new,
             z0=new_z,
-            method=interp_method,
-        ).squeeze()
+            order=interp_order,
+        )
+        imgs[0] = None
+        imgs[1] = None
+        del i1
+        del img1
         del i2
         del img2
-        imgs[1] = None
-        img_sum = img_interpolated1 + img_interpolated2
+
         merged = (new_origin, grid_polar_new, img_sum, new_z)
         imgs = imgs[2:] + [merged]
     return imgs[0][2]
 
 
 def multilook_polar(sar_img: Tensor, kernel: tuple, grid_polar: dict) -> (Tensor, dict):
-    sar_img = torch.nn.functional.avg_pool2d(sar_img.real, kernel, stride=None) + 1j*torch.nn.functional.avg_pool2d(sar_img.imag, kernel, stride=None)
-    grid_out = {"r": grid_polar["r"], "theta": grid_polar["theta"], "nr": sar_img.shape[-2], "ntheta": sar_img.shape[-1]}
+    sar_img = torch.nn.functional.avg_pool2d(
+        sar_img.real, kernel, stride=None
+    ) + 1j * torch.nn.functional.avg_pool2d(sar_img.imag, kernel, stride=None)
+    grid_out = {
+        "r": grid_polar["r"],
+        "theta": grid_polar["theta"],
+        "nr": sar_img.shape[-2],
+        "ntheta": sar_img.shape[-1],
+    }
     return sar_img, grid_out
 
 
@@ -2209,7 +2366,7 @@ def _backward_coherence_2d(ctx, grad):
     img0, img1 = ctx.saved_tensors
     ret = torch.ops.torchbp.coherence_2d_grad.default(grad, img0, img1, *ctx.saved)
     grads = [None] * coherence_2d_args
-    grads[:len(ret)] = ret
+    grads[: len(ret)] = ret
     return tuple(grads)
 
 
@@ -2251,5 +2408,7 @@ torch.library.register_autograd(
     "torchbp::abs_sum", _backward_abs_sum, setup_context=_setup_context_abs_sum
 )
 torch.library.register_autograd(
-    "torchbp::coherence_2d", _backward_coherence_2d, setup_context=_setup_context_coherence_2d
+    "torchbp::coherence_2d",
+    _backward_coherence_2d,
+    setup_context=_setup_context_coherence_2d,
 )
