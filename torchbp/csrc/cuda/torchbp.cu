@@ -1020,7 +1020,7 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
           float dtheta,
           int Nr,
           int Ntheta,
-          bool sin_look_angle) {
+          int normalization) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
     const int idr = idx / Ntheta;
@@ -1073,10 +1073,14 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         float g_i = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
         float sinl = 1.0f;
 
-        if (sin_look_angle) {
-            // Local incidence angle
+        if (normalization == 1) {
+            // sigma_0
             sinl = sqrtf(fmaxf(0.001f, 1.0f - (pos_z * pos_z) / (d * d)));
+        } else if (normalization == 2) {
+            // gamma_0
+            sinl = sqrtf(fmaxf(0.001f, 1.0f - (pos_z * pos_z) / (d * d))) * d / pos_z;
         }
+        // beta_0 otherwise
 
         float w = wa[idbatch * nsweeps + i];
         pixel += g_i * g_i * w * w / (d*d*d*d * sinl);
@@ -2030,7 +2034,7 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
           double dtheta,
           int64_t Nr,
           int64_t Ntheta,
-          int64_t sin_look_angle) {
+          int64_t normalization) {
 	TORCH_CHECK(wa.dtype() == at::kFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
@@ -2082,7 +2086,7 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
                   r0, dr,
                   theta0, dtheta,
                   Nr, Ntheta,
-                  sin_look_angle);
+                  normalization);
 	return img;
 }
 

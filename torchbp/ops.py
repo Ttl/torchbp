@@ -1803,7 +1803,7 @@ def backprojection_polar_2d_tx_power(
     r_res: float,
     pos: Tensor,
     att: Tensor,
-    sin_look_angle: bool = False,
+    normalization: str | None = None
 ) -> Tensor:
     """
     Calculate square root of transmitted power to image plane. Can be used to
@@ -1846,8 +1846,11 @@ def backprojection_polar_2d_tx_power(
     att : Tensor
         Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
         [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
-    sin_look_angle : bool
-        Multiply pixel value by sin of look angle.
+    normalization : str or None
+        Valid choices are:
+            "sigma" to divide each value by sin of incidence angle.
+            "gamma" to divide each value by of tan of incidence angle.
+            "beta" or None for no incidence angle normalization.
 
     Returns
     ----------
@@ -1880,6 +1883,15 @@ def backprojection_polar_2d_tx_power(
     g_daz = (g_az1 - g_az0) / g_naz
     g_del = (g_el1 - g_el0) / g_nel
 
+    if normalization == "beta" or normalization is None:
+        norm = 0
+    elif normalization == "sigma":
+        norm = 1
+    elif normalization == "gamma":
+        norm = 2
+    else:
+        raise ValueError(f"Invalid normalization {normalization}. Expected None,'sigma', or 'gamma'")
+
     return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(
         wa,
         pos,
@@ -1900,7 +1912,7 @@ def backprojection_polar_2d_tx_power(
         dtheta,
         nr,
         ntheta,
-        sin_look_angle,
+        norm,
     )
 
 
