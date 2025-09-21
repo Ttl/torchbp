@@ -285,6 +285,56 @@ static __device__ T lanczos_interp_2d(const T2 *img, int nx, int ny, float x, fl
     return sum;
 }
 
+static __device__ float knab_kernel_norm(int a, float v) {
+    return 1.0f / coshf(kPI * v * a);
+}
+
+static __device__ float knab_kernel(float x, int a, float v, float norm) {
+    // This is needed due to rounding errors.
+    if (fabsf(x) >= a) {
+        return 0.0f;
+    }
+    if (x == 0.0f) {
+        return 1.0f;
+    }
+    float xa = x / a;
+    return (sinpif(x) / (kPI * x)) * coshf(kPI * v * a * sqrtf(1.0f - xa*xa)) * norm;
+}
+
+template<class T, class T2>
+static __device__ T knab_interp_1d(const T2 *img, int n, float pos, int a, float v, float norm) {
+    int start = max(0, (int)ceilf(pos - a));
+    int end = min(n-1, (int)floorf(pos + a));
+    T sum{};
+    for (int i = start; i <= end; i++) {
+        float dx = pos - i;
+        float w = knab_kernel(dx, a, v, norm);
+        T val;
+        if constexpr (::cuda::std::is_same_v<T2, complex32_t> || ::cuda::std::is_same_v<T2, half2>) {
+            half2 val_h = ((half2*)img)[i];
+            val = {__half2float(val_h.x), __half2float(val_h.y)};
+        } else {
+            val = img[i];
+        }
+        sum += w * val;
+    }
+    return sum;
+}
+
+template<class T, class T2>
+static __device__ T knab_interp_2d(const T2 *img, int nx, int ny, float x, float y, int a, float v, float norm) {
+    int start_x = max(0, (int)ceilf(x - a));
+    int end_x = min(nx-1, (int)floorf(x + a));
+    T sum{};
+    for (int i = start_x; i <= end_x; i++) {
+        float dx = x - i;
+        float wx = knab_kernel(dx, a, v, norm);
+        T row_val = knab_interp_1d<T, T2>(img + i * ny, ny, y, a, v, norm);
+        sum += wx * row_val;
+    }
+    return sum;
+}
+
 template<typename T>
 __global__ void abs_sum_kernel(
           const T *data,
@@ -3998,10 +4048,7 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order,
-        const float *att,
-        const float *g, float g_az0, float g_el0, float g_daz,
-        float g_del, int g_naz, int g_nel) {
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -4045,35 +4092,62 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
             const float rpz = sqrtf(z0*z0 + rp*rp);
             sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
-            out[idr*Ntheta1 + idtheta] = v * ref;
-
-            if (g_naz > 0) {
-                const float look_angle = asinf(fmaxf(-z0 / rpz, -1.0f));
-                const float el_deg = look_angle - att[id * 3 + 0];
-                const float az_deg = tp - att[id * 3 + 2];
-
-                const float el_idx = (el_deg - g_el0) / g_del;
-                const float az_idx = (az_deg - g_az0) / g_daz;
-
-                const int el_int = el_idx;
-                const int az_int = az_idx;
-                const float el_frac = el_idx - el_int;
-                const float az_frac = az_idx - az_int;
-
-                if (el_int >= 0 && el_int+1 < g_nel && az_int >= 0 && az_int+1 < g_naz) {
-                    const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
-                    pixel += w * v * ref;
-                    w_sum += w*w;
-                }
-            } else {
-                pixel += v * ref;
-                w_sum += 1.0f;
-            }
+            pixel += v * ref;
         }
     }
-    if (g_naz > 0) {
-        if (w_sum > 0.0f) {
-            pixel *= 2.0f / sqrtf(w_sum);
+    out[idr*Ntheta1 + idtheta] = pixel;
+}
+
+__global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64_t *img1,
+        complex64_t *out, const float *dorigin,
+        float ref_phase, const float *r0, const float *dr, const float *theta0,
+        const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    if (idx >= Nr1 * Ntheta1) {
+        return;
+    }
+
+    const float d = r1 + dr1 * idr;
+    const float t = theta1 + dtheta1 * idtheta;
+    if (t < -1.0f || t > 1.0f) {
+        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+        return;
+    }
+
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+
+    complex64_t pixel{};
+    float w_sum = 0.0f;
+    const float knab_norm = knab_kernel_norm(order, knab_v);
+
+    for (int id=0; id < 2; id++) {
+        const complex64_t *img = id == 0 ? img0 : img1;
+        const float dorig0 = dorigin[id * 3 + 0];
+        const float dorig1 = dorigin[id * 3 + 1];
+        // TODO: Add dorig2
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float dri = (rp - r0[id]) / dr[id];
+        const float dti = (tp - theta0[id]) / dtheta[id];
+
+        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+            complex64_t v = knab_interp_2d<complex64_t, complex64_t>(
+                    img, Nr[id], Ntheta[id], dri, dti, order, knab_v, knab_norm);
+
+            float ref_sin, ref_cos;
+            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float dz = sqrtf(z1*z1 + d*d);
+            const float rpz = sqrtf(z0*z0 + rp*rp);
+            sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            pixel += v * ref;
         }
     }
     out[idr*Ntheta1 + idtheta] = pixel;
@@ -4328,15 +4402,7 @@ at::Tensor ffbp_merge2_lanczos_cuda(
           int64_t Nr1,
           int64_t Ntheta1,
           double z1,
-          int64_t order,
-          const at::Tensor &att,
-          const at::Tensor &g,
-          double g_az0,
-          double g_el0,
-          double g_daz,
-          double g_del,
-          int64_t g_naz,
-          int64_t g_nel) {
+          int64_t order) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -4346,8 +4412,6 @@ at::Tensor ffbp_merge2_lanczos_cuda(
 	TORCH_CHECK(dtheta0.dtype() == at::kFloat);
 	TORCH_CHECK(Nr0.dtype() == at::kInt);
 	TORCH_CHECK(Ntheta0.dtype() == at::kInt);
-	TORCH_CHECK(att.dtype() == at::kFloat);
-	TORCH_CHECK(g.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
@@ -4357,8 +4421,6 @@ at::Tensor ffbp_merge2_lanczos_cuda(
 	TORCH_INTERNAL_ASSERT(dtheta0.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(Nr0.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(Ntheta0.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
 	at::Tensor dorigin_contig = dorigin.contiguous();
 	at::Tensor img0_contig = img0.contiguous();
 	at::Tensor img1_contig = img1.contiguous();
@@ -4368,8 +4430,6 @@ at::Tensor ffbp_merge2_lanczos_cuda(
 	at::Tensor dtheta0_contig = dtheta0.contiguous();
 	at::Tensor Nr0_contig = Nr0.contiguous();
 	at::Tensor Ntheta0_contig = Ntheta0.contiguous();
-	at::Tensor att_contig = att.contiguous();
-	at::Tensor g_contig = g.contiguous();
 	at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
 	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
     c10::complex<float>* img0_ptr = img0_contig.data_ptr<c10::complex<float>>();
@@ -4381,8 +4441,6 @@ at::Tensor ffbp_merge2_lanczos_cuda(
     const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
     const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
     const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
-    const float* att_ptr = att_contig.data_ptr<float>();
-    const float* g_ptr = g_contig.data_ptr<float>();
 
 	dim3 thread_per_block = {256, 1};
 	// Up-rounding division.
@@ -4412,19 +4470,104 @@ at::Tensor ffbp_merge2_lanczos_cuda(
                   Nr1,
                   Ntheta1,
                   z1,
-                  order,
-                  att_ptr,
-                  g_ptr,
-                  g_az0,
-                  g_el0,
-                  g_daz,
-                  g_del,
-                  g_naz,
-                  g_nel
+                  order
                   );
 	return out;
 }
 
+at::Tensor ffbp_merge2_knab_cuda(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          const at::Tensor &dorigin,
+          double fc,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z1,
+          int64_t order,
+          double oversample) {
+	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(r0.dtype() == at::kFloat);
+	TORCH_CHECK(dr0.dtype() == at::kFloat);
+	TORCH_CHECK(theta0.dtype() == at::kFloat);
+	TORCH_CHECK(dtheta0.dtype() == at::kFloat);
+	TORCH_CHECK(Nr0.dtype() == at::kInt);
+	TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+	TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(r0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dr0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(theta0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dtheta0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(Nr0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(Ntheta0.device().type() == at::DeviceType::CUDA);
+	at::Tensor dorigin_contig = dorigin.contiguous();
+	at::Tensor img0_contig = img0.contiguous();
+	at::Tensor img1_contig = img1.contiguous();
+	at::Tensor r0_contig = r0.contiguous();
+	at::Tensor dr0_contig = dr0.contiguous();
+	at::Tensor theta0_contig = theta0.contiguous();
+	at::Tensor dtheta0_contig = dtheta0.contiguous();
+	at::Tensor Nr0_contig = Nr0.contiguous();
+	at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+	at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    c10::complex<float>* img0_ptr = img0_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* img1_ptr = img1_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr1 * Ntheta1;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, 1, 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+    const float v = 1.0f - 1.0f / oversample;
+
+    ffbp_merge2_kernel_knab
+          <<<block_count, thread_per_block>>>(
+                  (const complex64_t*)img0_ptr,
+                  (const complex64_t*)img1_ptr,
+                  (complex64_t*)out_ptr,
+                  dorigin_ptr,
+                  ref_phase,
+                  r0_ptr,
+                  dr0_ptr,
+                  theta0_ptr,
+                  dtheta0_ptr,
+                  Nr0_ptr,
+                  Ntheta0_ptr,
+                  r1,
+                  dr1,
+                  theta1,
+                  dtheta1,
+                  Nr1,
+                  Ntheta1,
+                  z1,
+                  order,
+                  v
+                  );
+	return out;
+}
 // Registers CUDA implementations
 TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cuda);
@@ -4440,6 +4583,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("polar_interp_bicubic", &polar_interp_bicubic_cuda);
   m.impl("polar_interp_lanczos", &polar_interp_lanczos_cuda);
   m.impl("ffbp_merge2_lanczos", &ffbp_merge2_lanczos_cuda);
+  m.impl("ffbp_merge2_knab", &ffbp_merge2_knab_cuda);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cuda);
   m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cuda);
   m.impl("polar_to_cart_bicubic", &polar_to_cart_bicubic_cuda);

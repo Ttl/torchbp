@@ -437,10 +437,7 @@ def ffbp_merge2_lanczos(
     fc: float,
     grid_polar_new: dict = None,
     z0: float = 0,
-    order: int = 3,
-    att: Tensor | None = None,
-    g: Tensor | None = None,
-    g_extent: list | None = None,
+    order: int = 3
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -479,28 +476,6 @@ def ffbp_merge2_lanczos(
         Height of the antenna phase center in the new image.
     order : int
         Interpolation order.
-    att : Tensor
-        Antenna rotation tensor.
-        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
-        out data outside the antenna beam.
-    g : Tensor or None
-        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
-        If TX antenna equals RX antenna, then this should be just antenna gain.
-        (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
-    g_extent : list or None
-        List of [g_el0, g_az0, g_el1, g_az1]
-        g_el0 : float
-            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
-            including data over the whole sphere.
-        g_az0 : float
-            grx and gtx azimuth axis starting value. Units in radians. -pi if
-            including data over the whole sphere.
-        g_el1 : float
-            grx and gtx elevation axis end value. Units in radians. +pi/2 if
-            including data over the whole sphere.
-        g_az1 : float
-            grx and gtx azimuth axis end value. Units in radians. +pi if
-            including data over the whole sphere.
 
     Returns
     ----------
@@ -550,22 +525,6 @@ def ffbp_merge2_lanczos(
     assert dorigin1.shape == (3,)
     dorigin = torch.stack((dorigin0, dorigin1), dim=0)
 
-    if att is None or g is None:
-        att = torch.zeros(1, dtype=torch.float32, device=img0.device)
-        g = att
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
-
     return torch.ops.torchbp.ffbp_merge2_lanczos.default(
         img0,
         img1,
@@ -585,15 +544,230 @@ def ffbp_merge2_lanczos(
         ntheta3,
         z0,
         order,
-        att,
-        g,
-        g_az0,
-        g_el0,
-        g_daz,
-        g_del,
-        g_naz,
-        g_nel,
     )
+
+
+def ffbp_merge2_knab(
+    img0: Tensor,
+    img1: Tensor,
+    dorigin0: Tensor,
+    dorigin1: Tensor,
+    grid_polars: list,
+    fc: float,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+    order: int = 3,
+    oversample: float = 1.5
+) -> Tensor:
+    """
+    Interpolate two pseudo-polar radar images to new grid and change origin
+    position by `dorigin`. Uses truncated sinc with Knab pulse for interpolation [1]_.
+
+    Gradient not supported.
+
+    Note: Z-axis interpolation likely incorrect.
+
+    Parameters
+    ----------
+    img0 : Tensor
+        2D radar image in [range, angle] format. Dimensions should
+        match with grid_polars grid. Image dimension can be different for each
+        element in the list.
+    img1 : Tensor
+        Same format as img0.
+    dorigin0 : Tensor
+        Difference between the origin of the old image to the new image. Units in meters.
+        Shape: [3].
+    dorigin1 : Tensor
+        Same format as dorigin0.
+    grid_polar : list of dict
+        List of grid definitions for each input image.
+        Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    grid_polar_new : dict, optional
+        Grid definition of the new image.
+        If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center in the new image.
+    order : int
+        Interpolation order.
+    oversample : float
+        Oversampling factor in the input data.
+
+    References
+    ----------
+    .. [1] J. Knab, "The sampling window," in IEEE Transactions on Information
+    Theory, vol. 29, no. 1, pp. 157-159, January 1983.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+
+    device = img0.device
+    nimages = 2
+
+    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dr0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dtheta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    for i in range(nimages):
+        r1_0, r1_1 = grid_polars[i]["r"]
+        theta1_0, theta1_1 = grid_polars[i]["theta"]
+        ntheta1 = grid_polars[i]["ntheta"]
+        nr1 = grid_polars[i]["nr"]
+        dtheta1 = (theta1_1 - theta1_0) / ntheta1
+        dr1 = (r1_1 - r1_0) / nr1
+        r0[i] = r1_0
+        dr0[i] = dr1
+        theta0[i] = theta1_0
+        dtheta0[i] = dtheta1
+        Nr0[i] = nr1
+        Ntheta0[i] = ntheta1
+
+    if grid_polar_new is None:
+        r3_0 = r1_0
+        r3_1 = r1_1
+        theta3_0 = theta1_0
+        theta3_1 = theta1_1
+        nr3 = nr1
+        ntheta3 = 2 * ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    assert dorigin0.shape == (3,)
+    assert dorigin1.shape == (3,)
+    dorigin = torch.stack((dorigin0, dorigin1), dim=0)
+
+    return torch.ops.torchbp.ffbp_merge2_knab.default(
+        img0,
+        img1,
+        dorigin,
+        fc,
+        r0,
+        dr0,
+        theta0,
+        dtheta0,
+        Nr0,
+        Ntheta0,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        z0,
+        order,
+        oversample
+    )
+
+def ffbp_merge2(
+    img0: Tensor,
+    img1: Tensor,
+    dorigin0: Tensor,
+    dorigin1: Tensor,
+    grid_polars: list,
+    fc: float,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+    method : tuple = ('lanczos', 3)
+) -> Tensor:
+    """
+    Interpolate two pseudo-polar radar images to new grid and change origin
+    position by `dorigin`.
+
+    Gradient not supported.
+
+    Note: Z-axis interpolation likely incorrect.
+
+    Parameters
+    ----------
+    img0 : Tensor
+        2D radar image in [range, angle] format. Dimensions should
+        match with grid_polars grid. Image dimension can be different for each
+        element in the list.
+    img1 : Tensor
+        Same format as img0.
+    dorigin0 : Tensor
+        Difference between the origin of the old image to the new image. Units in meters.
+        Shape: [3].
+    dorigin1 : Tensor
+        Same format as dorigin0.
+    grid_polar : list of dict
+        List of grid definitions for each input image.
+        Dictionary with keys "r", "theta", "nr", "ntheta".
+        "r": (r0, r1), tuple of min and max range,
+        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+        "nr": nr, number of range bins.
+        "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    grid_polar_new : dict, optional
+        Grid definition of the new image.
+        If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center in the new image.
+    method : str or tuple
+        Interpolation method. Valid choices are:
+        - ("lanczos", n): Lanczos resampling. `n` is half of the kernel length.
+        - ("knab", n, v): Knab pulse resampling. `n` is half of the kernel
+          length and v is oversampling factor in the data.
+
+    Returns
+    ----------
+    out : Tensor
+        Interpolated radar image.
+    """
+    if type(method) in (list, tuple):
+        method_params = method[1:]
+        method = method[0]
+    else:
+        method_params = None
+
+    if method == "lanczos":
+        if len(method_params) != 1:
+            raise ValueError("Lanczos interpolation needs sample length as argument")
+        return ffbp_merge2_lanczos(
+            img0,
+            img1,
+            dorigin0,
+            dorigin1,
+            grid_polars,
+            fc,
+            grid_polar_new,
+            z0,
+            order=method_params[0]
+        )
+    elif method == "knab":
+        if len(method_params) != 2:
+            raise ValueError("Knab interpolation needs sample length and oversampling factor as argument")
+        return ffbp_merge2_knab(
+            img0,
+            img1,
+            dorigin0,
+            dorigin1,
+            grid_polars,
+            fc,
+            grid_polar_new,
+            z0,
+            order=method_params[0],
+            oversample=method_params[1]
+        )
+    else:
+        raise ValueError(f"Unknown interp_method: {interp_method}")
 
 
 def polar_to_cart(
@@ -1822,13 +1996,12 @@ def ffbp(
     device = data.device
 
     try:
-        if interp_method[0] != "lanczos":
+        if interp_method[0] not in ["lanczos", "knab"]:
             raise ValueError(
-                "interp_method should be ('lanczos', N) for some integer N"
+                "interp_method should be ('lanczos', N) or ('knab', N, v)"
             )
     except IndexError:
         raise ValueError("interp_method should be ('lanczos', N) for some integer N")
-    interp_order = interp_method[1]
     imgs = []
     n = nsweeps // divisions
     for d in range(divisions):
@@ -1876,7 +2049,7 @@ def ffbp(
         dorigin2 = new_origin - img2[0]
         dorigin2[2] = -(new_z - img2[3])
 
-        img_sum = ffbp_merge2_lanczos(
+        img_sum = ffbp_merge2(
             i1,
             i2,
             dorigin1,
@@ -1885,7 +2058,7 @@ def ffbp(
             fc,
             grid_polar_new,
             z0=new_z,
-            order=interp_order,
+            method=interp_method,
         )
         imgs[0] = None
         imgs[1] = None
