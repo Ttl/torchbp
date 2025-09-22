@@ -1,3 +1,4 @@
+from __future__ import annotations
 import torch
 import numpy as np
 from torch import Tensor
@@ -23,7 +24,7 @@ from copy import deepcopy
 
 def pga_estimator(
     g: Tensor, estimator: str = "wls", eps: float = 1e-6, return_weight: bool = False
-) -> Tensor:
+) -> Union[Tuple[Tensor, Tensor], Tensor]:
     """
     Estimate phase error from set of measurements.
 
@@ -73,16 +74,16 @@ def pga_estimator(
         )
         gshift = torch.nn.functional.pad(g[..., :-1], (1, 0))
         phidot = torch.angle(
-            torch.sum((w / torch.max(w)) * (g * torch.conj(gshift)), axis=0)
+            torch.sum((w / torch.max(w)) * (g * torch.conj(gshift)), dim=0)
         )
         phi = torch.cumsum(phidot, dim=0)
         if return_weight:
             return phi, w
     elif estimator == "pd":
         z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
-        gdot = torch.diff(g, prepend=z, axis=-1)
-        phidot = torch.sum((torch.conj(g) * gdot).imag, axis=0) / torch.sum(
-            torch.abs(g) ** 2, axis=0
+        gdot = torch.diff(g, prepend=z, dim=-1)
+        phidot = torch.sum((torch.conj(g) * gdot).imag, dim=0) / torch.sum(
+            torch.abs(g) ** 2, dim=0
         )
         phi = torch.cumsum(phidot, dim=0)
     else:
@@ -284,7 +285,7 @@ def gpga_bp_polar(
         img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)[0]
 
     for i in range(max_iters):
-        rpeaks = torch.argmax(torch.abs(img), axis=1)
+        rpeaks = torch.argmax(torch.abs(img), dim=1)
         a = torch.abs(img[torch.arange(img.size(0)), rpeaks])
         max_a = torch.max(a)
 
@@ -494,7 +495,7 @@ def gpga_bp_polar_tde(
                 jr1 = (jr + 1) * azdiv if jr < azimuth_divisions - 1 else -1
                 local_img = img[ir * rdiv : ir1, jr * azdiv : jr1]
 
-                rpeaks = torch.argmax(torch.abs(local_img), axis=1)
+                rpeaks = torch.argmax(torch.abs(local_img), dim=1)
                 a = torch.abs(local_img[torch.arange(local_img.size(0)), rpeaks])
                 max_a = torch.max(a)
 
