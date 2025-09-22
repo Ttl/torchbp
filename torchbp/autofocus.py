@@ -187,7 +187,7 @@ def gpga_bp_polar(
     grid_polar: dict,
     window_width: int | None = None,
     max_iters: int = 10,
-    window_exp: float = 0.8,
+    window_exp: float = 0.7,
     min_window: int = 5,
     d0: float = 0.0,
     target_threshold_db: float = 20,
@@ -317,7 +317,7 @@ def gpga_bp_polar(
         pos_new[:, 0] = pos[:, 0] + d
 
         img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[0]
-        window_width = int(window_width**window_exp)
+        window_width = int(window_width * window_exp)
         if window_width < min_window:
             break
     return img, phi_sum
@@ -335,7 +335,7 @@ def gpga_bp_polar_tde(
     window_width: int | None = None,
     rms_error_limit: float = 0.05,
     max_iters: int = 20,
-    window_exp: float = 0.9,
+    window_exp: float = 0.7,
     min_window: int = 5,
     d0: float = 0.0,
     target_threshold_db: float = 20,
@@ -605,7 +605,7 @@ def gpga_bp_polar_tde(
             img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[
                 0
             ]
-        window_width = int(window_width**window_exp)
+        window_width = int(window_width * window_exp)
         if window_width < min_window:
             if verbose:
                 print("Window width below the minimum size")
