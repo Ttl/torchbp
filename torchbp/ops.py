@@ -1851,6 +1851,7 @@ def backprojection_polar_2d_tx_power(
             "sigma" to divide each value by sin of incidence angle.
             "gamma" to divide each value by of tan of incidence angle.
             "beta" or None for no incidence angle normalization.
+            "point" to normalize to constant reflectivity (no ground patch).
 
     Returns
     ----------
@@ -1889,8 +1890,10 @@ def backprojection_polar_2d_tx_power(
         norm = 1
     elif normalization == "gamma":
         norm = 2
+    elif normalization == "point":
+        norm = 3
     else:
-        raise ValueError(f"Invalid normalization {normalization}. Expected None,'sigma', or 'gamma'")
+        raise ValueError(f"Invalid normalization {normalization}.")
 
     return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(
         wa,

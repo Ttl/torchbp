@@ -1035,6 +1035,9 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
     const float x = r * sqrtf(1.0f - theta*theta);
     const float y = r * theta;
 
+    // Angular size of resolution cell at nadir.
+    const float min_look_angle = sqrtf(dr/pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2]);
+
     float pixel = 0.0f;
 
     for(int i = 0; i < nsweeps; i++) {
@@ -1075,15 +1078,19 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
 
         if (normalization == 1) {
             // sigma_0
-            sinl = sqrtf(fmaxf(0.001f, 1.0f - (pos_z * pos_z) / (d * d)));
+            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (pos_z * pos_z) / (d * d)));
         } else if (normalization == 2) {
             // gamma_0
-            sinl = sqrtf(fmaxf(0.001f, 1.0f - (pos_z * pos_z) / (d * d))) * d / pos_z;
+            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (pos_z * pos_z) / (d * d))) * d / pos_z;
+        } else if (normalization == 3) {
+            // point
+            // Scale as d^4 instead of d^3 for area target.
+            sinl = d;
         }
         // beta_0 otherwise
 
         float w = wa[idbatch * nsweeps + i];
-        pixel += g_i * g_i * w * w / (d*d*d*d * sinl);
+        pixel += g_i * g_i * w * w / (d*d*d * sinl);
     }
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = sqrtf(pixel);
 }
@@ -4072,7 +4079,6 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
     const float cost = sqrtf(1.0f - t*t);
 
     complex64_t pixel{};
-    float w_sum = 0.0f;
 
     for (int id=0; id < 2; id++) {
         const complex64_t *img = id == 0 ? img0 : img1;
@@ -4126,7 +4132,6 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
     const float cost = sqrtf(1.0f - t*t);
 
     complex64_t pixel{};
-    float w_sum = 0.0f;
     const float knab_norm = knab_kernel_norm(order, knab_v);
 
     for (int id=0; id < 2; id++) {
