@@ -124,8 +124,6 @@ def k_alpha_cal(
         device=sar_img.device,
     )
 
-    # Normalize M
-    M = M / torch.linalg.det(M) ** 0.25
     # Permutate to original channel order
     M = M[permutation, :][:, permutation]
 
