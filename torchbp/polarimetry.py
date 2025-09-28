@@ -100,7 +100,7 @@ def k_alpha_cal(
 
     if alpha is None:
         # Correlation matrix
-        c = correlation_matrix(sar_img, pol_order=pol_order, output_order=order)
+        c = correlation_matrix(sar_img, weight=weight, pol_order=pol_order, output_order=order)
 
         # Derivation assumes this polarization ordering
         hv = 1
