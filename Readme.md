@@ -1,10 +1,14 @@
 # Torchbp
 
-Fast C++ Pytorch extension for differentiable synthetic aperture radar image formation and autofocus library on CPU and GPU.
+![SAR image](https://github.com/Ttl/torchbp/blob/master/docs/img/07_19_1_autofocus_gamma0_pauli_pol_cal.png?raw=true)
 
-Only Nvidia GPUs are supported. Currently, some operations are not supported on CPU.
+Fast C++ Pytorch extension for differentiable synthetic aperture radar image formation and autofocus library on GPU.
 
-On RTX 3090 Ti backprojection on polar grid achieves 225 billion backprojections/s.
+Only Nvidia GPUs are supported. Currently, only some of the operations are supported on CPU.
+
+On RTX 3090 Ti backprojection on polar grid achieves 225 billion
+backprojections/s and fast factorized backprojection (ffbp) is ten times faster on
+moderate size images.
 
 ## Installation
 
