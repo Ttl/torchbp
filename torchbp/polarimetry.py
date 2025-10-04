@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from math import sin, cos
 
 
 def correlation_matrix(
@@ -57,7 +58,10 @@ def correlation_matrix(
             if weight is not None:
                 v *= weight / weight_mean
                 v *= weight / weight_mean
-            c[i, j] = torch.nanmean(v).to(device=device, dtype=dtype)
+            if device == torch.device("cpu"):
+                c[i, j] = torch.mean(torch.nan_to_num(v)).to(device=device, dtype=dtype)
+            else:
+                c[i, j] = torch.nanmean(v).to(device=device, dtype=dtype)
     return c
 
 
@@ -112,7 +116,11 @@ def k_alpha_cal(
         alpha = alpha.item()
 
     if corner_hh_vv is not None:
-        k = (corner_hh_vv / alpha**2) ** 0.5
+        k_guess = (corner_hh_vv / alpha**2) ** 0.5
+        if abs(k - k_guess) < abs(k + k_guess):
+            k = k_guess
+        else:
+            k = -k_guess
 
     M = torch.tensor(
         [
@@ -192,7 +200,12 @@ def ainsworth(
     alpha = alpha.to(dtype=c.dtype)
 
     if corner_hh_vv is not None:
-        k = (corner_hh_vv / alpha**2) ** 0.5
+        k_guess = (corner_hh_vv / alpha**2) ** 0.5
+        if abs(k - k_guess) < abs(k + k_guess):
+            k = k_guess
+        else:
+            k = -k_guess
+
     k = k * torch.ones_like(alpha)
     uvwz = torch.zeros(4, dtype=c.dtype, device=c.device)
 
@@ -317,7 +330,13 @@ def ainsworth(
     z = uvwz[3]
 
     if corner_hh_vv is not None:
-        k = ((-corner_hh_vv + v * w) / (alpha**2 * (corner_hh_vv * u * z - 1))) ** 0.5
+        k_guess = ((-corner_hh_vv + v * w) / (alpha**2 * (corner_hh_vv * u * z - 1))) ** 0.5
+
+        if abs(k - k_guess) < abs(k + k_guess):
+            k = k_guess
+        else:
+            k = -k_guess
+    print("k", torch.abs(k), torch.angle(k))
 
     M = torch.tensor(
         [
@@ -364,3 +383,60 @@ def apply_cal(sar_img: Tensor, cal: Tensor) -> Tensor:
     caled = cal @ img_reshaped
     caled = caled.view(*s)
     return caled
+
+
+def pol_antenna_rotation(sar_img: Tensor, theta: float, pol_order: list = ["VV", "VH", "HV", "HH"]) -> Tensor:
+    """
+    Calculate polarimetric SAR image with antenna rotated by angle theta
+    around the antenna axis.
+
+    Parameters
+    ----------
+    sar_img : Tensor
+        Input SAR image. Shape should be [3, M, N] or [4, M, N].
+    theta : float
+        Rotation angle.
+    pol_order : list
+        Order of polarizations in the SAR image.
+        Use "HV" for cross-polarized channel if image has three polarizations.
+
+    Returns
+    ----------
+    sar_img : Tensor
+        SAR image after rotation.
+    """
+    if theta == 0:
+        return sar_img
+
+    p = []
+    ch = sar_img.shape[0]
+    if ch not in [3, 4]:
+        raise ValueError(f"SAR image has {ch} channels which doesn't match pol_order.")
+
+    cal_order = ["HH", "HV", "VH", "VV"]
+    if ch == 3:
+        cal_order = ["HH", "HV", "VV"]
+    for i in range(ch):
+        p.append(pol_order.index(cal_order[i]))
+
+    shh = sar_img[p[0]]
+    shv = sar_img[p[1]]
+    svv = sar_img[p[-1]]
+    if ch == 3:
+        svh = shv
+    else:
+        svh = sar_img[p[2]]
+
+    cost = cos(theta)
+    sint = sin(theta)
+    out_img = torch.empty_like(sar_img)
+    # HH
+    out_img[p[0]] = shh * cost**2 - (shv + svh)*cost*sint + svv*sint**2
+    # HV
+    out_img[p[1]] = shv * cost**2  + (shh - svv)*cost*sint - svh*sint**2
+    if ch == 4:
+        # VH
+        out_img[p[2]] = svh * cost**2  + (shh - svv)*cost*sint - shv*sint**2
+    # VV
+    out_img[p[-1]] = svv * cost**2 - (shv + svh)*cost*sint + shh*sint**2
+    return out_img
