@@ -1,6 +1,6 @@
 # Torchbp
 
-![SAR image](https://github.com/Ttl/torchbp/blob/master/docs/img/07_19_1_autofocus_gamma0_pauli_pol_cal.png?raw=true)
+![SAR image](https://github.com/Ttl/torchbp/blob/master/docs/img/07_19_1_autofocus_sigma0_pol_cal_pauli.png?raw=true)
 
 Fast C++ Pytorch extension for differentiable synthetic aperture radar image formation and autofocus library on GPU.
 
