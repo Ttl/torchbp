@@ -550,14 +550,14 @@ def gpga_bp_polar_tde(
         # Local image centers in Cartesian coordinates
         local_y = local_centers[:, 0] * local_centers[:, 1]
         local_x = local_centers[:, 0] * torch.sqrt(1 - local_centers[:, 1] ** 2)
-        # Range from each position to local image centers
+        # Ground range from each position to local image centers
         local_r = torch.sqrt(
             (pos_new[:, 0][:, None] - local_x[None, :]) ** 2
             + (pos_new[:, 1][:, None] - local_y[None, :]) ** 2
         )
 
         # Local image center azimuth and elevation angles from each data position
-        target_el = torch.arcsin(torch.clamp(-pos_new[:, 2][:, None] / local_r, -1, 1))
+        target_el = torch.arctan2(-pos_new[:, 2][:, None], local_r)
         target_az = torch.arctan2(
             local_y[None, :] - pos_new[:, 1][:, None],
             local_x[None, :] - pos_new[:, 0][:, None],
