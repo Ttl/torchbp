@@ -400,6 +400,13 @@ def pol_antenna_rotation(sar_img: Tensor, theta: float, pol_order: list = ["VV",
         Order of polarizations in the SAR image.
         Use "HV" for cross-polarized channel if image has three polarizations.
 
+    References
+    ----------
+    .. [1] K. Sarabandi and F. T. Ulaby, "A convenient technique for
+    polarimetric calibration of single-antenna radar systems," in IEEE
+    Transactions on Geoscience and Remote Sensing, vol. 28, no. 6, pp.
+    1022-1033, Nov. 1990.
+
     Returns
     ----------
     sar_img : Tensor
