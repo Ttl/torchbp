@@ -1630,6 +1630,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cuda);
   m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cuda);
   m.impl("gpga_backprojection_2d_lanczos", &gpga_backprojection_2d_lanczos_cuda);
+  m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
 }
 
 }
