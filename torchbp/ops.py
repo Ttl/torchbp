@@ -1545,6 +1545,166 @@ def backprojection_cart_2d(
     )
 
 
+def projection_cart_2d(
+    img: Tensor,
+    pos: Tensor,
+    grid: dict,
+    fc: float,
+    fs:float,
+    gamma: float,
+    sweep_samples: int,
+    d0: float = 0.0,
+    dem: Tensor | None = None,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    use_rvp: bool = True,
+    normalization: str = "beta"
+) -> Tensor:
+    """
+    Calculate FMCW radar data from radar image.
+
+    Parameters
+    ----------
+    img : Tensor
+        SAR image in Cartesian coordinates.
+    grid : dict
+        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
+        "x": (x0, x1), tuple of min and max range,
+        "y": (y0, y1), tuple of min and max along-track coordinates.
+        "nx": number of X-axis bins.
+        "ny": number of Y-axis bins.
+    fc : float
+        RF center frequency in Hz.
+    fs : float
+        Sampling frequency in Hz.
+    gamma : float
+        BW / tsweep.
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+    d0 : float
+        Zero range correction.
+    dem : Tensor
+        Digital elevation map. Should have same shape as img.
+    att : Tensor
+        Antenna rotation tensor.
+        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
+        out data outside the antenna beam.
+    g : Tensor or None
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1]
+        g_el0 : float
+            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
+            including data over the whole sphere.
+        g_az0 : float
+            grx and gtx azimuth axis starting value. Units in radians. -pi if
+            including data over the whole sphere.
+        g_el1 : float
+            grx and gtx elevation axis end value. Units in radians. +pi/2 if
+            including data over the whole sphere.
+        g_az1 : float
+            grx and gtx azimuth axis end value. Units in radians. +pi if
+            including data over the whole sphere.
+    use_rvp : bool
+        True to add residual video phase term.
+    normalization : str
+        Which surface reflectivity definition `img` uses.
+        Valid choices are "sigma" or "gamma".
+
+    Returns
+    ----------
+    data : Tensor
+        FMCW radar data at each position. Shape [nbatch, nsweeps, nsamples].
+    """
+
+    x0, x1 = grid["x"]
+    y0, y1 = grid["y"]
+    nx = grid["nx"]
+    ny = grid["ny"]
+    dx = (x1 - x0) / nx
+    dy = (y1 - y0) / ny
+
+    if img.dim() == 2:
+        nbatch = 1
+        nsweeps = pos.shape[0]
+        if img.shape[0] != nx:
+            raise ValueError("grid and img have different number of points in x")
+        if img.shape[1] != ny:
+            raise ValueError("grid and img have different number of points in y")
+        if list(pos.shape) != [nsweeps, 3]:
+            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nsweeps, 3]}")
+    else:
+        nbatch = img.shape[0]
+        nsweeps = pos.shape[1]
+        if img.shape[1] != nx:
+            raise ValueError("grid and img have different number of points in x")
+        if img.shape[2] != ny:
+            raise ValueError("grid and img have different number of points in y")
+
+        if list(pos.shape) != [nbatch, nsweeps, 3]:
+            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nbatch, nsweeps, 3]}")
+
+    if normalization == "sigma":
+        norm = 0
+    elif normalization == "gamma":
+        norm = 1
+    else:
+        raise ValueError(f"Unknown normalization: {normalization}")
+
+    if dem is None:
+        dem = torch.zeros([nx, ny], dtype=torch.float32, device=img.device)
+    elif list(dem.shape) != [nx, ny]:
+        raise ValueError("img and dem shapes are different")
+
+    if att is None or g is None:
+        att = torch.zeros(1, dtype=torch.float32, device=img.device)
+        g = att
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
+    return torch.ops.torchbp.projection_cart_2d.default(
+        img,
+        dem,
+        pos,
+        att,
+        nbatch,
+        sweep_samples,
+        nsweeps,
+        fc,
+        fs,
+        gamma,
+        x0,
+        dx,
+        y0,
+        dy,
+        nx,
+        ny,
+        d0,
+        g,
+        g_az0,
+        g_el0,
+        g_daz,
+        g_del,
+        g_naz,
+        g_nel,
+        use_rvp,
+        norm
+    )
+
+
 def gpga_backprojection_2d_core(
     target_pos: Tensor,
     data: Tensor,
@@ -1803,7 +1963,7 @@ def backprojection_polar_2d_tx_power(
     r_res: float,
     pos: Tensor,
     att: Tensor,
-    normalization: str | None = None
+    normalization: str | None = None,
 ) -> Tensor:
     """
     Calculate square root of transmitted power to image plane. Can be used to

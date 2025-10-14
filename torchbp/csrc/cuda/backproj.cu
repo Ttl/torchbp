@@ -794,6 +794,216 @@ __global__ void backprojection_cart_2d_grad_kernel(
 }
 
 
+__global__ void projection_cart_2d_kernel(
+          const complex64_t* img,
+          const float* dem,
+          const float* pos,
+          const float* att,
+          complex64_t* data,
+          int sweep_samples,
+          int nsweeps,
+          float fc,
+          float fs,
+          float gamma,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          float d0,
+          const float *g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          bool use_rvp,
+          int normalization) {
+    const int idt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idy = idt % Ny;
+    const int idx = idt / Ny;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    unsigned mask = __ballot_sync(FULL_MASK, idt < Nx * Ny);
+
+    if (idx >= Nx || idy >= Ny) {
+        return;
+    }
+
+    const float x = x0 + idx * dx;
+    const float y = y0 + idy * dy;
+    const float z = (dem != nullptr) ? dem[idx * Ny + idy] : 0.0f;
+    const complex64_t w_img = img[idbatch * Nx * Ny + idx * Ny + idy];
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        float pz = (z - pos_z);
+
+        float d = sqrtf(px * px + py * py + pz * pz);
+        float tau = 2.0f * (d + d0) / kC0;
+
+        complex64_t w = w_img / (d * d);
+
+        if (g_naz > 0) {
+            const float look_angle = asinf(fmaxf(pz / d, -1.0f));
+            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+
+            const float el_idx = (el_deg - g_el0) / g_del;
+            const float az_idx = (az_deg - g_az0) / g_daz;
+
+            const int el_int = el_idx;
+            const int az_int = az_idx;
+            const float el_frac = el_idx - el_int;
+            const float az_frac = az_idx - az_int;
+
+            if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz) {
+                w = 0.0f;
+            } else {
+                w *= interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+            }
+        }
+
+        if (normalization == 1) {
+            // gamma_0
+            // sin of look_angle.
+            // Square root because this is amplitude.
+            w *= sqrtf(-pz / d);
+        }
+        // sigma_0 otherwise
+
+        float phase0 = -2.0f * (fc * tau);
+        if (use_rvp) {
+            phase0 += -gamma * tau * tau;
+        }
+
+        const float freq = 2.0f * gamma * tau / fs;
+        for (int j = 0; j < sweep_samples; j++) {
+            float phase = freq * j + phase0;
+
+            float ref_sin, ref_cos;
+            sincospif(phase, &ref_sin, &ref_cos);
+            complex64_t p = {ref_cos, ref_sin};
+            const complex64_t s = w * p;
+
+            float s_re = s.real();
+            float s_im = s.imag();
+
+            __syncwarp();
+            for (int offset = 16; offset > 0; offset /= 2) {
+                s_re += __shfl_down_sync(mask, s_re, offset);
+                s_im += __shfl_down_sync(mask, s_im, offset);
+            }
+
+            if (threadIdx.x % 32 == 0) {
+                float2 *x0 = (float2*)&data[idbatch * sweep_samples * nsweeps + i * sweep_samples + j];
+                atomicAdd(&x0->x, s_re);
+                atomicAdd(&x0->y, s_im);
+            }
+        }
+    }
+}
+
+
+at::Tensor projection_cart_2d_cuda(
+          const at::Tensor &img,
+          const at::Tensor &dem,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double fs,
+          double gamma,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double d0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t use_rvp,
+          int64_t normalization) {
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
+	TORCH_CHECK(img.dtype() == at::kComplexFloat);
+	TORCH_CHECK(dem.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor dem_contig = dem.contiguous();
+	at::Tensor g_contig = g.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(img.device());
+	at::Tensor data = torch::zeros({nbatch, nsweeps, sweep_samples}, options);
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+	const float* dem_ptr = dem_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
+    c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
+    c10::complex<float>* data_ptr = data.data_ptr<c10::complex<float>>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nx * Ny;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+
+    projection_cart_2d_kernel
+          <<<block_count, thread_per_block>>>(
+                  (complex64_t*)img_ptr,
+                  dem_ptr,
+                  pos_ptr,
+                  att_ptr,
+                  (complex64_t*)data_ptr,
+                  sweep_samples,
+                  nsweeps,
+                  fc,
+                  fs,
+                  gamma,
+                  x0, dx,
+                  y0, dy,
+                  Nx, Ny,
+                  d0,
+                  g_ptr,
+                  g_az0,
+                  g_el0,
+                  g_daz,
+                  g_del,
+                  g_naz,
+                  g_nel,
+                  use_rvp,
+                  normalization);
+
+    return data;
+}
+
+
 at::Tensor backprojection_polar_2d_cuda(
           const at::Tensor &data,
           const at::Tensor &pos,
@@ -1631,6 +1841,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cuda);
   m.impl("gpga_backprojection_2d_lanczos", &gpga_backprojection_2d_lanczos_cuda);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
+  m.impl("projection_cart_2d", &projection_cart_2d_cuda);
 }
 
 }
