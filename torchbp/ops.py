@@ -1414,8 +1414,8 @@ def backprojection_polar_2d_lanczos(
         assert pos.shape == (nbatch, nsweeps, 3)
 
     if att is None or g is None:
-        att = torch.zeros(1, dtype=torch.float32, device=data.device)
-        g = att
+        att = None
+        g = None
         g_nel = 0
         g_naz = 0
         g_daz = 0
