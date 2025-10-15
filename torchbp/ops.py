@@ -1271,8 +1271,8 @@ def backprojection_polar_2d(
         assert pos.shape == (nbatch, nsweeps, 3)
 
     if att is None or g is None:
-        att = torch.zeros(1, dtype=torch.float32, device=data.device)
-        g = att
+        att = None
+        g = None
         g_nel = 0
         g_naz = 0
         g_daz = 0
@@ -1562,12 +1562,13 @@ def projection_cart_2d(
     normalization: str = "beta"
 ) -> Tensor:
     """
-    Calculate FMCW radar data from radar image.
+    Calculate FMCW radar data for each radar position in `pos` when measuring
+    the scene in `img`.
 
     Parameters
     ----------
     img : Tensor
-        SAR image in Cartesian coordinates.
+        SAR image in Cartesian coordinates. Shape [nx, ny] or [nbatch, nx, ny].
     grid : dict
         Grid definition. Dictionary with keys "x", "y", "nx", "ny".
         "x": (x0, x1), tuple of min and max range,
@@ -1579,17 +1580,17 @@ def projection_cart_2d(
     fs : float
         Sampling frequency in Hz.
     gamma : float
-        BW / tsweep.
+        Distance to IF frequency conversion factor. For FMCW radar: BW / tsweep.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
     d0 : float
         Zero range correction.
-    dem : Tensor
-        Digital elevation map. Should have same shape as img.
-    att : Tensor
-        Antenna rotation tensor.
-        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
-        out data outside the antenna beam.
+    dem : Tensor or None
+        Digital elevation map. Should have shape: [nx, ny].
+        Set to zero if None.
+    att : Tensor or None
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+        [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
@@ -1611,8 +1612,10 @@ def projection_cart_2d(
     use_rvp : bool
         True to add residual video phase term.
     normalization : str
-        Which surface reflectivity definition `img` uses.
-        Valid choices are "sigma" or "gamma".
+        Surface reflectivity definition to use. Valid choices are "sigma" or "gamma".
+        "sigma": No look angle dependency (unphysical).
+        "gamma": Multiply the reflectivity be cross-sectional area of the patch
+        (more realistic).
 
     Returns
     ----------
@@ -1654,14 +1657,12 @@ def projection_cart_2d(
     else:
         raise ValueError(f"Unknown normalization: {normalization}")
 
-    if dem is None:
-        dem = torch.zeros([nx, ny], dtype=torch.float32, device=img.device)
-    elif list(dem.shape) != [nx, ny]:
+    if dem is not None and list(dem.shape) != [nx, ny]:
         raise ValueError("img and dem shapes are different")
 
     if att is None or g is None:
-        att = torch.zeros(1, dtype=torch.float32, device=img.device)
-        g = att
+        att = None
+        g = None
         g_nel = 0
         g_naz = 0
         g_daz = 0

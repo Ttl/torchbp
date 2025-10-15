@@ -544,7 +544,7 @@ def generate_fmcw_data(
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
-        (0, 0) angle is at the beam center.
+        (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1]
         g_el0 : float

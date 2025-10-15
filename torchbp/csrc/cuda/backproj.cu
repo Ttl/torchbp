@@ -83,7 +83,7 @@ __global__ void backprojection_polar_2d_kernel(
         sincospif(ref_phase * d, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
 
-        if (g_naz > 0) {
+        if (g != nullptr) {
             const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
             const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
             const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
@@ -110,7 +110,7 @@ __global__ void backprojection_polar_2d_kernel(
             pixel += s * ref;
         }
     }
-    if (g_naz > 0) {
+    if (g != nullptr) {
         if (w_sum > 0.0f) {
             pixel *= nsweeps / sqrtf(w_sum);
         }
@@ -339,7 +339,7 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
         sincospif(ref_phase * d, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
 
-        if (g_naz > 0) {
+        if (g != nullptr) {
             const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
             const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
             const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
@@ -366,7 +366,7 @@ __global__ void backprojection_polar_2d_lanczos_kernel(
             pixel += s * ref;
         }
     }
-    if (g_naz > 0) {
+    if (g != nullptr) {
         if (w_sum > 0.0f) {
             pixel *= nsweeps / sqrtf(w_sum);
         }
@@ -851,7 +851,7 @@ __global__ void projection_cart_2d_kernel(
 
         complex64_t w = w_img / (d * d);
 
-        if (g_naz > 0) {
+        if (g != nullptr) {
             const float look_angle = asinf(fmaxf(pz / d, -1.0f));
             const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
             const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
@@ -940,21 +940,25 @@ at::Tensor projection_cart_2d_cuda(
           int64_t use_rvp,
           int64_t normalization) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(att.dtype() == at::kFloat);
-	TORCH_CHECK(g.dtype() == at::kFloat);
 	TORCH_CHECK(img.dtype() == at::kComplexFloat);
-	TORCH_CHECK(dem.dtype() == at::kFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+
+    bool antenna_pattern = g.defined() || att.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+    }
+
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+    }
 
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor att_contig = att.contiguous();
 	at::Tensor img_contig = img.contiguous();
-	at::Tensor dem_contig = dem.contiguous();
-	at::Tensor g_contig = g.contiguous();
     auto options =
       torch::TensorOptions()
         .dtype(torch::kComplexFloat)
@@ -962,9 +966,20 @@ at::Tensor projection_cart_2d_cuda(
         .device(img.device());
 	at::Tensor data = torch::zeros({nbatch, nsweeps, sweep_samples}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* att_ptr = att_contig.data_ptr<float>();
-	const float* dem_ptr = dem_contig.data_ptr<float>();
-	const float* g_ptr = g_contig.data_ptr<float>();
+	const float* dem_ptr = nullptr;
+    if (dem.defined()) {
+        at::Tensor dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+    }
+    float* att_ptr = nullptr;
+    float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        at::Tensor att_contig = att.contiguous();
+        at::Tensor g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
+
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
     c10::complex<float>* data_ptr = data.data_ptr<c10::complex<float>>();
 
@@ -1030,18 +1045,20 @@ at::Tensor backprojection_polar_2d_cuda(
           int64_t g_naz,
           int64_t g_nel) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(att.dtype() == at::kFloat);
-	TORCH_CHECK(g.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
-	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 
+    bool antenna_pattern = g.defined() || att.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+    }
+
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor att_contig = att.contiguous();
 	at::Tensor data_contig = data.contiguous();
-	at::Tensor g_contig = g.contiguous();
     auto options =
       torch::TensorOptions()
         .dtype(torch::kComplexFloat)
@@ -1049,9 +1066,16 @@ at::Tensor backprojection_polar_2d_cuda(
         .device(data.device());
 	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* att_ptr = att_contig.data_ptr<float>();
-	const float* g_ptr = g_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
+
+    float* att_ptr = nullptr;
+    float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        at::Tensor att_contig = att.contiguous();
+        at::Tensor g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
 
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
@@ -1346,11 +1370,17 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
           int64_t g_naz,
           int64_t g_nel) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
-	TORCH_CHECK(att.dtype() == at::kFloat);
-	TORCH_CHECK(g.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
+
+    bool antenna_pattern = g.defined() || att.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+    }
 
 	at::Tensor pos_contig = pos.contiguous();
 	at::Tensor att_contig = att.contiguous();
@@ -1363,9 +1393,16 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
         .device(data.device());
 	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
-	const float* att_ptr = att_contig.data_ptr<float>();
-	const float* g_ptr = g_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
+
+    float* att_ptr = nullptr;
+    float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        at::Tensor att_contig = att.contiguous();
+        at::Tensor g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
 
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
