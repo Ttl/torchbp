@@ -12,14 +12,14 @@ moderate size images.
 
 ## Installation
 
-Tested with CUDA version 12.1, some newer versions might cause build issues.
+Tested with CUDA version 12.9.
 
 ### From source
 
 ```bash
 git clone https://github.com/Ttl/torchbp.git
 cd torchbp
-pip install .
+pip install --no-build-isolation -e .
 ```
 
 ## Documentation
