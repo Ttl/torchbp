@@ -1308,7 +1308,7 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order) {
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, bool alias) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -1326,6 +1326,7 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
 
     const float sint = t;
     const float cost = sqrtf(1.0f - t*t);
+    const float dz = sqrtf(z1*z1 + d*d);
 
     complex64_t pixel{};
 
@@ -1347,21 +1348,27 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
 
             float ref_sin, ref_cos;
             const float z0 = z1 + dorigin[id * 3 + 2];
-            const float dz = sqrtf(z1*z1 + d*d);
             const float rpz = sqrtf(z0*z0 + rp*rp);
             sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
             pixel += v * ref;
         }
     }
+    if (alias) {
+        float ref_sin, ref_cos;
+        sincospif(ref_phase * dz, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
+    }
     out[idr*Ntheta1 + idtheta] = pixel;
 }
+
 
 __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64_t *img1,
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v) {
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v, bool alias) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -1379,6 +1386,7 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
 
     const float sint = t;
     const float cost = sqrtf(1.0f - t*t);
+    const float dz = sqrtf(z1*z1 + d*d);
 
     complex64_t pixel{};
     const float knab_norm = knab_kernel_norm(order, knab_v);
@@ -1401,12 +1409,17 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
 
             float ref_sin, ref_cos;
             const float z0 = z1 + dorigin[id * 3 + 2];
-            const float dz = sqrtf(z1*z1 + d*d);
             const float rpz = sqrtf(z0*z0 + rp*rp);
             sincospif(ref_phase * (rpz - dz), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
             pixel += v * ref;
         }
+    }
+    if (alias) {
+        float ref_sin, ref_cos;
+        sincospif(ref_phase * dz, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
     }
     out[idr*Ntheta1 + idtheta] = pixel;
 }
@@ -1660,7 +1673,8 @@ at::Tensor ffbp_merge2_lanczos_cuda(
           int64_t Nr1,
           int64_t Ntheta1,
           double z1,
-          int64_t order) {
+          int64_t order,
+          int64_t alias) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -1728,7 +1742,8 @@ at::Tensor ffbp_merge2_lanczos_cuda(
                   Nr1,
                   Ntheta1,
                   z1,
-                  order
+                  order,
+                  alias
                   );
 	return out;
 }
@@ -1752,7 +1767,8 @@ at::Tensor ffbp_merge2_knab_cuda(
           int64_t Ntheta1,
           double z1,
           int64_t order,
-          double oversample) {
+          double oversample,
+          int64_t alias) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -1822,7 +1838,8 @@ at::Tensor ffbp_merge2_knab_cuda(
                   Ntheta1,
                   z1,
                   order,
-                  v
+                  v,
+                  alias
                   );
 	return out;
 }

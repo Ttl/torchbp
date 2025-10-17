@@ -437,7 +437,8 @@ def ffbp_merge2_lanczos(
     fc: float,
     grid_polar_new: dict = None,
     z0: float = 0,
-    order: int = 3
+    order: int = 3,
+    alias: bool = False
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -476,6 +477,8 @@ def ffbp_merge2_lanczos(
         Height of the antenna phase center in the new image.
     order : int
         Interpolation order.
+    alias : bool
+        Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
 
     Returns
     ----------
@@ -544,6 +547,7 @@ def ffbp_merge2_lanczos(
         ntheta3,
         z0,
         order,
+        alias,
     )
 
 
@@ -557,7 +561,8 @@ def ffbp_merge2_knab(
     grid_polar_new: dict = None,
     z0: float = 0,
     order: int = 3,
-    oversample: float = 1.5
+    oversample: float = 1.5,
+    alias: bool = False
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -598,6 +603,8 @@ def ffbp_merge2_knab(
         Interpolation order.
     oversample : float
         Oversampling factor in the input data.
+    alias : bool
+        Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
 
     References
     ----------
@@ -671,7 +678,8 @@ def ffbp_merge2_knab(
         ntheta3,
         z0,
         order,
-        oversample
+        oversample,
+        alias
     )
 
 def ffbp_merge2(
@@ -683,7 +691,8 @@ def ffbp_merge2(
     fc: float,
     grid_polar_new: dict = None,
     z0: float = 0,
-    method : tuple = ('lanczos', 3)
+    method : tuple = ('lanczos', 3),
+    alias: bool = False
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -725,6 +734,8 @@ def ffbp_merge2(
         - ("lanczos", n): Lanczos resampling. `n` is half of the kernel length.
         - ("knab", n, v): Knab pulse resampling. `n` is half of the kernel
           length and v is oversampling factor in the data.
+    alias : bool
+        Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
 
     Returns
     ----------
@@ -749,7 +760,8 @@ def ffbp_merge2(
             fc,
             grid_polar_new,
             z0,
-            order=method_params[0]
+            order=method_params[0],
+            alias=alias,
         )
     elif method == "knab":
         if len(method_params) != 2:
@@ -764,7 +776,8 @@ def ffbp_merge2(
             grid_polar_new,
             z0,
             order=method_params[0],
-            oversample=method_params[1]
+            oversample=method_params[1],
+            alias=alias,
         )
     else:
         raise ValueError(f"Unknown interp_method: {interp_method}")
@@ -2131,6 +2144,7 @@ def ffbp(
     interp_method: str | tuple = ("lanczos", 3),
     oversample_r: float = 1.6,
     oversample_theta: float = 1.6,
+    dealias: bool = False
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -2167,6 +2181,10 @@ def ffbp(
         Internally oversample range by this amount to avoid aliasing.
     oversample_theta : float
         Internally oversample theta by this amount to avoid aliasing.
+    dealias : bool
+        If True removes the range spectrum aliasing. Equivalent to applying
+        `torchbp.util.bp_polar_range_dealias` on the SAR image.
+        Default is False.
     """
     nsweeps = data.shape[0]
     device = data.device
@@ -2201,6 +2219,7 @@ def ffbp(
                 interp_method=interp_method,
                 oversample_r=1,  # Grid is already increased
                 oversample_theta=1,
+                dealias=True
             )
         else:
             img = backprojection_polar_2d(
@@ -2212,9 +2231,11 @@ def ffbp(
         img2 = imgs[1]
         new_origin = 0.5 * img1[0] + 0.5 * img2[0]
         new_z = 0.5 * (img1[3] + img2[3])
+        alias = False
         if len(imgs) == 2:
             # Interpolate the final image to the desired grid.
             grid_polar_new = grid
+            alias = not dealias
         else:
             grid_polar_new = deepcopy(img1[1])
             grid_polar_new["ntheta"] += img2[1]["ntheta"]
@@ -2235,6 +2256,7 @@ def ffbp(
             grid_polar_new,
             z0=new_z,
             method=interp_method,
+            alias=alias
         )
         imgs[0] = None
         imgs[1] = None
