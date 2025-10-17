@@ -49,12 +49,12 @@ def entropy(img: Tensor) -> Tensor:
 
 def polar_interp(
     img: Tensor,
-    dorigin: Tensor,
+    origin_old: Tensor,
+    origin_new: Tensor,
     grid_polar: dict,
     fc: float,
     rotation: float = 0,
     grid_polar_new: dict = None,
-    z0: float = 0,
     method: str | tuple = "linear",
 ) -> Tensor:
     """
@@ -63,16 +63,15 @@ def polar_interp(
 
     Gradient calculation is only supported with "linear" method.
 
-    Note: Z-axis interpolation likely incorrect.
-
     Parameters
     ----------
     img : Tensor
         2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
         [nbatch, range, angle] if interpolating multiple images at the same time.
-    dorigin : Tensor
-        Difference between the origin of the old image to the new image. Units in meters
-        [nbatch, 3] if img shape is 3D.
+    origin_old : Tensor
+        Origin of the img. Units in meters. [nbatch, 3] if img shape is 3D.
+    origin_new: Tensor
+        Origin after interpolation.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
         "r": (r0, r1), tuple of min and max range,
@@ -86,12 +85,9 @@ def polar_interp(
     grid_polar_new : dict, optional
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
-    z0 : float
-        Height of the antenna phase center.
     method : str or tuple
         Interpolation method. Valid choices are:
         - "linear": Linear interpolation.
-        - "cubic": Cubic interpolation.
         - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
 
     Returns
@@ -105,6 +101,10 @@ def polar_interp(
     else:
         method_params = None
 
+    dorigin = origin_new - origin_old
+    z0 = origin_new[...,2].item()
+    if not torch.all(origin_new[...,2] == z0):
+        raise ValueError("Batched interpolation with different output heights not supported")
     if method == "linear":
         return polar_interp_linear(
             img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0
@@ -137,8 +137,6 @@ def polar_interp_linear(
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
 
     Gradient can be calculated with respect to img and dorigin.
-
-    Note: Z-axis interpolation likely incorrect.
 
     Parameters
     ----------
@@ -235,8 +233,6 @@ def polar_interp_lanczos(
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
 
     Gradient not supported.
-
-    Note: Z-axis interpolation likely incorrect.
 
     Parameters
     ----------
@@ -337,8 +333,6 @@ def ffbp_merge2_lanczos(
     position by `dorigin`.
 
     Gradient not supported.
-
-    Note: Z-axis interpolation likely incorrect.
 
     Parameters
     ----------
@@ -461,8 +455,6 @@ def ffbp_merge2_knab(
     position by `dorigin`. Uses truncated sinc with Knab pulse for interpolation [1]_.
 
     Gradient not supported.
-
-    Note: Z-axis interpolation likely incorrect.
 
     Parameters
     ----------
@@ -592,8 +584,6 @@ def ffbp_merge2(
 
     Gradient not supported.
 
-    Note: Z-axis interpolation likely incorrect.
-
     Parameters
     ----------
     img0 : Tensor
@@ -717,7 +707,6 @@ def polar_to_cart(
     method : str or tuple
         Interpolation method. Valid choices are:
         - "linear": Linear interpolation.
-        - "cubic": Cubic interpolation.
         - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
 
     Returns
@@ -1875,8 +1864,6 @@ def ffbp(
 ) -> Tensor:
     """
     Fast factorized backprojection.
-
-    Large Z-axis movements not handled correctly.
 
     Parameters
     ----------
