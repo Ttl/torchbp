@@ -67,14 +67,71 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
         filtered = filtered.squeeze(0)
     return filtered
 
-def phase_to_elevation_polar(unw: Tensor, h1: Tensor, h2: Tensor, fc: float, grid: dict) -> Tensor:
+def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Tensor, fc: float) -> Tensor:
     """
+    Convert phase unwrapped interferogram to elevation.
 
+    Parameters
+    ----------
+    unw : Tensor
+        Unwrapped phase tensor. Shape: [Nx, Ny].
+    coords : Tensor
+        Coordinates for each position in image. Shape: [3, Nx, Ny].
+    origin1 : Tensor
+        3D antenna phase center location of the master image.
+    origin2 : Tensor
+        3D antenna phase center location of the slave image.
+    fc : float
+        RF center frequency in Hz.
+
+    Returns
+    ----------
+    z : Tensor
+        Elevation tensor with the same shape as unw.
     """
     device = unw.device
 
     c0 = 299792458
     wl = c0 / fc
+
+    w = (origin2 - origin1)[:,None,None]
+    v = coords - origin1[:,None,None]
+    w_dot_v = torch.sum(w*v, dim=0)
+    r1 = torch.linalg.norm(v, dim=0)
+
+    look_angle = torch.arccos(origin1[2] / r1)
+
+    # All these equations are equal
+    #bt = torch.linalg.norm(torch.cross(w, v, dim=0), dim=0) / r1
+    #bt = torch.sqrt(torch.linalg.norm(w, dim=0)**2 - w_dot_v**2 / r1**2)
+    bt = torch.linalg.norm(w - w_dot_v * v / r1**2, dim=0)
+
+    z = -wl * r1 * torch.sin(look_angle) * unw / (4 * torch.pi * bt)
+    return z
+
+def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: dict) -> Tensor:
+    """
+    Convert phase unwrapped interferogram to elevation.
+
+    Parameters
+    ----------
+    unw : Tensor
+        Unwrapped phase tensor. Shape: [Nx, Ny].
+    origin1 : Tensor
+        3D antenna phase center location of the master image.
+    origin2 : Tensor
+        3D antenna phase center location of the slave image.
+    fc : float
+        RF center frequency in Hz.
+    grid : dict
+        Image grid definition dictionary.
+
+    Returns
+    ----------
+    z : Tensor
+        Elevation tensor with the same shape as unw.
+    """
+    device = unw.device
 
     r0, r1 = grid["r"]
     theta0, theta1 = grid["theta"]
@@ -85,11 +142,45 @@ def phase_to_elevation_polar(unw: Tensor, h1: Tensor, h2: Tensor, fc: float, gri
 
     r = r0 + dr * torch.arange(nr, device=device)
     theta = theta0 + dtheta * torch.arange(ntheta, device=device)
+    coords = torch.stack([r[:,None] * torch.sqrt(1 - theta**2)[None,:], r[:,None] * theta[None,:], torch.zeros_like(unw)])
 
-    look_angle = torch.arctan2(torch.tensor(h1, device=r.device), r)[:,None]
+    return phase_to_elevation(unw, coords, origin1, origin2, fc)
 
-    bt = (h2 - h1) * torch.cos(look_angle)
+def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: dict) -> Tensor:
+    """
+    Convert phase unwrapped interferogram to elevation.
 
-    r1 = torch.sqrt(r**2 + h1**2)[:,None]
-    z = -wl * r1 * torch.sin(look_angle) * unw / (4 * torch.pi * bt)
-    return z
+    Parameters
+    ----------
+    unw : Tensor
+        Unwrapped phase tensor. Shape: [Nx, Ny].
+    origin1 : Tensor
+        3D antenna phase center location of the master image.
+    origin2 : Tensor
+        3D antenna phase center location of the slave image.
+    fc : float
+        RF center frequency in Hz.
+    grid : dict
+        Image grid definition dictionary.
+
+    Returns
+    ----------
+    z : Tensor
+        Elevation tensor with the same shape as unw.
+    """
+    device = unw.device
+
+    x0, x1 = grid["x"]
+    y0, y1 = grid["y"]
+    nx = grid["nx"]
+    ny = grid["ny"]
+    dx = (x1 - x0) / nx
+    dy = (y1 - y0) / ny
+
+    x = x0 + dx * torch.arange(nx, device=device)
+    y = y0 + dy * torch.arange(ny, device=device)
+    coords = torch.stack(torch.meshgrid([x, y, torch.tensor([0], device=device,
+        dtype=x.dtype)], indexing="ij"))
+    coords = coords[..., 0]
+
+    return phase_to_elevation(unw, coords, origin1, origin2, fc)
