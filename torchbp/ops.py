@@ -8,7 +8,6 @@ cart_2d_nargs = 15
 polar_2d_nargs = 25
 polar_interp_linear_args = 18
 polar_to_cart_linear_args = 17
-polar_to_cart_bicubic_args = 20
 entropy_args = 3
 abs_sum_args = 2
 coherence_2d_args = 7
@@ -110,10 +109,6 @@ def polar_interp(
         return polar_interp_linear(
             img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0
         )
-    elif method == "cubic":
-        return polar_interp_bicubic(
-            img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0
-        )
     elif method == "lanczos":
         return polar_interp_lanczos(
             img,
@@ -206,109 +201,6 @@ def polar_interp_linear(
 
     return torch.ops.torchbp.polar_interp_linear.default(
         img,
-        dorigin,
-        nbatch,
-        rotation,
-        fc,
-        r1_0,
-        dr1,
-        theta1_0,
-        dtheta1,
-        nr1,
-        ntheta1,
-        r3_0,
-        dr3,
-        theta3_0,
-        dtheta3,
-        nr3,
-        ntheta3,
-        z0,
-    )
-
-
-def polar_interp_bicubic(
-    img: Tensor,
-    dorigin: Tensor,
-    grid_polar: dict,
-    fc: float,
-    rotation: float = 0,
-    grid_polar_new: dict = None,
-    z0: float = 0,
-) -> Tensor:
-    """
-    Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
-
-    Gradient not supported.
-
-    Note: Z-axis interpolation likely incorrect.
-
-    Parameters
-    ----------
-    img : Tensor
-        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
-        [nbatch, range, angle] if interpolating multiple images at the same time.
-    dorigin : Tensor
-        Difference between the origin of the old image to the new image. Units in meters
-        [nbatch, 3] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
-    fc : float
-        RF center frequency in Hz.
-    rotation : float
-        Angle rotation to apply in radians.
-    grid_polar_new : dict, optional
-        Grid definition of the new image.
-        If None uses the same grid as input, but with double the angle points.
-    z0 : float
-        Height of the antenna phase center in the new image.
-
-    Returns
-    ----------
-    out : Tensor
-        Interpolated radar image.
-    """
-
-    if img.dim() == 3:
-        nbatch = img.shape[0]
-        assert dorigin.shape == (nbatch, 3)
-    else:
-        nbatch = 1
-        assert dorigin.shape == (3,)
-
-    r1_0, r1_1 = grid_polar["r"]
-    theta1_0, theta1_1 = grid_polar["theta"]
-    ntheta1 = grid_polar["ntheta"]
-    nr1 = grid_polar["nr"]
-    dtheta1 = (theta1_1 - theta1_0) / ntheta1
-    dr1 = (r1_1 - r1_0) / nr1
-
-    if grid_polar_new is None:
-        r3_0 = r1_0
-        r3_1 = r1_1
-        theta3_0 = theta1_0
-        theta3_1 = theta1_1
-        nr3 = nr1
-        ntheta3 = 2 * ntheta1
-    else:
-        r3_0, r3_1 = grid_polar_new["r"]
-        theta3_0, theta3_1 = grid_polar_new["theta"]
-        ntheta3 = grid_polar_new["ntheta"]
-        nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
-
-    img_gx, img_gy = torch.gradient(img, dim=(-2, -1), edge_order=2)
-    img_gxy = torch.gradient(img_gx, dim=-1)[0]
-
-    return torch.ops.torchbp.polar_interp_bicubic.default(
-        img,
-        img_gx,
-        img_gy,
-        img_gxy,
         dorigin,
         nbatch,
         rotation,
@@ -841,8 +733,6 @@ def polar_to_cart(
 
     if method == "linear":
         return polar_to_cart_linear(img, origin, grid_polar, grid_cart, fc, rotation)
-    elif method == "cubic":
-        return polar_to_cart_bicubic(img, origin, grid_polar, grid_cart, fc, rotation)
     elif method == "lanczos":
         return polar_to_cart_lanczos(
             img, origin, grid_polar, grid_cart, fc, rotation, order=method_params
@@ -919,169 +809,6 @@ def polar_to_cart_linear(
 
     return torch.ops.torchbp.polar_to_cart_linear.default(
         img,
-        origin,
-        nbatch,
-        rotation,
-        fc,
-        r0,
-        dr,
-        theta0,
-        dtheta,
-        nr,
-        ntheta,
-        x0,
-        y0,
-        dx,
-        dy,
-        nx,
-        ny,
-    )
-
-
-def polar_to_cart_bicubic(
-    img: Tensor,
-    origin: Tensor,
-    grid_polar: dict,
-    grid_cart: dict,
-    fc: float,
-    rotation: float = 0,
-) -> Tensor:
-    """
-    Interpolate polar radar image to cartesian grid with bicubic interpolation.
-
-    The input image should be either generated with `dealias=True` or call
-    `torchbp.util.bp_polar_range_dealias` first.
-
-    Parameters
-    ----------
-    img : Tensor
-        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
-        [nbatch, range, angle] if interpolating multiple images at the same time.
-    origin : Tensor
-        3D antenna phase center of the old image in with respect to new image.
-        Units in meters [nbatch, 3] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
-    grid_cart : dict
-        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-        "x": (x0, x1), tuple of min and max x-axis (range),
-        "y": (y0, y1), tuple of min and max y-axis (cross-range),
-        "nx": number of x-axis pixels.
-        "ny": number of y-axis pixels.
-    fc : float
-        RF center frequency in Hz.
-    rotation : float
-        Polar origin rotation angle.
-
-    Returns
-    ----------
-    out : Tensor
-        Interpolated radar image.
-    """
-
-    if img.dim() == 3:
-        nbatch = img.shape[0]
-        assert origin.shape == (nbatch, 3)
-    else:
-        nbatch = 1
-        assert origin.shape == (3,)
-
-    img_gx, img_gy = torch.gradient(img, dim=(-2, -1), edge_order=2)
-    img_gxy = torch.gradient(img_gx, dim=-1)[0]
-
-    return _polar_to_cart_bicubic(
-        img, img_gx, img_gy, img_gxy, origin, grid_polar, grid_cart, fc, rotation
-    )
-
-
-def _polar_to_cart_bicubic(
-    img: Tensor,
-    img_gx: Tensor,
-    img_gy: Tensor,
-    img_gxy: Tensor,
-    origin: Tensor,
-    grid_polar: dict,
-    grid_cart: dict,
-    fc: float,
-    rotation: float = 0,
-) -> Tensor:
-    """
-    Interpolate polar radar image to cartesian grid.
-
-    The input image should be either generated with `dealias=True` or call
-    `torchbp.util.bp_polar_range_dealias` first.
-
-    Parameters
-    ----------
-    img : Tensor
-        2D radar image in [range, angle] format. Dimensions should match with grid_polar grid.
-        [nbatch, range, angle] if interpolating multiple images at the same time.
-    img_gx : Tensor
-        X-axis gradient of img.
-    img_gy : Tensor
-        Y-axis gradient of img.
-    img_gxy : Tensor
-        XY-axis gradient of img.
-    origin : Tensor
-        3D origin of the old image in with respect to new image. Units in meters
-        [nbatch, 2] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
-    grid_cart : dict
-        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-        "x": (x0, x1), tuple of min and max x-axis (range),
-        "y": (y0, y1), tuple of min and max y-axis (cross-range),
-        "nx": number of x-axis pixels.
-        "ny": number of y-axis pixels.
-    fc : float
-        RF center frequency in Hz.
-    rotation : float
-        Polar origin rotation angle.
-
-    Returns
-    ----------
-    out : Tensor
-        Interpolated radar image.
-    """
-
-    if img.dim() == 3:
-        nbatch = img.shape[0]
-        assert origin.shape == (nbatch, 3)
-    else:
-        nbatch = 1
-        assert origin.shape == (3,)
-
-    assert img.shape == img_gx.shape
-    assert img.shape == img_gy.shape
-    assert img.shape == img_gxy.shape
-
-    r0, r1 = grid_polar["r"]
-    theta0, theta1 = grid_polar["theta"]
-    ntheta = grid_polar["ntheta"]
-    nr = grid_polar["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
-
-    x0, x1 = grid_cart["x"]
-    y0, y1 = grid_cart["y"]
-    nx = grid_cart["nx"]
-    ny = grid_cart["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
-
-    return torch.ops.torchbp.polar_to_cart_bicubic.default(
-        img,
-        img_gx,
-        img_gy,
-        img_gxy,
         origin,
         nbatch,
         rotation,
@@ -2406,80 +2133,6 @@ def _fake_polar_interp_linear_grad(
     return ret
 
 
-@torch.library.register_fake("torchbp::polar_to_cart_bicubic")
-def _fake_polar_to_cart_bicubic(
-    img: Tensor,
-    img_gx: Tensor,
-    img_gy: Tensor,
-    img_gxy: Tensor,
-    dorigin: Tensor,
-    nbatch: int,
-    rotation: float,
-    fc: float,
-    r0: float,
-    dr: float,
-    theta0: float,
-    dtheta: float,
-    nr: int,
-    ntheta: int,
-    x0: float,
-    y0: float,
-    dx: float,
-    dy: float,
-    nx: int,
-    ny: int,
-) -> Tensor:
-    torch._check(dorigin.dtype == torch.float32)
-    torch._check(img.dtype == torch.complex64)
-    return torch.empty((Nx, Ny), dtype=torch.complex64, device=img.device)
-
-
-@torch.library.register_fake("torchbp::polar_to_cart_bicubic_grad")
-def _fake_polar_interp_bicubic_grad(
-    grad: Tensor,
-    img: Tensor,
-    img_gx: Tensor,
-    img_gy: Tensor,
-    img_gxy: Tensor,
-    dorigin: Tensor,
-    rotation: float,
-    fc: float,
-    r0: float,
-    dr: float,
-    theta0: float,
-    dtheta: float,
-    Nr: float,
-    Ntheta: float,
-    x0: float,
-    dx: float,
-    y0: float,
-    dy: float,
-    Nx: float,
-    Ny: float,
-) -> Tensor:
-    torch._check(dorigin.dtype == torch.float32)
-    torch._check(img.dtype == torch.complex64)
-    torch._check(img_gx.dtype == torch.complex64)
-    torch._check(img_gy.dtype == torch.complex64)
-    torch._check(img_gxy.dtype == torch.complex64)
-    ret = []
-    if img.requires_grad:
-        ret.append(torch.empty_like(img))
-        ret.append(torch.empty_like(img_gx))
-        ret.append(torch.empty_like(img_gy))
-        ret.append(torch.empty_like(img_gxy))
-    else:
-        ret.append(None)
-        ret.append(None)
-        ret.append(None)
-        ret.append(None)
-    if dorigin.requires_grad:
-        ret.append(torch.empty_like(dorigin))
-    else:
-        ret.append(None)
-    return ret
-
-
 @torch.library.register_fake("torchbp::backprojection_polar_2d")
 def _fake_polar_2d(
     data: Tensor,
@@ -2682,29 +2335,6 @@ def _setup_context_polar_to_cart_linear(ctx, inputs, output):
     ctx.save_for_backward(img, origin)
 
 
-def _backward_polar_to_cart_bicubic(ctx, grad):
-    img, img_gx, img_gy, img_gxy, origin = ctx.saved_tensors
-    ret = torch.ops.torchbp.polar_to_cart_bicubic_grad.default(
-        grad, img, img_gx, img_gy, img_gxy, origin, *ctx.saved
-    )
-    grads = [None] * polar_to_cart_bicubic_args
-    grads[: len(ret)] = ret
-    return tuple(grads)
-
-
-def _setup_context_polar_to_cart_bicubic(ctx, inputs, output):
-    img, img_gx, img_gy, img_gxy, origin, *rest = inputs
-    for i in range(len(ctx.needs_input_grad)):
-        if ctx.needs_input_grad[i]:
-            if i <= 4:
-                continue
-            raise NotImplementedError(
-                "Only img, img_gx, img_gy, img_gxy gradient supported"
-            )
-    ctx.saved = rest
-    ctx.save_for_backward(img, img_gx, img_gy, img_gxy, origin)
-
-
 def _backward_entropy(ctx, grad):
     data, norm = ctx.saved_tensors
     ret = torch.ops.torchbp.entropy_grad.default(data, norm, grad, *ctx.saved)
@@ -2766,11 +2396,6 @@ torch.library.register_autograd(
     "torchbp::polar_to_cart_linear",
     _backward_polar_to_cart_linear,
     setup_context=_setup_context_polar_to_cart_linear,
-)
-torch.library.register_autograd(
-    "torchbp::polar_to_cart_bicubic",
-    _backward_polar_to_cart_bicubic,
-    setup_context=_setup_context_polar_to_cart_bicubic,
 )
 torch.library.register_autograd(
     "torchbp::entropy", _backward_entropy, setup_context=_setup_context_entropy
