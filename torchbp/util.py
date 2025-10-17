@@ -56,6 +56,30 @@ def bp_polar_range_dealias(
         phase = phase.unsqueeze(0)
     return phase * img
 
+def bp_polar_range_alias(
+    img: Tensor, origin: Tensor, fc: float, grid_polar: dict
+) -> Tensor:
+    """
+    Inverse of bp_polar_range_dealias.
+
+    Parameters
+    ----------
+    img : Tensor
+        Complex input image. Shape should be: [Range, azimuth].
+    origin : Tensor
+        Center of the platform position.
+    fc : float
+        RF center frequency.
+    grid_polar : dict
+        Polar grid definition
+
+    Returns
+    ----------
+    img : Tensor
+        SAR image with range spectrum aliasing.
+    """
+    return bp_polar_range_dealias(img, origin, -fc, grid_polar)
+
 
 def diff(x: Tensor, dim: int = -1, same_size: bool = False) -> Tensor:
     """
