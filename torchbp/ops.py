@@ -102,9 +102,14 @@ def polar_interp(
         method_params = None
 
     dorigin = origin_new - origin_old
-    z0 = origin_new[...,2].item()
+    if origin_new.dim() == 2:
+        z0 = origin_new[0,2].item()
+    else:
+        z0 = origin_new[2].item()
     if not torch.all(origin_new[...,2] == z0):
         raise ValueError("Batched interpolation with different output heights not supported")
+    if dorigin.dim() == 1 and img.dim() == 3:
+        dorigin = torch.tile(dorigin[None,:], (img.shape[0],1))
     if method == "linear":
         return polar_interp_linear(
             img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0
