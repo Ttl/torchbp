@@ -1293,7 +1293,8 @@ def projection_cart_2d(
     g: Tensor | None = None,
     g_extent: list | None = None,
     use_rvp: bool = True,
-    normalization: str = "beta"
+    normalization: str = "beta",
+    vel: Tensor | None = None,
 ) -> Tensor:
     """
     Calculate FMCW radar data for each radar position in `pos` when measuring
@@ -1350,6 +1351,8 @@ def projection_cart_2d(
         "sigma": No look angle dependency (unphysical).
         "gamma": Multiply the reflectivity be cross-sectional area of the patch
         (more realistic).
+    vel : Tensor or None
+        Velocity tensor in m/s. Shape should match with pos.
 
     Returns
     ----------
@@ -1410,10 +1413,15 @@ def projection_cart_2d(
         g_daz = (g_az1 - g_az0) / g_naz
         g_del = (g_el1 - g_el0) / g_nel
 
+    if vel is not None:
+        if vel.shape != pos.shape:
+            raise ValueError(f"vel shape {vel.shape} doesn't match with pos shape {pos.shape}")
+
     return torch.ops.torchbp.projection_cart_2d.default(
         img,
         dem,
         pos,
+        vel,
         att,
         nbatch,
         sweep_samples,

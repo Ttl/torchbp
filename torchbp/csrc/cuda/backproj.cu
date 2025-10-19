@@ -798,6 +798,7 @@ __global__ void projection_cart_2d_kernel(
           const complex64_t* img,
           const float* dem,
           const float* pos,
+          const float* vel,
           const float* att,
           complex64_t* data,
           int sweep_samples,
@@ -879,14 +880,26 @@ __global__ void projection_cart_2d_kernel(
         }
         // sigma_0 otherwise
 
-        float phase0 = -2.0f * (fc * tau);
-        if (use_rvp) {
-            phase0 += -gamma * tau * tau;
+        float vel_proj;
+        if (vel != nullptr) {
+            const float vx = vel[idbatch * nsweeps * 3 + i * 3 + 0];
+            const float vy = vel[idbatch * nsweeps * 3 + i * 3 + 1];
+            const float vz = vel[idbatch * nsweeps * 3 + i * 3 + 2];
+            vel_proj = (px * vx + py * vy + pz * vz) / d;
+            vel_proj /= fs;
         }
 
-        const float freq = 2.0f * gamma * tau / fs;
+        float freq = 2.0f * gamma * tau / fs;
         for (int j = 0; j < sweep_samples; j++) {
-            float phase = freq * j + phase0;
+            if (vel != nullptr) {
+                tau = 2.0f * (d + d0 + vel_proj * (j - sweep_samples/2)) / kC0;
+            }
+            float phase0 = -2.0f * (fc * tau);
+            if (use_rvp) {
+                phase0 += -gamma * tau * tau;
+            }
+            const float freq = 2.0f * gamma * tau / fs;
+            const float phase = freq * j + phase0;
 
             float ref_sin, ref_cos;
             sincospif(phase, &ref_sin, &ref_cos);
@@ -916,6 +929,7 @@ at::Tensor projection_cart_2d_cuda(
           const at::Tensor &img,
           const at::Tensor &dem,
           const at::Tensor &pos,
+          const at::Tensor &vel,
           const at::Tensor &att,
           int64_t nbatch,
           int64_t sweep_samples,
@@ -951,6 +965,10 @@ at::Tensor projection_cart_2d_cuda(
         TORCH_CHECK(att.dtype() == at::kFloat);
         TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
     }
+    if (vel.defined()) {
+        TORCH_CHECK(vel.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(vel.device().type() == at::DeviceType::CUDA);
+    }
 
     if (dem.defined()) {
         TORCH_CHECK(dem.dtype() == at::kFloat);
@@ -970,6 +988,11 @@ at::Tensor projection_cart_2d_cuda(
     if (dem.defined()) {
         at::Tensor dem_contig = dem.contiguous();
         dem_ptr = dem_contig.data_ptr<float>();
+    }
+	const float* vel_ptr = nullptr;
+    if (vel.defined()) {
+        at::Tensor vel_contig = vel.contiguous();
+        vel_ptr = vel_contig.data_ptr<float>();
     }
     float* att_ptr = nullptr;
     float* g_ptr = nullptr;
@@ -994,6 +1017,7 @@ at::Tensor projection_cart_2d_cuda(
                   (complex64_t*)img_ptr,
                   dem_ptr,
                   pos_ptr,
+                  vel_ptr,
                   att_ptr,
                   (complex64_t*)data_ptr,
                   sweep_samples,
