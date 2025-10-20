@@ -250,7 +250,6 @@ __global__ void power_coherence_2d_kernel(
     float corr = 0.0f;
     float p0 = 0.0f;
     float p1 = 0.0f;
-    int Navg = 0;
     int start_i = max(-w0, -idx);
     int end_i = min(w0, N1 - 1 - idx);
     int start_j = max(-w1, -idy);
@@ -264,16 +263,12 @@ __global__ void power_coherence_2d_kernel(
             p0 += v0_abs2 * v0_abs2;
             p1 += v1_abs2 * v1_abs2;
             corr += v0_abs2 * v1_abs2;
-            Navg += 1;
         }
     }
     float v;
-    corr /= Navg;
-    p0 /= Navg;
-    p1 /= Navg;
     v = corr / sqrtf(p0 * p1);
     if (corr_output) {
-        v = v > 0.5f ? sqrtf(2*v - 1) : 0.0f;
+        v = v > 0.5f ? sqrtf(2.0f*v - 1.0f) : 0.0f;
     }
     out[idbatch * N0 * N1 + idy * N1 + idx] = v;
 }
