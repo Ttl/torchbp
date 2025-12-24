@@ -36,7 +36,7 @@ if __name__ == "__main__":
     m = m.cpu().numpy()
     m2 = m + 40
 
-    sar_img_cart = torchbp.ops.polar_to_cart_bicubic(
+    sar_img_cart = torchbp.ops.polar_to_cart(
         torch.abs(sar_img),
         origin,
         grid_polar,
