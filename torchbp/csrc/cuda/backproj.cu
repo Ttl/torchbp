@@ -889,7 +889,6 @@ __global__ void projection_cart_2d_kernel(
             vel_proj /= fs;
         }
 
-        float freq = 2.0f * gamma * tau / fs;
         for (int j = 0; j < sweep_samples; j++) {
             if (vel != nullptr) {
                 tau = 2.0f * (d + d0 + vel_proj * (j - sweep_samples/2)) / kC0;

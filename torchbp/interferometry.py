@@ -2,6 +2,9 @@ from .util import process_image_with_patches
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from .ops import subpixel_correlation_op
+from scipy.optimize import minimize
+import numpy as np
 
 def _goldstein_patch(patches: Tensor, alpha: float, w: int=3):
     fpatch = torch.fft.fft2(patches)
@@ -67,6 +70,7 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
         filtered = filtered.squeeze(0)
     return filtered
 
+
 def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Tensor, fc: float) -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
@@ -109,6 +113,7 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
     z = -wl * r1 * torch.sin(look_angle) * unw / (4 * torch.pi * bt)
     return z
 
+
 def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: dict) -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
@@ -145,6 +150,7 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
     coords = torch.stack([r[:,None] * torch.sqrt(1 - theta**2)[None,:], r[:,None] * theta[None,:], torch.zeros_like(unw)])
 
     return phase_to_elevation(unw, coords, origin1, origin2, fc)
+
 
 def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: dict) -> Tensor:
     """
@@ -184,3 +190,52 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
     coords = coords[..., 0]
 
     return phase_to_elevation(unw, coords, origin1, origin2, fc)
+
+
+def subpixel_correlation(im_m: Tensor, im_s: Tensor):
+    """
+    Solve for subpixel offset that maximize coherent correlation between the two
+    input images. [1]_
+
+    Parameters
+    ----------
+    im_m : Tensor
+        Master image.
+    im_s : Tensor
+        Slave image.
+
+    References
+    ----------
+    .. [1] D. Li and Y. Zhang, "A Fast Offset Estimation Approach for InSAR
+    Image Subpixel Registration," in IEEE Geoscience and Remote Sensing Letters,
+    vol. 9, no. 2, pp. 267-271, March 2012.
+
+    Returns
+    ----------
+    offsets : Tensor
+        Solved X and Y subpixel offsets.
+    corrs : Tensor
+        Correlation at the best subpixel offset.
+    """
+    a, b, c = subpixel_correlation_op(im_m, im_s)
+    a = a.cpu().numpy()
+    b = b.cpu().numpy()
+    c = c.cpu().numpy()
+
+    corrs = torch.zeros((c.shape[0]), dtype=torch.float32, device=im_m.device)
+    offsets = torch.zeros((c.shape[0], 2), dtype=torch.float32, device=im_m.device)
+    for i in range(a.shape[0]):
+        ai = a[i]
+        bi = b[i]
+        ci = c[i]
+        def opt(x):
+            dx, dy = x
+            return -np.abs(bi[0] + bi[1]*dx + bi[2]*dy + bi[3]*dx*dy) / np.sqrt(ci
+                    * (ai[0] + ai[1]*dx + ai[2]*dy + ai[3]*dx**2 + ai[4]*dy**2
+                        + ai[5]*dx*dy + ai[6]*dx**2*dy + ai[7]*dx*dy**2
+                        + ai[8]*dx**2*dy**2))
+        sol = minimize(opt, [0, 0], method="SLSQP", bounds=[(0, 1), (0, 1)])
+        offsets[i, 0] = sol.x[0]
+        offsets[i, 1] = sol.x[1]
+        corrs[i] = -sol.fun
+    return offsets, corrs

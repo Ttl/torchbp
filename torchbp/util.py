@@ -56,6 +56,7 @@ def bp_polar_range_dealias(
         phase = phase.unsqueeze(0)
     return phase * img
 
+
 def bp_polar_range_alias(
     img: Tensor, origin: Tensor, fc: float, grid_polar: dict
 ) -> Tensor:
@@ -689,8 +690,8 @@ def make_polar_grid(
     grid_polar : dict
         Polar grid dict.
     """
-    t0 = np.clip(np.sin(squint) - theta_limit, -1, 1)
-    t1 = np.clip(np.sin(squint) + theta_limit, -1, 1)
+    t0 = float(np.clip(np.sin(squint) - theta_limit, -1, 1))
+    t1 = float(np.clip(np.sin(squint) + theta_limit, -1, 1))
     grid_polar = {"r": (r0, r1), "theta": (t0, t1), "nr": nr, "ntheta": ntheta}
     return grid_polar
 

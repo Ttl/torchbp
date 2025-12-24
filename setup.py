@@ -72,7 +72,7 @@ setup(
     version="0.0.1",
     packages=find_packages(),
     ext_modules=get_extensions(),
-    install_requires=["torch", "numpy"],
+    install_requires=["torch", "numpy", "scipy"],
     extras_require = {
         'docs':  [
             "matplotlib >=3.5",
