@@ -12,10 +12,26 @@ torchbp.autofocus module
    :undoc-members:
    :show-inheritance:
 
+torchbp.interferometry module
+-----------------------------
+
+.. automodule:: torchbp.interferometry
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 torchbp.ops module
 ------------------
 
 .. automodule:: torchbp.ops
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+torchbp.polarimetry module
+--------------------------
+
+.. automodule:: torchbp.polarimetry
    :members:
    :undoc-members:
    :show-inheritance:

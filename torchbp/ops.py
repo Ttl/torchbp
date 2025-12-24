@@ -30,7 +30,7 @@ def entropy(img: Tensor) -> Tensor:
         [nbatch, range, angle] if interpolating multiple images at the same time.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -74,10 +74,10 @@ def polar_interp(
         Origin after interpolation.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -91,7 +91,7 @@ def polar_interp(
         - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -153,10 +153,10 @@ def polar_interp_linear(
         [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -168,7 +168,7 @@ def polar_interp_linear(
         Height of the antenna phase center in the new image.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -249,10 +249,10 @@ def polar_interp_lanczos(
         [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -264,7 +264,7 @@ def polar_interp_lanczos(
         Height of the antenna phase center in the new image.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -353,12 +353,11 @@ def ffbp_merge2_lanczos(
     dorigin1 : Tensor
         Same format as dorigin0.
     grid_polar : list of dict
-        List of grid definitions for each input image.
-        Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     grid_polar_new : dict, optional
@@ -372,7 +371,7 @@ def ffbp_merge2_lanczos(
         Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -475,12 +474,11 @@ def ffbp_merge2_knab(
     dorigin1 : Tensor
         Same format as dorigin0.
     grid_polar : list of dict
-        List of grid definitions for each input image.
-        Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     grid_polar_new : dict, optional
@@ -498,10 +496,10 @@ def ffbp_merge2_knab(
     References
     ----------
     .. [1] J. Knab, "The sampling window," in IEEE Transactions on Information
-    Theory, vol. 29, no. 1, pp. 157-159, January 1983.
+        Theory, vol. 29, no. 1, pp. 157-159, January 1983.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -603,12 +601,11 @@ def ffbp_merge2(
     dorigin1 : Tensor
         Same format as dorigin0.
     grid_polar : list of dict
-        List of grid definitions for each input image.
-        Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     grid_polar_new : dict, optional
@@ -618,14 +615,14 @@ def ffbp_merge2(
         Height of the antenna phase center in the new image.
     method : str or tuple
         Interpolation method. Valid choices are:
-        - ("lanczos", n): Lanczos resampling. `n` is half of the kernel length.
-        - ("knab", n, v): Knab pulse resampling. `n` is half of the kernel
-          length and v is oversampling factor in the data.
+            - ("lanczos", n): Lanczos resampling. `n` is half of the kernel length.
+            - ("knab", n, v): Knab pulse resampling. `n` is half of the kernel
+              length and v is oversampling factor in the data.
     alias : bool
         Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -695,16 +692,16 @@ def polar_to_cart(
         Units in meters [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     grid_cart : dict
         Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-        "x": (x0, x1), tuple of min and max x-axis (range),
-        "y": (y0, y1), tuple of min and max y-axis (cross-range),
-        "nx": number of x-axis pixels.
-        "ny": number of y-axis pixels.
+            - "x": (x0, x1), tuple of min and max x-axis (range),
+            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
+            - "nx": number of x-axis pixels.
+            - "ny": number of y-axis pixels.
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -715,7 +712,7 @@ def polar_to_cart(
         - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -759,23 +756,23 @@ def polar_to_cart_linear(
         Units in meters [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     grid_cart : dict
         Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-        "x": (x0, x1), tuple of min and max x-axis (range),
-        "y": (y0, y1), tuple of min and max y-axis (cross-range),
-        "nx": number of x-axis pixels.
-        "ny": number of y-axis pixels.
+            - "x": (x0, x1), tuple of min and max x-axis (range),
+            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
+            - "nx": number of x-axis pixels.
+            - "ny": number of y-axis pixels.
     fc : float
         RF center frequency in Hz.
     rotation : float
         Polar origin rotation angle.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -847,16 +844,16 @@ def polar_to_cart_lanczos(
         Units in meters [nbatch, 3] if img shape is 3D.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     grid_cart : dict
         Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-        "x": (x0, x1), tuple of min and max x-axis (range),
-        "y": (y0, y1), tuple of min and max y-axis (cross-range),
-        "nx": number of x-axis pixels.
-        "ny": number of y-axis pixels.
+            - "x": (x0, x1), tuple of min and max x-axis (range),
+            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
+            - "nx": number of x-axis pixels.
+            - "ny": number of y-axis pixels.
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -865,7 +862,7 @@ def polar_to_cart_lanczos(
         Lanczos interpolation order.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Interpolated radar image.
     """
@@ -939,10 +936,10 @@ def backprojection_polar_2d(
         with same grid and other arguments.
     grid : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -966,22 +963,14 @@ def backprojection_polar_2d(
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
     g_extent : list or None
-        List of [g_el0, g_az0, g_el1, g_az1]
-        g_el0 : float
-            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
-            including data over the whole sphere.
-        g_az0 : float
-            grx and gtx azimuth axis starting value. Units in radians. -pi if
-            including data over the whole sphere.
-        g_el1 : float
-            grx and gtx elevation axis end value. Units in radians. +pi/2 if
-            including data over the whole sphere.
-        g_az1 : float
-            grx and gtx azimuth axis end value. Units in radians. +pi if
-            including data over the whole sphere.
+        List of [g_el0, g_az0, g_el1, g_az1].
+        g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
+        in radians. -pi/2 + +pi/2 if including data over the whole sphere.
+        g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
+        radians. -pi to +pi if including data over the whole sphere.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Pseudo-polar format radar image.
     """
@@ -1080,10 +1069,10 @@ def backprojection_polar_2d_lanczos(
         with same grid and other arguments.
     grid : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -1109,22 +1098,14 @@ def backprojection_polar_2d_lanczos(
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
     g_extent : list or None
-        List of [g_el0, g_az0, g_el1, g_az1]
-        g_el0 : float
-            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
-            including data over the whole sphere.
-        g_az0 : float
-            grx and gtx azimuth axis starting value. Units in radians. -pi if
-            including data over the whole sphere.
-        g_el1 : float
-            grx and gtx elevation axis end value. Units in radians. +pi/2 if
-            including data over the whole sphere.
-        g_az1 : float
-            grx and gtx azimuth axis end value. Units in radians. +pi if
-            including data over the whole sphere.
+        List of [g_el0, g_az0, g_el1, g_az1].
+        g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
+        in radians. -pi/2 + +pi/2 if including data over the whole sphere.
+        g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
+        radians. -pi to +pi if including data over the whole sphere.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Pseudo-polar format radar image.
     """
@@ -1219,10 +1200,10 @@ def backprojection_cart_2d(
         with same grid and other arguments.
     grid : dict
         Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-        "x": (x0, x1), tuple of min and max range,
-        "y": (y0, y1), tuple of min and max along-track coordinates.
-        "nx": number of X-axis bins.
-        "ny": number of Y-axis bins.
+            - "x": (x0, x1), tuple of min and max x-axis (range),
+            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
+            - "nx": number of x-axis pixels.
+            - "ny": number of y-axis pixels.
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -1237,7 +1218,7 @@ def backprojection_cart_2d(
         Zero range correction.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Cartesian format radar image.
     """
@@ -1306,10 +1287,10 @@ def projection_cart_2d(
         SAR image in Cartesian coordinates. Shape [nx, ny] or [nbatch, nx, ny].
     grid : dict
         Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-        "x": (x0, x1), tuple of min and max range,
-        "y": (y0, y1), tuple of min and max along-track coordinates.
-        "nx": number of X-axis bins.
-        "ny": number of Y-axis bins.
+            - "x": (x0, x1), tuple of min and max x-axis (range),
+            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
+            - "nx": number of x-axis pixels.
+            - "ny": number of y-axis pixels.
     fc : float
         RF center frequency in Hz.
     fs : float
@@ -1331,19 +1312,11 @@ def projection_cart_2d(
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
     g_extent : list or None
-        List of [g_el0, g_az0, g_el1, g_az1]
-        g_el0 : float
-            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
-            including data over the whole sphere.
-        g_az0 : float
-            grx and gtx azimuth axis starting value. Units in radians. -pi if
-            including data over the whole sphere.
-        g_el1 : float
-            grx and gtx elevation axis end value. Units in radians. +pi/2 if
-            including data over the whole sphere.
-        g_az1 : float
-            grx and gtx azimuth axis end value. Units in radians. +pi if
-            including data over the whole sphere.
+        List of [g_el0, g_az0, g_el1, g_az1].
+        g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
+        in radians. -pi/2 + +pi/2 if including data over the whole sphere.
+        g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
+        radians. -pi to +pi if including data over the whole sphere.
     use_rvp : bool
         True to add residual video phase term.
     normalization : str
@@ -1355,7 +1328,7 @@ def projection_cart_2d(
         Velocity tensor in m/s. Shape should match with pos.
 
     Returns
-    ----------
+    -------
     data : Tensor
         FMCW radar data at each position. Shape [nbatch, nsweeps, nsamples].
     """
@@ -1483,7 +1456,7 @@ def gpga_backprojection_2d_core(
         ("lanczos", N): Lanczos interpolation with order 2*N+1.
 
     Returns
-    ----------
+    -------
     data_out : Tensor
         Values from input data used in backprojection of each target in
         target_pos tensor. Shape is [ntargets, nsweeps].
@@ -1543,7 +1516,7 @@ def cfar_2d(
         Defaults is False.
 
     Returns
-    ----------
+    -------
     detection : Tensor
         Detections tensor same shape as the input image. For each pixel 0 for no
         detection, positive value is the SNR of detection at that position.
@@ -1606,7 +1579,7 @@ def coherence_2d(img0: Tensor, img1: Tensor, Navg: tuple) -> Tensor:
         Number of averaged cells in 2D (N1, N0).
 
     Returns
-    ----------
+    -------
     out : Tensor
         Real valued coherence image with same shape as input calculated over the
         moving window.
@@ -1664,11 +1637,11 @@ def power_coherence_2d(
     References
     ----------
     .. [1] A. M. Guarnieri and C. Prati, "SAR interferometry: a "Quick and
-    dirty" coherence estimator for data browsing," in IEEE Transactions on
-    Geoscience and Remote Sensing, vol. 35, no. 3, pp. 660-669, May 1997.
+        dirty" coherence estimator for data browsing," in IEEE Transactions on
+        Geoscience and Remote Sensing, vol. 35, no. 3, pp. 660-669, May 1997.
 
     Returns
-    ----------
+    -------
     out : Tensor
         Real valued coherence image with same shape as input calculated over the
         moving window.
@@ -1736,10 +1709,10 @@ def backprojection_polar_2d_tx_power(
         including data over the whole sphere.
     grid : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -1757,7 +1730,7 @@ def backprojection_polar_2d_tx_power(
             "point" to normalize to constant reflectivity (no ground patch).
 
     Returns
-    ----------
+    -------
     tx_power : Tensor
         Pseudo-polar format image of square root of power returned from each
         pixel assuming constant reflectivity.
@@ -1838,7 +1811,7 @@ def lee_filter(img: Tensor, wx: int, wy: int, cu: float) -> Tensor:
         Coefficient of variance of the noise-free image.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Filtered input image.
     """
@@ -1884,10 +1857,10 @@ def ffbp(
         Range compressed input data. Shape should be [nsweeps, samples].
     grid : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     fc : float
         RF center frequency in Hz.
     r_res : float

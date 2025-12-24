@@ -30,7 +30,7 @@ def correlation_matrix(
         Correlation matrix dtype. Normally either `torch.complex64` or `torch.complex128`.
 
     Returns
-    ----------
+    -------
     c : Tensor
         Correlation matrix.
     """
@@ -93,7 +93,7 @@ def k_alpha_cal(
         Used to solve for k if not None.
 
     Returns
-    ----------
+    -------
     Minv : Tensor
         Normalized polarimetric calibration matrix.
     """
@@ -172,11 +172,11 @@ def ainsworth(
     References
     ----------
     .. [1] T. L. Ainsworth, L. Ferro-Famil and Jong-Sen Lee, "Orientation angle
-    preserving a posteriori polarimetric SAR calibration," in IEEE Transactions
-    on Geoscience and Remote Sensing, vol. 44, no. 4, pp. 994-1003, April 2006.
+        preserving a posteriori polarimetric SAR calibration," in IEEE Transactions
+        on Geoscience and Remote Sensing, vol. 44, no. 4, pp. 994-1003, April 2006.
 
     Returns
-    ----------
+    -------
     Minv : Tensor
         Normalized polarimetric calibration matrix.
     """
@@ -369,7 +369,7 @@ def apply_cal(sar_img: Tensor, cal: Tensor) -> Tensor:
         4x4 polarimetric calibration correction matrix.
 
     Returns
-    ----------
+    -------
     caled : Tensor
         Calibrated SAR image.
     """
@@ -388,7 +388,7 @@ def apply_cal(sar_img: Tensor, cal: Tensor) -> Tensor:
 def pol_antenna_rotation(sar_img: Tensor, theta: float, pol_order: list = ["VV", "VH", "HV", "HH"]) -> Tensor:
     """
     Calculate polarimetric SAR image with antenna rotated by angle theta
-    around the antenna axis.
+    around the antenna axis. [1]_
 
     Parameters
     ----------
@@ -403,12 +403,12 @@ def pol_antenna_rotation(sar_img: Tensor, theta: float, pol_order: list = ["VV",
     References
     ----------
     .. [1] K. Sarabandi and F. T. Ulaby, "A convenient technique for
-    polarimetric calibration of single-antenna radar systems," in IEEE
-    Transactions on Geoscience and Remote Sensing, vol. 28, no. 6, pp.
-    1022-1033, Nov. 1990.
+        polarimetric calibration of single-antenna radar systems," in IEEE
+        Transactions on Geoscience and Remote Sensing, vol. 28, no. 6, pp.
+        1022-1033, Nov. 1990.
 
     Returns
-    ----------
+    -------
     sar_img : Tensor
         SAR image after rotation.
     """

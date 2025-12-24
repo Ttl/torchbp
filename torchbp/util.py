@@ -10,7 +10,7 @@ def bp_polar_range_dealias(
     img: Tensor, origin: Tensor, fc: float, grid_polar: dict
 ) -> Tensor:
     """
-    De-alias range-axis spectrum of polar SAR image processed with backprojection.
+    De-alias range-axis spectrum of polar SAR image processed with backprojection. [1]_
 
     Parameters
     ----------
@@ -25,12 +25,12 @@ def bp_polar_range_dealias(
 
     References
     ----------
-    .. [#] T. Shi, X. Mao, A. Jakobsson and Y. Liu, "Extended PGA for Spotlight
-    SAR-Filtered Backprojection Imagery," in IEEE Geoscience and Remote Sensing
-    Letters, vol. 19, pp. 1-5, 2022, Art no. 4516005.
+    .. [1] T. Shi, X. Mao, A. Jakobsson and Y. Liu, "Extended PGA for Spotlight
+        SAR-Filtered Backprojection Imagery," in IEEE Geoscience and Remote Sensing
+        Letters, vol. 19, pp. 1-5, 2022, Art no. 4516005.
 
     Returns
-    ----------
+    -------
     img : Tensor
         SAR image without range spectrum aliasing.
     """
@@ -75,7 +75,7 @@ def bp_polar_range_alias(
         Polar grid definition
 
     Returns
-    ----------
+    -------
     img : Tensor
         SAR image with range spectrum aliasing.
     """
@@ -96,7 +96,7 @@ def diff(x: Tensor, dim: int = -1, same_size: bool = False) -> Tensor:
         Pad output to same size as input.
 
     Returns
-    ----------
+    -------
     d : Tensor
         Difference tensor.
     """
@@ -128,7 +128,7 @@ def unwrap(phi: Tensor, dim: int = -1) -> Tensor:
         Dimension.
 
     Returns
-    ----------
+    -------
     phi : Tensor
         Unwrapped tensor.
     """
@@ -156,7 +156,7 @@ def unwrap_ref(x: Tensor, y: Tensor):
         Reference signal.
 
     Returns
-    ----------
+    -------
     unwrapped_x : Tensor
         Phase unwrapped x
     """
@@ -179,7 +179,7 @@ def quad_interp(a: Tensor, v: int) -> Tensor:
         Peak index.
 
     Returns
-    ----------
+    -------
     f : float
         Estimated fractional peak index.
     """
@@ -215,7 +215,7 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
         Dimensions to shift.
 
     Returns
-    ----------
+    -------
     c : int
         Estimated shift.
     """
@@ -254,7 +254,7 @@ def subset_cart(
         Subset y1.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Subset of input image.
     grid : dict
@@ -305,7 +305,7 @@ def subset_polar(
         Subset tehta1.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Subset of input image.
     grid_new : dict
@@ -350,7 +350,7 @@ def find_image_shift_2d(
         Dimension.
 
     Returns
-    ----------
+    -------
     c : tuple
         Estimated shift.
     a : float
@@ -418,7 +418,7 @@ def fft_peak_1d(x: Tensor, dim: int = -1, fractional: bool = True) -> Tensor:
         Estimate peak location with fractional index accuracy.
 
     Returns
-    ----------
+    -------
     a : int or float
         Estimated peak index.
     """
@@ -440,8 +440,9 @@ def detrend(x: Tensor) -> Tensor:
     ----------
     x : Tensor
         Input tensor. Should be 1 dimensional.
+
     Returns
-    ----------
+    -------
     x : Tensor
         x with linear trend removed.
     """
@@ -474,7 +475,7 @@ def entropy(x: Tensor) -> Tensor:
         Input tensor.
 
     Returns
-    ----------
+    -------
     entropy : Tensor
         Calculated entropy of the input.
     """
@@ -498,7 +499,7 @@ def contrast(x: Tensor, dim: int = -1) -> Tensor:
         Input tensor.
 
     Returns
-    ----------
+    -------
     contrast: Tensor
         Calculated negative contrast of the input.
     """
@@ -518,7 +519,7 @@ def shift_spectrum(x: Tensor, dim: int = -1) -> Tensor:
         Input tensor.
 
     Returns
-    ----------
+    -------
     y : Tensor
         Shifted tensor.
     """
@@ -571,19 +572,11 @@ def generate_fmcw_data(
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
     g_extent : list or None
-        List of [g_el0, g_az0, g_el1, g_az1]
-        g_el0 : float
-            grx and gtx elevation axis starting value. Units in radians. -pi/2 if
-            including data over the whole sphere.
-        g_az0 : float
-            grx and gtx azimuth axis starting value. Units in radians. -pi if
-            including data over the whole sphere.
-        g_el1 : float
-            grx and gtx elevation axis end value. Units in radians. +pi/2 if
-            including data over the whole sphere.
-        g_az1 : float
-            grx and gtx azimuth axis end value. Units in radians. +pi if
-            including data over the whole sphere.
+        List of [g_el0, g_az0, g_el1, g_az1].
+        g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
+        in radians. -pi/2 + +pi/2 if including data over the whole sphere.
+        g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
+        radians. -pi to +pi if including data over the whole sphere.
     att : Tensor
         Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3].
         [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
@@ -591,7 +584,7 @@ def generate_fmcw_data(
         True to include residual video phase term.
 
     Returns
-    ----------
+    -------
     data : Tensor
         [nsweeps, nsamples] measurement data.
     """
@@ -686,7 +679,7 @@ def make_polar_grid(
         Grid azimuth mean angle, radians.
 
     Returns
-    ----------
+    -------
     grid_polar : dict
         Polar grid dict.
     """
@@ -735,7 +728,7 @@ def fft_lowpass_filter_precalculate_window(
         Circular convolution if True, otherwise zero pad.
 
     Returns
-    ----------
+    -------
     w : Tensor
         Windowing Tensor.
     """
@@ -777,7 +770,7 @@ def fft_lowpass_filter_window(
         Circular convolution if True, otherwise zero pad.
 
     Returns
-    ----------
+    -------
     filtered_data : Tensor
         Filtered tensor (same shape as input)
     """
@@ -823,7 +816,7 @@ def center_pos(pos: Tensor):
         3D positions. Shape should be [N, 3].
 
     Returns
-    ----------
+    -------
     pos_local : Tensor
         Centered positions.
     origin : Tensor
@@ -851,13 +844,11 @@ def bounding_cart_grid(
     Parameters
     ----------
     grid_polar : dict
-        {
-          "r":      (r0, r1),              # range
-          "theta":  (s0, s1),              # sine of azimuth angle
-          "nr":     nr,                    # number of samples in r
-          "ntheta": ntheta                 # number of samples in theta
-        }
-
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     origin : tuple
         Origin coordinates of grid_polar in the Cartesian grid.
     origin_angle : float
@@ -912,7 +903,7 @@ def create_triangular_weights(patch_size, overlap, device="cpu"):
         Pytorch device.
 
     Returns
-    ----------
+    -------
     weights_2d : Tensor
         Weight tensor of [patch_size, patch_size] with triangular weighting
     """
@@ -957,7 +948,7 @@ def extract_overlapping_patches(img, patch_size, overlap):
         Overlap between patches.
 
     Returns
-    ----------
+    -------
     patches : Tensor
         Tensor of shape [C, P, K, K] where P is the number of patches.
     dim : tuple
@@ -1010,7 +1001,7 @@ def merge_patches_with_triangular_weights(
         Tuple (N_pad, M_pad) of padded dimensions.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Reconstructed image tensor of shape [C, N, M].
     """
@@ -1122,7 +1113,7 @@ def process_image_with_patches(img, patch_size, overlap, process_fn):
         Function to apply to patches.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Processed image with same shape as the input.
     """

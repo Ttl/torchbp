@@ -82,7 +82,8 @@ setup(
             "sphinx >=4",
             "nbsphinx >= 0.8.9",
             "openpyxl >= 3",
-            "lxml-html-clean >= 0.4.1"]
+            "lxml-html-clean >= 0.4.1",
+            "numpydoc"]
     },
     description="Differentiable synthetic aperture radar library",
     long_description=open("Readme.md").read(),

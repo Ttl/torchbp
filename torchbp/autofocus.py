@@ -34,29 +34,29 @@ def pga_estimator(
         Demodulated phase from each target. Shape [Ntargets, Nazimuth].
     estimator : str
         Estimator to use.
-        "pd": Phase difference. [1]_
-        "ml": Maximum likelihood. [2]_
-        "wls": Weighted least squares using estimated signal-to-clutter weighting. [3]_
+            - "pd": Phase difference. [1]_
+            - "ml": Maximum likelihood. [2]_
+            - "wls": Weighted least squares using estimated signal-to-clutter weighting. [3]_
     eps : float
         Minimum weight for weighted PGA.
 
     References
     ----------
     .. [1] D. E. Wahl, P. H. Eichel, D. C. Ghiglia and C. V. Jakowatz, "Phase
-    gradient autofocus - A robust tool for high resolution SAR phase
-    correction," in IEEE Transactions on Aerospace and Electronic Systems, vol.
-    30, no. 3, pp. 827-835, July 1994.
+        gradient autofocus - A robust tool for high resolution SAR phase
+        correction," in IEEE Transactions on Aerospace and Electronic Systems, vol.
+        30, no. 3, pp. 827-835, July 1994.
 
     .. [2] Charles V. Jakowatz and Daniel E. Wahl, "Eigenvector method for
-    maximum-likelihood estimation of phase errors in synthetic-aperture-radar
-    imagery," J. Opt. Soc. Am. A 10, 2539-2546 (1993).
+        maximum-likelihood estimation of phase errors in synthetic-aperture-radar
+        imagery," J. Opt. Soc. Am. A 10, 2539-2546 (1993).
 
     .. [3] Wei Ye, Tat Soon Yeo and Zheng Bao, "Weighted least-squares
-    estimation of phase errors for SAR/ISAR autofocus," in IEEE Transactions on
-    Geoscience and Remote Sensing, vol. 37, no. 5, pp. 2487-2494, Sept. 1999.
+        estimation of phase errors for SAR/ISAR autofocus," in IEEE Transactions on
+        Geoscience and Remote Sensing, vol. 37, no. 5, pp. 2487-2494, Sept. 1999.
 
     Returns
-    ----------
+    -------
     phi : Tensor
         Solved phase error.
     """
@@ -129,7 +129,7 @@ def pga(
         Minimum weight for weighted PGA.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Focused image.
     phi : Tensor
@@ -199,7 +199,7 @@ def gpga_bp_polar(
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
-    backprojection image formation.
+    backprojection image formation. [1]_
 
     Parameters
     ----------
@@ -218,10 +218,10 @@ def gpga_bp_polar(
         and oversample is FFT oversampling factor.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     window_width : int or None
         Initial low-pass filter window width in samples. None for initial
         maximum size.
@@ -253,12 +253,12 @@ def gpga_bp_polar(
 
     References
     ----------
-    .. [#] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
-    Algorithm," in IEEE Transactions on Computational Imaging, vol. 5, no. 4,
-    pp. 606-619, Dec. 2019.
+    .. [1] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
+        Algorithm," in IEEE Transactions on Computational Imaging, vol. 5, no. 4,
+        pp. 606-619, Dec. 2019.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Focused SAR image.
     phi : Tensor
@@ -349,12 +349,12 @@ def gpga_bp_polar_tde(
     verbose: bool = False,
 ) -> (Tensor, Tensor):
     """
-    Generalized phase gradient autofocus [0]_ using 2D polar coordinate
+    Generalized phase gradient autofocus [1]_ using 2D polar coordinate
     backprojection image formation.
 
     Estimates 3D position error by dividing the image into subimages, estimating
     slant range error to each subimage, and then solving for 3D position error
-    from slant range errors. [1]_
+    from slant range errors. [2]_
 
     Z-axis estimation requires variable look angles in the image. Set
     `estimate_z` to False if this is not the case, for example ground based
@@ -377,10 +377,10 @@ def gpga_bp_polar_tde(
         and oversample is FFT oversampling factor.
     grid_polar : dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-        "r": (r0, r1), tuple of min and max range,
-        "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-        "nr": nr, number of range bins.
-        "ntheta": number of angle bins.
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
     azimuth_divisions : int
         Number of divisions for local images in azimuth direction.
     range_divisions : int
@@ -423,16 +423,16 @@ def gpga_bp_polar_tde(
 
     References
     ----------
-    .. [0] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
-    Algorithm," in IEEE Transactions on Computational Imaging, vol. 5, no. 4,
-    pp. 606-619, Dec. 2019.
-    .. [1] Z. Ding et al., "An Autofocus Approach for UAV-Based Ultrawideband
-    Ultrawidebeam SAR Data With Frequency-Dependent and 2-D Space-Variant
-    Motion Errors," in IEEE Transactions on Geoscience and Remote Sensing, vol.
-    60, pp. 1-18, 2022, Art no. 5203518.
+    .. [1] A. Evers and J. A. Jackson, "A Generalized Phase Gradient Autofocus
+        Algorithm," in IEEE Transactions on Computational Imaging, vol. 5, no. 4,
+        pp. 606-619, Dec. 2019.
+    .. [2] Z. Ding et al., "An Autofocus Approach for UAV-Based Ultrawideband
+        Ultrawidebeam SAR Data With Frequency-Dependent and 2-D Space-Variant
+        Motion Errors," in IEEE Transactions on Geoscience and Remote Sensing, vol.
+        60, pp. 1-18, 2022, Art no. 5203518.
 
     Returns
-    ----------
+    -------
     img : Tensor
         Focused SAR image.
     pos_new : Tensor
@@ -700,7 +700,7 @@ def minimum_entropy_grad_autofocus(
         Reject steps that would increase image entropy.
 
     Returns
-    ----------
+    -------
     sar_img : Tensor
         Optimized radar image.
     origin : Tensor
@@ -880,7 +880,7 @@ def bp_polar_grad_minimum_entropy(
         First `fixed_pos` positions are kept fixed and are not optimized.
 
     Returns
-    ----------
+    -------
     sar_img : Tensor
         Optimized radar image.
     origin : Tensor
@@ -966,7 +966,7 @@ def bp_cart_grad_minimum_entropy(
         First `fixed_pos` positions are kept fixed and are not optimized.
 
     Returns
-    ----------
+    -------
     sar_img : Tensor
         Optimized radar image.
     origin : Tensor

@@ -50,11 +50,11 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
     References
     ----------
     .. [1] R. M. Goldstein and C. L. Werner, "Radar interferogram filtering for
-    geophysical applications," in Geophysical Research Letters, vol. 25, no. 21,
-    pp 4035-4038, 1998
+        geophysical applications," in Geophysical Research Letters, vol. 25, no. 21,
+        pp 4035-4038, 1998
 
     Returns
-    ----------
+    -------
     filtered : Tensor
         Filtered interferogram.
     """
@@ -89,7 +89,7 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
         RF center frequency in Hz.
 
     Returns
-    ----------
+    -------
     z : Tensor
         Elevation tensor with the same shape as unw.
     """
@@ -132,7 +132,7 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
         Image grid definition dictionary.
 
     Returns
-    ----------
+    -------
     z : Tensor
         Elevation tensor with the same shape as unw.
     """
@@ -170,7 +170,7 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
         Image grid definition dictionary.
 
     Returns
-    ----------
+    -------
     z : Tensor
         Elevation tensor with the same shape as unw.
     """
@@ -207,11 +207,11 @@ def subpixel_correlation(im_m: Tensor, im_s: Tensor):
     References
     ----------
     .. [1] D. Li and Y. Zhang, "A Fast Offset Estimation Approach for InSAR
-    Image Subpixel Registration," in IEEE Geoscience and Remote Sensing Letters,
-    vol. 9, no. 2, pp. 267-271, March 2012.
+        Image Subpixel Registration," in IEEE Geoscience and Remote Sensing Letters,
+        vol. 9, no. 2, pp. 267-271, March 2012.
 
     Returns
-    ----------
+    -------
     offsets : Tensor
         Solved X and Y subpixel offsets.
     corrs : Tensor
