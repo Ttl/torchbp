@@ -754,11 +754,8 @@ def minimum_entropy_grad_autofocus(
             pos_loss = pos_reg * torch.mean(torch.square(pos - pos_orig))
             # acc_loss = acc_reg * torch.mean(torch.square(pos_d2[1:]))
 
-            origin = torch.tensor(
-                [torch.mean(pos[:, 0]), torch.mean(pos[:, 1]), 0],
-                device=dev,
-                dtype=torch.float32,
-            )[None, :]
+            origin = torch.mean(pos, axis=0, keepdim=True)
+            origin[:,2] = 0
             pos_centered = pos - origin
 
             sar_img = f(data, grid, fc, r_res, pos_centered, d0).squeeze()
