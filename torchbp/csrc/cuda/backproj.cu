@@ -895,9 +895,9 @@ __global__ void projection_cart_2d_kernel(
             }
             float phase0 = -2.0f * (fc * tau);
             if (use_rvp) {
-                phase0 += -gamma * tau * tau;
+                phase0 += gamma * tau * tau;
             }
-            const float freq = 2.0f * gamma * tau / fs;
+            const float freq = -2.0f * gamma * tau / fs;
             const float phase = freq * j + phase0;
 
             float ref_sin, ref_cos;

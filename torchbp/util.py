@@ -649,7 +649,7 @@ def generate_fmcw_data(
             g_a = 1
 
         data += (g_a * rcs_abs / d**2) * torch.exp(
-            -1j * 2 * pi * (fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
+            1j * 2 * pi * (-fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
             + 1j * rcs_phase
         )
     return data
