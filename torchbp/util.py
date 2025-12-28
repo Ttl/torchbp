@@ -7,7 +7,7 @@ from scipy.signal import get_window
 
 
 def bp_polar_range_dealias(
-    img: Tensor, origin: Tensor, fc: float, grid_polar: dict
+    img: Tensor, origin: Tensor, fc: float, grid_polar: dict, alias_fmod=0
 ) -> Tensor:
     """
     De-alias range-axis spectrum of polar SAR image processed with backprojection. [1]_
@@ -22,6 +22,8 @@ def bp_polar_range_dealias(
         RF center frequency.
     grid_polar : dict
         Polar grid definition
+    alias_fmod : float
+        Range modulation frequency applied to input.
 
     References
     ----------
@@ -41,7 +43,8 @@ def bp_polar_range_dealias(
     dtheta = (theta1 - theta0) / ntheta
     dr = (r1 - r0) / nr
 
-    r = r0 + dr * torch.arange(nr, device=img.device)
+    er = torch.arange(nr, device=img.device)
+    r = r0 + dr * er
     theta = theta0 + dtheta * torch.arange(ntheta, device=img.device)
 
     x = r[:, None] * torch.sqrt(1 - torch.square(theta))[None, :]
@@ -51,14 +54,14 @@ def bp_polar_range_dealias(
         origin = origin[0]
     d = torch.sqrt((x - origin[0]) ** 2 + (y - origin[1]) ** 2 + origin[2] ** 2)
     c0 = 299792458
-    phase = torch.exp(-1j * 4 * pi * fc * d / c0)
+    phase = torch.exp(-1j * 4 * pi * fc * d / c0 + 1j*alias_fmod*er[:,None])
     if img.dim() == 3:
         phase = phase.unsqueeze(0)
     return phase * img
 
 
 def bp_polar_range_alias(
-    img: Tensor, origin: Tensor, fc: float, grid_polar: dict
+    img: Tensor, origin: Tensor, fc: float, grid_polar: dict, alias_fmod: float=0
 ) -> Tensor:
     """
     Inverse of bp_polar_range_dealias.
@@ -79,7 +82,7 @@ def bp_polar_range_alias(
     img : Tensor
         SAR image with range spectrum aliasing.
     """
-    return bp_polar_range_dealias(img, origin, -fc, grid_polar)
+    return bp_polar_range_dealias(img, origin, -fc, grid_polar, -alias_fmod)
 
 
 def diff(x: Tensor, dim: int = -1, same_size: bool = False) -> Tensor:

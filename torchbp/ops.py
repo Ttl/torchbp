@@ -3,11 +3,12 @@ from math import pi
 from torch import Tensor
 from copy import deepcopy
 from .util import bp_polar_range_dealias, center_pos
+from warnings import warn
 
-cart_2d_nargs = 15
-polar_2d_nargs = 25
-polar_interp_linear_args = 18
-polar_to_cart_linear_args = 17
+cart_2d_nargs = 16
+polar_2d_nargs = 26
+polar_interp_linear_args = 19
+polar_to_cart_linear_args = 18
 entropy_args = 3
 abs_sum_args = 2
 coherence_2d_args = 7
@@ -56,6 +57,7 @@ def polar_interp(
     rotation: float = 0,
     grid_polar_new: dict = None,
     method: str | tuple = "linear",
+    alias_fmod : float = 0
 ) -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
@@ -89,6 +91,8 @@ def polar_interp(
         Interpolation method. Valid choices are:
         - "linear": Linear interpolation.
         - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
+    alias_fmod : float
+        Range modulation frequency applied to input.
 
     Returns
     -------
@@ -112,7 +116,7 @@ def polar_interp(
         dorigin = torch.tile(dorigin[None,:], (img.shape[0],1))
     if method == "linear":
         return polar_interp_linear(
-            img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0
+            img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0, alias_fmod
         )
     elif method == "lanczos":
         return polar_interp_lanczos(
@@ -124,6 +128,7 @@ def polar_interp(
             grid_polar_new,
             z0,
             order=method_params,
+            alias_fmod=alias_fmod
         )
     else:
         raise ValueError(f"Unknown interp_method: {interp_method}")
@@ -137,6 +142,7 @@ def polar_interp_linear(
     rotation: float = 0,
     grid_polar_new: dict = None,
     z0: float = 0,
+    alias_fmod: float = 0,
 ) -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
@@ -166,6 +172,8 @@ def polar_interp_linear(
         If None uses the same grid as input, but with double the angle points.
     z0 : float
         Height of the antenna phase center in the new image.
+    alias_fmod : float
+        Range modulation frequency applied to input.
 
     Returns
     -------
@@ -221,6 +229,7 @@ def polar_interp_linear(
         nr3,
         ntheta3,
         z0,
+        alias_fmod,
     )
 
 
@@ -232,7 +241,8 @@ def polar_interp_lanczos(
     rotation: float = 0,
     grid_polar_new: dict = None,
     z0: float = 0,
-    order: int = 4,
+    order: int = 6,
+    alias_fmod : float = 0
 ) -> Tensor:
     """
     Interpolate pseudo-polar radar image to new grid and change origin position by `dorigin`.
@@ -262,6 +272,10 @@ def polar_interp_lanczos(
         If None uses the same grid as input, but with double the angle points.
     z0 : float
         Height of the antenna phase center in the new image.
+    order : int
+        Number of nearby samples to use for interpolation of one new sample.
+    alias_fmod : float
+        Range modulation frequency applied to input.
 
     Returns
     -------
@@ -318,6 +332,7 @@ def polar_interp_lanczos(
         ntheta3,
         z0,
         order,
+        alias_fmod
     )
 
 
@@ -330,8 +345,10 @@ def ffbp_merge2_lanczos(
     fc: float,
     grid_polar_new: dict = None,
     z0: float = 0,
-    order: int = 3,
-    alias: bool = False
+    order: int = 6,
+    alias: bool = False,
+    alias_fmod: float = 0,
+    output_alias: bool = True
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -366,9 +383,13 @@ def ffbp_merge2_lanczos(
     z0 : float
         Height of the antenna phase center in the new image.
     order : int
-        Interpolation order.
+        Number of nearby samples to use for interpolation of one new sample.
     alias : bool
         Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
+    alias_fmod : float
+        Range modulation frequency applied to input.
+    output_alias : bool
+        If True and `alias` is True apply `alias_fmod` to output.
 
     Returns
     -------
@@ -418,6 +439,13 @@ def ffbp_merge2_lanczos(
     assert dorigin1.shape == (3,)
     dorigin = torch.stack((dorigin0, dorigin1), dim=0)
 
+    alias_mode = 0
+    if alias:
+        if not output_alias:
+            alias_mode = 2
+        else:
+            alias_mode = 1
+
     return torch.ops.torchbp.ffbp_merge2_lanczos.default(
         img0,
         img1,
@@ -437,7 +465,8 @@ def ffbp_merge2_lanczos(
         ntheta3,
         z0,
         order,
-        alias,
+        alias_mode,
+        alias_fmod,
     )
 
 
@@ -450,9 +479,11 @@ def ffbp_merge2_knab(
     fc: float,
     grid_polar_new: dict = None,
     z0: float = 0,
-    order: int = 3,
+    order: int = 6,
     oversample: float = 1.5,
-    alias: bool = False
+    alias: bool = False,
+    alias_fmod: float = 0,
+    output_alias: bool = True
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -487,11 +518,16 @@ def ffbp_merge2_knab(
     z0 : float
         Height of the antenna phase center in the new image.
     order : int
-        Interpolation order.
+        Number of nearby samples to use for interpolation of one new sample.
+        Even number is preferred.
     oversample : float
         Oversampling factor in the input data.
     alias : bool
         Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
+    alias_fmod : float
+        Range modulation frequency applied to input.
+    output_alias : bool
+        If True and `alias` is True apply `alias_fmod` to output.
 
     References
     ----------
@@ -546,6 +582,13 @@ def ffbp_merge2_knab(
     assert dorigin1.shape == (3,)
     dorigin = torch.stack((dorigin0, dorigin1), dim=0)
 
+    alias_mode = 0
+    if alias:
+        if not output_alias:
+            alias_mode = 2
+        else:
+            alias_mode = 1
+
     return torch.ops.torchbp.ffbp_merge2_knab.default(
         img0,
         img1,
@@ -566,8 +609,10 @@ def ffbp_merge2_knab(
         z0,
         order,
         oversample,
-        alias
+        alias_mode,
+        alias_fmod,
     )
+
 
 def ffbp_merge2(
     img0: Tensor,
@@ -578,8 +623,10 @@ def ffbp_merge2(
     fc: float,
     grid_polar_new: dict = None,
     z0: float = 0,
-    method : tuple = ('lanczos', 3),
-    alias: bool = False
+    method : tuple = ('lanczos', 6),
+    alias: bool = False,
+    alias_fmod: float = 0,
+    output_alias: bool = True
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -615,11 +662,15 @@ def ffbp_merge2(
         Height of the antenna phase center in the new image.
     method : str or tuple
         Interpolation method. Valid choices are:
-            - ("lanczos", n): Lanczos resampling. `n` is half of the kernel length.
-            - ("knab", n, v): Knab pulse resampling. `n` is half of the kernel
+            - ("lanczos", n): Lanczos resampling. `n` is the number of samples used.
+            - ("knab", n, v): Knab pulse resampling. `n` is the number of samples used.
               length and v is oversampling factor in the data.
     alias : bool
         Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
+    alias_fmod : float
+        Range modulation frequency applied to input.
+    output_alias : bool
+        If True and `alias` is True apply `alias_fmod` to output.
 
     Returns
     -------
@@ -646,6 +697,8 @@ def ffbp_merge2(
             z0,
             order=method_params[0],
             alias=alias,
+            alias_fmod=alias_fmod,
+            output_alias=output_alias
         )
     elif method == "knab":
         if len(method_params) != 2:
@@ -662,6 +715,8 @@ def ffbp_merge2(
             order=method_params[0],
             oversample=method_params[1],
             alias=alias,
+            alias_fmod=alias_fmod,
+            output_alias=output_alias
         )
     else:
         raise ValueError(f"Unknown interp_method: {interp_method}")
@@ -674,6 +729,7 @@ def polar_to_cart(
     grid_cart: dict,
     fc: float,
     rotation: float = 0,
+    alias_fmod: float = 0,
     method: str | tuple = "linear",
 ) -> Tensor:
     """
@@ -710,6 +766,8 @@ def polar_to_cart(
         Interpolation method. Valid choices are:
         - "linear": Linear interpolation.
         - ("lanczos", n): Lanczos resampling. `n` is the half of kernel length.
+    alias_fmod : float
+        Range modulation frequency applied to input.
 
     Returns
     -------
@@ -723,10 +781,10 @@ def polar_to_cart(
         method_params = None
 
     if method == "linear":
-        return polar_to_cart_linear(img, origin, grid_polar, grid_cart, fc, rotation)
+        return polar_to_cart_linear(img, origin, grid_polar, grid_cart, fc, rotation, alias_fmod)
     elif method == "lanczos":
         return polar_to_cart_lanczos(
-            img, origin, grid_polar, grid_cart, fc, rotation, order=method_params
+            img, origin, grid_polar, grid_cart, fc, rotation, alias_fmod, order=method_params
         )
     else:
         raise ValueError(f"Unknown interp_method: {interp_method}")
@@ -739,6 +797,7 @@ def polar_to_cart_linear(
     grid_cart: dict,
     fc: float,
     rotation: float = 0,
+    alias_fmod: float = 0
 ) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid with linear interpolation.
@@ -770,6 +829,8 @@ def polar_to_cart_linear(
         RF center frequency in Hz.
     rotation : float
         Polar origin rotation angle.
+    alias_fmod : float
+        Range modulation frequency applied to input.
 
     Returns
     -------
@@ -816,6 +877,7 @@ def polar_to_cart_linear(
         dy,
         nx,
         ny,
+        alias_fmod
     )
 
 
@@ -826,7 +888,8 @@ def polar_to_cart_lanczos(
     grid_cart: dict,
     fc: float,
     rotation: float = 0,
-    order: int = 2,
+    alias_fmod: float = 0,
+    order: int = 6,
 ) -> Tensor:
     """
     Interpolate polar radar image to cartesian grid with linear interpolation.
@@ -859,7 +922,9 @@ def polar_to_cart_lanczos(
     rotation : float
         Polar origin rotation angle.
     order : int
-        Lanczos interpolation order.
+        Number of nearby samples to use for interpolation of one new sample.
+    alias_fmod : float
+        Range modulation frequency applied to input.
 
     Returns
     -------
@@ -906,6 +971,7 @@ def polar_to_cart_lanczos(
         dy,
         nx,
         ny,
+        alias_fmod,
         order,
     )
 
@@ -921,6 +987,8 @@ def backprojection_polar_2d(
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
+    data_fmod: float = 0,
+    alias_fmod: float = 0
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
@@ -968,6 +1036,10 @@ def backprojection_polar_2d(
         in radians. -pi/2 + +pi/2 if including data over the whole sphere.
         g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
         radians. -pi to +pi if including data over the whole sphere.
+    data_fmod : float
+        Range modulation frequency applied to input data.
+    alias_fmod : float
+        Range modulation frequency applied to SAR image.
 
     Returns
     -------
@@ -1011,7 +1083,9 @@ def backprojection_polar_2d(
 
     z0 = 0
     if dealias:
-        z0 = torch.mean(pos[:, 2])
+        if nbatch != 1:
+            raise ValueError("Only nbatch=1 supported with dealias")
+        z0 = torch.mean(pos[..., 2])
 
     return torch.ops.torchbp.backprojection_polar_2d.default(
         data,
@@ -1038,6 +1112,8 @@ def backprojection_polar_2d(
         g_del,
         g_naz,
         g_nel,
+        data_fmod,
+        alias_fmod,
     )
 
 
@@ -1049,10 +1125,12 @@ def backprojection_polar_2d_lanczos(
     pos: Tensor,
     d0: float = 0.0,
     dealias: bool = False,
-    order: int = 4,
+    order: int = 6,
     att: Tensor | None = None,
     g: Tensor = None,
     g_extent: list | None = None,
+    data_fmod: float = 0,
+    alias_fmod: float = 0
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
@@ -1088,7 +1166,7 @@ def backprojection_polar_2d_lanczos(
         `torchbp.util.bp_polar_range_dealias` on the SAR image.
         Default is False.
     order : int
-        Lanczos interpolation order. The default is 4.
+        Number of nearby samples to use for interpolation of one new sample.
     att : Tensor
         Antenna rotation tensor.
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
@@ -1103,6 +1181,10 @@ def backprojection_polar_2d_lanczos(
         in radians. -pi/2 + +pi/2 if including data over the whole sphere.
         g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
         radians. -pi to +pi if including data over the whole sphere.
+    data_fmod : float
+        Range modulation frequency applied to input data.
+    alias_fmod : float
+        Range modulation frequency applied to SAR image.
 
     Returns
     -------
@@ -1174,6 +1256,157 @@ def backprojection_polar_2d_lanczos(
         g_del,
         g_naz,
         g_nel,
+        data_fmod,
+        alias_fmod
+    )
+
+
+def backprojection_polar_2d_knab(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    d0: float = 0.0,
+    dealias: bool = False,
+    order: int = 4,
+    oversample: float = 2,
+    att: Tensor | None = None,
+    g: Tensor = None,
+    g_extent: list | None = None,
+    data_fmod: float = 0,
+    alias_fmod: float = 0
+) -> Tensor:
+    """
+    2D backprojection with pseudo-polar coordinates. Interpolates input data
+    using knab interpolation.
+
+    Gradient not supported.
+
+    Parameters
+    ----------
+    data : Tensor
+        Range compressed input data. Shape should be [nbatch, nsweeps, samples] or
+        [nsweeps, samples]. If input is 3 dimensional the first dimensions is number
+        of independent images to form at the same time. Whole batch is processed
+        with same grid and other arguments.
+    grid : dict
+        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
+        and oversample is FFT oversampling factor.
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+    d0 : float
+        Zero range correction.
+    dealias : bool
+        If True removes the range spectrum aliasing. Equivalent to applying
+        `torchbp.util.bp_polar_range_dealias` on the SAR image.
+        Default is False.
+    order : int
+        Number of nearby samples to use for interpolation of one new sample.
+        Even number is preferred.
+    oversample : float
+        Oversampling factor in the input data.
+    att : Tensor
+        Antenna rotation tensor.
+        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
+        out data outside the antenna beam.
+    g : Tensor
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center.
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1].
+        g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
+        in radians. -pi/2 + +pi/2 if including data over the whole sphere.
+        g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
+        radians. -pi to +pi if including data over the whole sphere.
+    data_fmod : float
+        Range modulation frequency applied to input data.
+    alias_fmod : float
+        Range modulation frequency applied to SAR image.
+
+    Returns
+    -------
+    img : Tensor
+        Pseudo-polar format radar image.
+    """
+
+    r0, r1 = grid["r"]
+    theta0, theta1 = grid["theta"]
+    nr = grid["nr"]
+    ntheta = grid["ntheta"]
+    dr = (r1 - r0) / nr
+    dtheta = (theta1 - theta0) / ntheta
+
+    if data.dim() == 2:
+        nbatch = 1
+        nsweeps = data.shape[0]
+        sweep_samples = data.shape[1]
+        assert pos.shape == (nsweeps, 3)
+    else:
+        nbatch = data.shape[0]
+        nsweeps = data.shape[1]
+        sweep_samples = data.shape[2]
+        assert pos.shape == (nbatch, nsweeps, 3)
+
+    if att is None or g is None:
+        att = None
+        g = None
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
+    z0 = 0
+    if dealias:
+        z0 = torch.mean(pos[:, 2])
+
+    return torch.ops.torchbp.backprojection_polar_2d_knab.default(
+        data,
+        pos,
+        att,
+        nbatch,
+        sweep_samples,
+        nsweeps,
+        fc,
+        r_res,
+        r0,
+        dr,
+        theta0,
+        dtheta,
+        nr,
+        ntheta,
+        d0,
+        dealias,
+        z0,
+        order,
+        oversample,
+        g,
+        g_az0,
+        g_el0,
+        g_daz,
+        g_del,
+        g_naz,
+        g_nel,
+        data_fmod,
+        alias_fmod
     )
 
 
@@ -1185,6 +1418,7 @@ def backprojection_cart_2d(
     pos: Tensor,
     d0: float = 0.0,
     beamwidth: float = pi,
+    data_fmod: float = 0
 ) -> Tensor:
     """
     2D backprojection with cartesian coordinates.
@@ -1216,6 +1450,8 @@ def backprojection_cart_2d(
         Beamwidth of the antenna in radians. Points outside the beam are not calculated.
     d0 : float
         Zero range correction.
+    data_fmod : float
+        Range modulation frequency applied to input data.
 
     Returns
     -------
@@ -1257,6 +1493,7 @@ def backprojection_cart_2d(
         ny,
         beamwidth,
         d0,
+        data_fmod
     )
 
 
@@ -1429,6 +1666,7 @@ def gpga_backprojection_2d_core(
     r_res: float,
     d0: float = 0.0,
     interp_method: str = "linear",
+    data_fmod: float = 0
 ) -> Tensor:
     """
     Generalized phase gradient autofocus.
@@ -1453,7 +1691,9 @@ def gpga_backprojection_2d_core(
     interp_method : str
         Interpolation method
         "linear": linear interpolation.
-        ("lanczos", N): Lanczos interpolation with order 2*N+1.
+        ("lanczos", N): Lanczos interpolation with order N.
+    data_fmod : float
+        Range modulation frequency applied to input data.
 
     Returns
     -------
@@ -1472,10 +1712,9 @@ def gpga_backprojection_2d_core(
         interp_method = interp_method[0]
     else:
         method_params = None
-
     if interp_method == "linear":
         return torch.ops.torchbp.gpga_backprojection_2d.default(
-            target_pos, data, pos, sweep_samples, nsweeps, fc, r_res, ntargets, d0
+            target_pos, data, pos, sweep_samples, nsweeps, fc, r_res, ntargets, d0, data_fmod
         )
     elif interp_method == "lanczos":
         return torch.ops.torchbp.gpga_backprojection_2d_lanczos.default(
@@ -1489,6 +1728,7 @@ def gpga_backprojection_2d_core(
             ntargets,
             d0,
             method_params,
+            data_fmod
         )
     else:
         raise ValueError(f"Unknown interp_method f{interp_method}")
@@ -1843,10 +2083,13 @@ def ffbp(
     stages: int,
     divisions: int = 2,
     d0: float = 0.0,
-    interp_method: str | tuple = ("lanczos", 3),
-    oversample_r: float = 1.6,
-    oversample_theta: float = 1.6,
-    dealias: bool = False
+    interp_method: str | tuple = ("lanczos", 6),
+    oversample_r: float = 1.4,
+    oversample_theta: float = 1.4,
+    grid_oversample: float = 1,
+    dealias: bool = False,
+    data_fmod: float = 0,
+    alias_fmod: float = None,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -1881,13 +2124,40 @@ def ffbp(
         Internally oversample range by this amount to avoid aliasing.
     oversample_theta : float
         Internally oversample theta by this amount to avoid aliasing.
+    grid_oversample : float
+        Oversample ratio of the output grid. Used only for calculating the
+        alias_fmod when alias_fmod is None. 1 for critically sampled grid, 2 for
+        twice oversampled grid, etc.
     dealias : bool
         If True removes the range spectrum aliasing. Equivalent to applying
         `torchbp.util.bp_polar_range_dealias` on the SAR image.
         Default is False.
+    data_fmod : float
+        Range modulation frequency applied to input data.
+    alias_fmod : float or None
+        Range modulation frequency applied to SAR image.
+        If None, the alias frequency is calculated automatically assuming
+        that the image spectrum is at positive frequencies. grid_oversample
+        should be given when automatic calculation is used.
+
+        Note that when `dealias` is True and the `alias_fmod` is calculated
+        automatically, the output will not have `alias_fmod` modulation and
+        `alias_fmod` is used only internally to decrease interpolation errors.
+
+    Returns
+    -------
+    img : Tensor
+        SAR image.
     """
     nsweeps = data.shape[0]
     device = data.device
+
+    output_alias = alias_fmod is not None
+    if alias_fmod is None:
+        if grid_oversample < 1:
+            warn(f"Grid is undersampled. grid_oversample={grid_oversample}")
+        im_margin = max(0, grid_oversample * oversample_r - 1)
+        alias_fmod = -torch.pi * (1 - im_margin / (1 + im_margin))
 
     try:
         if interp_method[0] not in ["lanczos", "knab"]:
@@ -1895,7 +2165,7 @@ def ffbp(
                 "interp_method should be ('lanczos', N) or ('knab', N, v)"
             )
     except IndexError:
-        raise ValueError("interp_method should be ('lanczos', N) for some integer N")
+        raise ValueError("interp_method should be ('lanczos', N) or ('knab', N, v)")
     imgs = []
     n = nsweeps // divisions
     for d in range(divisions):
@@ -1904,7 +2174,10 @@ def ffbp(
         grid_local = deepcopy(grid)
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
         data_local = data[d * n : (d + 1) * n]
-        if stages > 1 and len(data_local) > 4 * divisions:
+        # TODO: Better edge handling for interpolation.
+        # Interpolation doesn't work too well with too small image due to edges.
+        # Limit the minimum image size to avoid large interpolation errors.
+        if stages > 1 and len(data_local) > 128:
             grid_local["nr"] = int(oversample_r * grid_local["nr"])
             grid_local["ntheta"] = int(oversample_theta * grid_local["ntheta"])
             img = ffbp(
@@ -1919,11 +2192,13 @@ def ffbp(
                 interp_method=interp_method,
                 oversample_r=1,  # Grid is already increased
                 oversample_theta=1,
-                dealias=True
+                dealias=True,
+                data_fmod=data_fmod,
+                alias_fmod=alias_fmod,
             )
         else:
             img = backprojection_polar_2d(
-                data_local, grid_local, fc, r_res, pos_local, d0=d0, dealias=True
+                data_local, grid_local, fc, r_res, pos_local, d0=d0, dealias=True, data_fmod=data_fmod, alias_fmod=alias_fmod
             )[0]
         imgs.append((origin_local[0], grid_local, img, z0))
     while len(imgs) > 1:
@@ -1932,6 +2207,8 @@ def ffbp(
         new_origin = 0.5 * img1[0] + 0.5 * img2[0]
         new_z = 0.5 * (img1[3] + img2[3])
         alias = False
+        # output_alias only applies to final merge
+        out_alias = output_alias
         if len(imgs) == 2:
             # Interpolate the final image to the desired grid.
             grid_polar_new = grid
@@ -1939,6 +2216,7 @@ def ffbp(
         else:
             grid_polar_new = deepcopy(img1[1])
             grid_polar_new["ntheta"] += img2[1]["ntheta"]
+            out_alias = True
         i1 = img1[2]
         i2 = img2[2]
         dorigin1 = new_origin - img1[0]
@@ -1956,7 +2234,9 @@ def ffbp(
             grid_polar_new,
             z0=new_z,
             method=interp_method,
-            alias=alias
+            alias=alias,
+            alias_fmod=alias_fmod,
+            output_alias=out_alias
         )
         imgs[0] = None
         imgs[1] = None
@@ -2032,6 +2312,8 @@ def _fake_polar_interp_linear(
     dtheta1: float,
     Nr1: float,
     Ntheta1: float,
+    z1: float,
+    alias_fmod: float,
 ) -> Tensor:
     torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
@@ -2057,6 +2339,8 @@ def _fake_polar_interp_linear_grad(
     dtheta1: float,
     Nr1: float,
     Ntheta1: float,
+    z1: float,
+    alias_fmod: float,
 ) -> Tensor:
     torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
@@ -2257,6 +2541,8 @@ def _setup_context_polar_2d(ctx, inputs, output):
 def _backward_polar_2d(ctx, grad):
     data = ctx.saved_tensors[0]
     pos = ctx.saved_tensors[1]
+    if ctx.saved[13]:
+        raise ValueError("dealias gradient not supported")
     ret = torch.ops.torchbp.backprojection_polar_2d_grad.default(
         grad, data, pos, *ctx.saved
     )

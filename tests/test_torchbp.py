@@ -7,6 +7,7 @@ import torchbp
 from torch import Tensor
 from typing import Tuple
 import torch.nn.functional as F
+from random import uniform
 
 class TestCoherence2D(TestCase):
     def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
@@ -92,7 +93,8 @@ class TestPolarInterpLinear(TestCase):
             'fc': 6e9,
             'rotation': 0.3,
             'grid_polar_new': grid_polar_new,
-            'z0': 2
+            'z0': 2,
+            'alias_fmod': uniform(0, 2*torch.pi),
         }
         return [args]
 
@@ -167,6 +169,7 @@ class TestPolarToCartLinear(TestCase):
             'grid_cart': grid_cart,
             'fc': 6e9,
             'rotation': 0.1,
+            'alias_fmod': uniform(0, 2*torch.pi),
         }
         return [args]
 
@@ -249,6 +252,12 @@ class TestBackprojectionPolar(TestCase):
             'r_res': 0.15,
             'pos': make_pos_tensor((nbatch, sweeps, 3), dtype=torch.float32),
             'd0': 0.2,
+            'dealias': False,
+            'att': None,
+            'g': None,
+            'g_extent': None,
+            'data_fmod': uniform(0, 2*torch.pi),
+            'alias_fmod': 0,
         }
         return [args]
 
@@ -330,6 +339,7 @@ class TestBackprojectionCart(TestCase):
             'pos': make_pos_tensor((nbatch, sweeps, 3), dtype=torch.float32),
             'beamwidth': 3.14,
             'd0': 0.2,
+            'data_fmod': uniform(0, 2*torch.pi),
         }
         return [args]
 

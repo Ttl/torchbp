@@ -243,7 +243,7 @@ __device__ void bicubic_interp2d_grad(T *img_grad, T *img_gx_grad,
     img_gxy_grad[3] = g * (xb[3] * by[3]);
 }
 
-inline __device__ float lanczos_kernel(float x, int a) {
+inline __device__ float lanczos_kernel(float x, float a) {
     // Ensured by calling code
     //if (fabsf(x) >= a) {
     //    return 0.0f;
@@ -255,7 +255,8 @@ inline __device__ float lanczos_kernel(float x, int a) {
 }
 
 template<class T, class T2>
-__device__ T lanczos_interp_1d(const T2 *img, int n, float pos, int a) {
+__device__ T lanczos_interp_1d(const T2 *img, int n, float pos, int order) {
+    float a = 0.5f * order;
     int start = max(0, (int)ceilf(pos - a));
     int end = min(n-1, (int)floorf(pos + a));
     T sum{};
@@ -275,24 +276,26 @@ __device__ T lanczos_interp_1d(const T2 *img, int n, float pos, int a) {
 }
 
 template<class T, class T2>
-__device__ T lanczos_interp_2d(const T2 *img, int nx, int ny, float x, float y, int a) {
+__device__ T lanczos_interp_2d(const T2 *img, int nx, int ny, float x, float y, int order) {
+    float a = 0.5f * order;
     int start_x = max(0, (int)ceilf(x - a));
     int end_x = min(nx-1, (int)floorf(x + a));
     T sum{};
     for (int i = start_x; i <= end_x; i++) {
         float dx = x - i;
         float wx = lanczos_kernel(dx, a);
-        T row_val = lanczos_interp_1d<T, T2>(img + i * ny, ny, y, a);
+        T row_val = lanczos_interp_1d<T, T2>(img + i * ny, ny, y, order);
         sum += wx * row_val;
     }
     return sum;
 }
 
-inline __device__ float knab_kernel_norm(int a, float v) {
+inline __device__ float knab_kernel_norm(int order, float v) {
+    float a = 0.5f * order;
     return 1.0f / coshf(kPI * v * a);
 }
 
-inline __device__ float knab_kernel(float x, int a, float v, float norm) {
+inline __device__ float knab_kernel(float x, float a, float v, float norm) {
     // This is needed due to rounding errors.
     if (fabsf(x) >= a) {
         return 0.0f;
@@ -305,7 +308,8 @@ inline __device__ float knab_kernel(float x, int a, float v, float norm) {
 }
 
 template<class T, class T2>
-__device__ T knab_interp_1d(const T2 *img, int n, float pos, int a, float v, float norm) {
+__device__ T knab_interp_1d(const T2 *img, int n, float pos, int order, float v, float norm) {
+    float a = 0.5f * order;
     int start = max(0, (int)ceilf(pos - a));
     int end = min(n-1, (int)floorf(pos + a));
     T sum{};
@@ -325,14 +329,15 @@ __device__ T knab_interp_1d(const T2 *img, int n, float pos, int a, float v, flo
 }
 
 template<class T, class T2>
-__device__ T knab_interp_2d(const T2 *img, int nx, int ny, float x, float y, int a, float v, float norm) {
+__device__ T knab_interp_2d(const T2 *img, int nx, int ny, float x, float y, int order, float v, float norm) {
+    float a = 0.5f * order;
     int start_x = max(0, (int)ceilf(x - a));
     int end_x = min(nx-1, (int)floorf(x + a));
     T sum{};
     for (int i = start_x; i <= end_x; i++) {
         float dx = x - i;
         float wx = knab_kernel(dx, a, v, norm);
-        T row_val = knab_interp_1d<T, T2>(img + i * ny, ny, y, a, v, norm);
+        T row_val = knab_interp_1d<T, T2>(img + i * ny, ny, y, order, v, norm);
         sum += wx * row_val;
     }
     return sum;

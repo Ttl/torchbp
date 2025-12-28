@@ -196,6 +196,7 @@ def gpga_bp_polar(
     lowpass_window: str = "boxcar",
     eps: float = 1e-6,
     interp_method: str = "linear",
+    data_fmod: float = 0
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus using 2D polar coordinate
@@ -250,6 +251,8 @@ def gpga_bp_polar(
         Interpolation method
         "linear": linear interpolation.
         ("lanczos", N): Lanczos interpolation with order 2*N+1.
+    data_fmod : float
+        Range modulation frequency applied to input data.
 
     References
     ----------
@@ -282,7 +285,7 @@ def gpga_bp_polar(
         window_width = data.shape[0]
 
     if img is None:
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)[0]
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[0]
 
     for i in range(max_iters):
         rpeaks = torch.argmax(torch.abs(img), dim=1)
@@ -300,7 +303,7 @@ def gpga_bp_polar(
 
         # Get range profile samples for each target
         target_data = gpga_backprojection_2d_core(
-            target_pos, data, pos_new, fc, r_res, d0, interp_method=interp_method
+            target_pos, data, pos_new, fc, r_res, d0, interp_method=interp_method, data_fmod=data_fmod
         )
         # Filter samples
         if window_width is not None and window_width < target_data.shape[1]:
@@ -316,7 +319,7 @@ def gpga_bp_polar(
         d = phi_sum * c0 / (4 * torch.pi * fc)
         pos_new[:, 0] = pos[:, 0] + d
 
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[0]
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[0]
         window_width = int(window_width * window_exp)
         if window_width < min_window:
             break
@@ -347,6 +350,7 @@ def gpga_bp_polar_tde(
     use_ffbp: bool = False,
     ffbp_opts: dict | None = None,
     verbose: bool = False,
+    data_fmod: float = 0
 ) -> (Tensor, Tensor):
     """
     Generalized phase gradient autofocus [1]_ using 2D polar coordinate
@@ -420,6 +424,8 @@ def gpga_bp_polar_tde(
         Dictionary of options for ffbp.
     verbose : bool
         Print progress stats.
+    data_fmod : float
+        Range modulation frequency applied to input data.
 
     References
     ----------
@@ -455,7 +461,7 @@ def gpga_bp_polar_tde(
         window_width = data.shape[0] // azimuth_divisions
 
     if img is None:
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new)[0]
+        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[0]
 
     rdiv = img.shape[0] // range_divisions
     azdiv = img.shape[1] // azimuth_divisions
@@ -525,6 +531,7 @@ def gpga_bp_polar_tde(
                     r_res,
                     d0,
                     interp_method=interp_method,
+                    data_fmod=data_fmod,
                 )
                 # Filter samples
                 if window_width is not None and window_width < target_data.shape[1]:
@@ -597,12 +604,12 @@ def gpga_bp_polar_tde(
             pos_new[:, 2] = pos_new[:, 2] + d_solved[2]
 
         if use_ffbp:
-            opts = {"stages": 5, "oversample_r": 1.6, "oversample_theta": 1.6}
+            opts = {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}
             if ffbp_opts is not None:
                 opts.update(ffbp_opts)
-            img = ffbp(data, grid_polar, fc, r_res, pos_new, d0=d0, **opts)
+            img = ffbp(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod, **opts)
         else:
-            img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0)[
+            img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[
                 0
             ]
         window_width = int(window_width * window_exp)
@@ -644,6 +651,7 @@ def minimum_entropy_grad_autofocus(
     grad_limit_quantile: float = 0.9,
     fixed_pos: int = 0,
     minimize_only: bool = False,
+    data_fmod: float = 0
 ) -> (Tensor, Tensor, Tensor, int):
     """
     Minimum entropy autofocus using backpropagation optimization through image
@@ -698,6 +706,8 @@ def minimum_entropy_grad_autofocus(
         First `fixed_pos` positions are kept fixed and are not optimized.
     minimize_only : bool
         Reject steps that would increase image entropy.
+    data_fmod : float
+        Range modulation frequency applied to input data.
 
     Returns
     -------
@@ -758,7 +768,7 @@ def minimum_entropy_grad_autofocus(
             origin[:,2] = 0
             pos_centered = pos - origin
 
-            sar_img = f(data, grid, fc, r_res, pos_centered, d0).squeeze()
+            sar_img = f(data, grid, fc, r_res, pos_centered, d0, data_fmod=data_fmod).squeeze()
             if tx_norm is not None:
                 entr = entropy(sar_img / tx_norm)
             else:
@@ -827,6 +837,7 @@ def bp_polar_grad_minimum_entropy(
     max_step_limit: float = 0.25,
     grad_limit_quantile: float = 0.9,
     fixed_pos: int = 0,
+    data_fmod: float = 0
 ):
     """
     Minimum entropy autofocus optimization autofocus.
@@ -878,6 +889,8 @@ def bp_polar_grad_minimum_entropy(
         0 to 1 range.
     fixed_pos : int
         First `fixed_pos` positions are kept fixed and are not optimized.
+    data_fmod : float
+        Range modulation frequency applied to input data.
 
     Returns
     -------
@@ -913,6 +926,7 @@ def bp_cart_grad_minimum_entropy(
     max_step_limit: float = 0.25,
     grad_limit_quantile: float = 0.9,
     fixed_pos: int = 0,
+    data_fmod: float = 0
 ):
     """
     Minimum entropy autofocus optimization autofocus.
@@ -964,6 +978,8 @@ def bp_cart_grad_minimum_entropy(
         0 to 1 range.
     fixed_pos : int
         First `fixed_pos` positions are kept fixed and are not optimized.
+    data_fmod : float
+        Range modulation frequency applied to input data.
 
     Returns
     -------

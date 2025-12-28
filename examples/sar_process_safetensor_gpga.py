@@ -35,8 +35,8 @@ if __name__ == "__main__":
     # Windowing functions
     range_window = "hamming"
     angle_window = ("taylor", 4, 50)
-    # FFT oversampling factor, decrease to 2 to save some VRAM
-    fft_oversample = 3
+    # FFT oversampling factor. Increase to decrease interpolation error.
+    fft_oversample = 1.5
     dev = torch.device("cuda")
     # Distance in radar data corresponding to zero actual distance
     # Slightly higher than zero due to antenna feedlines and other delays.
@@ -54,10 +54,10 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print("Input file {filename} not found.")
 
-    sweeps = tensors["data"][sweep_start:nsweeps].to(dtype=torch.float32)
-    pos = tensors["pos"][sweep_start:nsweeps].cpu().numpy()
-    att = tensors["att"][sweep_start:nsweeps].cpu().numpy()
-    counts = tensors["counts"][sweep_start:nsweeps]
+    sweeps = tensors["data"][sweep_start:sweep_start+nsweeps].to(dtype=torch.float32)
+    pos = tensors["pos"][sweep_start:sweep_start+nsweeps].cpu().numpy()
+    att = tensors["att"][sweep_start:sweep_start+nsweeps].cpu().numpy()
+    counts = tensors["counts"][sweep_start:sweep_start+nsweeps]
     nsweeps = sweeps.shape[0]
     del tensors
 
@@ -122,23 +122,26 @@ if __name__ == "__main__":
     ).to(dtype=torch.float32, device=dev)
     wa /= torch.mean(wa)
 
-    # Residual video phase compensation
-    nsamples = sweeps.shape[-1]
-    f = torch.fft.rfftfreq(int(nsamples * fft_oversample), d=1 / fs).to(dev)
-    rvp = torch.exp(-1j * torch.pi * f**2 * tsweep / bw)
-    r_res = c0 / (2 * bw * fft_oversample)
-    del f
-
-    # Timestamp of each sweep
-    data_time = sweep_interval * counts
-
     # Apply windowing
     sweeps *= wa[:, None, None].cpu()
     sweeps *= wr[None, None, :].cpu()
 
-    # FFT radar data in blocks to decrease the maximum needed VRAM
+    nsamples = sweeps.shape[-1]
     n = int(nsamples * fft_oversample)
+    fft_oversample = n / nsamples
+    # Modulation frequency to center the data spectrum to DC for decreased
+    # interpolation error.
+    data_fmod = -torch.pi * (1 - (fft_oversample-1) / fft_oversample)
+
+    f = torch.fft.rfftfreq(n, d=1 / fs).to(dev)
+    # Residual video phase compensation
+    rvp = torch.exp(-1j * torch.pi * f**2 * tsweep / bw)
+    r_res = c0 / (2 * bw * fft_oversample)
+    del f
+
+    data_fmod_f = torch.exp(1j*data_fmod*torch.arange(n//2+1, device=dev))[None,:]
     fsweeps = torch.zeros((sweeps.shape[0], n // 2 + 1), dtype=data_dtype, device=dev)
+    # FFT radar data in blocks to decrease the maximum needed VRAM
     blocks = 16
     block = (sweeps.shape[0] + blocks - 1) // blocks
     for b in range(blocks):
@@ -146,15 +149,16 @@ if __name__ == "__main__":
         s1 = min((b + 1) * block, sweeps.shape[0])
         fsw = torch.fft.rfft(
             sweeps[s0:s1, 0, :].to(device=dev), n=n, norm="forward", dim=-1
-        )
-        fsw = torch.conj(fsw)
+        ).conj()
+        fsw *= data_fmod_f
         fsw *= rvp[None, :]
         fsweeps[s0:s1] = fsw.to(dtype=data_dtype)
     del sweeps
     del fsw
+    del data_fmod_f
+    del rvp
 
     pos = pos.to(device=dev)
-    data_time = data_time.to(device=dev)
 
     print("Calculating autofocus. This might take a while.")
 
@@ -167,7 +171,7 @@ if __name__ == "__main__":
     sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
             pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
             azimuth_divisions=8, range_divisions=8,
-            use_ffbp=ffbp)
+            use_ffbp=ffbp, data_fmod=data_fmod, verbose=True)
     torch.cuda.synchronize()
     print(f"Autofocus done in {time.time() - tstart:.3g} s")
 
@@ -186,10 +190,10 @@ if __name__ == "__main__":
     tstart = time.time()
     if ffbp:
         sar_img = torchbp.ops.ffbp(fsweeps, grid_polar, fc, r_res, pos_centered,
-                stages=5, divisions=2, d0=d0, oversample_r=2, oversample_theta=2)
+                stages=5, divisions=2, d0=d0, oversample_r=1.3, oversample_theta=1.3, interp_method=("knab", 6, 1.3), data_fmod=data_fmod, alias_fmod=None)
     else:
         sar_img = torchbp.ops.backprojection_polar_2d(
-            fsweeps, grid_polar, fc, r_res, pos_centered, d0)[0]
+            fsweeps, grid_polar, fc, r_res, pos_centered, d0, data_fmod=data_fmod)[0]
     torch.cuda.synchronize()
     print(f"Final image created in {time.time() - tstart:.3g} s")
     print("Entropy", torchbp.util.entropy(sar_img).item())

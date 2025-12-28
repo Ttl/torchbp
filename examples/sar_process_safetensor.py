@@ -98,8 +98,8 @@ if __name__ == "__main__":
     # Windowing functions
     range_window = "hamming"
     angle_window = ("taylor", 4, 50)
-    # FFT oversampling factor, decrease to 2 to save some VRAM
-    fft_oversample = 3
+    # FFT oversampling factor. Increase to decrease interpolation error.
+    fft_oversample = 1.5
     dev = torch.device("cuda")
     # Distance in radar data corresponding to zero actual distance
     # Slightly higher than zero due to antenna feedlines and other delays.
@@ -116,10 +116,10 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print("Input file {filename} not found.")
 
-    sweeps = tensors["data"][sweep_start:nsweeps].to(dtype=torch.float32)
-    pos = tensors["pos"][sweep_start:nsweeps].cpu().numpy()
-    att = tensors["att"][sweep_start:nsweeps].cpu().numpy()
-    counts = tensors["counts"][sweep_start:nsweeps]
+    sweeps = tensors["data"][sweep_start:sweep_start+nsweeps].to(dtype=torch.float32)
+    pos = tensors["pos"][sweep_start:sweep_start+nsweeps].cpu().numpy()
+    att = tensors["att"][sweep_start:sweep_start+nsweeps].cpu().numpy()
+    counts = tensors["counts"][sweep_start:sweep_start+nsweeps]
     nsweeps = sweeps.shape[0]
     del tensors
 
@@ -183,16 +183,8 @@ if __name__ == "__main__":
     ).to(dtype=torch.float32, device=dev)
     wa /= torch.mean(wa)
 
-    # Residual video phase compensation
-    nsamples = sweeps.shape[-1]
-    f = torch.fft.rfftfreq(int(nsamples * fft_oversample), d=1 / fs).to(dev)
-    rvp = torch.exp(-1j * torch.pi * f**2 * tsweep / bw)
-    r_res = c0 / (2 * bw * fft_oversample)
-    del f
-
     # Timestamp of each sweep
     data_time = sweep_interval * counts
-
     v = torch.diff(pos, dim=0, prepend=pos[0].unsqueeze(0)) / sweep_interval
     pos_mean = torch.mean(pos, dim=0)
     v_orig = v.detach().clone()
@@ -201,9 +193,22 @@ if __name__ == "__main__":
     sweeps *= wa[:, None, None].cpu()
     sweeps *= wr[None, None, :].cpu()
 
-    # FFT radar data in blocks to decrease the maximum needed VRAM
+    # Modulation frequency to center the data spectrum to DC for decreased
+    # interpolation error.
+    data_fmod = -torch.pi * (1 - (fft_oversample-1) / fft_oversample)
+
+    nsamples = sweeps.shape[-1]
     n = int(nsamples * fft_oversample)
+    fft_oversample = n / nsamples
+    f = torch.fft.rfftfreq(n, d=1 / fs).to(dev)
+    # Residual video phase compensation
+    rvp = torch.exp(-1j * torch.pi * f**2 * tsweep / bw)
+    r_res = c0 / (2 * bw * fft_oversample)
+    del f
+
+    data_fmod_f = torch.exp(1j*data_fmod*torch.arange(n//2+1, device=dev))[None,:]
     fsweeps = torch.zeros((sweeps.shape[0], n // 2 + 1), dtype=data_dtype, device=dev)
+    # FFT radar data in blocks to decrease the maximum needed VRAM
     blocks = 16
     block = (sweeps.shape[0] + blocks - 1) // blocks
     for b in range(blocks):
@@ -213,10 +218,12 @@ if __name__ == "__main__":
             sweeps[s0:s1, 0, :].to(device=dev), n=n, norm="forward", dim=-1
         )
         fsw = torch.conj(fsw)
+        fsw *= data_fmod_f
         fsw *= rvp[None, :]
         fsweeps[s0:s1] = fsw.to(dtype=data_dtype)
     del sweeps
     del fsw
+    del data_fmod_f
 
     pos = pos.to(device=dev)
     data_time = data_time.to(device=dev)
@@ -229,7 +236,7 @@ if __name__ == "__main__":
             pos_centered = pos - origin
             sar_img, phi = torchbp.autofocus.gpga_bp_polar(None, fsweeps,
                     pos_centered, fc, r_res, grid_polar_autofocus,
-                    window_width=nsweeps//8, d0=d0, target_threshold_db=20)
+                    window_width=nsweeps//8, d0=d0, target_threshold_db=20, data_fmod=data_fmod)
 
             d = torchbp.util.phase_to_distance(phi, fc)
             d -= torch.mean(d)
@@ -255,6 +262,7 @@ if __name__ == "__main__":
             max_step_limit=max_step_limit,
             grad_limit_quantile=0.99,
             fixed_pos=0,
+            data_fmod=data_fmod
         )
         v = torch.diff(pos, dim=0, prepend=pos[0].unsqueeze(0)) / sweep_interval
 
@@ -280,7 +288,7 @@ if __name__ == "__main__":
     pos_centered = pos - origin
     print("Focusing final image")
     sar_img = torchbp.ops.backprojection_polar_2d( fsweeps, grid_polar, fc,
-            r_res, pos_centered, d0).squeeze()
+            r_res, pos_centered, d0, data_fmod=data_fmod).squeeze()
     print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()
 
