@@ -45,6 +45,8 @@ if __name__ == "__main__":
     # Use fast factorized backprojection, slightly reduces the image quality
     # but is faster.
     ffbp = True
+    # Autofocus image to improve image quality.
+    autofocus = True
 
     c0 = 299792458
 
@@ -160,30 +162,30 @@ if __name__ == "__main__":
 
     pos = pos.to(device=dev)
 
-    print("Calculating autofocus. This might take a while.")
-
     origin = torch.tensor([torch.mean(pos[:,0]), torch.mean(pos[:,1]), 0],
             device=dev, dtype=torch.float32)[None,:]
     pos_centered = pos - origin
 
-    torch.cuda.synchronize()
-    tstart = time.time()
-    sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
-            pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
-            azimuth_divisions=8, range_divisions=8,
-            use_ffbp=ffbp, data_fmod=data_fmod, verbose=True)
-    torch.cuda.synchronize()
-    print(f"Autofocus done in {time.time() - tstart:.3g} s")
+    if autofocus:
+        print("Calculating autofocus. This might take a while.")
+        torch.cuda.synchronize()
+        tstart = time.time()
+        sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
+                pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
+                azimuth_divisions=8, range_divisions=8,
+                use_ffbp=ffbp, data_fmod=data_fmod, verbose=True)
+        torch.cuda.synchronize()
+        print(f"Autofocus done in {time.time() - tstart:.3g} s")
 
-    plt.figure()
-    plt.plot((pos_new[:,0] - pos_centered[:,0]).cpu().numpy(), label="x")
-    plt.plot((pos_new[:,1] - pos_centered[:,1]).cpu().numpy(), label="y")
-    plt.plot((pos_new[:,2] - pos_centered[:,2]).cpu().numpy(), label="z")
-    plt.xlabel("Sweep index")
-    plt.ylabel("Solved position error (m)")
-    plt.legend(loc="best")
+        plt.figure()
+        plt.plot((pos_new[:,0] - pos_centered[:,0]).cpu().numpy(), label="x")
+        plt.plot((pos_new[:,1] - pos_centered[:,1]).cpu().numpy(), label="y")
+        plt.plot((pos_new[:,2] - pos_centered[:,2]).cpu().numpy(), label="z")
+        plt.xlabel("Sweep index")
+        plt.ylabel("Solved position error (m)")
+        plt.legend(loc="best")
 
-    pos_centered = pos_new
+        pos_centered = pos_new
 
     print("Focusing final image")
     torch.cuda.synchronize()

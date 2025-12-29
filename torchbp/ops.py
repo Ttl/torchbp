@@ -442,9 +442,11 @@ def ffbp_merge2_lanczos(
     alias_mode = 0
     if alias:
         if not output_alias:
-            alias_mode = 2
-        else:
             alias_mode = 1
+        else:
+            alias_mode = 2
+    elif not output_alias:
+        alias_mode = 3
 
     return torch.ops.torchbp.ffbp_merge2_lanczos.default(
         img0,
@@ -585,9 +587,11 @@ def ffbp_merge2_knab(
     alias_mode = 0
     if alias:
         if not output_alias:
-            alias_mode = 2
-        else:
             alias_mode = 1
+        else:
+            alias_mode = 2
+    elif not output_alias:
+        alias_mode = 3
 
     return torch.ops.torchbp.ffbp_merge2_knab.default(
         img0,
@@ -787,7 +791,7 @@ def polar_to_cart(
             img, origin, grid_polar, grid_cart, fc, rotation, alias_fmod, order=method_params
         )
     else:
-        raise ValueError(f"Unknown interp_method: {interp_method}")
+        raise ValueError(f"Unknown method: {method}")
 
 
 def polar_to_cart_linear(

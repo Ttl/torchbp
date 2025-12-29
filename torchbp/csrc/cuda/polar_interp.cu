@@ -842,6 +842,9 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
         if (alias == 2) {
             alias_fmod = 0.0f;
         }
+        if (alias == 3) {
+            ref_phase = 0.0f;
+        }
         sincospif(ref_phase * dz - alias_fmod*idr, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
         pixel *= ref;
@@ -904,6 +907,9 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
         float ref_sin, ref_cos;
         if (alias == 2) {
             alias_fmod = 0.0f;
+        }
+        if (alias == 3) {
+            ref_phase = 0.0f;
         }
         sincospif(ref_phase * dz - alias_fmod*idr, &ref_sin, &ref_cos);
         complex64_t ref = {ref_cos, ref_sin};
