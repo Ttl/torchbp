@@ -292,7 +292,7 @@ __device__ T lanczos_interp_2d(const T2 *img, int nx, int ny, float x, float y, 
 
 inline __device__ float knab_kernel_norm(int order, float v) {
     float a = 0.5f * order;
-    return 1.0f / coshf(kPI * v * a);
+    return expf(-2.0f*a*kPI*v);
 }
 
 inline __device__ float knab_kernel(float x, float a, float v, float norm) {
@@ -304,7 +304,8 @@ inline __device__ float knab_kernel(float x, float a, float v, float norm) {
         return 1.0f;
     }
     float xa = x / a;
-    return (sinpif(x) / (kPI * x)) * coshf(kPI * v * a * sqrtf(1.0f - xa*xa)) * norm;
+    float n = expf(kPI * a * v * (sqrtf(1.0f - xa*xa) - 1.0f));
+    return (sinpif(x) / (kPI * x)) * (norm/(n*(norm + 1.0f)) + n/(norm + 1.0f));
 }
 
 template<class T, class T2>
