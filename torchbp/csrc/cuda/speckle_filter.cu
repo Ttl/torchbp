@@ -88,11 +88,12 @@ at::Tensor lee_filter_cuda(
     int blocks = Nx * Ny;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (img.dtype() == at::kComplexFloat) {
         c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
         lee_filter_kernel<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (const complex64_t*)img_ptr,
                       out_ptr,
                       Nx,
@@ -104,7 +105,7 @@ at::Tensor lee_filter_cuda(
     } else {
         float* img_ptr = img_contig.data_ptr<float>();
         lee_filter_kernel<float>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       img_ptr,
                       out_ptr,
                       Nx,

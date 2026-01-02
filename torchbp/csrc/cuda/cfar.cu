@@ -80,8 +80,9 @@ at::Tensor cfar_2d_cuda(
 	// Up-rounding division.
 	unsigned int block_x = (N0 * N1 + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    cfar_2d_kernel<<<block_count, thread_per_block>>>(
+    cfar_2d_kernel<<<block_count, thread_per_block, 0, stream>>>(
           img_ptr,
           detections_ptr,
           N0,

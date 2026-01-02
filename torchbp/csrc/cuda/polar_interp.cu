@@ -437,12 +437,13 @@ at::Tensor polar_to_cart_linear_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (img.dtype() == at::kComplexFloat) {
         c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
         c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
         polar_to_cart_kernel_linear<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (const complex64_t*)img_ptr,
                       (complex64_t*)out_ptr,
                       origin_ptr,
@@ -466,7 +467,7 @@ at::Tensor polar_to_cart_linear_cuda(
         float* img_ptr = img_contig.data_ptr<float>();
         float* out_ptr = out.data_ptr<float>();
         polar_to_cart_kernel_linear<float>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       img_ptr,
                       out_ptr,
                       origin_ptr,
@@ -547,9 +548,10 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     polar_to_cart_kernel_linear_grad
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (const complex64_t*)img_ptr,
                   origin_ptr,
                   rotation,
@@ -669,12 +671,13 @@ at::Tensor polar_to_cart_lanczos_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (img.dtype() == at::kComplexFloat) {
         c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
         c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
         polar_to_cart_kernel_lanczos<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (const complex64_t*)img_ptr,
                       (complex64_t*)out_ptr,
                       origin_ptr,
@@ -699,7 +702,7 @@ at::Tensor polar_to_cart_lanczos_cuda(
         float* img_ptr = img_contig.data_ptr<float>();
         float* out_ptr = out.data_ptr<float>();
         polar_to_cart_kernel_lanczos<float>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       img_ptr,
                       out_ptr,
                       origin_ptr,
@@ -762,9 +765,10 @@ at::Tensor polar_interp_linear_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     polar_interp_kernel_linear
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (const complex64_t*)img_ptr,
                   (complex64_t*)out_ptr,
                   dorigin_ptr,
@@ -1046,9 +1050,10 @@ at::Tensor polar_interp_lanczos_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     polar_interp_kernel_lanczos
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (const complex64_t*)img_ptr,
                   (complex64_t*)out_ptr,
                   dorigin_ptr,
@@ -1140,9 +1145,10 @@ at::Tensor ffbp_merge2_lanczos_cuda(
 	dim3 block_count = {block_x, 1, 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     ffbp_merge2_kernel_lanczos
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (const complex64_t*)img0_ptr,
                   (const complex64_t*)img1_ptr,
                   (complex64_t*)out_ptr,
@@ -1237,9 +1243,10 @@ at::Tensor ffbp_merge2_knab_cuda(
 
     const float ref_phase = 4.0f * fc / kC0;
     const float v = 1.0f - 1.0f / oversample;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     ffbp_merge2_kernel_knab
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (const complex64_t*)img0_ptr,
                   (const complex64_t*)img1_ptr,
                   (complex64_t*)out_ptr,

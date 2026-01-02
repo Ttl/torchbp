@@ -147,9 +147,10 @@ at::Tensor entropy_cuda(
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
     const float* norm_ptr = norm_contig.data_ptr<float>();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     entropy_kernel<complex64_t>
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (complex64_t*)data_ptr,
                   res_ptr,
                   norm_ptr,
@@ -191,9 +192,10 @@ std::vector<at::Tensor> entropy_grad_cuda(
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
     const float* norm_ptr = norm_contig.data_ptr<float>();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     entropy_grad_kernel<complex64_t>
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (complex64_t*)data_ptr,
                   norm_ptr,
                   grad_ptr,
@@ -232,9 +234,10 @@ at::Tensor abs_sum_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     abs_sum_kernel<complex64_t>
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (complex64_t*)data_ptr,
                   res_ptr,
                   blocks
@@ -268,9 +271,10 @@ at::Tensor abs_sum_grad_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     abs_sum_grad_kernel<complex64_t>
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (complex64_t*)data_ptr,
                   grad_ptr,
                   (complex64_t*)data_grad_ptr,

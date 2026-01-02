@@ -150,8 +150,9 @@ at::Tensor coherence_2d_cuda(
 	// Up-rounding division.
 	unsigned int block_x = (N0 * N1 + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    coherence_2d_kernel<<<block_count, thread_per_block>>>(
+    coherence_2d_kernel<<<block_count, thread_per_block, 0, stream>>>(
           (complex64_t*)img0_ptr,
           (complex64_t*)img1_ptr,
           out_ptr,
@@ -210,8 +211,9 @@ std::vector<at::Tensor> coherence_2d_grad_cuda(
 	// Up-rounding division.
 	unsigned int block_x = (N0 * N1 + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    coherence_2d_grad_kernel<<<block_count, thread_per_block>>>(
+    coherence_2d_grad_kernel<<<block_count, thread_per_block, 0, stream>>>(
           grad_ptr,
           (complex64_t*)img0_ptr,
           (complex64_t*)img1_ptr,
@@ -305,8 +307,9 @@ at::Tensor power_coherence_2d_cuda(
 	// Up-rounding division.
 	unsigned int block_x = (N0 * N1 + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    power_coherence_2d_kernel<<<block_count, thread_per_block>>>(
+    power_coherence_2d_kernel<<<block_count, thread_per_block, 0, stream>>>(
           (complex64_t*)img0_ptr,
           (complex64_t*)img1_ptr,
           out_ptr,

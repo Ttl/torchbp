@@ -1137,8 +1137,9 @@ at::Tensor projection_cart_2d_cuda(
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     projection_cart_2d_kernel
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (complex64_t*)img_ptr,
                   dem_ptr,
                   pos_ptr,
@@ -1237,10 +1238,11 @@ at::Tensor backprojection_polar_2d_cuda(
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         backprojection_polar_2d_kernel<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (complex64_t*)data_ptr,
                       pos_ptr,
                       att_ptr,
@@ -1266,7 +1268,7 @@ at::Tensor backprojection_polar_2d_cuda(
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         backprojection_polar_2d_kernel<half2>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (half2*)data_ptr,
                       pos_ptr,
                       att_ptr,
@@ -1364,13 +1366,14 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
     int blocks = Nr * Ntheta;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         if (have_pos_grad) {
             if (have_data_grad) {
                 backprojection_polar_2d_grad_kernel<complex64_t, true, true>
-                      <<<block_count, thread_per_block>>>(
+                      <<<block_count, thread_per_block, 0, stream>>>(
                               (complex64_t*)data_ptr,
                               pos_ptr,
                               sweep_samples,
@@ -1390,7 +1393,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               );
             } else {
                 backprojection_polar_2d_grad_kernel<complex64_t, true, false>
-                      <<<block_count, thread_per_block>>>(
+                      <<<block_count, thread_per_block, 0, stream>>>(
                               (complex64_t*)data_ptr,
                               pos_ptr,
                               sweep_samples,
@@ -1413,7 +1416,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
         } else {
             if (have_data_grad) {
                 backprojection_polar_2d_grad_kernel<complex64_t, false, true>
-                      <<<block_count, thread_per_block>>>(
+                      <<<block_count, thread_per_block, 0, stream>>>(
                               (complex64_t*)data_ptr,
                               pos_ptr,
                               sweep_samples,
@@ -1440,7 +1443,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
         if (have_pos_grad) {
             if (have_data_grad) {
                 backprojection_polar_2d_grad_kernel<half2, true, true>
-                      <<<block_count, thread_per_block>>>(
+                      <<<block_count, thread_per_block, 0, stream>>>(
                               (half2*)data_ptr,
                               pos_ptr,
                               sweep_samples,
@@ -1460,7 +1463,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
                               );
             } else {
                 backprojection_polar_2d_grad_kernel<half2, true, false>
-                      <<<block_count, thread_per_block>>>(
+                      <<<block_count, thread_per_block, 0, stream>>>(
                               (half2*)data_ptr,
                               pos_ptr,
                               sweep_samples,
@@ -1483,7 +1486,7 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
         } else {
             if (have_data_grad) {
                 backprojection_polar_2d_grad_kernel<half2, false, true>
-                      <<<block_count, thread_per_block>>>(
+                      <<<block_count, thread_per_block, 0, stream>>>(
                               (half2*)data_ptr,
                               pos_ptr,
                               sweep_samples,
@@ -1583,11 +1586,12 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
     int blocks = Nr * Ntheta;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         backprojection_polar_2d_lanczos_kernel<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (complex64_t*)data_ptr,
                       pos_ptr,
                       att_ptr,
@@ -1613,7 +1617,7 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         backprojection_polar_2d_lanczos_kernel<half2>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (half2*)data_ptr,
                       pos_ptr,
                       att_ptr,
@@ -1714,11 +1718,12 @@ at::Tensor backprojection_polar_2d_knab_cuda(
     int blocks = Nr * Ntheta;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         backprojection_polar_2d_knab_kernel<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (complex64_t*)data_ptr,
                       pos_ptr,
                       att_ptr,
@@ -1744,7 +1749,7 @@ at::Tensor backprojection_polar_2d_knab_cuda(
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         backprojection_polar_2d_knab_kernel<half2>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       (half2*)data_ptr,
                       pos_ptr,
                       att_ptr,
@@ -1811,11 +1816,12 @@ at::Tensor gpga_backprojection_2d_cuda(
     int blocks = Ntarget * nsweeps;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         gpga_backprojection_2d_kernel<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       target_pos_ptr,
                       (complex64_t*)data_ptr,
                       pos_ptr,
@@ -1830,7 +1836,7 @@ at::Tensor gpga_backprojection_2d_cuda(
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         gpga_backprojection_2d_kernel<half2>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       target_pos_ptr,
                       (half2*)data_ptr,
                       pos_ptr,
@@ -1886,11 +1892,12 @@ at::Tensor gpga_backprojection_2d_lanczos_cuda(
     int blocks = Ntarget * nsweeps;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         gpga_backprojection_2d_lanczos_kernel<complex64_t>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       target_pos_ptr,
                       (complex64_t*)data_ptr,
                       pos_ptr,
@@ -1906,7 +1913,7 @@ at::Tensor gpga_backprojection_2d_lanczos_cuda(
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         gpga_backprojection_2d_lanczos_kernel<half2>
-              <<<block_count, thread_per_block>>>(
+              <<<block_count, thread_per_block, 0, stream>>>(
                       target_pos_ptr,
                       (half2*)data_ptr,
                       pos_ptr,
@@ -1976,9 +1983,10 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
     int blocks = Nr * Ntheta;
 	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     backprojection_polar_2d_tx_power_kernel
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   wa_ptr,
                   pos_ptr,
                   att_ptr,
@@ -2037,9 +2045,10 @@ at::Tensor backprojection_cart_2d_cuda(
 	// Up-rounding division.
 	unsigned int block_x = (Nx * Ny + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
 	backprojection_cart_2d_kernel
-          <<<block_count, thread_per_block>>>(
+          <<<block_count, thread_per_block, 0, stream>>>(
                   (complex64_t*)data_ptr,
                   pos_ptr,
                   (complex64_t*)img_ptr,
@@ -2117,11 +2126,12 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cuda(
 	// Up-rounding division.
 	unsigned int block_x = (Nx * Ny + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (have_pos_grad) {
         if (have_data_grad) {
             backprojection_cart_2d_grad_kernel<true, true>
-                  <<<block_count, thread_per_block>>>(
+                  <<<block_count, thread_per_block, 0, stream>>>(
                           (complex64_t*)data_ptr,
                           pos_ptr,
                           sweep_samples,
@@ -2139,7 +2149,7 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cuda(
                           );
         } else {
             backprojection_cart_2d_grad_kernel<true, false>
-                  <<<block_count, thread_per_block>>>(
+                  <<<block_count, thread_per_block, 0, stream>>>(
                           (complex64_t*)data_ptr,
                           pos_ptr,
                           sweep_samples,
@@ -2159,7 +2169,7 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cuda(
     } else {
         if (have_data_grad) {
             backprojection_cart_2d_grad_kernel<false, true>
-                  <<<block_count, thread_per_block>>>(
+                  <<<block_count, thread_per_block, 0, stream>>>(
                           (complex64_t*)data_ptr,
                           pos_ptr,
                           sweep_samples,
