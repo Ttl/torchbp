@@ -261,8 +261,7 @@ class TestBackprojectionPolar(TestCase):
         }
         return [args]
 
-    #@unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
-    @unittest.skip
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_cpu_and_gpu(self):
         samples = self.sample_inputs("cuda")
         for sample in samples:
@@ -271,8 +270,7 @@ class TestBackprojectionPolar(TestCase):
             res_cpu = torchbp.ops.backprojection_polar_2d(**sample_cpu)
             torch.testing.assert_close(res_cpu, res_gpu, atol=1e-3, rtol=1e-2)
 
-    #@unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
-    @unittest.skip
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_cpu_and_gpu_grad(self):
         samples = self.sample_inputs("cuda", requires_grad=True)
         for sample in samples:

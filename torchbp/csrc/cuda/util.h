@@ -1,10 +1,14 @@
 #ifndef _TORCHBP_UTIL_CUH
 #define _TORCHBP_UTIL_CUH
-#include <torch/extension.h>
+#include <ATen/Operators.h>
+#include <torch/all.h>
+#include <torch/library.h>
 
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+
 #define LIBCUDACXX_ENABLE_HOST_NVFP16
 // cuda::std::complex multiplication checks for nans which causes
 // it to be extremely slow. This can be disabled by definition below on

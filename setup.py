@@ -1,6 +1,7 @@
 import os
 import torch
 import glob
+from packaging.version import Version
 
 from setuptools import find_packages, setup
 
@@ -12,6 +13,11 @@ from torch.utils.cpp_extension import (
 )
 
 library_name = "torchbp"
+
+if Version(torch.__version__) >= Version("2.6.0"):
+    py_limited_api = True
+else:
+    py_limited_api = False
 
 def get_extensions():
     debug_mode = os.getenv("DEBUG", "0") == "1"
@@ -33,6 +39,7 @@ def get_extensions():
             "-O3" if not debug_mode else "-O0",
             "-fdiagnostics-color=always",
             "-fopenmp",
+            "-DPy_LIMITED_API=0x03090000", # Min Python version 3.9
         ],
         "nvcc": [
             "-O3" if not debug_mode else "-O0",
@@ -61,6 +68,7 @@ def get_extensions():
             sources,
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
+            py_limited_api=py_limited_api,
         )
     ]
 
@@ -90,4 +98,5 @@ setup(
     long_description_content_type="text/markdown",
     #url="",
     cmdclass={"build_ext": BuildExtension},
+    options={"bdist_wheel": {"py_limited_api": "cp39"}} if py_limited_api else {},
 )
