@@ -261,6 +261,10 @@ at::Tensor polar_interp_linear_cpu(
     at::Tensor out = torch::empty({nbatch, nr1, ntheta1}, img_contig.options());
     at::Tensor dorigin_contig = dorigin.contiguous();
 
+    // FIXME openmp hack to use more than 1 thread.
+    int num_threads = at::get_num_interop_threads();
+    omp_set_num_threads(num_threads);
+
     if (img.dtype() == at::kComplexFloat) {
         TORCH_CHECK(dorigin.dtype() == at::kFloat);
         const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
@@ -327,6 +331,10 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
 	at::Tensor grad_contig = grad.contiguous();
     at::Tensor img_grad;
     at::Tensor dorigin_grad;
+
+    // FIXME openmp hack to use more than 1 thread.
+    int num_threads = at::get_num_interop_threads();
+    omp_set_num_threads(num_threads);
 
     if (img.dtype() == at::kComplexFloat) {
         TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -584,6 +592,10 @@ at::Tensor backprojection_polar_2d_cpu(
     const float ref_phase = 4.0f * fc / kC0;
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 
+    // FIXME openmp hack to use more than 1 thread.
+    int num_threads = at::get_num_interop_threads();
+    omp_set_num_threads(num_threads);
+
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
         for(int idx = 0; idx < Nr * Ntheta; idx++) {
@@ -816,6 +828,10 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
 
+    // FIXME openmp hack to use more than 1 thread.
+    int num_threads = at::get_num_interop_threads();
+    omp_set_num_threads(num_threads);
+
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
         for(int idx = 0; idx < Nr * Ntheta; idx++) {
@@ -931,6 +947,10 @@ at::Tensor polar_to_cart_linear_cpu(
 	const float* origin_ptr = origin_contig.data_ptr<float>();
 
     const float ref_phase = 4.0f * fc / kC0;
+
+    // FIXME openmp hack to use more than 1 thread.
+    int num_threads = at::get_num_interop_threads();
+    omp_set_num_threads(num_threads);
 
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
