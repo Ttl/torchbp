@@ -1809,6 +1809,97 @@ def cfar_2d(
     )
 
 
+def div_2d_interp_linear(
+    img1: Tensor,
+    img2: Tensor
+) -> Tensor:
+    """
+    Calculate img1 / img2 and interpolate img2 dimensions to match img1.
+
+    Gradient is not supported.
+
+    Parameters
+    ----------
+    img1 : Tensor
+        2D or 3D image with complex64 or float type.
+    img2 : Tensor
+        2D or 3D image with complex64 or float type.
+        If 3D, the first dimension must match with img1.
+
+    Returns
+    -------
+    out : Tensor
+        img1 / img2.
+    """
+
+    if img1.dim() == 3:
+        nbatch = img1.shape[0]
+        if img2.dim() == 3 and img2.shape[0] != nbatch or img2.dim() == 2 and nbatch != 1:
+            raise ValueError(f"Invalid dimensions {img1.shape} and {img2.shape}")
+    else:
+        nbatch = 1
+        if img2.dim() == 3 and img2.shape[0] != 1:
+            raise ValueError(f"Invalid dimensions {img1.shape} and {img2.shape}")
+
+    na0 = img1.shape[-2]
+    na1 = img1.shape[-1]
+    nb0 = img2.shape[-2]
+    nb1 = img2.shape[-1]
+
+    return torch.ops.torchbp.div_2d_interp_linear.default(
+        img1,
+        img2,
+        nbatch,
+        na0, na1,
+        nb0, nb1
+    )
+
+
+def mul_2d_interp_linear(
+    img1: Tensor,
+    img2: Tensor
+) -> Tensor:
+    """
+    Calculate img1 * img2 and interpolate img2 dimensions to match img1.
+
+    Gradient is not supported.
+
+    Parameters
+    ----------
+    img1 : Tensor
+        2D or 3D image with complex64 or float type.
+    img2 : Tensor
+        2D or 3D image with complex64 or float type.
+        If 3D, the first dimension must match with img1.
+
+    Returns
+    -------
+    out : Tensor
+        img1 * img2.
+    """
+
+    if img1.dim() == 3:
+        nbatch = img1.shape[0]
+        if img2.dim() == 3 and img2.shape[0] != nbatch or img2.dim() == 2 and nbatch != 1:
+            raise ValueError(f"Invalid dimensions {img1.shape} and {img2.shape}")
+    else:
+        nbatch = 1
+        if img2.dim() == 3 and img2.shape[0] != 1:
+            raise ValueError(f"Invalid dimensions {img1.shape} and {img2.shape}")
+
+    na0 = img1.shape[-2]
+    na1 = img1.shape[-1]
+    nb0 = img2.shape[-2]
+    nb1 = img2.shape[-1]
+
+    return torch.ops.torchbp.mul_2d_interp_linear.default(
+        img1,
+        img2,
+        nbatch,
+        na0, na1,
+        nb0, nb1
+    )
+
 def coherence_2d(img0: Tensor, img1: Tensor, Navg: tuple) -> Tensor:
     """
     Coherence of two complex images over moving window `Navg`.

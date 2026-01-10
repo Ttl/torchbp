@@ -735,21 +735,13 @@ template<class _Tp>
 complex<_Tp>
 operator/(const complex<_Tp>& __z, const complex<_Tp>& __w)
 {
-    int __ilogbw = 0;
     _Tp __a = __z.real();
     _Tp __b = __z.imag();
     _Tp __c = __w.real();
     _Tp __d = __w.imag();
-    _Tp __logbw = logb(fmax(fabs(__c), fabs(__d)));
-    if (__libcpp_isfinite_or_builtin(__logbw))
-    {
-        __ilogbw = static_cast<int>(__logbw);
-        __c = detail::__scalbn(__c, -__ilogbw);
-        __d = detail::__scalbn(__d, -__ilogbw);
-    }
     _Tp __denom = __c * __c + __d * __d;
-    _Tp __x = detail::__scalbn((__a * __c + __b * __d) / __denom, -__ilogbw);
-    _Tp __y = detail::__scalbn((__b * __c - __a * __d) / __denom, -__ilogbw);
+    _Tp __x = (__a * __c + __b * __d) / __denom;
+    _Tp __y = (__b * __c - __a * __d) / __denom;
     /*
     if (__libcpp_isnan_or_builtin(__x) && __libcpp_isnan_or_builtin(__y))
     {

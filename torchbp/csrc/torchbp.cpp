@@ -804,9 +804,6 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
 	const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 	const c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
 
-    const bool have_pos_grad = pos.requires_grad();
-    const bool have_data_grad = data.requires_grad();
-
     at::Tensor pos_grad;
     float* pos_grad_ptr = nullptr;
     if (pos.requires_grad()) {
@@ -1041,6 +1038,8 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("power_coherence_2d(Tensor img0, Tensor img1, int nbatch, int N0, int N1, int w0, int w1, int corr_output) -> Tensor");
   m.def("projection_cart_2d(Tensor img, Tensor dem, Tensor pos, Tensor vel, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float fs, float gamma, float x0, float dx, float y0, float dy, int Nx, int Ny, float d0, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel, int use_rvp, int normalization) -> Tensor");
   m.def("subpixel_correlation(Tensor im_m, Tensor im_s, Tensor mean_m, Tensor mean_s, int nbatch, int N0, int N1) -> Tensor[]");
+  m.def("div_2d_interp_linear(Tensor a, Tensor b, int nbatch, int Na0, int Na1, int Nb0, int Nb1) -> Tensor");
+  m.def("mul_2d_interp_linear(Tensor a, Tensor b, int nbatch, int Na0, int Na1, int Nb0, int Nb1) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {

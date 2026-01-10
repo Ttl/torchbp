@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 from math import sin, cos
+from .ops import mul_2d_interp_linear
 
 
 def correlation_matrix(
@@ -19,7 +20,8 @@ def correlation_matrix(
     sar_img : Tensor
         Input SAR image. Shape should be [C, M, N], where C is the number of polarizations.
     weight : Tensor or None
-        Weight for correlation matrix calculation, should have shape [M, N].
+        Weight for correlation matrix calculation. Should be 2D, dimensions are interpolated
+        to match sar_img if shape doesn't match.
     pol_order : list
         Order of polarizations in the SAR image.
     output_order : list
@@ -49,15 +51,16 @@ def correlation_matrix(
 
     c = torch.zeros((ch, ch), dtype=dtype, device=device)
     if weight is not None:
-        if weight.shape != sar_img.shape[1:]:
-            raise ValueError(f"Invalid weight shape {weight.shape}, expected {sar_img.shape[1:]}")
+        if weight.dim() != 2:
+            raise ValueError(f"Invalid weight shape {weight.shape}")
         weight_mean = torch.mean(weight).item()
     for i in range(ch):
         for j in range(ch):
             v = sar_img[permutation[i]] * sar_img[permutation[j]].conj()
             if weight is not None:
-                v *= weight / weight_mean
-                v *= weight / weight_mean
+                # Multiply by weight**2 and interpolate if needed
+                v = mul_2d_interp_linear(v, weight / weight_mean)
+                v = mul_2d_interp_linear(v, weight / weight_mean)
             if device == torch.device("cpu"):
                 c[i, j] = torch.mean(torch.nan_to_num(v)).to(device=device, dtype=dtype)
             else:
