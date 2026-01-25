@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch.utils.benchmark as benchmark
 
+
 def main(device):
     nbatch = 1
     nr = 1024
@@ -21,7 +22,12 @@ def main(device):
     data = torch.randn((nbatch, nsweeps, nsamples), dtype=data_dtype, device=device)
 
     pos = torch.zeros((nbatch, nsweeps, 3), dtype=torch.float32, device=device)
-    pos[:,:,1] = 0.25 * 3e8/fc * (torch.arange(nsweeps, dtype=torch.float32, device=device) - nsweeps/2)
+    pos[:, :, 1] = (
+        0.25
+        * 3e8
+        / fc
+        * (torch.arange(nsweeps, dtype=torch.float32, device=device) - nsweeps / 2)
+    )
 
     pos.requires_grad = True
 
@@ -30,19 +36,34 @@ def main(device):
     iterations = 10
 
     tf = benchmark.Timer(
-        stmt='torchbp.ops.backprojection_polar_2d(data, grid_polar, fc, r_res, pos)',
-        setup='import torchbp',
-        globals={'data': data, 'grid_polar': grid_polar, 'fc': fc, 'r_res': r_res, 'pos': pos})
+        stmt="torchbp.ops.backprojection_polar_2d(data, grid_polar, fc, r_res, pos)",
+        setup="import torchbp",
+        globals={
+            "data": data,
+            "grid_polar": grid_polar,
+            "fc": fc,
+            "r_res": r_res,
+            "pos": pos,
+        },
+    )
 
     tb = benchmark.Timer(
-        stmt='torch.mean(torch.abs(torchbp.ops.backprojection_polar_2d(data, grid_polar, fc, r_res, pos))).backward()',
-        setup='import torchbp; ',
-        globals={'data': data, 'grid_polar': grid_polar, 'fc': fc, 'r_res': r_res, 'pos': pos})
+        stmt="torch.mean(torch.abs(torchbp.ops.backprojection_polar_2d(data, grid_polar, fc, r_res, pos))).backward()",
+        setup="import torchbp; ",
+        globals={
+            "data": data,
+            "grid_polar": grid_polar,
+            "fc": fc,
+            "r_res": r_res,
+            "pos": pos,
+        },
+    )
 
     f = tf.timeit(iterations).median
     print(f"Device {device}, Forward: {backprojs / f:.3g} backprojections/s")
     b = tb.timeit(iterations).median
     print(f"Device {device}, Backward: {backprojs / (b - f):.3g} backprojections/s")
+
 
 if __name__ == "__main__":
     main("cuda")
