@@ -4,6 +4,71 @@ from torch import Tensor
 cart_2d_nargs = 16
 polar_2d_nargs = 26
 
+def _prepare_backprojection_polar_2d_args(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    d0: float = 0.0,
+    dealias: bool = False,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    data_fmod: float = 0,
+    alias_fmod: float = 0
+) -> tuple:
+    """Prepare arguments for C++ backprojection_polar_2d operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by backprojection_polar_2d and for testing.
+    """
+    r0, r1 = grid["r"]
+    theta0, theta1 = grid["theta"]
+    nr = grid["nr"]
+    ntheta = grid["ntheta"]
+    dr = (r1 - r0) / nr
+    dtheta = (theta1 - theta0) / ntheta
+
+    if data.dim() == 2:
+        nbatch = 1
+        nsweeps = data.shape[0]
+        sweep_samples = data.shape[1]
+        assert pos.shape == (nsweeps, 3)
+    else:
+        nbatch = data.shape[0]
+        nsweeps = data.shape[1]
+        sweep_samples = data.shape[2]
+        assert pos.shape == (nbatch, nsweeps, 3)
+
+    if att is None or g is None:
+        att = None
+        g = None
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
+    z0 = 0
+    if dealias:
+        if nbatch != 1:
+            raise ValueError("Only nbatch=1 supported with dealias")
+        z0 = torch.mean(pos[..., 2])
+
+    return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
+            r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0,
+            g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            data_fmod, alias_fmod)
+
+
 def backprojection_polar_2d(
     data: Tensor,
     grid: dict,
@@ -74,75 +139,11 @@ def backprojection_polar_2d(
     img : Tensor
         Pseudo-polar format radar image.
     """
-
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    nr = grid["nr"]
-    ntheta = grid["ntheta"]
-    dr = (r1 - r0) / nr
-    dtheta = (theta1 - theta0) / ntheta
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
-
-    if att is None or g is None:
-        att = None
-        g = None
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
-
-    z0 = 0
-    if dealias:
-        if nbatch != 1:
-            raise ValueError("Only nbatch=1 supported with dealias")
-        z0 = torch.mean(pos[..., 2])
-
-    return torch.ops.torchbp.backprojection_polar_2d.default(
-        data,
-        pos,
-        att,
-        nbatch,
-        sweep_samples,
-        nsweeps,
-        fc,
-        r_res,
-        r0,
-        dr,
-        theta0,
-        dtheta,
-        nr,
-        ntheta,
-        d0,
-        dealias,
-        z0,
-        g,
-        g_az0,
-        g_el0,
-        g_daz,
-        g_del,
-        g_naz,
-        g_nel,
-        data_fmod,
-        alias_fmod,
+    cpp_args = _prepare_backprojection_polar_2d_args(
+        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent,
+        data_fmod, alias_fmod
     )
+    return torch.ops.torchbp.backprojection_polar_2d.default(*cpp_args)
 
 
 def backprojection_polar_2d_lanczos(
@@ -438,6 +439,43 @@ def backprojection_polar_2d_knab(
     )
 
 
+def _prepare_backprojection_cart_2d_args(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    d0: float = 0.0,
+    beamwidth: float = torch.pi,
+    data_fmod: float = 0
+) -> tuple:
+    """Prepare arguments for C++ backprojection_cart_2d operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by backprojection_cart_2d and for testing.
+    """
+    x0, x1 = grid["x"]
+    y0, y1 = grid["y"]
+    nx = grid["nx"]
+    ny = grid["ny"]
+    dx = (x1 - x0) / nx
+    dy = (y1 - y0) / ny
+
+    if data.dim() == 2:
+        nbatch = 1
+        nsweeps = data.shape[0]
+        sweep_samples = data.shape[1]
+        assert pos.shape == (nsweeps, 3)
+    else:
+        nbatch = data.shape[0]
+        nsweeps = data.shape[1]
+        sweep_samples = data.shape[2]
+        assert pos.shape == (nbatch, nsweeps, 3)
+
+    return (data, pos, nbatch, sweep_samples, nsweeps, fc, r_res,
+            x0, dx, y0, dy, nx, ny, beamwidth, d0, data_fmod)
+
+
 def backprojection_cart_2d(
     data: Tensor,
     grid: dict,
@@ -486,43 +524,10 @@ def backprojection_cart_2d(
     img : Tensor
         Cartesian format radar image.
     """
-
-    x0, x1 = grid["x"]
-    y0, y1 = grid["y"]
-    nx = grid["nx"]
-    ny = grid["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
-
-    return torch.ops.torchbp.backprojection_cart_2d.default(
-        data,
-        pos,
-        nbatch,
-        sweep_samples,
-        nsweeps,
-        fc,
-        r_res,
-        x0,
-        dx,
-        y0,
-        dy,
-        nx,
-        ny,
-        beamwidth,
-        d0,
-        data_fmod
+    cpp_args = _prepare_backprojection_cart_2d_args(
+        data, grid, fc, r_res, pos, d0, beamwidth, data_fmod
     )
+    return torch.ops.torchbp.backprojection_cart_2d.default(*cpp_args)
 
 
 def projection_cart_2d(
@@ -890,6 +895,7 @@ def backprojection_polar_2d_tx_power(
 def _fake_polar_2d(
     data: Tensor,
     pos: Tensor,
+    att: Tensor,
     nbatch: int,
     sweep_samples: int,
     nsweeps: int,
@@ -902,6 +908,17 @@ def _fake_polar_2d(
     Nr: int,
     Ntheta: int,
     d0: float,
+    dealias: bool,
+    z0: float,
+    g: Tensor,
+    g_az0: float,
+    g_el0: float,
+    g_daz: float,
+    g_del: float,
+    g_naz: int,
+    g_nel: int,
+    data_fmod: float,
+    alias_fmod: float,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
@@ -913,6 +930,7 @@ def _fake_polar_2d_grad(
     grad: Tensor,
     data: Tensor,
     pos: Tensor,
+    att: Tensor,
     nbatch: int,
     sweep_samples: int,
     nsweeps: int,
@@ -925,6 +943,17 @@ def _fake_polar_2d_grad(
     Nr: int,
     Ntheta: int,
     d0: float,
+    dealias: bool,
+    z0: float,
+    g: Tensor,
+    g_az0: float,
+    g_el0: float,
+    g_daz: float,
+    g_del: float,
+    g_naz: int,
+    g_nel: int,
+    data_fmod: float,
+    alias_fmod: float,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
@@ -945,6 +974,7 @@ def _fake_polar_2d_grad(
 def _fake_cart_2d(
     data: Tensor,
     pos: Tensor,
+    nbatch: int,
     sweep_samples: int,
     nsweeps: int,
     fc: float,
@@ -957,10 +987,11 @@ def _fake_cart_2d(
     Ny: int,
     beamwidth: float,
     d0: float,
+    data_fmod: float,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64)
-    return torch.empty((Nx, Ny), dtype=torch.complex64, device=data.device)
+    return torch.empty((nbatch, Nx, Ny), dtype=torch.complex64, device=data.device)
 
 
 @torch.library.register_fake("torchbp::backprojection_cart_2d_grad")
@@ -968,6 +999,7 @@ def _fake_cart_2d_grad(
     grad: Tensor,
     data: Tensor,
     pos: Tensor,
+    nbatch: int,
     sweep_samples: int,
     nsweeps: int,
     fc: float,
@@ -980,6 +1012,7 @@ def _fake_cart_2d_grad(
     Ny: int,
     beamwidth: float,
     d0: float,
+    data_fmod: float,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64)

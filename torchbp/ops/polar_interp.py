@@ -90,6 +90,54 @@ def polar_interp(
         raise ValueError(f"Unknown interp_method: {interp_method}")
 
 
+def _prepare_polar_interp_linear_args(
+    img: Tensor,
+    dorigin: Tensor,
+    grid_polar: dict,
+    fc: float,
+    rotation: float = 0,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+    alias_fmod: float = 0,
+) -> tuple:
+    """Prepare arguments for C++ polar_interp_linear operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by polar_interp_linear and for testing.
+    """
+    if img.dim() == 3:
+        nbatch = img.shape[0]
+        assert dorigin.shape == (nbatch, 3)
+    else:
+        nbatch = 1
+        assert dorigin.shape == (3,)
+
+    r1_0, r1_1 = grid_polar["r"]
+    theta1_0, theta1_1 = grid_polar["theta"]
+    ntheta1 = grid_polar["ntheta"]
+    nr1 = grid_polar["nr"]
+    dtheta1 = (theta1_1 - theta1_0) / ntheta1
+    dr1 = (r1_1 - r1_0) / nr1
+
+    if grid_polar_new is None:
+        r3_0 = r1_0
+        r3_1 = r1_1
+        theta3_0 = theta1_0
+        theta3_1 = theta1_1
+        nr3 = nr1
+        ntheta3 = 2 * ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    return (img, dorigin, nbatch, rotation, fc, r1_0, dr1, theta1_0, dtheta1,
+            nr1, ntheta1, r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3, z0, alias_fmod)
+
+
 def polar_interp_linear(
     img: Tensor,
     dorigin: Tensor,
@@ -136,57 +184,10 @@ def polar_interp_linear(
     out : Tensor
         Interpolated radar image.
     """
-
-    if img.dim() == 3:
-        nbatch = img.shape[0]
-        assert dorigin.shape == (nbatch, 3)
-    else:
-        nbatch = 1
-        assert dorigin.shape == (3,)
-
-    r1_0, r1_1 = grid_polar["r"]
-    theta1_0, theta1_1 = grid_polar["theta"]
-    ntheta1 = grid_polar["ntheta"]
-    nr1 = grid_polar["nr"]
-    dtheta1 = (theta1_1 - theta1_0) / ntheta1
-    dr1 = (r1_1 - r1_0) / nr1
-
-    if grid_polar_new is None:
-        r3_0 = r1_0
-        r3_1 = r1_1
-        theta3_0 = theta1_0
-        theta3_1 = theta1_1
-        nr3 = nr1
-        ntheta3 = 2 * ntheta1
-    else:
-        r3_0, r3_1 = grid_polar_new["r"]
-        theta3_0, theta3_1 = grid_polar_new["theta"]
-        ntheta3 = grid_polar_new["ntheta"]
-        nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
-
-    return torch.ops.torchbp.polar_interp_linear.default(
-        img,
-        dorigin,
-        nbatch,
-        rotation,
-        fc,
-        r1_0,
-        dr1,
-        theta1_0,
-        dtheta1,
-        nr1,
-        ntheta1,
-        r3_0,
-        dr3,
-        theta3_0,
-        dtheta3,
-        nr3,
-        ntheta3,
-        z0,
-        alias_fmod,
+    cpp_args = _prepare_polar_interp_linear_args(
+        img, dorigin, grid_polar, fc, rotation, grid_polar_new, z0, alias_fmod
     )
+    return torch.ops.torchbp.polar_interp_linear.default(*cpp_args)
 
 
 def polar_interp_lanczos(
@@ -750,6 +751,45 @@ def polar_to_cart(
         raise ValueError(f"Unknown method: {method}")
 
 
+def _prepare_polar_to_cart_linear_args(
+    img: Tensor,
+    origin: Tensor,
+    grid_polar: dict,
+    grid_cart: dict,
+    fc: float,
+    rotation: float = 0,
+    alias_fmod: float = 0
+) -> tuple:
+    """Prepare arguments for C++ polar_to_cart_linear operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by polar_to_cart_linear and for testing.
+    """
+    if img.dim() == 3:
+        nbatch = img.shape[0]
+        assert origin.shape == (nbatch, 3)
+    else:
+        nbatch = 1
+        assert origin.shape == (3,)
+
+    r0, r1 = grid_polar["r"]
+    theta0, theta1 = grid_polar["theta"]
+    ntheta = grid_polar["ntheta"]
+    nr = grid_polar["nr"]
+    dtheta = (theta1 - theta0) / ntheta
+    dr = (r1 - r0) / nr
+
+    x0, x1 = grid_cart["x"]
+    y0, y1 = grid_cart["y"]
+    nx = grid_cart["nx"]
+    ny = grid_cart["ny"]
+    dx = (x1 - x0) / nx
+    dy = (y1 - y0) / ny
+
+    return (img, origin, nbatch, rotation, fc, r0, dr, theta0, dtheta,
+            nr, ntheta, x0, y0, dx, dy, nx, ny, alias_fmod)
+
+
 def polar_to_cart_linear(
     img: Tensor,
     origin: Tensor,
@@ -797,48 +837,10 @@ def polar_to_cart_linear(
     out : Tensor
         Interpolated radar image.
     """
-
-    if img.dim() == 3:
-        nbatch = img.shape[0]
-        assert origin.shape == (nbatch, 3)
-    else:
-        nbatch = 1
-        assert origin.shape == (3,)
-
-    r0, r1 = grid_polar["r"]
-    theta0, theta1 = grid_polar["theta"]
-    ntheta = grid_polar["ntheta"]
-    nr = grid_polar["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
-
-    x0, x1 = grid_cart["x"]
-    y0, y1 = grid_cart["y"]
-    nx = grid_cart["nx"]
-    ny = grid_cart["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
-
-    return torch.ops.torchbp.polar_to_cart_linear.default(
-        img,
-        origin,
-        nbatch,
-        rotation,
-        fc,
-        r0,
-        dr,
-        theta0,
-        dtheta,
-        nr,
-        ntheta,
-        x0,
-        y0,
-        dx,
-        dy,
-        nx,
-        ny,
-        alias_fmod
+    cpp_args = _prepare_polar_to_cart_linear_args(
+        img, origin, grid_polar, grid_cart, fc, rotation, alias_fmod
     )
+    return torch.ops.torchbp.polar_to_cart_linear.default(*cpp_args)
 
 
 def polar_to_cart_lanczos(
@@ -944,26 +946,27 @@ def polar_to_cart_lanczos(
 def _fake_polar_interp_linear(
     img: Tensor,
     dorigin: Tensor,
+    nbatch: int,
     rotation: float,
     fc: float,
     r0: float,
     dr0: float,
     theta0: float,
     dtheta0: float,
-    Nr0: float,
-    Ntheta0: float,
+    Nr0: int,
+    Ntheta0: int,
     r1: float,
     dr1: float,
     theta1: float,
     dtheta1: float,
-    Nr1: float,
-    Ntheta1: float,
+    Nr1: int,
+    Ntheta1: int,
     z1: float,
     alias_fmod: float,
 ) -> Tensor:
     torch._check(dorigin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
-    return torch.empty((Nr1, Ntheta1), dtype=torch.complex64, device=img.device)
+    return torch.empty((nbatch, Nr1, Ntheta1), dtype=torch.complex64, device=img.device)
 
 
 @torch.library.register_fake("torchbp::polar_interp_linear_grad")
@@ -971,20 +974,21 @@ def _fake_polar_interp_linear_grad(
     grad: Tensor,
     img: Tensor,
     dorigin: Tensor,
+    nbatch: int,
     rotation: float,
     fc: float,
     r0: float,
     dr0: float,
     theta0: float,
     dtheta0: float,
-    Nr0: float,
-    Ntheta0: float,
+    Nr0: int,
+    Ntheta0: int,
     r1: float,
     dr1: float,
     theta1: float,
     dtheta1: float,
-    Nr1: float,
-    Ntheta1: float,
+    Nr1: int,
+    Ntheta1: int,
     z1: float,
     alias_fmod: float,
 ) -> Tensor:
@@ -992,13 +996,11 @@ def _fake_polar_interp_linear_grad(
     torch._check(img.dtype == torch.complex64)
     ret = []
     if img.requires_grad:
-        ret.append(
-            torch.empty((Nr1, Ntheta1), dtype=torch.complex64, device=img.device)
-        )
+        ret.append(torch.empty_like(img))
     else:
         ret.append(None)
     if dorigin.requires_grad:
-        ret.append(torch.empty((2,), dtype=torch.float, device=img.device))
+        ret.append(torch.empty_like(dorigin))
     else:
         ret.append(None)
     return ret
@@ -1007,7 +1009,7 @@ def _fake_polar_interp_linear_grad(
 @torch.library.register_fake("torchbp::polar_to_cart_linear")
 def _fake_polar_to_cart_linear(
     img: Tensor,
-    dorigin: Tensor,
+    origin: Tensor,
     nbatch: int,
     rotation: float,
     fc: float,
@@ -1023,41 +1025,44 @@ def _fake_polar_to_cart_linear(
     dy: float,
     nx: int,
     ny: int,
+    alias_fmod: float,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float32)
+    torch._check(origin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
-    return torch.empty((Nx, Ny), dtype=torch.complex64, device=img.device)
+    return torch.empty((nbatch, nx, ny), dtype=torch.complex64, device=img.device)
 
 
 @torch.library.register_fake("torchbp::polar_to_cart_linear_grad")
-def _fake_polar_interp_linear_grad(
+def _fake_polar_to_cart_linear_grad(
     grad: Tensor,
     img: Tensor,
-    dorigin: Tensor,
+    origin: Tensor,
+    nbatch: int,
     rotation: float,
     fc: float,
     r0: float,
     dr: float,
     theta0: float,
     dtheta: float,
-    Nr: float,
-    Ntheta: float,
+    nr: int,
+    ntheta: int,
     x0: float,
-    dx: float,
     y0: float,
+    dx: float,
     dy: float,
-    Nx: float,
-    Ny: float,
+    nx: int,
+    ny: int,
+    alias_fmod: float,
 ) -> Tensor:
-    torch._check(dorigin.dtype == torch.float32)
+    torch._check(origin.dtype == torch.float32)
     torch._check(img.dtype == torch.complex64)
     ret = []
     if img.requires_grad:
         ret.append(torch.empty_like(img))
     else:
         ret.append(None)
-    if dorigin.requires_grad:
-        ret.append(torch.empty_like(dorigin))
+    if origin.requires_grad:
+        ret.append(torch.empty_like(origin))
     else:
         ret.append(None)
     return ret

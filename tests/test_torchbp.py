@@ -41,6 +41,27 @@ class TestCoherence2D(TestCase):
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
+    def _opcheck(self, device):
+        from torchbp.ops.coherence import _prepare_coherence_2d_args
+
+        samples = self.sample_inputs(device, requires_grad=True)
+        samples.extend(self.sample_inputs(device, requires_grad=False))
+        for args in samples:
+            cpp_args = _prepare_coherence_2d_args(**args)
+            opcheck(
+                torch.ops.torchbp.coherence_2d,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
 
 class TestEntropy(TestCase):
     def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
@@ -88,6 +109,36 @@ class TestEntropy(TestCase):
             ]
             torch.testing.assert_close(grads_cpu, grads_gpu)
             torch.testing.assert_close(res_gpu.cpu(), res_cpu)
+
+    def _opcheck(self, device):
+        # Test the underlying C++ operators
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            img = args["img"]
+            nbatch = 1 if img.dim() == 2 else img.shape[0]
+
+            # Test abs_sum operator
+            opcheck(
+                torch.ops.torchbp.abs_sum,
+                (img, nbatch),
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+            # Test entropy operator (need norm from abs_sum)
+            norm = torch.ops.torchbp.abs_sum.default(img, nbatch)
+            opcheck(
+                torch.ops.torchbp.entropy,
+                (img, norm, nbatch),
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
 
 
 class TestPolarInterpLinear(TestCase):
@@ -185,6 +236,27 @@ class TestPolarInterpLinear(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
+
+    def _opcheck(self, device):
+        from torchbp.ops.polar_interp import _prepare_polar_interp_linear_args
+
+        samples = self.sample_inputs(device, requires_grad=True)
+        samples.extend(self.sample_inputs(device, requires_grad=False))
+        for args in samples:
+            cpp_args = _prepare_polar_interp_linear_args(**args)
+            opcheck(
+                torch.ops.torchbp.polar_interp_linear,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
 
 
 class TestPolarToCartLinear(TestCase):
@@ -285,6 +357,27 @@ class TestPolarToCartLinear(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
+
+    def _opcheck(self, device):
+        from torchbp.ops.polar_interp import _prepare_polar_to_cart_linear_args
+
+        samples = self.sample_inputs(device, requires_grad=True)
+        samples.extend(self.sample_inputs(device, requires_grad=False))
+        for args in samples:
+            cpp_args = _prepare_polar_to_cart_linear_args(**args)
+            opcheck(
+                torch.ops.torchbp.polar_to_cart_linear,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
 
 
 class TestBackprojectionPolar(TestCase):
@@ -391,6 +484,27 @@ class TestBackprojectionPolar(TestCase):
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
+    def _opcheck(self, device):
+        from torchbp.ops.backproj import _prepare_backprojection_polar_2d_args
+
+        samples = self.sample_inputs(device, requires_grad=True)
+        samples.extend(self.sample_inputs(device, requires_grad=False))
+        for args in samples:
+            cpp_args = _prepare_backprojection_polar_2d_args(**args)
+            opcheck(
+                torch.ops.torchbp.backprojection_polar_2d,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
 
 class TestBackprojectionCart(TestCase):
     def sample_inputs(self, device, *, requires_grad=False):
@@ -445,19 +559,27 @@ class TestBackprojectionCart(TestCase):
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
-    # def _opcheck(self, device):
-    #    # Use opcheck to check for incorrect usage of operator registration APIs
-    #    samples = self.sample_inputs(device, requires_grad=True)
-    #    samples.extend(self.sample_inputs(device, requires_grad=False))
-    #    for args in samples:
-    #        opcheck(torch.ops.torchbp.backprojection_cart_2d, list(args.values()))
+    def _opcheck(self, device):
+        # Use opcheck to check for incorrect usage of operator registration APIs
+        from torchbp.ops.backproj import _prepare_backprojection_cart_2d_args
 
-    # def test_opcheck_cpu(self):
-    #    self._opcheck("cpu")
+        samples = self.sample_inputs(device, requires_grad=True)
+        samples.extend(self.sample_inputs(device, requires_grad=False))
+        for args in samples:
+            cpp_args = _prepare_backprojection_cart_2d_args(**args)
+            opcheck(
+                torch.ops.torchbp.backprojection_cart_2d,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
 
-    # @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
-    # def test_opcheck_cuda(self):
-    #    self._opcheck("cuda")
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
 
 
 if __name__ == "__main__":
