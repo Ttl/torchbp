@@ -582,5 +582,304 @@ class TestBackprojectionCart(TestCase):
         self._opcheck("cuda")
 
 
+class TestCfar2D(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.float32):
+        def make_tensor(size, dtype=dtype):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x.abs()
+
+        args = {
+            "img": make_tensor((2, 10, 10), dtype=dtype),
+            "Navg": (3, 3),
+            "Nguard": (1, 1),
+            "threshold": 2.0,
+            "peaks_only": False,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            img = args["img"]
+            nbatch = 1 if img.dim() == 2 else img.shape[0]
+            N0 = img.shape[-2]
+            N1 = img.shape[-1]
+
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.cfar_2d,
+                (img, nbatch, N0, N1, args["Navg"][0], args["Navg"][1],
+                 args["Nguard"][0], args["Nguard"][1], args["threshold"], args["peaks_only"]),
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestDivMul2DInterpLinear(TestCase):
+    def sample_inputs_div(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        args = {
+            "img1": make_tensor((2, 5, 5), dtype=dtype),
+            "img2": make_tensor((2, 3, 3), dtype=dtype),
+        }
+        return [args]
+
+    def sample_inputs_mul(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        args = {
+            "img1": make_tensor((2, 5, 5), dtype=dtype),
+            "img2": make_tensor((2, 3, 3), dtype=dtype),
+        }
+        return [args]
+
+    def _opcheck_div(self, device):
+        samples = self.sample_inputs_div(device, requires_grad=False)
+        for args in samples:
+            img1 = args["img1"]
+            img2 = args["img2"]
+            nbatch = 1 if img1.dim() == 2 else img1.shape[0]
+            na0, na1 = img1.shape[-2], img1.shape[-1]
+            nb0, nb1 = img2.shape[-2], img2.shape[-1]
+
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.div_2d_interp_linear,
+                (img1, img2, nbatch, na0, na1, nb0, nb1),
+                test_utils=["test_schema"]
+            )
+
+    def _opcheck_mul(self, device):
+        samples = self.sample_inputs_mul(device, requires_grad=False)
+        for args in samples:
+            img1 = args["img1"]
+            img2 = args["img2"]
+            nbatch = 1 if img1.dim() == 2 else img1.shape[0]
+            na0, na1 = img1.shape[-2], img1.shape[-1]
+            nb0, nb1 = img2.shape[-2], img2.shape[-1]
+
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.mul_2d_interp_linear,
+                (img1, img2, nbatch, na0, na1, nb0, nb1),
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_div_cpu(self):
+        self._opcheck_div("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_div_cuda(self):
+        self._opcheck_div("cuda")
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_mul_cpu(self):
+        self._opcheck_mul("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_mul_cuda(self):
+        self._opcheck_mul("cuda")
+
+
+class TestSubpixelCorrelation(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.float32):
+        def make_tensor(size, dtype=dtype):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        args = {
+            "im_m": make_tensor((2, 10, 10), dtype=dtype),
+            "im_s": make_tensor((2, 10, 10), dtype=dtype),
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False, dtype=torch.complex64)
+        for args in samples:
+            im_m = args["im_m"]
+            im_s = args["im_s"]
+            nbatch = 1 if im_m.dim() == 2 else im_m.shape[0]
+            Nx = im_m.shape[-2]
+            Ny = im_m.shape[-1]
+            mean_m = torch.mean(im_m, dim=(-2, -1))
+            mean_s = torch.mean(im_s, dim=(-2, -1))
+
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.subpixel_correlation,
+                (im_m, im_s, mean_m, mean_s, nbatch, Nx, Ny),
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestLeeFilter(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        args = {
+            "img": make_tensor((2, 10, 10), dtype=dtype),
+            "wx": 3,
+            "wy": 3,
+            "cu": 0.5,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            img = args["img"]
+            nbatch = 1 if img.dim() == 2 else img.shape[0]
+            Nx = img.shape[-2]
+            Ny = img.shape[-1]
+            wx = args["wx"] // 2
+            wy = args["wy"] // 2
+
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.lee_filter,
+                (img, nbatch, Nx, Ny, wx, wy, args["cu"]),
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestPowerCoherence2D(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        args = {
+            "img0": make_tensor((2, 10, 10), dtype=dtype),
+            "img1": make_tensor((2, 10, 10), dtype=dtype),
+            "Navg": (3, 3),
+            "corr_output": True,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            img0 = args["img0"]
+            img1 = args["img1"]
+            nbatch = 1 if img0.dim() == 2 else img0.shape[0]
+            N0 = img0.shape[-2]
+            N1 = img0.shape[-1]
+
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.power_coherence_2d,
+                (img0, img1, nbatch, N0, N1, args["Navg"][0], args["Navg"][1], args["corr_output"]),
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestGPGABackprojection2D(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        def make_pos_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            x = x - torch.max(x[:, 0]) - 2
+            return x
+
+        ntargets = 3
+        nsweeps = 5
+        sweep_samples = 64
+
+        args = {
+            "target_pos": make_tensor((ntargets, 3), dtype=torch.float32),
+            "data": make_tensor((nsweeps, sweep_samples), dtype=torch.complex64),
+            "pos": make_pos_tensor((nsweeps, 3), dtype=torch.float32),
+            "fc": 6e9,
+            "r_res": 0.15,
+            "d0": 0.2,
+            "data_fmod": uniform(0, 2 * torch.pi),
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            target_pos = args["target_pos"]
+            data = args["data"]
+            pos = args["pos"]
+            nsweeps = data.shape[0]
+            sweep_samples = data.shape[1]
+            ntargets = target_pos.shape[0]
+
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.gpga_backprojection_2d,
+                (target_pos, data, pos, sweep_samples, nsweeps, args["fc"],
+                 args["r_res"], ntargets, args["d0"], args["data_fmod"]),
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
 if __name__ == "__main__":
     unittest.main()
