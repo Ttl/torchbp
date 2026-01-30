@@ -35,6 +35,9 @@ namespace torchbp {
 using complex64_t = cuda::std::complex<float>;
 using complex32_t = cuda::std::complex<__half>;
 
+// Constant memory for polynomial coefficients
+constexpr int POLY_COEF_MAX = 15;
+__constant__ float d_poly_coefs[POLY_COEF_MAX];
 
 template<class T>
 __device__ T interp1d_cubic(const T *y, int nx,
@@ -344,6 +347,86 @@ __device__ T knab_interp_2d(const T2 *img, int nx, int ny, float x, float y, int
         float wx = knab_kernel(dx, a, v, norm);
         T row_val = knab_interp_1d<T, T2>(img + i * ny, ny, y, order, v, norm);
         sum += wx * row_val;
+    }
+    return sum;
+}
+
+// Template-specialized polynomial evaluation for full compile-time unrolling
+// Evaluates 1 + c1*x + c2*x^2 + ... + cn*x^n using Horner's method
+// N_COEFS is the number of coefficients (c1..cn, excluding implicit c0=1)
+template<int N_COEFS>
+inline __device__ float polyval_c0_one(float x) {
+    static_assert(N_COEFS >= 1 && N_COEFS <= POLY_COEF_MAX, "N_COEFS must be 1-POLY_COEF_MAX");
+    float inner = d_poly_coefs[N_COEFS - 1];
+    #pragma unroll
+    for (int i = N_COEFS - 2; i >= 0; i--) {
+        inner = __fmaf_rn(inner, x, d_poly_coefs[i]);
+    }
+    return __fmaf_rn(x, inner, 1.0f);
+}
+
+// Full Knab kernel using polynomial approximation of entire kernel (sinc * window)
+// Eliminates sinpif and division - uses ONLY polynomial evaluation with FMA.
+// Polynomial is in x²: 1 + c1*x² + c2*x⁴ + ... where x is distance from interpolation point.
+// Uses parallel Horner for improved ILP.
+// N_COEFS is the number of coefficients (c1..cn, excluding implicit c0=1), must be even
+// a2 is the squared half-width (a² where a = order/2)
+template<int N_COEFS>
+inline __device__ float poly_interp_kernel(float x, float inv_a2) {
+    float x2 = x * x;
+    // Polynomial was fitted for (x/a)²
+    float t = x2 * inv_a2;
+    return polyval_c0_one<N_COEFS>(t);
+}
+
+template<class T, class T2, int N_COEFS, int MAX_ORDER=8>
+__device__ T interp_2d_poly(const T2 *img, int nx, int ny, float x, float y, int order) {
+    float a = 0.5f * order;
+    float inv_a2 = 1 / (a * a);
+
+    int start_x = max(0, (int)ceilf(x - a));
+    int end_x = min(nx-1, (int)floorf(x + a));
+    int start_y = max(0, (int)ceilf(y - a));
+    int end_y = min(ny-1, (int)floorf(y + a));
+
+    int nx_count = end_x - start_x + 1;
+    int ny_count = end_y - start_y + 1;
+
+    // Precompute Y weights - polynomial evaluation is pure math, no bounds check needed
+    // since start/end already ensure we're within kernel support
+    // No point in precomputing wx since they are only used once.
+    float wy[MAX_ORDER];
+
+    #pragma unroll
+    for (int j = 0; j < MAX_ORDER; j++) {
+        if (j < ny_count) {
+            float dy = y - (float)(start_y + j);
+            wy[j] = poly_interp_kernel<N_COEFS>(dy, inv_a2);
+        }
+    }
+
+    T sum{};
+    #pragma unroll
+    for (int i = 0; i < MAX_ORDER; i++) {
+        if (i >= nx_count) break;
+
+        float dx = x - (float)(start_x + i);
+        float wx = poly_interp_kernel<N_COEFS>(dx, inv_a2);
+
+        const T2 *row = img + (start_x + i) * ny;
+
+        #pragma unroll
+        for (int j = 0; j < MAX_ORDER; j++) {
+            if (j >= ny_count) break;
+            T val;
+            if constexpr (::cuda::std::is_same_v<T2, complex32_t> || ::cuda::std::is_same_v<T2, half2>) {
+                half2 val_h = ((half2*)row)[start_y + j];
+                val = {__half2float(val_h.x), __half2float(val_h.y)};
+            } else {
+                val = row[start_y + j];
+            }
+            sum += (wx * wy[j]) * val;
+        }
     }
     return sum;
 }

@@ -1,8 +1,82 @@
 import torch
 from torch import Tensor
+import numpy as np
 
 polar_interp_linear_args = 19
 polar_to_cart_linear_args = 18
+
+def select_knab_poly_degree(oversample: float, order: int) -> int:
+    """
+    Select minimum polynomial degree for full Knab kernel polynomial approximation.
+
+    Based on empirical testing with MSE threshold = 0.1 dB.
+
+    Parameters
+    ----------
+    oversample : float
+        Oversampling ratio.
+    order : int
+        Kernel order (number of samples used in interpolation).
+
+    Returns
+    -------
+    int
+        Polynomial degree.
+    """
+    if order <= 2:
+        return 6
+    elif order <= 4:
+        return 6
+    elif order <= 6:
+        if oversample < 1.29:
+            return 6
+        elif oversample < 1.98:
+            return 8
+        else:
+            return 10
+    else:  # order >= 8
+        if oversample < 1.25:
+            return 8
+        elif oversample < 1.66:
+            return 10
+        elif oversample < 2.76:
+            return 12
+        else:
+            return 14
+
+
+def compute_knab_poly_coefs_full(order, oversample, poly_degree=None):
+    if poly_degree is None:
+        poly_degree = select_knab_poly_degree(oversample, order)
+
+    a = order / 2.0
+    v = 1.0 - 1.0 / oversample
+
+    # Chebyshev nodes in t ∈ [0, 1]
+    n = max(3 * order, 3 * poly_degree)
+    k = np.arange(n)
+    t = 0.5 * (1 + np.cos((2*k + 1) * np.pi / (2*n)))
+
+    # x from t
+    x = a * np.sqrt(t)
+
+    # True kernel
+    cosh_num = np.cosh(np.pi * v * a * np.sqrt(1 - t))
+    cosh_den = np.cosh(np.pi * v * a)
+    y = np.sinc(x) * (cosh_num / cosh_den)
+
+    # Build Vandermonde for w(t) = 1 + c1 t + c2 t^2 + ...
+    y_target = y - 1.0
+    A = t[:, None] ** np.arange(1, poly_degree + 1)
+
+    # Enforce w(1) = 0 as hard constraint
+    row = np.ones((1, poly_degree))
+    A = np.vstack([A, row])
+    y_target = np.concatenate([y_target, [-1.0]])
+
+    coefs, *_ = np.linalg.lstsq(A, y_target, rcond=None)
+    return torch.from_numpy(coefs).float()
+
 
 def polar_interp(
     img: Tensor,
@@ -575,6 +649,179 @@ def ffbp_merge2_knab(
     )
 
 
+def ffbp_merge2_poly(
+    img0: Tensor,
+    img1: Tensor,
+    dorigin0: Tensor,
+    dorigin1: Tensor,
+    grid_polars: list,
+    fc: float,
+    grid_polar_new: dict = None,
+    z0: float = 0,
+    order: int = 6,
+    oversample: float = 1.5,
+    alias: bool = False,
+    alias_fmod: float = 0,
+    output_alias: bool = True,
+    poly_degree: int = None,
+    poly_coefs: Tensor = None
+) -> Tensor:
+    """
+    Interpolate two pseudo-polar radar images to new grid and change origin
+    position by `dorigin`. Uses polynomial approximation for interpolation.
+
+    This function uses polynomial approximation of the Knab kernel,
+    avoiding expensive exp and sqrt operations.
+
+    Gradient not supported.
+
+    Parameters
+    ----------
+    img0 : Tensor
+        2D radar image in [range, angle] format. Dimensions should
+        match with grid_polars grid. Image dimension can be different for each
+        element in the list.
+    img1 : Tensor
+        Same format as img0.
+    dorigin0 : Tensor
+        Difference between the origin of the old image to the new image. Units in meters.
+        Shape: [3].
+    dorigin1 : Tensor
+        Same format as dorigin0.
+    grid_polar : list of dict
+        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
+            - "r": (r0, r1), tuple of min and max range,
+            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
+            - "nr": nr, number of range bins.
+            - "ntheta": number of angle bins.
+    fc : float
+        RF center frequency in Hz.
+    grid_polar_new : dict, optional
+        Grid definition of the new image.
+        If None uses the same grid as input, but with double the angle points.
+    z0 : float
+        Height of the antenna phase center in the new image.
+    order : int
+        Number of nearby samples to use for interpolation of one new sample.
+        Even number is preferred. Must be in [2, 8].
+    oversample : float
+        Oversampling factor in the input data.
+    alias : bool
+        Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
+    alias_fmod : float
+        Range modulation frequency applied to input.
+    output_alias : bool
+        If True and `alias` is True apply `alias_fmod` to output.
+    poly_degree : int, optional
+        Degree of polynomial approximation for the full Knab kernel.
+        The polynomial approximates sinc(x)*window(x) as a single polynomial in x²,
+        eliminating expensive sinpif and division operations.
+        If None (default), automatically selected based on oversample:
+        - oversample < 1.5: degree 10
+        - oversample >= 1.5: degree 12
+    poly_coefs : Tensor, optional
+        Precomputed polynomial coefficients. If provided, poly_degree is ignored.
+        Use compute_knab_poly_coefs_full() to compute these coefficients.
+        Precomputing is useful when calling this function multiple times with
+        the same order and oversample parameters.
+
+    Returns
+    -------
+    out : Tensor
+        Interpolated radar image.
+    """
+
+    device = img0.device
+    nimages = 2
+
+    if order > 8:
+        raise ValueError(f"Polynomial interpolation knab order must be <= 8, got {order}")
+
+    # Use precomputed coefficients if provided, otherwise compute them
+    if poly_coefs is None:
+        # Auto-select polynomial degree if not specified
+        if poly_degree is None:
+            poly_degree = select_knab_poly_degree(oversample, order)
+
+        # Compute polynomial coefficients for full Knab kernel (sinc * window as single polynomial)
+        # This eliminates sinpif and division from the CUDA kernel
+        poly_coefs = compute_knab_poly_coefs_full(order, oversample, poly_degree).to(device)
+    else:
+        poly_coefs = poly_coefs.to(device)
+
+    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dr0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dtheta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    for i in range(nimages):
+        r1_0, r1_1 = grid_polars[i]["r"]
+        theta1_0, theta1_1 = grid_polars[i]["theta"]
+        ntheta1 = grid_polars[i]["ntheta"]
+        nr1 = grid_polars[i]["nr"]
+        dtheta1 = (theta1_1 - theta1_0) / ntheta1
+        dr1 = (r1_1 - r1_0) / nr1
+        r0[i] = r1_0
+        dr0[i] = dr1
+        theta0[i] = theta1_0
+        dtheta0[i] = dtheta1
+        Nr0[i] = nr1
+        Ntheta0[i] = ntheta1
+
+    if grid_polar_new is None:
+        r3_0 = r1_0
+        r3_1 = r1_1
+        theta3_0 = theta1_0
+        theta3_1 = theta1_1
+        nr3 = nr1
+        ntheta3 = 2 * ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    assert dorigin0.shape == (3,)
+    assert dorigin1.shape == (3,)
+    dorigin = torch.stack((dorigin0, dorigin1), dim=0)
+
+    alias_mode = 0
+    if alias:
+        if not output_alias:
+            alias_mode = 1
+        else:
+            alias_mode = 2
+    elif not output_alias:
+        alias_mode = 3
+
+    return torch.ops.torchbp.ffbp_merge2_poly.default(
+        img0,
+        img1,
+        dorigin,
+        fc,
+        r0,
+        dr0,
+        theta0,
+        dtheta0,
+        Nr0,
+        Ntheta0,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        z0,
+        order,
+        poly_coefs,
+        alias_mode,
+        alias_fmod,
+    )
+
+
 def ffbp_merge2(
     img0: Tensor,
     img1: Tensor,
@@ -584,10 +831,12 @@ def ffbp_merge2(
     fc: float,
     grid_polar_new: dict = None,
     z0: float = 0,
-    method : tuple = ('lanczos', 6),
+    method : tuple = ('knab', 6, 1.5),
     alias: bool = False,
     alias_fmod: float = 0,
-    output_alias: bool = True
+    output_alias: bool = True,
+    use_poly: bool = True,
+    poly_coefs: Tensor = None
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -621,17 +870,20 @@ def ffbp_merge2(
         If None uses the same grid as input, but with double the angle points.
     z0 : float
         Height of the antenna phase center in the new image.
-    method : str or tuple
-        Interpolation method. Valid choices are:
-            - ("lanczos", n): Lanczos resampling. `n` is the number of samples used.
-            - ("knab", n, v): Knab pulse resampling. `n` is the number of samples used.
-              length and v is oversampling factor in the data.
+    method : tuple
+        Interpolation method: ("knab", n, v) where n is the number of samples used
+        and v is the oversampling factor in the data.
     alias : bool
         Add back range dependent phase. Inverse of `util.bp_polar_range_dealias`.
     alias_fmod : float
         Range modulation frequency applied to input.
     output_alias : bool
         If True and `alias` is True apply `alias_fmod` to output.
+    use_poly : bool
+        If True (default), use polynomial-approximation kernel for knab interpolation.
+    poly_coefs : Tensor, optional
+        Precomputed polynomial coefficients.
+        Use compute_knab_poly_coefs_full() to compute these for Knab kernels.
 
     Returns
     -------
@@ -644,43 +896,33 @@ def ffbp_merge2(
     else:
         method_params = None
 
-    if method == "lanczos":
-        if len(method_params) != 1:
-            raise ValueError("Lanczos interpolation needs sample length as argument")
-        return ffbp_merge2_lanczos(
-            img0,
-            img1,
-            dorigin0,
-            dorigin1,
-            grid_polars,
-            fc,
-            grid_polar_new,
-            z0,
-            order=method_params[0],
-            alias=alias,
-            alias_fmod=alias_fmod,
-            output_alias=output_alias
-        )
-    elif method == "knab":
+    if method == "knab":
         if len(method_params) != 2:
             raise ValueError("Knab interpolation needs sample length and oversampling factor as argument")
-        return ffbp_merge2_knab(
-            img0,
-            img1,
-            dorigin0,
-            dorigin1,
-            grid_polars,
-            fc,
-            grid_polar_new,
-            z0,
-            order=method_params[0],
+        order = method_params[0]
+        knab_func = ffbp_merge2_poly if (use_poly and order <= 8) else ffbp_merge2_knab
+        kwargs = dict(
+            order=order,
             oversample=method_params[1],
             alias=alias,
             alias_fmod=alias_fmod,
             output_alias=output_alias
         )
+        if use_poly and poly_coefs is not None:
+            kwargs['poly_coefs'] = poly_coefs
+        return knab_func(
+            img0,
+            img1,
+            dorigin0,
+            dorigin1,
+            grid_polars,
+            fc,
+            grid_polar_new,
+            z0,
+            **kwargs
+        )
     else:
-        raise ValueError(f"Unknown interp_method: {interp_method}")
+        raise ValueError(f"Unknown interp_method: {method}")
 
 
 def polar_to_cart(

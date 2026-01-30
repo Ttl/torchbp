@@ -1,7 +1,8 @@
 import torch
 from torch import Tensor
+from warnings import warn
 from .backproj import backprojection_polar_2d
-from .polar_interp import ffbp_merge2
+from .polar_interp import ffbp_merge2, ffbp_merge2_poly, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
 
@@ -14,13 +15,14 @@ def ffbp(
     stages: int,
     divisions: int = 2,
     d0: float = 0.0,
-    interp_method: str | tuple = ("lanczos", 6),
+    interp_method: tuple = ("knab", 6, 1.5),
     oversample_r: float = 1.4,
     oversample_theta: float = 1.4,
     grid_oversample: float = 1,
     dealias: bool = False,
     data_fmod: float = 0,
     alias_fmod: float = None,
+    use_poly: bool = True
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -49,8 +51,9 @@ def ffbp(
         Number of subapertures divisions per stage. Default is 2.
     d0 : float
         Zero range correction.
-    interp_method : str or tuple
-        Interpolation method. See `polar_interp` function.
+    interp_method : tuple
+        Interpolation method: ("knab", order, oversample) where order is the
+        number of samples used and oversample is the oversampling factor.
     oversample_r : float
         Internally oversample range by this amount to avoid aliasing.
     oversample_theta : float
@@ -74,6 +77,8 @@ def ffbp(
         Note that when `dealias` is True and the `alias_fmod` is calculated
         automatically, the output will not have `alias_fmod` modulation and
         `alias_fmod` is used only internally to decrease interpolation errors.
+    use_poly: bool
+        Use polynomial approximation for interpolation.
 
     Returns
     -------
@@ -90,13 +95,48 @@ def ffbp(
         im_margin = max(0, grid_oversample * oversample_r - 1)
         alias_fmod = -torch.pi * (1 - im_margin / (1 + im_margin))
 
-    try:
-        if interp_method[0] not in ["lanczos", "knab"]:
-            raise ValueError(
-                "interp_method should be ('lanczos', N) or ('knab', N, v)"
-            )
-    except IndexError:
-        raise ValueError("interp_method should be ('lanczos', N) or ('knab', N, v)")
+    # Parse interpolation method - only knab is supported
+    if interp_method[0] != "knab":
+        raise ValueError("interp_method should be ('knab', order, oversample)")
+    if len(interp_method) != 3:
+        raise ValueError("interp_method should be ('knab', order, oversample)")
+
+    knab_order = interp_method[1]
+    knab_oversample = interp_method[2]
+
+    # Precompute polynomial coefficients once for all merge operations
+    poly_degree = select_knab_poly_degree(knab_oversample, knab_order)
+    poly_coefs = compute_knab_poly_coefs_full(knab_order, knab_oversample, poly_degree)
+
+    return _ffbp_impl(
+        data, grid, fc, r_res, pos, stages, divisions, d0, interp_method,
+        oversample_r, oversample_theta, dealias, data_fmod, alias_fmod,
+        output_alias, use_poly, poly_coefs
+    )
+
+
+def _ffbp_impl(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    stages: int,
+    divisions: int,
+    d0: float,
+    interp_method: tuple,
+    oversample_r: float,
+    oversample_theta: float,
+    dealias: bool,
+    data_fmod: float,
+    alias_fmod: float,
+    output_alias: bool,
+    use_poly: bool,
+    poly_coefs: Tensor,
+) -> Tensor:
+    """Internal implementation of ffbp with precomputed polynomial coefficients."""
+    nsweeps = data.shape[0]
+
     imgs = []
     n = nsweeps // divisions
     for d in range(divisions):
@@ -111,7 +151,7 @@ def ffbp(
         if stages > 1 and len(data_local) > 128:
             grid_local["nr"] = int(oversample_r * grid_local["nr"])
             grid_local["ntheta"] = int(oversample_theta * grid_local["ntheta"])
-            img = ffbp(
+            img = _ffbp_impl(
                 data_local,
                 grid_local,
                 fc,
@@ -126,6 +166,9 @@ def ffbp(
                 dealias=True,
                 data_fmod=data_fmod,
                 alias_fmod=alias_fmod,
+                output_alias=True,
+                use_poly=use_poly,
+                poly_coefs=poly_coefs,
             )
         else:
             img = backprojection_polar_2d(
@@ -167,7 +210,9 @@ def ffbp(
             method=interp_method,
             alias=alias,
             alias_fmod=alias_fmod,
-            output_alias=out_alias
+            output_alias=out_alias,
+            use_poly=use_poly,
+            poly_coefs=poly_coefs
         )
         imgs[0] = None
         imgs[1] = None

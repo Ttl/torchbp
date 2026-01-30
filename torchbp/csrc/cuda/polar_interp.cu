@@ -922,6 +922,75 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
     out[idr*Ntheta1 + idtheta] = pixel;
 }
 
+
+// FFBP merge kernel using polynomial approximation for interpolation kernel
+// Uses constant memory d_poly_coefs for polynomial coefficients
+template<int N_COEFS>
+__global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64_t *img1,
+        complex64_t *out, const float *dorigin,
+        float ref_phase, const float *r0, const float *dr, const float *theta0,
+        const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    if (idx >= Nr1 * Ntheta1) {
+        return;
+    }
+
+    const float d = r1 + dr1 * idr;
+    const float t = theta1 + dtheta1 * idtheta;
+    if (t < -1.0f || t > 1.0f) {
+        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+        return;
+    }
+
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    const float dz = sqrtf(z1*z1 + d*d);
+
+    complex64_t pixel{};
+
+    for (int id=0; id < 2; id++) {
+        const complex64_t *img = id == 0 ? img0 : img1;
+        const float dorig0 = dorigin[id * 3 + 0];
+        const float dorig1 = dorigin[id * 3 + 1];
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float dri = (rp - r0[id]) / dr[id];
+        const float dti = (tp - theta0[id]) / dtheta[id];
+
+        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+            complex64_t v = interp_2d_poly<complex64_t, complex64_t, N_COEFS>(
+                    img, Nr[id], Ntheta[id], dri, dti, order);
+
+            float ref_sin, ref_cos;
+            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float rpz = sqrtf(z0*z0 + rp*rp);
+            sincospif(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            pixel += v * ref;
+        }
+    }
+    if (alias) {
+        float ref_sin, ref_cos;
+        if (alias == 2) {
+            alias_fmod = 0.0f;
+        }
+        if (alias == 3) {
+            ref_phase = 0.0f;
+        }
+        sincospif(ref_phase * dz - alias_fmod*idr, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
+    }
+    out[idr*Ntheta1 + idtheta] = pixel;
+}
+
+
 std::vector<at::Tensor> polar_interp_linear_grad_cuda(
           const at::Tensor &grad,
           const at::Tensor &img,
@@ -1273,6 +1342,117 @@ at::Tensor ffbp_merge2_knab_cuda(
 	return out;
 }
 
+at::Tensor ffbp_merge2_poly_cuda(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          const at::Tensor &dorigin,
+          double fc,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z1,
+          int64_t order,
+          const at::Tensor &poly_coefs,
+          int64_t alias,
+          double alias_fmod) {
+	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(r0.dtype() == at::kFloat);
+	TORCH_CHECK(dr0.dtype() == at::kFloat);
+	TORCH_CHECK(theta0.dtype() == at::kFloat);
+	TORCH_CHECK(dtheta0.dtype() == at::kFloat);
+	TORCH_CHECK(Nr0.dtype() == at::kInt);
+	TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+	TORCH_CHECK(poly_coefs.dtype() == at::kFloat);
+	TORCH_CHECK(order >= 2 && order <= 8,
+		"ffbp_merge2_poly requires order in [2, 8], got ", order);
+	// n_coefs is the number of polynomial coefficients (c1..cn, excluding implicit c0=1)
+	int64_t n_coefs = poly_coefs.size(0);
+	TORCH_CHECK(n_coefs <= POLY_COEF_MAX,
+		"ffbp_merge2_poly: poly_coefs has ", n_coefs, " coefficients, max is ", POLY_COEF_MAX);
+	TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(r0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dr0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(theta0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dtheta0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(Nr0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(Ntheta0.device().type() == at::DeviceType::CUDA);
+	at::Tensor dorigin_contig = dorigin.contiguous();
+	at::Tensor img0_contig = img0.contiguous();
+	at::Tensor img1_contig = img1.contiguous();
+	at::Tensor r0_contig = r0.contiguous();
+	at::Tensor dr0_contig = dr0.contiguous();
+	at::Tensor theta0_contig = theta0.contiguous();
+	at::Tensor dtheta0_contig = dtheta0.contiguous();
+	at::Tensor Nr0_contig = Nr0.contiguous();
+	at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+	at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    c10::complex<float>* img0_ptr = img0_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* img1_ptr = img1_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+
+    // Copy polynomial coefficients to constant memory
+    // poly_coefs contains [c1, c2, ..., cn] (n_coefs total, excluding implicit c0=1)
+    at::Tensor poly_coefs_cpu = poly_coefs.contiguous().cpu();
+    cudaMemcpyToSymbol(d_poly_coefs, poly_coefs_cpu.data_ptr<float>(),
+                       n_coefs * sizeof(float), 0, cudaMemcpyHostToDevice);
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr1 * Ntheta1;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, 1, 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Dispatch to template-specialized kernel based on n_coefs
+    // This enables full compile-time unrolling of polynomial evaluation
+    #define LAUNCH_KERNEL(N) \
+        ffbp_merge2_kernel_poly<N><<<block_count, thread_per_block, 0, stream>>>( \
+            (const complex64_t*)img0_ptr, (const complex64_t*)img1_ptr, \
+            (complex64_t*)out_ptr, dorigin_ptr, ref_phase, \
+            r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
+            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI)
+
+    switch (n_coefs) {
+        case 4: LAUNCH_KERNEL(4); break;
+        case 5: LAUNCH_KERNEL(5); break;
+        case 6: LAUNCH_KERNEL(6); break;
+        case 7: LAUNCH_KERNEL(7); break;
+        case 8: LAUNCH_KERNEL(8); break;
+        case 9: LAUNCH_KERNEL(9); break;
+        case 10: LAUNCH_KERNEL(10); break;
+        case 11: LAUNCH_KERNEL(11); break;
+        case 12: LAUNCH_KERNEL(12); break;
+        case 13: LAUNCH_KERNEL(13); break;
+        case 14: LAUNCH_KERNEL(14); break;
+        default:
+            TORCH_CHECK(false, "ffbp_merge2_poly: n_coefs must be 4-14, got ", n_coefs);
+    }
+    #undef LAUNCH_KERNEL
+
+	return out;
+}
 
 // Registers CUDA implementations
 TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
@@ -1281,6 +1461,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("polar_interp_lanczos", &polar_interp_lanczos_cuda);
   m.impl("ffbp_merge2_lanczos", &ffbp_merge2_lanczos_cuda);
   m.impl("ffbp_merge2_knab", &ffbp_merge2_knab_cuda);
+  m.impl("ffbp_merge2_poly", &ffbp_merge2_poly_cuda);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cuda);
   m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cuda);
   m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cuda);

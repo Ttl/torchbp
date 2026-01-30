@@ -45,6 +45,7 @@ def get_extensions():
             "-O3" if not debug_mode else "-O0",
             "-DLIBCUDACXX_ENABLE_SIMPLIFIED_COMPLEX_OPERATIONS",
             "--use_fast_math",
+            "-lineinfo"
         ],
     }
     if debug_mode:

@@ -881,5 +881,103 @@ class TestGPGABackprojection2D(TestCase):
         self._opcheck("cuda")
 
 
+class TestFFBPMerge2Poly(TestCase):
+    """Test polynomial approximation version against reference Knab implementation."""
+
+    def sample_inputs(self, device, *, dtype=torch.float32):
+        def make_tensor(size, dtype=dtype):
+            return torch.randn(size, device=device, dtype=dtype)
+
+        complex_dtype = torch.complex64 if dtype == torch.float32 else torch.complex128
+
+        # Create two polar grid images with slightly different grids
+        grid_polar0 = {"r": (100, 200), "theta": (-0.8, 0.8), "nr": 50, "ntheta": 40}
+        grid_polar1 = {"r": (105, 195), "theta": (-0.75, 0.75), "nr": 48, "ntheta": 38}
+        grid_polar_new = {"r": (100, 200), "theta": (-0.8, 0.8), "nr": 60, "ntheta": 50}
+
+        img0 = make_tensor((grid_polar0["nr"], grid_polar0["ntheta"]), dtype=complex_dtype)
+        img1 = make_tensor((grid_polar1["nr"], grid_polar1["ntheta"]), dtype=complex_dtype)
+        dorigin0 = 0.1 * make_tensor((3,), dtype=dtype)
+        dorigin1 = 0.1 * make_tensor((3,), dtype=dtype)
+
+        args = {
+            "img0": img0,
+            "img1": img1,
+            "dorigin0": dorigin0,
+            "dorigin1": dorigin1,
+            "grid_polars": [grid_polar0, grid_polar1],
+            "fc": 10e9,
+            "grid_polar_new": grid_polar_new,
+            "z0": 1.0,
+            "order": 6,
+            "oversample": 1.5,
+            "alias": False,
+            "alias_fmod": 0.0,
+            "output_alias": True,
+        }
+        return [args]
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_poly_vs_knab_reference(self):
+        """Compare polynomial approximation against reference Knab implementation."""
+        samples = self.sample_inputs("cuda")
+
+        for args in samples:
+            # Run reference Knab implementation
+            result_knab = torchbp.ops.ffbp_merge2_knab(**args)
+
+            # Run polynomial approximation version
+            result_poly = torchbp.ops.ffbp_merge2_poly(**args)
+
+            # They should be reasonably close (polynomial is an approximation)
+            # The polynomial trades accuracy for speed
+            # Allow for moderate differences due to approximation
+            torch.testing.assert_close(
+                result_poly,
+                result_knab,
+                rtol=0.05,
+                atol=1e-3
+            )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_poly_with_precomputed_coefs(self):
+        """Test that precomputed polynomial coefficients give same result."""
+        samples = self.sample_inputs("cuda")
+
+        for args in samples:
+            # Compute polynomial coefficients once
+            from torchbp.ops.polar_interp import compute_knab_poly_coefs_full
+            poly_coefs = compute_knab_poly_coefs_full(args["order"], args["oversample"])
+
+            # Run with automatic coefficient computation
+            result_auto = torchbp.ops.ffbp_merge2_poly(**args)
+
+            # Run with precomputed coefficients
+            result_precomp = torchbp.ops.ffbp_merge2_poly(**args, poly_coefs=poly_coefs)
+
+            # Should be identical
+            torch.testing.assert_close(result_precomp, result_auto)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_different_orders(self):
+        """Test polynomial approximation with different interpolation orders."""
+        samples = self.sample_inputs("cuda")
+
+        for args in samples:
+            for order in [4, 6, 8]:
+                args_order = args.copy()
+                args_order["order"] = order
+
+                # Should not raise an error
+                result = torchbp.ops.ffbp_merge2_poly(**args_order)
+
+                # Check output shape
+                expected_shape = (
+                    args["grid_polar_new"]["nr"],
+                    args["grid_polar_new"]["ntheta"]
+                )
+                self.assertEqual(result.shape, expected_shape)
+
+
 if __name__ == "__main__":
     unittest.main()
