@@ -44,9 +44,9 @@ if __name__ == "__main__":
     data_dtype = torch.complex64  # Can be `torch.complex32` to save VRAM
     # Use fast factorized backprojection, slightly reduces the image quality
     # but is faster.
-    ffbp = True
+    ffbp = False
     # Autofocus image to improve image quality.
-    autofocus = True
+    autofocus = False
 
     c0 = 299792458
 
