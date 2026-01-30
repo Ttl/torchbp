@@ -32,11 +32,8 @@ __global__ void backprojection_polar_2d_kernel(
           int g_naz,
           int g_nel) {
 
-    // Optimization 1: Process 2 pixels per thread to hide 'pos' load latency
-    const int PIXELS_PER_THREAD = 2;
-
-    // Optimization 2: Tile size for Shared Memory buffering of 'pos'
-    const int POS_TILE_SIZE = 32;
+    // Process multiple pixels per thread to amortize pos loads
+    const int PIXELS_PER_THREAD = 4;
 
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
@@ -46,13 +43,11 @@ __global__ void backprojection_polar_2d_kernel(
     // Bounds check
     if (idr_base >= Nr || idtheta >= Ntheta) return;
 
-    // --- GEOMETRY FIX: Restore original coordinate math ---
-    const float theta = theta0 + idtheta * dtheta;
-    // Precompute the theta component shared by both pixels
-    const float theta_sq = theta * theta;
-    const float sqrt_one_minus_theta_sq = sqrtf(1.0f - theta_sq);
+    // Precompute theta sin/cos once (shared by all pixels in this thread)
+    const float sin_theta = theta0 + idtheta * dtheta;  // theta IS sin(angle) in this coord system
+    const float cos_theta = sqrtf(1.0f - sin_theta * sin_theta);
 
-    // Coordinate storage for the 2 pixels
+    // Coordinate storage for the pixels
     float r[PIXELS_PER_THREAD];
     float x[PIXELS_PER_THREAD];
     float y[PIXELS_PER_THREAD];
@@ -64,11 +59,8 @@ __global__ void backprojection_polar_2d_kernel(
     for(int k=0; k<PIXELS_PER_THREAD; ++k) {
         if(idr_base + k < Nr) {
             r[k] = r0 + (idr_base + k) * dr;
-            float s = theta0 + idtheta * dtheta;
-            float c = sqrtf(1.0f - s*s);
-
-            x[k] = r[k] * c;
-            y[k] = r[k] * s;
+            x[k] = r[k] * cos_theta;
+            y[k] = r[k] * sin_theta;
         }
     }
 
@@ -76,82 +68,88 @@ __global__ void backprojection_polar_2d_kernel(
     const int data_batch_stride = idbatch * sweep_samples * nsweeps;
     const int max_id0 = sweep_samples - 2;
 
-    __shared__ float sh_pos[POS_TILE_SIZE * 3];
+    // Fused phase coefficient: phase = phase_coef * (d + d0) + phase_offset2
+    // where phase_offset2 = phase_offset - phase_coef * d0
+    // This way we compute d_eff = d + d0 once and use it for both sx and phase
+    const float phase_offset2 = phase_offset - phase_coef * d0;
 
-    for (int tile_start = 0; tile_start < nsweeps; tile_start += POS_TILE_SIZE) {
+    // Direct L1 cache path - no shared memory overhead
+    for (int i = 0; i < nsweeps; i++) {
+        // Load pos directly via __ldg (L1 cached, broadcast across warp)
+        const int pos_idx = pos_batch_offset + i * 3;
+        float pos_x = __ldg(&pos[pos_idx + 0]);
+        float pos_y = __ldg(&pos[pos_idx + 1]);
+        float pos_z = __ldg(&pos[pos_idx + 2]);
 
-        // Cooperative Load into Shared Memory
-        int tid = threadIdx.x;
-        int valid_tile_items = min(POS_TILE_SIZE, nsweeps - tile_start);
+        // Precompute pos_z² outside pixel loop
+        float pz2 = pos_z * pos_z;
+        int sweep_offset = data_batch_stride + i * sweep_samples;
 
-        if (tid < valid_tile_items * 3) {
-            sh_pos[tid] = __ldg(&pos[pos_batch_offset + (tile_start * 3) + tid]);
-        }
-        __syncthreads();
+        #pragma unroll
+        for(int k=0; k<PIXELS_PER_THREAD; ++k) {
+            if(idr_base + k >= Nr) continue;
 
-        // Process Tile
-        #pragma unroll 4
-        for (int j = 0; j < valid_tile_items; j++) {
-            // Read from Shared Mem (Broadcast)
-            float pos_x = sh_pos[j*3 + 0];
-            float pos_y = sh_pos[j*3 + 1];
-            float pos_z = sh_pos[j*3 + 2];
+            float px = x[k] - pos_x;
+            float py = y[k] - pos_y;
+            float d_sq = fmaf(px, px, fmaf(py, py, pz2));
+            float d = sqrtf(d_sq);
 
-            int i = tile_start + j;
-            int sweep_offset = data_batch_stride + i * sweep_samples;
+            // Compute d_eff once, use for both sx and phase
+            float d_eff = d + d0;
+            float sx = delta_r * d_eff;
+            int id0 = (int)sx;
 
-            #pragma unroll
-            for(int k=0; k<PIXELS_PER_THREAD; ++k) {
-                // Check if this specific pixel is valid (handles odd Nr)
-                if(idr_base + k >= Nr) continue;
+            if (id0 >= 0 && id0 <= max_id0) {
+                int data_idx = sweep_offset + id0;
+                float s0_re, s0_im, s1_re, s1_im;
 
-                float px = x[k] - pos_x;
-                float py = y[k] - pos_y;
-                float d_sq = px*px + py*py + pos_z*pos_z;
-                float d = sqrtf(d_sq);
+                if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+                    float2 s0f = __ldg(&((const float2*)data)[data_idx]);
+                    float2 s1f = __ldg(&((const float2*)data)[data_idx + 1]);
+                    s0_re = s0f.x; s0_im = s0f.y;
+                    s1_re = s1f.x; s1_im = s1f.y;
+                } else {
+                    half2 s0h = __ldg(&((const half2*)data)[data_idx]);
+                    half2 s1h = __ldg(&((const half2*)data)[data_idx + 1]);
+                    s0_re = __half2float(s0h.x); s0_im = __half2float(s0h.y);
+                    s1_re = __half2float(s1h.x); s1_im = __half2float(s1h.y);
+                }
 
-                float sx = delta_r * (d + d0);
-                int id0 = (int)sx;
+                float interp_idx = sx - id0;
+                float s_re = fmaf(interp_idx, s1_re - s0_re, s0_re);
+                float s_im = fmaf(interp_idx, s1_im - s0_im, s0_im);
 
-                // Optimized check: Skip load entirely if out of bounds
-                // Original code loaded safely then multiplied by 0. This is faster.
-                if (id0 >= 0 && id0 <= max_id0) {
+                float ref_sin, ref_cos;
+                __sincosf(fmaf(phase_coef, d_eff, phase_offset2), &ref_sin, &ref_cos);
 
-                    int data_idx = sweep_offset + id0;
-                    float s0_re, s0_im, s1_re, s1_im;
+                if constexpr (HasAntennaPattern) {
+                    const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+                    const float el_deg = look_angle - __ldg(&att[pos_idx + 0]);
+                    const float az_deg = atan2f(py, px) - __ldg(&att[pos_idx + 2]);
 
-                    if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
-                        float2 s0f = __ldg(&((const float2*)data)[data_idx]);
-                        float2 s1f = __ldg(&((const float2*)data)[data_idx + 1]);
-                        s0_re = s0f.x; s0_im = s0f.y;
-                        s1_re = s1f.x; s1_im = s1f.y;
-                    } else {
-                        half2 s0h = __ldg(&((const half2*)data)[data_idx]);
-                        half2 s1h = __ldg(&((const half2*)data)[data_idx + 1]);
-                        s0_re = __half2float(s0h.x); s0_im = __half2float(s0h.y);
-                        s1_re = __half2float(s1h.x); s1_im = __half2float(s1h.y);
+                    const float el_idx = (el_deg - g_el0) / g_del;
+                    const float az_idx = (az_deg - g_az0) / g_daz;
+
+                    const int el_int = (int)el_idx;
+                    const int az_int = (int)az_idx;
+
+                    if (el_int >= 0 && el_int + 1 < g_nel && az_int >= 0 && az_int + 1 < g_naz) {
+                        const float el_frac = el_idx - el_int;
+                        const float az_frac = az_idx - az_int;
+                        const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+
+                        float ws_re = w * s_re;
+                        float ws_im = w * s_im;
+                        pixel_re[k] = fmaf(ws_re, ref_cos, fmaf(-ws_im, ref_sin, pixel_re[k]));
+                        pixel_im[k] = fmaf(ws_re, ref_sin, fmaf(ws_im, ref_cos, pixel_im[k]));
+                        w_sum[k] += w * w;
                     }
-
-                    float interp_idx = sx - id0;
-                    float s_re = fmaf(interp_idx, s1_re - s0_re, s0_re);
-                    float s_im = fmaf(interp_idx, s1_im - s0_im, s0_im);
-
-                    float ref_sin, ref_cos;
-                    __sincosf(fmaf(phase_coef, d, phase_offset), &ref_sin, &ref_cos);
-
-                    // Antenna pattern logic (simplified for template=false path)
-                    if constexpr (HasAntennaPattern) {
-                        // ... (Insert Antenna Pattern Logic Here if needed) ...
-                        // Ensure w_sum is updated
-                    } else {
-                        // Accumulate
-                        pixel_re[k] = fmaf(s_re, ref_cos, fmaf(-s_im, ref_sin, pixel_re[k]));
-                        pixel_im[k] = fmaf(s_re, ref_sin, fmaf(s_im, ref_cos, pixel_im[k]));
-                    }
+                } else {
+                    pixel_re[k] = fmaf(s_re, ref_cos, fmaf(-s_im, ref_sin, pixel_re[k]));
+                    pixel_im[k] = fmaf(s_re, ref_sin, fmaf(s_im, ref_cos, pixel_im[k]));
                 }
             }
         }
-        __syncthreads();
     }
 
     // Write output
@@ -178,6 +176,7 @@ __global__ void backprojection_polar_2d_kernel(
         }
     }
 }
+
 template<typename T, bool have_pos_grad, bool have_data_grad>
 __global__ void backprojection_polar_2d_grad_kernel(
           const T* data,
@@ -1290,7 +1289,7 @@ at::Tensor backprojection_polar_2d_cuda(
     const float dealias_fmod = alias_fmod;  // already divided by kPI in caller
 
 	dim3 thread_per_block = {256, 1};
-    int pixels_per_thread = 2;
+    int pixels_per_thread = 4;
     int total_work_items = (Nr * Ntheta + pixels_per_thread - 1) / pixels_per_thread;
     unsigned int block_x = (total_work_items + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
