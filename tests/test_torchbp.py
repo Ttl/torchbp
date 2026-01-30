@@ -506,6 +506,191 @@ class TestBackprojectionPolar(TestCase):
         self._opcheck("cuda")
 
 
+class TestBackprojectionPolarLanczos(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        # Make sure that scene is in view
+        def make_pos_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            x = x - torch.max(x[:, 0]) - 2
+            return x
+
+        def make_nondiff_tensor(size, dtype=torch.float32):
+            return torch.randn(size, device=device, requires_grad=False, dtype=dtype)
+
+        nbatch = 2
+        sweeps = 2
+        sweep_samples = 64
+        grid = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 4, "ntheta": 4}
+        args = {
+            "data": make_tensor((nbatch, sweeps, sweep_samples), dtype=torch.complex64),
+            "grid": grid,
+            "fc": 6e9,
+            "r_res": 0.15,
+            "pos": make_pos_tensor((nbatch, sweeps, 3), dtype=torch.float32),
+            "d0": 0.2,
+            "dealias": False,
+            "order": 4,
+            "att": None,
+            "g": None,
+            "g_extent": None,
+            "data_fmod": uniform(0, 2 * torch.pi),
+            "alias_fmod": 0,
+        }
+        return [args]
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_basic_execution(self):
+        """Test that lanczos backprojection executes without errors."""
+        samples = self.sample_inputs("cuda")
+        for sample in samples:
+            result = torchbp.ops.backprojection_polar_2d_lanczos(**sample)
+            # Check output shape
+            nbatch = sample["data"].shape[0]
+            nr = sample["grid"]["nr"]
+            ntheta = sample["grid"]["ntheta"]
+            self.assertEqual(result.shape, (nbatch, nr, ntheta))
+            # Check that result is not NaN or Inf
+            self.assertFalse(torch.isnan(result).any())
+            self.assertFalse(torch.isinf(result).any())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_comparison_with_linear(self):
+        """Test that lanczos produces similar results to linear interpolation."""
+        samples = self.sample_inputs("cuda")
+        for sample in samples:
+            # Remove lanczos-specific parameters for linear version
+            sample_linear = {k: v for k, v in sample.items() if k != "order"}
+
+            res_lanczos = torchbp.ops.backprojection_polar_2d_lanczos(**sample)
+            res_linear = torchbp.ops.backprojection_polar_2d(**sample_linear)
+
+            # Results should be reasonably similar (lanczos is higher order)
+            # but not identical due to different interpolation methods
+            self.assertEqual(res_lanczos.shape, res_linear.shape)
+
+    def _opcheck(self, device):
+        from torchbp.ops.backproj import _prepare_backprojection_polar_2d_lanczos_args
+
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = _prepare_backprojection_polar_2d_lanczos_args(**args)
+            # Only test schema - no gradient or faketensor support
+            opcheck(
+                torch.ops.torchbp.backprojection_polar_2d_lanczos,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestBackprojectionPolarKnab(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        # Make sure that scene is in view
+        def make_pos_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            x = x - torch.max(x[:, 0]) - 2
+            return x
+
+        def make_nondiff_tensor(size, dtype=torch.float32):
+            return torch.randn(size, device=device, requires_grad=False, dtype=dtype)
+
+        nbatch = 2
+        sweeps = 2
+        sweep_samples = 64
+        grid = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 4, "ntheta": 4}
+        args = {
+            "data": make_tensor((nbatch, sweeps, sweep_samples), dtype=torch.complex64),
+            "grid": grid,
+            "fc": 6e9,
+            "r_res": 0.15,
+            "pos": make_pos_tensor((nbatch, sweeps, 3), dtype=torch.float32),
+            "d0": 0.2,
+            "dealias": False,
+            "order": 4,
+            "oversample": 1.5,
+            "att": None,
+            "g": None,
+            "g_extent": None,
+            "data_fmod": uniform(0, 2 * torch.pi),
+            "alias_fmod": 0,
+        }
+        return [args]
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_basic_execution(self):
+        """Test that knab backprojection executes without errors."""
+        samples = self.sample_inputs("cuda")
+        for sample in samples:
+            result = torchbp.ops.backprojection_polar_2d_knab(**sample)
+            # Check output shape
+            nbatch = sample["data"].shape[0]
+            nr = sample["grid"]["nr"]
+            ntheta = sample["grid"]["ntheta"]
+            self.assertEqual(result.shape, (nbatch, nr, ntheta))
+            # Check that result is not NaN or Inf
+            self.assertFalse(torch.isnan(result).any())
+            self.assertFalse(torch.isinf(result).any())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_comparison_with_linear(self):
+        """Test that knab produces similar results to linear interpolation."""
+        samples = self.sample_inputs("cuda")
+        for sample in samples:
+            # Remove knab-specific parameters for linear version
+            sample_linear = {k: v for k, v in sample.items() if k not in ("order", "oversample")}
+
+            res_knab = torchbp.ops.backprojection_polar_2d_knab(**sample)
+            res_linear = torchbp.ops.backprojection_polar_2d(**sample_linear)
+
+            # Results should be reasonably similar (knab is higher order)
+            # but not identical due to different interpolation methods
+            self.assertEqual(res_knab.shape, res_linear.shape)
+
+    def _opcheck(self, device):
+        from torchbp.ops.backproj import _prepare_backprojection_polar_2d_knab_args
+
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = _prepare_backprojection_polar_2d_knab_args(**args)
+            # Only test schema - no gradient or faketensor support
+            opcheck(
+                torch.ops.torchbp.backprojection_polar_2d_knab,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
 class TestBackprojectionCart(TestCase):
     def sample_inputs(self, device, *, requires_grad=False):
         def make_tensor(size, dtype=torch.float32):

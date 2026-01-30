@@ -69,6 +69,139 @@ def _prepare_backprojection_polar_2d_args(
             data_fmod, alias_fmod)
 
 
+def _prepare_backprojection_polar_2d_lanczos_args(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    d0: float = 0.0,
+    dealias: bool = False,
+    order: int = 6,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    data_fmod: float = 0,
+    alias_fmod: float = 0
+) -> tuple:
+    """Prepare arguments for C++ backprojection_polar_2d_lanczos operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by backprojection_polar_2d_lanczos and for testing.
+    """
+    r0, r1 = grid["r"]
+    theta0, theta1 = grid["theta"]
+    nr = grid["nr"]
+    ntheta = grid["ntheta"]
+    dr = (r1 - r0) / nr
+    dtheta = (theta1 - theta0) / ntheta
+
+    if data.dim() == 2:
+        nbatch = 1
+        nsweeps = data.shape[0]
+        sweep_samples = data.shape[1]
+        assert pos.shape == (nsweeps, 3)
+    else:
+        nbatch = data.shape[0]
+        nsweeps = data.shape[1]
+        sweep_samples = data.shape[2]
+        assert pos.shape == (nbatch, nsweeps, 3)
+
+    if att is None or g is None:
+        att = None
+        g = None
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
+    z0 = 0
+    if dealias:
+        if nbatch != 1:
+            raise ValueError("Only nbatch=1 supported with dealias")
+        z0 = torch.mean(pos[..., 2])
+
+    return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
+            r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0, order,
+            g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            data_fmod, alias_fmod)
+
+
+def _prepare_backprojection_polar_2d_knab_args(
+    data: Tensor,
+    grid: dict,
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    d0: float = 0.0,
+    dealias: bool = False,
+    order: int = 6,
+    oversample: float = 1.5,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    data_fmod: float = 0,
+    alias_fmod: float = 0
+) -> tuple:
+    """Prepare arguments for C++ backprojection_polar_2d_knab operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by backprojection_polar_2d_knab and for testing.
+    """
+    r0, r1 = grid["r"]
+    theta0, theta1 = grid["theta"]
+    nr = grid["nr"]
+    ntheta = grid["ntheta"]
+    dr = (r1 - r0) / nr
+    dtheta = (theta1 - theta0) / ntheta
+
+    if data.dim() == 2:
+        nbatch = 1
+        nsweeps = data.shape[0]
+        sweep_samples = data.shape[1]
+        assert pos.shape == (nsweeps, 3)
+    else:
+        nbatch = data.shape[0]
+        nsweeps = data.shape[1]
+        sweep_samples = data.shape[2]
+        assert pos.shape == (nbatch, nsweeps, 3)
+
+    if att is None or g is None:
+        att = None
+        g = None
+        g_nel = 0
+        g_naz = 0
+        g_daz = 0
+        g_del = 0
+        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
+    else:
+        g_nel = g.shape[0]
+        g_naz = g.shape[1]
+        assert g.shape == torch.Size([g_nel, g_naz])
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        g_daz = (g_az1 - g_az0) / g_naz
+        g_del = (g_el1 - g_el0) / g_nel
+
+    z0 = 0
+    if dealias:
+        if nbatch != 1:
+            raise ValueError("Only nbatch=1 supported with dealias")
+        z0 = torch.mean(pos[..., 2])
+
+    return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
+            r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0, order, oversample,
+            g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            data_fmod, alias_fmod)
+
+
 def backprojection_polar_2d(
     data: Tensor,
     grid: dict,

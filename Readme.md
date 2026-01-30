@@ -6,7 +6,7 @@ Fast C++ Pytorch extension for differentiable synthetic aperture radar image for
 
 Only Nvidia GPUs are supported. Currently, only some of the operations are supported on CPU.
 
-On RTX 3090 Ti backprojection on polar grid achieves 225 billion
+On RTX 3090 Ti backprojection on polar grid achieves 370 billion
 backprojections/s and fast factorized backprojection (ffbp) is ten times faster on
 moderate size images.
 

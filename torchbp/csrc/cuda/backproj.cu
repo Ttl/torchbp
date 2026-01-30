@@ -2,7 +2,14 @@
 
 namespace torchbp {
 
-template<typename T, bool HasAntennaPattern>
+// Interpolation methods for backprojection kernels
+enum class InterpMethod {
+    LINEAR,
+    LANCZOS,
+    KNAB
+};
+
+template<typename T, bool HasAntennaPattern, InterpMethod Method = InterpMethod::LINEAR>
 __global__ void backprojection_polar_2d_kernel(
           const T* __restrict__ data,
           const float* __restrict__ pos,
@@ -30,7 +37,9 @@ __global__ void backprojection_polar_2d_kernel(
           float g_daz,
           float g_del,
           int g_naz,
-          int g_nel) {
+          int g_nel,
+          int interp_order = 2,
+          float knab_v = 0.0f) {
 
     // Process multiple pixels per thread to amortize pos loads
     const int PIXELS_PER_THREAD = 4;
@@ -97,27 +106,55 @@ __global__ void backprojection_polar_2d_kernel(
             // Compute d_eff once, use for both sx and phase
             float d_eff = d + d0;
             float sx = delta_r * d_eff;
-            int id0 = (int)sx;
 
-            if (id0 >= 0 && id0 <= max_id0) {
-                int data_idx = sweep_offset + id0;
-                float s0_re, s0_im, s1_re, s1_im;
+            // Bounds check and interpolation
+            float s_re, s_im;
+            bool valid_sample;
 
-                if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
-                    float2 s0f = __ldg(&((const float2*)data)[data_idx]);
-                    float2 s1f = __ldg(&((const float2*)data)[data_idx + 1]);
-                    s0_re = s0f.x; s0_im = s0f.y;
-                    s1_re = s1f.x; s1_im = s1f.y;
-                } else {
-                    half2 s0h = __ldg(&((const half2*)data)[data_idx]);
-                    half2 s1h = __ldg(&((const half2*)data)[data_idx + 1]);
-                    s0_re = __half2float(s0h.x); s0_im = __half2float(s0h.y);
-                    s1_re = __half2float(s1h.x); s1_im = __half2float(s1h.y);
+            if constexpr (Method == InterpMethod::LINEAR) {
+                int id0 = (int)sx;
+                valid_sample = (id0 >= 0 && id0 <= max_id0);
+
+                if (valid_sample) {
+                    int data_idx = sweep_offset + id0;
+                    float s0_re, s0_im, s1_re, s1_im;
+
+                    if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+                        float2 s0f = __ldg(&((const float2*)data)[data_idx]);
+                        float2 s1f = __ldg(&((const float2*)data)[data_idx + 1]);
+                        s0_re = s0f.x; s0_im = s0f.y;
+                        s1_re = s1f.x; s1_im = s1f.y;
+                    } else {
+                        half2 s0h = __ldg(&((const half2*)data)[data_idx]);
+                        half2 s1h = __ldg(&((const half2*)data)[data_idx + 1]);
+                        s0_re = __half2float(s0h.x); s0_im = __half2float(s0h.y);
+                        s1_re = __half2float(s1h.x); s1_im = __half2float(s1h.y);
+                    }
+
+                    float interp_idx = sx - id0;
+                    s_re = fmaf(interp_idx, s1_re - s0_re, s0_re);
+                    s_im = fmaf(interp_idx, s1_im - s0_im, s0_im);
                 }
+            } else if constexpr (Method == InterpMethod::LANCZOS) {
+                valid_sample = (sx >= 0.0f && sx < sweep_samples - 1);
+                if (valid_sample) {
+                    complex64_t s = lanczos_interp_1d<complex64_t, T>(
+                        &data[sweep_offset], sweep_samples, sx, interp_order);
+                    s_re = s.real();
+                    s_im = s.imag();
+                }
+            } else if constexpr (Method == InterpMethod::KNAB) {
+                valid_sample = (sx >= 0.0f && sx < sweep_samples - 1);
+                if (valid_sample) {
+                    const float knab_norm = knab_kernel_norm(interp_order, knab_v);
+                    complex64_t s = knab_interp_1d<complex64_t, T>(
+                        &data[sweep_offset], sweep_samples, sx, interp_order, knab_v, knab_norm);
+                    s_re = s.real();
+                    s_im = s.imag();
+                }
+            }
 
-                float interp_idx = sx - id0;
-                float s_re = fmaf(interp_idx, s1_re - s0_re, s0_re);
-                float s_im = fmaf(interp_idx, s1_im - s0_im, s0_im);
+            if (valid_sample) {
 
                 float ref_sin, ref_cos;
                 __sincosf(fmaf(phase_coef, d_eff, phase_offset2), &ref_sin, &ref_cos);
@@ -320,237 +357,6 @@ __global__ void backprojection_polar_2d_grad_kernel(
             }
         }
     }
-}
-
-template<typename T>
-__global__ void backprojection_polar_2d_lanczos_kernel(
-          const T* data,
-          const float* pos,
-          const float* att,
-          complex64_t* img,
-          int sweep_samples,
-          int nsweeps,
-          float ref_phase,
-          float delta_r,
-          float r0,
-          float dr,
-          float theta0,
-          float dtheta,
-          int Nr,
-          int Ntheta,
-          float d0,
-          bool dealias,
-          float z0,
-          int order,
-          const float *g,
-          float g_az0,
-          float g_el0,
-          float g_daz,
-          float g_del,
-          int g_naz,
-          int g_nel,
-          float data_fmod,
-          float alias_fmod) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int idtheta = idx % Ntheta;
-    const int idr = idx / Ntheta;
-    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (idr >= Nr || idtheta >= Ntheta) {
-        return;
-    }
-
-    const float r = r0 + idr * dr;
-    const float theta = theta0 + idtheta * dtheta;
-    const float x = r * sqrtf(1.0f - theta*theta);
-    const float y = r * theta;
-
-    complex64_t pixel = {0.0f, 0.0f};
-    float w_sum = 0.0f;
-
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
-        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
-        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
-        float px = (x - pos_x);
-        float py = (y - pos_y);
-        float pz2 = pos_z * pos_z;
-
-        // Calculate distance to the pixel.
-        const float d = sqrtf(px * px + py * py + pz2);
-
-        float sx = delta_r * (d + d0);
-
-        if (sx < 0 || sx > sweep_samples - 1) {
-            continue;
-        }
-
-        complex64_t s = lanczos_interp_1d<complex64_t, T>(
-                &data[idbatch * sweep_samples * nsweeps + i * sweep_samples],
-                sweep_samples, sx, order);
-
-        float ref_sin, ref_cos;
-        sincospif(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
-        complex64_t ref = {ref_cos, ref_sin};
-
-        if (g != nullptr) {
-            const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
-            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
-            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
-
-            const float el_idx = (el_deg - g_el0) / g_del;
-            const float az_idx = (az_deg - g_az0) / g_daz;
-
-            const int el_int = el_idx;
-            const int az_int = az_idx;
-            const float el_frac = el_idx - el_int;
-            const float az_frac = az_idx - az_int;
-
-            if (el_int < 0 || el_int+1 >= g_nel) {
-                continue;
-            }
-            if (az_int < 0 || az_int+1 >= g_naz) {
-                continue;
-            }
-            const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
-
-            pixel += w * s * ref;
-            w_sum += w*w;
-        } else {
-            pixel += s * ref;
-        }
-    }
-    if (g != nullptr) {
-        if (w_sum > 0.0f) {
-            pixel *= nsweeps / sqrtf(w_sum);
-        }
-    }
-    if (dealias) {
-        const float d = sqrtf(x*x + y*y + z0*z0);
-        float ref_sin, ref_cos;
-        sincospif(-ref_phase * d + alias_fmod*idr, &ref_sin, &ref_cos);
-        complex64_t ref = {ref_cos, ref_sin};
-        pixel *= ref;
-    }
-    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
-}
-
-template<typename T>
-__global__ void backprojection_polar_2d_knab_kernel(
-          const T* data,
-          const float* pos,
-          const float* att,
-          complex64_t* img,
-          int sweep_samples,
-          int nsweeps,
-          float ref_phase,
-          float delta_r,
-          float r0,
-          float dr,
-          float theta0,
-          float dtheta,
-          int Nr,
-          int Ntheta,
-          float d0,
-          bool dealias,
-          float z0,
-          int order,
-          float knab_v,
-          const float *g,
-          float g_az0,
-          float g_el0,
-          float g_daz,
-          float g_del,
-          int g_naz,
-          int g_nel,
-          float data_fmod,
-          float alias_fmod) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int idtheta = idx % Ntheta;
-    const int idr = idx / Ntheta;
-    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (idr >= Nr || idtheta >= Ntheta) {
-        return;
-    }
-
-    const float r = r0 + idr * dr;
-    const float theta = theta0 + idtheta * dtheta;
-    const float x = r * sqrtf(1.0f - theta*theta);
-    const float y = r * theta;
-
-    complex64_t pixel = {0.0f, 0.0f};
-    float w_sum = 0.0f;
-
-    const float knab_norm = knab_kernel_norm(order, knab_v);
-
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
-        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
-        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
-        float px = (x - pos_x);
-        float py = (y - pos_y);
-        float pz2 = pos_z * pos_z;
-
-        // Calculate distance to the pixel.
-        const float d = sqrtf(px * px + py * py + pz2);
-
-        float sx = delta_r * (d + d0);
-
-        if (sx < 0 || sx > sweep_samples - 1) {
-            continue;
-        }
-
-        complex64_t s = knab_interp_1d<complex64_t, T>(
-                &data[idbatch * sweep_samples * nsweeps + i * sweep_samples],
-                sweep_samples, sx, order, knab_v, knab_norm);
-
-        float ref_sin, ref_cos;
-        sincospif(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
-        complex64_t ref = {ref_cos, ref_sin};
-
-        if (g != nullptr) {
-            const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
-            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
-            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
-
-            const float el_idx = (el_deg - g_el0) / g_del;
-            const float az_idx = (az_deg - g_az0) / g_daz;
-
-            const int el_int = el_idx;
-            const int az_int = az_idx;
-            const float el_frac = el_idx - el_int;
-            const float az_frac = az_idx - az_int;
-
-            if (el_int < 0 || el_int+1 >= g_nel) {
-                continue;
-            }
-            if (az_int < 0 || az_int+1 >= g_naz) {
-                continue;
-            }
-            const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
-
-            pixel += w * s * ref;
-            w_sum += w*w;
-        } else {
-            pixel += s * ref;
-        }
-    }
-    if (g != nullptr) {
-        if (w_sum > 0.0f) {
-            pixel *= nsweeps / sqrtf(w_sum);
-        }
-    }
-    if (dealias) {
-        const float d = sqrtf(x*x + y*y + z0*z0);
-        float ref_sin, ref_cos;
-        sincospif(-ref_phase * d + alias_fmod*idr, &ref_sin, &ref_cos);
-        complex64_t ref = {ref_cos, ref_sin};
-        pixel *= ref;
-    }
-    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
 }
 
 template<typename T>
@@ -1289,8 +1095,9 @@ at::Tensor backprojection_polar_2d_cuda(
     const float dealias_fmod = alias_fmod;  // already divided by kPI in caller
 
 	dim3 thread_per_block = {256, 1};
-    int pixels_per_thread = 4;
-    int total_work_items = (Nr * Ntheta + pixels_per_thread - 1) / pixels_per_thread;
+    constexpr int pixels_per_thread = 4;
+    int r_groups = (Nr + pixels_per_thread - 1) / pixels_per_thread;
+    int total_work_items = r_groups * Ntheta;
     unsigned int block_x = (total_work_items + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
 
@@ -1613,66 +1420,50 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
 
+    // Precompute phase coefficients with PI multiplied in
+    const float phase_coef = (ref_phase - (data_fmod / kPI) * delta_r) * kPI;
+    const float phase_offset = -(data_fmod / kPI) * delta_r * d0 * kPI;
+    const float dealias_coef = -ref_phase * kPI;
+    const float dealias_fmod = alias_fmod;  // already divided by kPI in caller
+
 	dim3 thread_per_block = {256, 1};
-	// Up-rounding division.
-    int blocks = Nr * Ntheta;
-	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+    constexpr int pixels_per_thread = 4;
+    int r_groups = (Nr + pixels_per_thread - 1) / pixels_per_thread;
+    int total_work_items = r_groups * Ntheta;
+    unsigned int block_x = (total_work_items + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Use template specialization to eliminate antenna pattern branch
+    #define LAUNCH_KERNEL(T, has_antenna) \
+        backprojection_polar_2d_kernel<T, has_antenna, InterpMethod::LANCZOS> \
+              <<<block_count, thread_per_block, 0, stream>>>( \
+                      (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
+                      sweep_samples, nsweeps, \
+                      phase_coef, phase_offset, delta_r, \
+                      r0, dr, theta0, dtheta, Nr, Ntheta, \
+                      d0, dealias, z0, dealias_coef, dealias_fmod, \
+                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      order)
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
-        backprojection_polar_2d_lanczos_kernel<complex64_t>
-              <<<block_count, thread_per_block, 0, stream>>>(
-                      (complex64_t*)data_ptr,
-                      pos_ptr,
-                      att_ptr,
-                      (complex64_t*)img_ptr,
-                      sweep_samples,
-                      nsweeps,
-                      ref_phase,
-                      delta_r,
-                      r0, dr,
-                      theta0, dtheta,
-                      Nr, Ntheta,
-                      d0,
-                      dealias, z0, order,
-                      g_ptr,
-                      g_az0,
-                      g_el0,
-                      g_daz,
-                      g_del,
-                      g_naz,
-                      g_nel,
-                      data_fmod/kPI,
-                      alias_fmod/kPI);
+        if (antenna_pattern) {
+            LAUNCH_KERNEL(complex64_t, true);
+        } else {
+            LAUNCH_KERNEL(complex64_t, false);
+        }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
-        backprojection_polar_2d_lanczos_kernel<half2>
-              <<<block_count, thread_per_block, 0, stream>>>(
-                      (half2*)data_ptr,
-                      pos_ptr,
-                      att_ptr,
-                      (complex64_t*)img_ptr,
-                      sweep_samples,
-                      nsweeps,
-                      ref_phase,
-                      delta_r,
-                      r0, dr,
-                      theta0, dtheta,
-                      Nr, Ntheta,
-                      d0,
-                      dealias, z0, order,
-                      g_ptr,
-                      g_az0,
-                      g_el0,
-                      g_daz,
-                      g_del,
-                      g_naz,
-                      g_nel,
-                      data_fmod/kPI,
-                      alias_fmod/kPI);
+        if (antenna_pattern) {
+            LAUNCH_KERNEL(half2, true);
+        } else {
+            LAUNCH_KERNEL(half2, false);
+        }
     }
+
+    #undef LAUNCH_KERNEL
 
 	return img;
 }
@@ -1745,66 +1536,50 @@ at::Tensor backprojection_polar_2d_knab_cuda(
     const float ref_phase = 4.0f * fc / kC0;
     const float v = 1.0f - 1.0f / oversample;
 
+    // Precompute phase coefficients with PI multiplied in
+    const float phase_coef = (ref_phase - (data_fmod / kPI) * delta_r) * kPI;
+    const float phase_offset = -(data_fmod / kPI) * delta_r * d0 * kPI;
+    const float dealias_coef = -ref_phase * kPI;
+    const float dealias_fmod = alias_fmod;  // already divided by kPI in caller
+
 	dim3 thread_per_block = {256, 1};
-	// Up-rounding division.
-    int blocks = Nr * Ntheta;
-	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+    constexpr int pixels_per_thread = 4;
+    int r_groups = (Nr + pixels_per_thread - 1) / pixels_per_thread;
+    int total_work_items = r_groups * Ntheta;
+    unsigned int block_x = (total_work_items + thread_per_block.x - 1) / thread_per_block.x;
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Use template specialization to eliminate antenna pattern branch
+    #define LAUNCH_KERNEL(T, has_antenna) \
+        backprojection_polar_2d_kernel<T, has_antenna, InterpMethod::KNAB> \
+              <<<block_count, thread_per_block, 0, stream>>>( \
+                      (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
+                      sweep_samples, nsweeps, \
+                      phase_coef, phase_offset, delta_r, \
+                      r0, dr, theta0, dtheta, Nr, Ntheta, \
+                      d0, dealias, z0, dealias_coef, dealias_fmod, \
+                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      order, v)
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
-        backprojection_polar_2d_knab_kernel<complex64_t>
-              <<<block_count, thread_per_block, 0, stream>>>(
-                      (complex64_t*)data_ptr,
-                      pos_ptr,
-                      att_ptr,
-                      (complex64_t*)img_ptr,
-                      sweep_samples,
-                      nsweeps,
-                      ref_phase,
-                      delta_r,
-                      r0, dr,
-                      theta0, dtheta,
-                      Nr, Ntheta,
-                      d0,
-                      dealias, z0, order, v,
-                      g_ptr,
-                      g_az0,
-                      g_el0,
-                      g_daz,
-                      g_del,
-                      g_naz,
-                      g_nel,
-                      data_fmod/kPI,
-                      alias_fmod/kPI);
+        if (antenna_pattern) {
+            LAUNCH_KERNEL(complex64_t, true);
+        } else {
+            LAUNCH_KERNEL(complex64_t, false);
+        }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
-        backprojection_polar_2d_knab_kernel<half2>
-              <<<block_count, thread_per_block, 0, stream>>>(
-                      (half2*)data_ptr,
-                      pos_ptr,
-                      att_ptr,
-                      (complex64_t*)img_ptr,
-                      sweep_samples,
-                      nsweeps,
-                      ref_phase,
-                      delta_r,
-                      r0, dr,
-                      theta0, dtheta,
-                      Nr, Ntheta,
-                      d0,
-                      dealias, z0, order, v,
-                      g_ptr,
-                      g_az0,
-                      g_el0,
-                      g_daz,
-                      g_del,
-                      g_naz,
-                      g_nel,
-                      data_fmod/kPI,
-                      alias_fmod/kPI);
+        if (antenna_pattern) {
+            LAUNCH_KERNEL(half2, true);
+        } else {
+            LAUNCH_KERNEL(half2, false);
+        }
     }
+
+    #undef LAUNCH_KERNEL
 
 	return img;
 }
