@@ -10,6 +10,7 @@ import pickle
 import torch
 import torchbp
 from torchbp.util import make_polar_grid
+from torchbp.grid import PolarGrid, CartesianGrid
 from safetensors.torch import safe_open
 from sar_process_safetensor import grid_extent, load_data
 plt.style.use("ggplot")
@@ -54,7 +55,7 @@ if __name__ == "__main__":
     try:
         mission, tensors = load_data(filename)
     except FileNotFoundError:
-        print("Input file {filename} not found.")
+        print(f"Input file {filename} not found.")
 
     sweeps = tensors["data"][sweep_start:sweep_start+nsweeps].to(dtype=torch.float32)
     pos = tensors["pos"][sweep_start:sweep_start+nsweeps].cpu().numpy()
@@ -76,7 +77,7 @@ if __name__ == "__main__":
     x, y = grid_extent(pos, att, x0, x1, bw=antenna_bw, origin_angle=origin_angle)
     nx = int((x[1] - x[0]) / res)
     ny = int((y[1] - y[0]) / res)
-    grid = {"x": x, "y": y, "nx": nx, "ny": ny}
+    grid = CartesianGrid(x_range=x, y_range=y, nx=nx, ny=ny)
     print("mission", mission)
     print("grid_cart", grid)
 
@@ -170,19 +171,13 @@ if __name__ == "__main__":
         print("Calculating autofocus. This might take a while.")
         torch.cuda.synchronize()
         tstart = time.time()
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ]
-        ) as p:
-            sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
-                    pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
-                    azimuth_divisions=8, range_divisions=8,
-                    use_ffbp=ffbp, data_fmod=data_fmod, verbose=True)
+        sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(
+            None, fsweeps, pos_centered, fc, r_res,
+            grid_polar_autofocus, d0=d0,
+            azimuth_divisions=8, range_divisions=8,
+            use_ffbp=ffbp, data_fmod=data_fmod, verbose=True
+        )
         torch.cuda.synchronize()
-        print(p.key_averages().table(
-            sort_by="self_cuda_time_total", row_limit=-1))
         print(f"Autofocus done in {time.time() - tstart:.3g} s")
 
         plt.figure()
@@ -199,23 +194,23 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     tstart = time.time()
     if ffbp:
-        sar_img = torchbp.ops.ffbp(fsweeps, grid_polar, fc, r_res, pos_centered,
-                stages=5, divisions=2, d0=d0, oversample_r=1.3, oversample_theta=1.3, interp_method=("knab", 6, 1.3), data_fmod=data_fmod, alias_fmod=None)
+        sar_img = torchbp.ops.ffbp(
+            fsweeps, grid_polar, fc, r_res, pos_centered,
+            stages=5, divisions=2, d0=d0, oversample_r=1.3, oversample_theta=1.3,
+            interp_method=("knab", 6, 1.3), data_fmod=data_fmod, alias_fmod=None
+        )
     else:
         sar_img = torchbp.ops.backprojection_polar_2d(
-            fsweeps, grid_polar, fc, r_res, pos_centered, d0, data_fmod=data_fmod)[0]
+            fsweeps, grid_polar, fc, r_res, pos_centered, d0,
+            data_fmod=data_fmod
+        )[0]
     torch.cuda.synchronize()
     print(f"Final image created in {time.time() - tstart:.3g} s")
     print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()
 
     plt.figure()
-    extent = [
-        grid_polar["r"][0],
-        grid_polar["r"][1],
-        grid_polar["theta"][0],
-        grid_polar["theta"][1],
-    ]
+    extent = [grid_polar.r0, grid_polar.r1, grid_polar.theta0, grid_polar.theta1]
     abs_img = np.abs(sar_img)
     m = 20 * np.log10(np.median(abs_img)) - 13
     plt.imshow(
@@ -230,6 +225,8 @@ if __name__ == "__main__":
     # Export image as pickle file
     with open("sar_img.p", "wb") as f:
         origin = origin.cpu().numpy().squeeze()
-        pickle.dump((sar_img, mission, grid, grid_polar, origin, origin_angle), f)
+        pickle.dump(
+            (sar_img, mission, grid.to_dict(), grid_polar.to_dict(), origin, origin_angle), f
+        )
 
     plt.show(block=True)

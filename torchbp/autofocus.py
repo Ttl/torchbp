@@ -2,6 +2,11 @@ from __future__ import annotations
 import torch
 import numpy as np
 from torch import Tensor
+from typing import TYPE_CHECKING
+from .grid import unpack_polar_grid
+
+if TYPE_CHECKING:
+    from .grid import PolarGrid
 from .ops import (
     backprojection_polar_2d,
     backprojection_cart_2d,
@@ -15,7 +20,7 @@ from .util import (
     detrend,
     fft_lowpass_filter_precalculate_window,
     fft_lowpass_filter_window,
-    diff,
+    diff
 )
 import inspect
 from scipy import signal
@@ -184,7 +189,7 @@ def gpga_bp_polar(
     pos: Tensor,
     fc: float,
     r_res: float,
-    grid_polar: dict,
+    grid_polar: "PolarGrid | dict",
     window_width: int | None = None,
     max_iters: int = 10,
     window_exp: float = 0.7,
@@ -217,8 +222,8 @@ def gpga_bp_polar(
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+    grid_polar : PolarGrid or dict
+        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta". If dict:
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
             - "nr": nr, number of range bins.
@@ -267,12 +272,7 @@ def gpga_bp_polar(
     phi : Tensor
         Solved phase error.
     """
-    r0, r1 = grid_polar["r"]
-    theta0, theta1 = grid_polar["theta"]
-    ntheta = grid_polar["ntheta"]
-    nr = grid_polar["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
 
     phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
 
@@ -332,7 +332,7 @@ def gpga_bp_polar_tde(
     pos: Tensor,
     fc: float,
     r_res: float,
-    grid_polar: dict,
+    grid_polar: "PolarGrid | dict",
     azimuth_divisions: int,
     range_divisions: int,
     window_width: int | None = None,
@@ -379,8 +379,8 @@ def gpga_bp_polar_tde(
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+    grid_polar : PolarGrid or dict
+        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta". If dict:
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
             - "nr": nr, number of range bins.
@@ -444,12 +444,7 @@ def gpga_bp_polar_tde(
     pos_new : Tensor
         Solved 3D position error.
     """
-    r0, r1 = grid_polar["r"]
-    theta0, theta1 = grid_polar["theta"]
-    ntheta = grid_polar["ntheta"]
-    nr = grid_polar["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
 
     r = r0 + dr * torch.arange(nr, device=data.device, dtype=torch.float32)
     theta = theta0 + dtheta * torch.arange(
@@ -637,7 +632,7 @@ def minimum_entropy_grad_autofocus(
     pos: Tensor,
     fc: float,
     r_res: float,
-    grid: dict,
+    grid: "PolarGrid | dict",
     wa: Tensor,
     tx_norm: Tensor = None,
     max_steps: float = 100,
@@ -673,7 +668,7 @@ def minimum_entropy_grad_autofocus(
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
-    grid : dict
+    grid : PolarGrid or dict
         Grid definition. Correct definition depends on the radar image function.
     wa : Tensor
         Azimuth windowing function.
@@ -824,7 +819,7 @@ def bp_polar_grad_minimum_entropy(
     pos: Tensor,
     fc: float,
     r_res: float,
-    grid: dict,
+    grid: "PolarGrid | dict",
     wa: Tensor,
     tx_norm: Tensor = None,
     max_steps: float = 100,
@@ -858,7 +853,7 @@ def bp_polar_grad_minimum_entropy(
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
-    grid : dict
+    grid : PolarGrid or dict
         Grid definition. Correct definition depends on the radar image function.
     wa : Tensor
         Azimuth windowing function.
@@ -913,7 +908,7 @@ def bp_cart_grad_minimum_entropy(
     pos: Tensor,
     fc: float,
     r_res: float,
-    grid: dict,
+    grid: "PolarGrid | dict",
     wa: Tensor,
     tx_norm: Tensor = None,
     max_steps: float = 100,
@@ -947,7 +942,7 @@ def bp_cart_grad_minimum_entropy(
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
-    grid : dict
+    grid : PolarGrid or dict
         Grid definition. Correct definition depends on the radar image function.
     wa : Tensor
         Azimuth windowing function.

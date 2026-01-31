@@ -4,6 +4,7 @@ import pickle
 import matplotlib.pyplot as plt
 import torchbp
 from torchbp.util import entropy
+from torchbp.grid import PolarGrid, CartesianGrid
 import torch
 import sys
 from torchvision.transforms.functional import resize
@@ -13,7 +14,11 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         filename = sys.argv[1]
     with open(filename, "rb") as f:
-        sar_img, mission, grid, grid_polar, origin, origin_angle = pickle.load(f)
+        sar_img, mission, grid_dict, grid_polar_dict, origin, origin_angle = pickle.load(f)
+
+    # Convert dicts to Grid objects
+    grid = CartesianGrid.from_dict(grid_dict)
+    grid_polar = PolarGrid.from_dict(grid_polar_dict)
 
     dev = "cuda"
     sar_img = torch.from_numpy(sar_img).to(dtype=torch.complex64, device=dev)
@@ -26,8 +31,10 @@ if __name__ == "__main__":
     # Can be used for multilook processing, when the input polar format data
     # resolution is higher than can fit into the Cartesian grid
     multilook = 2
-    grid["nx"] = int(oversample * grid["nx"] * multilook)
-    grid["ny"] = int(oversample * grid["ny"] * multilook)
+    grid = grid.resize(
+        nx=int(oversample * grid.nx * multilook),
+        ny=int(oversample * grid.ny * multilook)
+    )
 
     plt.figure()
     origin = torch.from_numpy(origin).to(dtype=torch.float32, device=dev)
@@ -44,7 +51,7 @@ if __name__ == "__main__":
         fc,
         origin_angle
     )
-    extent = [grid["x"][0], grid["x"][1], grid["y"][0], grid["y"][1]]
+    extent = [grid.x0, grid.x1, grid.y0, grid.y1]
     img_db = torch.abs(sar_img_cart) + 1e-10
     out_shape = [img_db.shape[-2] // multilook, img_db.shape[-1] // multilook]
     img_db = resize(img_db, out_shape).squeeze()

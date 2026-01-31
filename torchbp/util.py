@@ -4,10 +4,14 @@ import torch.nn.functional as F
 from math import pi
 import numpy as np
 from scipy.signal import get_window
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .grid import PolarGrid, CartesianGrid
 
 
 def bp_polar_range_dealias(
-    img: Tensor, origin: Tensor, fc: float, grid_polar: dict, alias_fmod=0
+    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict", alias_fmod=0
 ) -> Tensor:
     """
     De-alias range-axis spectrum of polar SAR image processed with backprojection. [1]_
@@ -20,8 +24,8 @@ def bp_polar_range_dealias(
         Center of the platform position.
     fc : float
         RF center frequency.
-    grid_polar : dict
-        Polar grid definition
+    grid_polar : PolarGrid or dict
+        Polar grid definition. PolarGrid object or dictionary.
     alias_fmod : float
         Range modulation frequency applied to input.
 
@@ -61,7 +65,7 @@ def bp_polar_range_dealias(
 
 
 def bp_polar_range_alias(
-    img: Tensor, origin: Tensor, fc: float, grid_polar: dict, alias_fmod: float=0
+    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict", alias_fmod: float=0
 ) -> Tensor:
     """
     Inverse of bp_polar_range_dealias.
@@ -74,8 +78,8 @@ def bp_polar_range_alias(
         Center of the platform position.
     fc : float
         RF center frequency.
-    grid_polar : dict
-        Polar grid definition
+    grid_polar : PolarGrid or dict
+        Polar grid definition. PolarGrid object or dictionary.
 
     Returns
     -------
@@ -237,7 +241,7 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
 
 
 def subset_cart(
-    img: Tensor, grid_cart: dict, x0: float, x1: float, y0: float, y1: float
+    img: Tensor, grid_cart: "CartesianGrid | dict", x0: float, x1: float, y0: float, y1: float
 ) -> (Tensor, dict):
     """Cartesian image subset.
 
@@ -245,7 +249,7 @@ def subset_cart(
     ----------
     img : Tensor
         Input image.
-    grid_cart : dict
+    grid_cart : CartesianGrid or dict
         Cartesian grid dictionary.
     x0 : float
         Subset x0.
@@ -288,7 +292,7 @@ def subset_cart(
 
 
 def subset_polar(
-    img: Tensor, grid_polar: dict, r0: float, r1: float, theta0: float, theta1: float
+    img: Tensor, grid_polar: "PolarGrid | dict", r0: float, r1: float, theta0: float, theta1: float
 ) -> (Tensor, dict):
     """Polar image subset.
 
@@ -296,7 +300,7 @@ def subset_polar(
     ----------
     img : Tensor
         Input image.
-    grid_cart : dict
+    grid_cart : CartesianGrid or dict
         Cartesian grid dictionary.
     r0 : float
         Subset r0.
@@ -660,40 +664,6 @@ def generate_fmcw_data(
 
 def make_polar_grid(
     r0: float, r1: float, nr: int, ntheta: int, theta_limit: int = 1, squint: float = 0
-) -> dict:
-    """
-    Generate polar grid dict in format understood by other polar functions.
-
-    Parameters
-    ----------
-    r0 : float
-        Minimum range in m.
-    r1 : float
-        Maximum range in m.
-    nr : float
-        Number of range points.
-    ntheta : float
-        Number of azimuth points.
-    theta_limit : float
-        Theta axis limits, symmetrical around zero.
-        Units are sin of angle (0 to 1 valid range).
-        Default is 1.
-    squint : float
-        Grid azimuth mean angle, radians.
-
-    Returns
-    -------
-    grid_polar : dict
-        Polar grid dict.
-    """
-    t0 = float(np.clip(np.sin(squint) - theta_limit, -1, 1))
-    t1 = float(np.clip(np.sin(squint) + theta_limit, -1, 1))
-    grid_polar = {"r": (r0, r1), "theta": (t0, t1), "nr": nr, "ntheta": ntheta}
-    return grid_polar
-
-
-def make_polar_grid_obj(
-    r0: float, r1: float, nr: int, ntheta: int, theta_limit: int = 1, squint: float = 0
 ):
     """
     Generate PolarGrid object.
@@ -725,6 +695,10 @@ def make_polar_grid_obj(
     t0 = float(np.clip(np.sin(squint) - theta_limit, -1, 1))
     t1 = float(np.clip(np.sin(squint) + theta_limit, -1, 1))
     return PolarGrid(r_range=(r0, r1), theta_range=(t0, t1), nr=nr, ntheta=ntheta)
+
+
+# Alias for backward compatibility
+make_polar_grid_obj = make_polar_grid
 
 
 def phase_to_distance(p: Tensor, fc: float) -> Tensor:
@@ -863,7 +837,7 @@ def center_pos(pos: Tensor):
 
 
 def bounding_cart_grid(
-    grid_polar: dict,
+    grid_polar: "PolarGrid | dict",
     origin: tuple,
     origin_angle: float,
 ) -> dict:
@@ -872,7 +846,7 @@ def bounding_cart_grid(
 
     Parameters
     ----------
-    grid_polar : dict
+    grid_polar : PolarGrid or dict
         Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.

@@ -1,10 +1,15 @@
 from .util import process_image_with_patches
+from .grid import unpack_polar_grid, unpack_cartesian_grid
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from typing import TYPE_CHECKING
 from .ops import subpixel_correlation_op
 from scipy.optimize import minimize
 import numpy as np
+
+if TYPE_CHECKING:
+    from .grid import PolarGrid, CartesianGrid
 
 def _goldstein_patch(patches: Tensor, alpha: float, w: int=3):
     fpatch = torch.fft.fft2(patches)
@@ -114,7 +119,7 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
     return z
 
 
-def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: dict) -> Tensor:
+def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "PolarGrid | dict") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -128,8 +133,8 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
         3D antenna phase center location of the slave image.
     fc : float
         RF center frequency in Hz.
-    grid : dict
-        Image grid definition dictionary.
+    grid : PolarGrid or dict
+        Image grid definition. PolarGrid object or dictionary.
 
     Returns
     -------
@@ -138,12 +143,7 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
     """
     device = unw.device
 
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    ntheta = grid["ntheta"]
-    nr = grid["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
 
     r = r0 + dr * torch.arange(nr, device=device)
     theta = theta0 + dtheta * torch.arange(ntheta, device=device)
@@ -152,7 +152,7 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
     return phase_to_elevation(unw, coords, origin1, origin2, fc)
 
 
-def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: dict) -> Tensor:
+def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid) -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -166,8 +166,8 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
         3D antenna phase center location of the slave image.
     fc : float
         RF center frequency in Hz.
-    grid : dict
-        Image grid definition dictionary.
+    grid : CartesianGrid or dict
+        Image grid definition. CartesianGrid object or dictionary.
 
     Returns
     -------
@@ -176,12 +176,7 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
     """
     device = unw.device
 
-    x0, x1 = grid["x"]
-    y0, y1 = grid["y"]
-    nx = grid["nx"]
-    ny = grid["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
 
     x = x0 + dx * torch.arange(nx, device=device)
     y = y0 + dy * torch.arange(ny, device=device)

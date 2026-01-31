@@ -1,14 +1,18 @@
 import torch
 from torch import Tensor
+from typing import Union, TYPE_CHECKING
 from warnings import warn
 from .backproj import backprojection_polar_2d
 from .polar_interp import ffbp_merge2, ffbp_merge2_poly, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
 
+if TYPE_CHECKING:
+    from ..grid import PolarGrid
+
 def ffbp(
     data: Tensor,
-    grid: dict,
+    grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -31,8 +35,9 @@ def ffbp(
     ----------
     data : Tensor
         Range compressed input data. Shape should be [nsweeps, samples].
-    grid : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+    grid : PolarGrid or dict
+        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
+        If dict:
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
             - "nr": nr, number of range bins.
@@ -85,6 +90,10 @@ def ffbp(
     img : Tensor
         SAR image.
     """
+    # Convert Grid object to dict for backward compatibility
+    if hasattr(grid, 'to_dict'):
+        grid = grid.to_dict()
+
     nsweeps = data.shape[0]
     device = data.device
 

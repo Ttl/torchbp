@@ -5,7 +5,7 @@ with validation, type safety, and cached computations.
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Tuple, Union
 import numpy as np
 
 
@@ -348,3 +348,63 @@ class CartesianGrid(Grid):
             f"y=({self.y0:.1f}, {self.y1:.1f}), "
             f"nx={self.nx}, ny={self.ny})"
         )
+
+
+def unpack_polar_grid(grid: Union[PolarGrid, dict]) -> Tuple[float, float, float, float, int, int, float, float]:
+    """Unpack polar grid to (r0, r1, theta0, theta1, nr, ntheta, dr, dtheta).
+
+    Accepts both PolarGrid objects (new API) and dicts (legacy API).
+
+    Parameters
+    ----------
+    grid : PolarGrid or dict
+        Polar grid specification
+
+    Returns
+    -------
+    tuple
+        (r0, r1, theta0, theta1, nr, ntheta, dr, dtheta)
+    """
+    # Check if it's a PolarGrid object (duck typing to avoid circular import)
+    if hasattr(grid, 'r0') and hasattr(grid, 'dr'):
+        # New API: PolarGrid object
+        return (grid.r0, grid.r1, grid.theta0, grid.theta1,
+                grid.nr, grid.ntheta, grid.dr, grid.dtheta)
+    else:
+        # Legacy API: dict
+        r0, r1 = grid["r"]
+        theta0, theta1 = grid["theta"]
+        nr, ntheta = grid["nr"], grid["ntheta"]
+        dr = (r1 - r0) / nr
+        dtheta = (theta1 - theta0) / ntheta
+        return r0, r1, theta0, theta1, nr, ntheta, dr, dtheta
+
+
+def unpack_cartesian_grid(grid: Union[CartesianGrid, dict]) -> Tuple[float, float, float, float, int, int, float, float]:
+    """Unpack cartesian grid to (x0, x1, y0, y1, nx, ny, dx, dy).
+
+    Accepts both CartesianGrid objects (new API) and dicts (legacy API).
+
+    Parameters
+    ----------
+    grid : CartesianGrid or dict
+        Cartesian grid specification
+
+    Returns
+    -------
+    tuple
+        (x0, x1, y0, y1, nx, ny, dx, dy)
+    """
+    # Check if it's a CartesianGrid object (duck typing to avoid circular import)
+    if hasattr(grid, 'x0') and hasattr(grid, 'dx'):
+        # New API: CartesianGrid object
+        return (grid.x0, grid.x1, grid.y0, grid.y1,
+                grid.nx, grid.ny, grid.dx, grid.dy)
+    else:
+        # Legacy API: dict
+        x0, x1 = grid["x"]
+        y0, y1 = grid["y"]
+        nx, ny = grid["nx"], grid["ny"]
+        dx = (x1 - x0) / nx
+        dy = (y1 - y0) / ny
+        return x0, x1, y0, y1, nx, ny, dx, dy

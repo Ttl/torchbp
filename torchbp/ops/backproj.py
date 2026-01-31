@@ -1,13 +1,17 @@
 import torch
 from torch import Tensor
+from typing import Union, TYPE_CHECKING
 from ._utils import unpack_polar_grid, unpack_cartesian_grid, get_batch_dims, AntennaPattern
+
+if TYPE_CHECKING:
+    from ..grid import PolarGrid, CartesianGrid
 
 cart_2d_nargs = 16
 polar_2d_nargs = 26
 
 def _prepare_backprojection_polar_2d_args(
     data: Tensor,
-    grid: dict,
+    grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -42,7 +46,7 @@ def _prepare_backprojection_polar_2d_args(
 
 def _prepare_backprojection_polar_2d_lanczos_args(
     data: Tensor,
-    grid: dict,
+    grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -78,7 +82,7 @@ def _prepare_backprojection_polar_2d_lanczos_args(
 
 def _prepare_backprojection_polar_2d_knab_args(
     data: Tensor,
-    grid: dict,
+    grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -115,7 +119,7 @@ def _prepare_backprojection_polar_2d_knab_args(
 
 def backprojection_polar_2d(
     data: Tensor,
-    grid: dict,
+    grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -139,8 +143,9 @@ def backprojection_polar_2d(
         [nsweeps, samples]. If input is 3 dimensional the first dimensions is number
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
-    grid : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+    grid : PolarGrid or dict
+        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
+        If dict:
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
             - "nr": nr, number of range bins.
@@ -192,7 +197,7 @@ def backprojection_polar_2d(
 
 def backprojection_polar_2d_lanczos(
     data: Tensor,
-    grid: dict,
+    grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -218,8 +223,9 @@ def backprojection_polar_2d_lanczos(
         [nsweeps, samples]. If input is 3 dimensional the first dimensions is number
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
-    grid : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+    grid : PolarGrid or dict
+        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
+        If dict:
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
             - "nr": nr, number of range bins.
@@ -300,7 +306,7 @@ def backprojection_polar_2d_lanczos(
 
 def backprojection_polar_2d_knab(
     data: Tensor,
-    grid: dict,
+    grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -327,8 +333,9 @@ def backprojection_polar_2d_knab(
         [nsweeps, samples]. If input is 3 dimensional the first dimensions is number
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
-    grid : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+    grid : PolarGrid or dict
+        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
+        If dict:
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
             - "nr": nr, number of range bins.
@@ -413,7 +420,7 @@ def backprojection_polar_2d_knab(
 
 def _prepare_backprojection_cart_2d_args(
     data: Tensor,
-    grid: dict,
+    grid: "CartesianGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -435,7 +442,7 @@ def _prepare_backprojection_cart_2d_args(
 
 def backprojection_cart_2d(
     data: Tensor,
-    grid: dict,
+    grid: "CartesianGrid | dict",
     fc: float,
     r_res: float,
     pos: Tensor,
@@ -455,8 +462,8 @@ def backprojection_cart_2d(
         [nsweeps, samples]. If input is 3 dimensional the first dimensions is number
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
-    grid : dict
-        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
+    grid : CartesianGrid or dict
+        Grid definition. CartesianGrid object or dictionary with keys "x", "y", "nx", "ny".
             - "x": (x0, x1), tuple of min and max x-axis (range),
             - "y": (y0, y1), tuple of min and max y-axis (cross-range),
             - "nx": number of x-axis pixels.
@@ -490,7 +497,7 @@ def backprojection_cart_2d(
 def projection_cart_2d(
     img: Tensor,
     pos: Tensor,
-    grid: dict,
+    grid: "CartesianGrid | dict",
     fc: float,
     fs:float,
     gamma: float,
@@ -512,8 +519,8 @@ def projection_cart_2d(
     ----------
     img : Tensor
         SAR image in Cartesian coordinates. Shape [nx, ny] or [nbatch, nx, ny].
-    grid : dict
-        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
+    grid : CartesianGrid or dict
+        Grid definition. CartesianGrid object or dictionary with keys "x", "y", "nx", "ny".
             - "x": (x0, x1), tuple of min and max x-axis (range),
             - "y": (y0, y1), tuple of min and max y-axis (cross-range),
             - "nx": number of x-axis pixels.
@@ -560,12 +567,7 @@ def projection_cart_2d(
         FMCW radar data at each position. Shape [nbatch, nsweeps, nsamples].
     """
 
-    x0, x1 = grid["x"]
-    y0, y1 = grid["y"]
-    nx = grid["nx"]
-    ny = grid["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
 
     if img.dim() == 2:
         nbatch = 1
@@ -728,7 +730,7 @@ def backprojection_polar_2d_tx_power(
     wa: Tensor,
     g: Tensor,
     g_extent: list,
-    grid: dict,
+    grid: "PolarGrid | dict",
     r_res: float,
     pos: Tensor,
     att: Tensor,
@@ -760,8 +762,9 @@ def backprojection_polar_2d_tx_power(
     g_el1 : float
         grx and gtx elevation axis end value. Units in radians. +pi/2 if
         including data over the whole sphere.
-    grid : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
+    grid : PolarGrid or dict
+        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
+        If dict:
             - "r": (r0, r1), tuple of min and max range,
             - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
             - "nr": nr, number of range bins.
@@ -789,12 +792,7 @@ def backprojection_polar_2d_tx_power(
         pixel assuming constant reflectivity.
     """
 
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    nr = grid["nr"]
-    ntheta = grid["ntheta"]
-    dr = (r1 - r0) / nr
-    dtheta = (theta1 - theta0) / ntheta
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
 
     if wa.dim() == 1:
         nbatch = 1

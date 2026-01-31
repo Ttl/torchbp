@@ -9,6 +9,7 @@ import pickle
 import torch
 import torchbp
 from torchbp.util import make_polar_grid
+from torchbp.grid import CartesianGrid
 from safetensors.torch import safe_open
 
 plt.style.use("ggplot")
@@ -114,7 +115,7 @@ if __name__ == "__main__":
     try:
         mission, tensors = load_data(filename)
     except FileNotFoundError:
-        print("Input file {filename} not found.")
+        print(f"Input file {filename} not found.")
 
     sweeps = tensors["data"][sweep_start:sweep_start+nsweeps].to(dtype=torch.float32)
     pos = tensors["pos"][sweep_start:sweep_start+nsweeps].cpu().numpy()
@@ -136,7 +137,7 @@ if __name__ == "__main__":
     x, y = grid_extent(pos, att, x0, x1, bw=antenna_bw, origin_angle=origin_angle)
     nx = int((x[1] - x[0]) / res)
     ny = int((y[1] - y[0]) / res)
-    grid = {"x": x, "y": y, "nx": nx, "ny": ny}
+    grid = CartesianGrid(x_range=x, y_range=y, nx=nx, ny=ny)
     print("mission", mission)
     print("grid_cart", grid)
 
@@ -293,12 +294,7 @@ if __name__ == "__main__":
     sar_img = sar_img.cpu().numpy()
 
     plt.figure()
-    extent = [
-        grid_polar["r"][0],
-        grid_polar["r"][1],
-        grid_polar["theta"][0],
-        grid_polar["theta"][1],
-    ]
+    extent = [grid_polar.r0, grid_polar.r1, grid_polar.theta0, grid_polar.theta1]
     abs_img = np.abs(sar_img)
     m = 20 * np.log10(np.median(abs_img)) - 13
     plt.imshow(
@@ -313,6 +309,8 @@ if __name__ == "__main__":
     # Export image as pickle file
     with open("sar_img.p", "wb") as f:
         origin = origin.cpu().numpy().squeeze()
-        pickle.dump((sar_img, mission, grid, grid_polar, origin, origin_angle), f)
+        pickle.dump(
+            (sar_img, mission, grid.to_dict(), grid_polar.to_dict(), origin, origin_angle), f
+        )
 
     plt.show(block=True)
