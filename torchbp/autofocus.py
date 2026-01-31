@@ -493,7 +493,7 @@ def gpga_bp_polar_tde(
 
     for i in range(max_iters):
         lp_w = fft_lowpass_filter_precalculate_window(
-            pos_new.shape[0], window_width, img.device, lowpass_window
+            pos_new.shape[0], window_width, img.device, lowpass_window, fast_len=True
         )
         for ir in range(range_divisions):
             for jr in range(azimuth_divisions):

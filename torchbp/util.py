@@ -741,48 +741,53 @@ def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     c0 = 299792458
     return c0 * p / (4 * torch.pi * fc)
 
+def next_fast_len(n):
+    """CuFFT-friendly length (powers of 2,3,5,7)"""
+    def is_fast(k):
+        for p in (2,3,5,7):
+            while k % p == 0:
+                k //= p
+        return k == 1
+
+    while not is_fast(n):
+        n += 1
+    return n
+
+
 def fft_lowpass_filter_precalculate_window(
         data_length: int,
         window_width: int,
         device: str,
         window: str | tuple,
-        circular_conv: bool = False) -> Tensor:
+        circular_conv: bool = False,
+        fast_len: bool = True) -> Tensor:
     """
     Precompute window to be used with `fft_lowpass_filter_window`.
-
-    Parameters
-    ----------
-    data_length : int
-        Data size.
-    window_width : int
-        Width of the window in samples. If None or larger than signal, returns
-        the input unchanged.
-    device : str
-        Pytorch device for output tensor.
-    window_type : str
-        Window to apply. See scipy.get_window for syntax.
-        e.g., 'hann', 'hamming', 'blackman'.
-    circular_conv : bool
-        Circular convolution if True, otherwise zero pad.
 
     Returns
     -------
     w : Tensor
         Windowing Tensor.
+    pad_size : int
+        Amount of padding added to signal (needed for extraction).
     """
     half_width = (window_width + 1) // 2
 
-    if not circular_conv:
-        data_length += 2*half_width
+    # Original padding for linear convolution
+    pad_size = 2 * half_width if not circular_conv else 0
 
-    # Window needs to be centered at DC in FFT
-    half_window = get_window(window, 2 * half_width - 1, fftbins=True)[half_width - 1 :]
-    w = np.zeros(data_length, dtype=np.float32)
+    # FFT length
+    fft_len = data_length + pad_size
+    if fast_len:
+        fft_len = next_fast_len(fft_len)
+
+    # Window centered at DC (symmetric for zero-phase)
+    half_window = get_window(window, 2 * half_width - 1, fftbins=True)[half_width - 1:]
+    w = np.zeros(fft_len, dtype=np.float32)
     w[:half_width] = half_window
-    w[-half_width + 1 :] = np.flip(half_window[1:])
-    w = torch.tensor(w).to(device)
+    w[-half_width + 1:] = np.flip(half_window[1:])
 
-    return w
+    return torch.tensor(w, device=device)
 
 
 def fft_lowpass_filter_window(
@@ -790,55 +795,41 @@ def fft_lowpass_filter_window(
     window: str | tuple | Tensor = "hamming",
     window_width: int = None,
     circular_conv: bool = False,
+    fast_len: bool = True,
 ) -> Tensor:
     """
     FFT low-pass filtering with a configurable window function.
-
-    Parameters
-    ----------
-    target_data : Tensor
-        Input data.
-    window_type : str
-        Window to apply. See scipy.get_window for syntax.
-        e.g., 'hann', 'hamming', 'blackman'.
-    window_width : int
-        Width of the window in samples. If None or larger than signal, returns
-        the input unchanged.
-    circular_conv : bool
-        Circular convolution if True, otherwise zero pad.
-
-    Returns
-    -------
-    filtered_data : Tensor
-        Filtered tensor (same shape as input)
     """
-
-    # If window_width is None, do nothing
     if window_width is None or window_width > target_data.shape[-1]:
         return target_data
 
     half_width = (window_width + 1) // 2
+    N = target_data.shape[-1]
 
-    if not circular_conv:
-        target_data = F.pad(target_data, (0, 2*half_width))
-
-    fdata = torch.fft.fft(target_data, dim=-1)
-
-    if type(window) == Tensor:
-        w = window
-        if w.shape != torch.Size([target_data.shape[-1]]):
-            raise ValueError(f"Invalid shape for window tensor {w.shape}, expected [{target_data.shape[-1]}]")
+    # Determine padding and FFT length
+    if isinstance(window, Tensor):
+        fft_len = window.numel()
+        pad_size = 2 * half_width if not circular_conv else 0
     else:
-        w = fft_lowpass_filter_precalculate_window(
-            target_data.shape[-1],
-            window_width,
-            target_data.device,
-            window,
-            circular_conv)
+        pad_size = 2 * half_width if not circular_conv else 0
+        fft_len = N + pad_size
+        if fast_len:
+            fft_len = next_fast_len(fft_len)
+
+    fdata = torch.fft.fft(target_data, dim=-1, n=fft_len)
+
+    if isinstance(window, Tensor):
+        w = window
+    else:
+        w, pad_size = fft_lowpass_filter_precalculate_window(
+            N, window_width, target_data.device, window,
+            circular_conv=circular_conv, fast_len=fast_len
+        )
 
     filtered_data = torch.fft.ifft(fdata * w, dim=-1)
-    if not circular_conv:
-        filtered_data = filtered_data[..., :-2*half_width]
+
+    # Trim to original length
+    filtered_data = filtered_data[..., :N]
 
     return filtered_data
 
