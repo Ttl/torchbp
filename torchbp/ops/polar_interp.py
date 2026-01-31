@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 import numpy as np
+from ._utils import unpack_polar_grid, unpack_cartesian_grid, get_batch_dims_img
 
 polar_interp_linear_args = 19
 polar_to_cart_linear_args = 18
@@ -179,34 +180,18 @@ def _prepare_polar_interp_linear_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by polar_interp_linear and for testing.
     """
-    if img.dim() == 3:
-        nbatch = img.shape[0]
-        assert dorigin.shape == (nbatch, 3)
-    else:
-        nbatch = 1
-        assert dorigin.shape == (3,)
-
-    r1_0, r1_1 = grid_polar["r"]
-    theta1_0, theta1_1 = grid_polar["theta"]
-    ntheta1 = grid_polar["ntheta"]
-    nr1 = grid_polar["nr"]
-    dtheta1 = (theta1_1 - theta1_0) / ntheta1
-    dr1 = (r1_1 - r1_0) / nr1
+    nbatch = get_batch_dims_img(img, dorigin)
+    r1_0, r1_1, theta1_0, theta1_1, nr1, ntheta1, dr1, dtheta1 = unpack_polar_grid(grid_polar)
 
     if grid_polar_new is None:
-        r3_0 = r1_0
-        r3_1 = r1_1
-        theta3_0 = theta1_0
-        theta3_1 = theta1_1
+        r3_0, r3_1 = r1_0, r1_1
+        theta3_0, theta3_1 = theta1_0, theta1_1
         nr3 = nr1
         ntheta3 = 2 * ntheta1
+        dr3 = dr1
+        dtheta3 = dtheta1 / 2
     else:
-        r3_0, r3_1 = grid_polar_new["r"]
-        theta3_0, theta3_1 = grid_polar_new["theta"]
-        ntheta3 = grid_polar_new["ntheta"]
-        nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
+        r3_0, r3_1, theta3_0, theta3_1, nr3, ntheta3, dr3, dtheta3 = unpack_polar_grid(grid_polar_new)
 
     return (img, dorigin, nbatch, rotation, fc, r1_0, dr1, theta1_0, dtheta1,
             nr1, ntheta1, r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3, z0, alias_fmod)
@@ -1007,26 +992,9 @@ def _prepare_polar_to_cart_linear_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by polar_to_cart_linear and for testing.
     """
-    if img.dim() == 3:
-        nbatch = img.shape[0]
-        assert origin.shape == (nbatch, 3)
-    else:
-        nbatch = 1
-        assert origin.shape == (3,)
-
-    r0, r1 = grid_polar["r"]
-    theta0, theta1 = grid_polar["theta"]
-    ntheta = grid_polar["ntheta"]
-    nr = grid_polar["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
-
-    x0, x1 = grid_cart["x"]
-    y0, y1 = grid_cart["y"]
-    nx = grid_cart["nx"]
-    ny = grid_cart["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
+    nbatch = get_batch_dims_img(img, origin)
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid_cart)
 
     return (img, origin, nbatch, rotation, fc, r0, dr, theta0, dtheta,
             nr, ntheta, x0, y0, dx, dy, nx, ny, alias_fmod)

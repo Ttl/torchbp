@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from ._utils import unpack_polar_grid, unpack_cartesian_grid, get_batch_dims, AntennaPattern
 
 cart_2d_nargs = 16
 polar_2d_nargs = 26
@@ -23,39 +24,9 @@ def _prepare_backprojection_polar_2d_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by backprojection_polar_2d and for testing.
     """
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    nr = grid["nr"]
-    ntheta = grid["ntheta"]
-    dr = (r1 - r0) / nr
-    dtheta = (theta1 - theta0) / ntheta
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
-
-    if att is None or g is None:
-        att = None
-        g = None
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
+    antenna = AntennaPattern(g, g_extent)
 
     z0 = 0
     if dealias:
@@ -65,7 +36,7 @@ def _prepare_backprojection_polar_2d_args(
 
     return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
             r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0,
-            g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            *antenna.to_cpp_args(),
             data_fmod, alias_fmod)
 
 
@@ -89,39 +60,9 @@ def _prepare_backprojection_polar_2d_lanczos_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by backprojection_polar_2d_lanczos and for testing.
     """
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    nr = grid["nr"]
-    ntheta = grid["ntheta"]
-    dr = (r1 - r0) / nr
-    dtheta = (theta1 - theta0) / ntheta
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
-
-    if att is None or g is None:
-        att = None
-        g = None
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
+    antenna = AntennaPattern(g, g_extent)
 
     z0 = 0
     if dealias:
@@ -131,7 +72,7 @@ def _prepare_backprojection_polar_2d_lanczos_args(
 
     return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
             r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0, order,
-            g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            *antenna.to_cpp_args(),
             data_fmod, alias_fmod)
 
 
@@ -156,39 +97,9 @@ def _prepare_backprojection_polar_2d_knab_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by backprojection_polar_2d_knab and for testing.
     """
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    nr = grid["nr"]
-    ntheta = grid["ntheta"]
-    dr = (r1 - r0) / nr
-    dtheta = (theta1 - theta0) / ntheta
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
-
-    if att is None or g is None:
-        att = None
-        g = None
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
+    antenna = AntennaPattern(g, g_extent)
 
     z0 = 0
     if dealias:
@@ -198,7 +109,7 @@ def _prepare_backprojection_polar_2d_knab_args(
 
     return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
             r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0, order, oversample,
-            g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            *antenna.to_cpp_args(),
             data_fmod, alias_fmod)
 
 
@@ -354,39 +265,9 @@ def backprojection_polar_2d_lanczos(
         Pseudo-polar format radar image.
     """
 
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    nr = grid["nr"]
-    ntheta = grid["ntheta"]
-    dr = (r1 - r0) / nr
-    dtheta = (theta1 - theta0) / ntheta
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
-
-    if att is None or g is None:
-        att = None
-        g = None
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
+    antenna = AntennaPattern(g, g_extent)
 
     z0 = 0
     if dealias:
@@ -411,13 +292,7 @@ def backprojection_polar_2d_lanczos(
         dealias,
         z0,
         order,
-        g,
-        g_az0,
-        g_el0,
-        g_daz,
-        g_del,
-        g_naz,
-        g_nel,
+        *antenna.to_cpp_args(),
         data_fmod,
         alias_fmod
     )
@@ -502,39 +377,9 @@ def backprojection_polar_2d_knab(
         Pseudo-polar format radar image.
     """
 
-    r0, r1 = grid["r"]
-    theta0, theta1 = grid["theta"]
-    nr = grid["nr"]
-    ntheta = grid["ntheta"]
-    dr = (r1 - r0) / nr
-    dtheta = (theta1 - theta0) / ntheta
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
-
-    if att is None or g is None:
-        att = None
-        g = None
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
+    antenna = AntennaPattern(g, g_extent)
 
     z0 = 0
     if dealias:
@@ -560,13 +405,7 @@ def backprojection_polar_2d_knab(
         z0,
         order,
         oversample,
-        g,
-        g_az0,
-        g_el0,
-        g_daz,
-        g_del,
-        g_naz,
-        g_nel,
+        *antenna.to_cpp_args(),
         data_fmod,
         alias_fmod
     )
@@ -587,23 +426,8 @@ def _prepare_backprojection_cart_2d_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by backprojection_cart_2d and for testing.
     """
-    x0, x1 = grid["x"]
-    y0, y1 = grid["y"]
-    nx = grid["nx"]
-    ny = grid["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
-
-    if data.dim() == 2:
-        nbatch = 1
-        nsweeps = data.shape[0]
-        sweep_samples = data.shape[1]
-        assert pos.shape == (nsweeps, 3)
-    else:
-        nbatch = data.shape[0]
-        nsweeps = data.shape[1]
-        sweep_samples = data.shape[2]
-        assert pos.shape == (nbatch, nsweeps, 3)
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
 
     return (data, pos, nbatch, sweep_samples, nsweeps, fc, r_res,
             x0, dx, y0, dy, nx, ny, beamwidth, d0, data_fmod)

@@ -44,9 +44,9 @@ if __name__ == "__main__":
     data_dtype = torch.complex64  # Can be `torch.complex32` to save VRAM
     # Use fast factorized backprojection, slightly reduces the image quality
     # but is faster.
-    ffbp = False
+    ffbp = True
     # Autofocus image to improve image quality.
-    autofocus = False
+    autofocus = True
 
     c0 = 299792458
 
@@ -170,11 +170,19 @@ if __name__ == "__main__":
         print("Calculating autofocus. This might take a while.")
         torch.cuda.synchronize()
         tstart = time.time()
-        sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
-                pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
-                azimuth_divisions=8, range_divisions=8,
-                use_ffbp=ffbp, data_fmod=data_fmod, verbose=True)
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as p:
+            sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(None, fsweeps,
+                    pos_centered, fc, r_res, grid_polar_autofocus, d0=d0,
+                    azimuth_divisions=8, range_divisions=8,
+                    use_ffbp=ffbp, data_fmod=data_fmod, verbose=True)
         torch.cuda.synchronize()
+        print(p.key_averages().table(
+            sort_by="self_cuda_time_total", row_limit=-1))
         print(f"Autofocus done in {time.time() - tstart:.3g} s")
 
         plt.figure()

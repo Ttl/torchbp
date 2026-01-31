@@ -692,6 +692,41 @@ def make_polar_grid(
     return grid_polar
 
 
+def make_polar_grid_obj(
+    r0: float, r1: float, nr: int, ntheta: int, theta_limit: int = 1, squint: float = 0
+):
+    """
+    Generate PolarGrid object.
+
+    Parameters
+    ----------
+    r0 : float
+        Minimum range in m.
+    r1 : float
+        Maximum range in m.
+    nr : float
+        Number of range points.
+    ntheta : float
+        Number of azimuth points.
+    theta_limit : float
+        Theta axis limits, symmetrical around zero.
+        Units are sin of angle (0 to 1 valid range).
+        Default is 1.
+    squint : float
+        Grid azimuth mean angle, radians.
+
+    Returns
+    -------
+    grid_polar : PolarGrid
+        Polar grid object.
+    """
+    from .grid import PolarGrid
+
+    t0 = float(np.clip(np.sin(squint) - theta_limit, -1, 1))
+    t1 = float(np.clip(np.sin(squint) + theta_limit, -1, 1))
+    return PolarGrid(r_range=(r0, r1), theta_range=(t0, t1), nr=nr, ntheta=ntheta)
+
+
 def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     """
     Convert radar reflection phase shift to distance.
