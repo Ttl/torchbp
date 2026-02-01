@@ -1,9 +1,3 @@
-"""Grid classes for SAR image formation.
-
-This module provides typed grid classes to replace dictionary-based grid definitions
-with validation, type safety, and cached computations.
-"""
-
 from abc import ABC, abstractmethod
 from typing import Tuple, Union
 import numpy as np
@@ -24,7 +18,7 @@ class Grid(ABC):
 
     @abstractmethod
     def to_dict(self) -> dict:
-        """Convert to legacy dict format for backward compatibility."""
+        """Convert to dict format for backward compatibility."""
         pass
 
 
@@ -125,7 +119,7 @@ class PolarGrid(Grid):
         return (self.dr, self.dtheta)
 
     def to_dict(self) -> dict:
-        """Convert to legacy dict format.
+        """Convert to dict format.
 
         Returns
         -------
@@ -141,7 +135,7 @@ class PolarGrid(Grid):
 
     @classmethod
     def from_dict(cls, d: dict) -> 'PolarGrid':
-        """Create PolarGrid from legacy dict format.
+        """Create PolarGrid from dict format.
 
         Parameters
         ----------
@@ -290,7 +284,7 @@ class CartesianGrid(Grid):
         return (self.dx, self.dy)
 
     def to_dict(self) -> dict:
-        """Convert to legacy dict format.
+        """Convert to dict format.
 
         Returns
         -------
@@ -306,7 +300,7 @@ class CartesianGrid(Grid):
 
     @classmethod
     def from_dict(cls, d: dict) -> 'CartesianGrid':
-        """Create CartesianGrid from legacy dict format.
+        """Create CartesianGrid from dict format.
 
         Parameters
         ----------
@@ -353,7 +347,7 @@ class CartesianGrid(Grid):
 def unpack_polar_grid(grid: Union[PolarGrid, dict]) -> Tuple[float, float, float, float, int, int, float, float]:
     """Unpack polar grid to (r0, r1, theta0, theta1, nr, ntheta, dr, dtheta).
 
-    Accepts both PolarGrid objects (new API) and dicts (legacy API).
+    Accepts both PolarGrid objects and dicts.
 
     Parameters
     ----------
@@ -383,7 +377,7 @@ def unpack_polar_grid(grid: Union[PolarGrid, dict]) -> Tuple[float, float, float
 def unpack_cartesian_grid(grid: Union[CartesianGrid, dict]) -> Tuple[float, float, float, float, int, int, float, float]:
     """Unpack cartesian grid to (x0, x1, y0, y1, nx, ny, dx, dy).
 
-    Accepts both CartesianGrid objects (new API) and dicts (legacy API).
+    Accepts both CartesianGrid objects and dicts.
 
     Parameters
     ----------

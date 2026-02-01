@@ -1,6 +1,14 @@
 torchbp package
 ===============
 
+Subpackages
+-----------
+
+.. toctree::
+   :maxdepth: 4
+
+   torchbp.ops
+
 Submodules
 ----------
 
@@ -12,18 +20,18 @@ torchbp.autofocus module
    :undoc-members:
    :show-inheritance:
 
-torchbp.interferometry module
------------------------------
+torchbp.grid module
+-------------------
 
-.. automodule:: torchbp.interferometry
+.. automodule:: torchbp.grid
    :members:
    :undoc-members:
    :show-inheritance:
 
-torchbp.ops module
-------------------
+torchbp.interferometry module
+-----------------------------
 
-.. automodule:: torchbp.ops
+.. automodule:: torchbp.interferometry
    :members:
    :undoc-members:
    :show-inheritance:

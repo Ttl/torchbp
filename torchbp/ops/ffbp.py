@@ -36,12 +36,12 @@ def ffbp(
     data : Tensor
         Range compressed input data. Shape should be [nsweeps, samples].
     grid : PolarGrid or dict
-        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
-        If dict:
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object (recommended): ``PolarGrid(r_range=(50, 100), theta_range=(-1, 1), nr=200, ntheta=400)``
+        - dict (legacy): ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
         RF center frequency in Hz.
     r_res : float

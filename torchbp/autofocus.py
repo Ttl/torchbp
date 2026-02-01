@@ -223,11 +223,12 @@ def gpga_bp_polar(
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
     grid_polar : PolarGrid or dict
-        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta". If dict:
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)
+        - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
+
+        where theta is sin of angle (-1, 1 for 180 degree view).
     window_width : int or None
         Initial low-pass filter window width in samples. None for initial
         maximum size.
@@ -380,11 +381,12 @@ def gpga_bp_polar_tde(
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
     grid_polar : PolarGrid or dict
-        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta". If dict:
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)
+        - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
+
+        where theta is sin of angle (-1, 1 for 180 degree view).
     azimuth_divisions : int
         Number of divisions for local images in azimuth direction.
     range_divisions : int

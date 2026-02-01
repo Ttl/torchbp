@@ -1,5 +1,9 @@
 import torch
 from torch import Tensor
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..grid import PolarGrid
 
 
 def cfar_2d(
@@ -165,7 +169,35 @@ def mul_2d_interp_linear(
     )
 
 
-def multilook_polar(sar_img: Tensor, kernel: tuple, grid_polar: dict) -> (Tensor, dict):
+def multilook_polar(sar_img: Tensor, kernel: tuple, grid_polar: "PolarGrid | dict") -> tuple[Tensor, dict]:
+    """
+    Apply multilook (spatial averaging) to polar SAR image.
+
+    Parameters
+    ----------
+    sar_img : Tensor
+        SAR image in polar coordinates.
+    kernel : tuple
+        Kernel size (nr, ntheta) for averaging.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object (recommended): ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict (legacy): ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
+
+    Returns
+    -------
+    sar_img_ml : Tensor
+        Multilooked SAR image.
+    grid_out : dict
+        Updated grid definition reflecting reduced resolution.
+    """
+    # Convert Grid object to dict for manipulation
+    if hasattr(grid_polar, 'to_dict'):
+        grid_polar = grid_polar.to_dict()
+
     sar_img = torch.nn.functional.avg_pool2d(
         sar_img.real, kernel, stride=None
     ) + 1j * torch.nn.functional.avg_pool2d(sar_img.imag, kernel, stride=None)
@@ -178,7 +210,7 @@ def multilook_polar(sar_img: Tensor, kernel: tuple, grid_polar: dict) -> (Tensor
     return sar_img, grid_out
 
 
-def subpixel_correlation_op(im_m: Tensor, im_s: Tensor) -> (Tensor, Tensor, Tensor):
+def subpixel_correlation_op(im_m: Tensor, im_s: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     if im_m.dim() == 3:
         nbatch = im_m.shape[0]
         Nx = im_m.shape[1]

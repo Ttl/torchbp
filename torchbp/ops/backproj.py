@@ -144,12 +144,12 @@ def backprojection_polar_2d(
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
     grid : PolarGrid or dict
-        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
-        If dict:
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(50, 100), theta_range=(-1, 1), nr=200, ntheta=400)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -224,12 +224,12 @@ def backprojection_polar_2d_lanczos(
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
     grid : PolarGrid or dict
-        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
-        If dict:
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(50, 100), theta_range=(-1, 1), nr=200, ntheta=400)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -334,12 +334,12 @@ def backprojection_polar_2d_knab(
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
     grid : PolarGrid or dict
-        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
-        If dict:
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(50, 100), theta_range=(-1, 1), nr=200, ntheta=400)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -463,11 +463,10 @@ def backprojection_cart_2d(
         of independent images to form at the same time. Whole batch is processed
         with same grid and other arguments.
     grid : CartesianGrid or dict
-        Grid definition. CartesianGrid object or dictionary with keys "x", "y", "nx", "ny".
-            - "x": (x0, x1), tuple of min and max x-axis (range),
-            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
-            - "nx": number of x-axis pixels.
-            - "ny": number of y-axis pixels.
+        Cartesian grid definition. Can be:
+
+        - CartesianGrid object: ``CartesianGrid(x_range=(-50, 50), y_range=(-50, 50), nx=200, ny=200)``
+        - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -520,11 +519,10 @@ def projection_cart_2d(
     img : Tensor
         SAR image in Cartesian coordinates. Shape [nx, ny] or [nbatch, nx, ny].
     grid : CartesianGrid or dict
-        Grid definition. CartesianGrid object or dictionary with keys "x", "y", "nx", "ny".
-            - "x": (x0, x1), tuple of min and max x-axis (range),
-            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
-            - "nx": number of x-axis pixels.
-            - "ny": number of y-axis pixels.
+        Cartesian grid definition. Can be:
+
+        - CartesianGrid object: ``CartesianGrid(x_range=(-50, 50), y_range=(-50, 50), nx=200, ny=200)``
+        - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
         RF center frequency in Hz.
     fs : float
@@ -763,12 +761,12 @@ def backprojection_polar_2d_tx_power(
         grx and gtx elevation axis end value. Units in radians. +pi/2 if
         including data over the whole sphere.
     grid : PolarGrid or dict
-        Grid definition. PolarGrid object or dictionary with keys "r", "theta", "nr", "ntheta".
-        If dict:
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(50, 100), theta_range=(-1, 1), nr=200, ntheta=400)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,

@@ -25,7 +25,10 @@ def bp_polar_range_dealias(
     fc : float
         RF center frequency.
     grid_polar : PolarGrid or dict
-        Polar grid definition. PolarGrid object or dictionary.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)
+        - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
     alias_fmod : float
         Range modulation frequency applied to input.
 
@@ -79,7 +82,12 @@ def bp_polar_range_alias(
     fc : float
         RF center frequency.
     grid_polar : PolarGrid or dict
-        Polar grid definition. PolarGrid object or dictionary.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)
+        - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
+    alias_fmod : float
+        Range modulation frequency applied to output.
 
     Returns
     -------
@@ -242,7 +250,7 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
 
 def subset_cart(
     img: Tensor, grid_cart: "CartesianGrid | dict", x0: float, x1: float, y0: float, y1: float
-) -> (Tensor, dict):
+) -> tuple[Tensor, dict]:
     """Cartesian image subset.
 
     Parameters
@@ -250,7 +258,10 @@ def subset_cart(
     img : Tensor
         Input image.
     grid_cart : CartesianGrid or dict
-        Cartesian grid dictionary.
+        Cartesian grid definition. Can be:
+
+        - CartesianGrid object: CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny)
+        - dict: {"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}
     x0 : float
         Subset x0.
     x1 : float
@@ -845,11 +856,12 @@ def bounding_cart_grid(
     Parameters
     ----------
     grid_polar : PolarGrid or dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+        Polar grid definition. Can be:
+
+        - PolarGrid object: PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)
+        - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
+
+        where theta is sin of angle (-1, 1 for 180 degree view).
     origin : tuple
         Origin coordinates of grid_polar in the Cartesian grid.
     origin_angle : float

@@ -1,7 +1,11 @@
 import torch
 from torch import Tensor
 import numpy as np
+from typing import TYPE_CHECKING
 from ._utils import unpack_polar_grid, unpack_cartesian_grid, get_batch_dims_img
+
+if TYPE_CHECKING:
+    from ..grid import PolarGrid, CartesianGrid
 
 polar_interp_linear_args = 19
 polar_to_cart_linear_args = 18
@@ -83,10 +87,10 @@ def polar_interp(
     img: Tensor,
     origin_old: Tensor,
     origin_new: Tensor,
-    grid_polar: dict,
+    grid_polar: "PolarGrid | dict",
     fc: float,
     rotation: float = 0,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     method: str | tuple = "linear",
     alias_fmod : float = 0
 ) -> Tensor:
@@ -105,12 +109,13 @@ def polar_interp(
         Origin of the img. Units in meters. [nbatch, 3] if img shape is 3D.
     origin_new: Tensor
         Origin after interpolation.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -168,10 +173,10 @@ def polar_interp(
 def _prepare_polar_interp_linear_args(
     img: Tensor,
     dorigin: Tensor,
-    grid_polar: dict,
+    grid_polar: "PolarGrid | dict",
     fc: float,
     rotation: float = 0,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     z0: float = 0,
     alias_fmod: float = 0,
 ) -> tuple:
@@ -200,10 +205,10 @@ def _prepare_polar_interp_linear_args(
 def polar_interp_linear(
     img: Tensor,
     dorigin: Tensor,
-    grid_polar: dict,
+    grid_polar: "PolarGrid | dict",
     fc: float,
     rotation: float = 0,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     z0: float = 0,
     alias_fmod: float = 0,
 ) -> Tensor:
@@ -220,12 +225,13 @@ def polar_interp_linear(
     dorigin : Tensor
         Difference between the origin of the old image to the new image. Units in meters
         [nbatch, 3] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -252,10 +258,10 @@ def polar_interp_linear(
 def polar_interp_lanczos(
     img: Tensor,
     dorigin: Tensor,
-    grid_polar: dict,
+    grid_polar: "PolarGrid | dict",
     fc: float,
     rotation: float = 0,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     z0: float = 0,
     order: int = 6,
     alias_fmod : float = 0
@@ -273,12 +279,13 @@ def polar_interp_lanczos(
     dorigin : Tensor
         Difference between the origin of the old image to the new image. Units in meters
         [nbatch, 3] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -357,9 +364,9 @@ def ffbp_merge2_lanczos(
     img1: Tensor,
     dorigin0: Tensor,
     dorigin1: Tensor,
-    grid_polars: list,
+    grid_polars: list["PolarGrid | dict"],
     fc: float,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     z0: float = 0,
     order: int = 6,
     alias: bool = False,
@@ -385,12 +392,13 @@ def ffbp_merge2_lanczos(
         Shape: [3].
     dorigin1 : Tensor
         Same format as dorigin0.
-    grid_polar : list of dict
-        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+    grid_polar : list of PolarGrid or dict
+        List of polar grid definitions for each input image. Each element can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
         RF center frequency in Hz.
     grid_polar_new : dict, optional
@@ -493,9 +501,9 @@ def ffbp_merge2_knab(
     img1: Tensor,
     dorigin0: Tensor,
     dorigin1: Tensor,
-    grid_polars: list,
+    grid_polars: list["PolarGrid | dict"],
     fc: float,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     z0: float = 0,
     order: int = 6,
     oversample: float = 1.5,
@@ -522,12 +530,13 @@ def ffbp_merge2_knab(
         Shape: [3].
     dorigin1 : Tensor
         Same format as dorigin0.
-    grid_polar : list of dict
-        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+    grid_polar : list of PolarGrid or dict
+        List of polar grid definitions for each input image. Each element can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
         RF center frequency in Hz.
     grid_polar_new : dict, optional
@@ -639,9 +648,9 @@ def ffbp_merge2_poly(
     img1: Tensor,
     dorigin0: Tensor,
     dorigin1: Tensor,
-    grid_polars: list,
+    grid_polars: list["PolarGrid | dict"],
     fc: float,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     z0: float = 0,
     order: int = 6,
     oversample: float = 1.5,
@@ -673,12 +682,13 @@ def ffbp_merge2_poly(
         Shape: [3].
     dorigin1 : Tensor
         Same format as dorigin0.
-    grid_polar : list of dict
-        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+    grid_polar : list of PolarGrid or dict
+        List of polar grid definitions for each input image. Each element can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
         RF center frequency in Hz.
     grid_polar_new : dict, optional
@@ -812,9 +822,9 @@ def ffbp_merge2(
     img1: Tensor,
     dorigin0: Tensor,
     dorigin1: Tensor,
-    grid_polars: list,
+    grid_polars: list["PolarGrid | dict"],
     fc: float,
-    grid_polar_new: dict = None,
+    grid_polar_new: "PolarGrid | dict" = None,
     z0: float = 0,
     method : tuple = ('knab', 6, 1.5),
     alias: bool = False,
@@ -842,12 +852,13 @@ def ffbp_merge2(
         Shape: [3].
     dorigin1 : Tensor
         Same format as dorigin0.
-    grid_polar : list of dict
-        List of grid definitions for each input image. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
+    grid_polar : list of PolarGrid or dict
+        List of polar grid definitions for each input image. Each element can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
         RF center frequency in Hz.
     grid_polar_new : dict, optional
@@ -913,8 +924,8 @@ def ffbp_merge2(
 def polar_to_cart(
     img: Tensor,
     origin: Tensor,
-    grid_polar: dict,
-    grid_cart: dict,
+    grid_polar: "PolarGrid | dict",
+    grid_cart: "CartesianGrid | dict",
     fc: float,
     rotation: float = 0,
     alias_fmod: float = 0,
@@ -934,18 +945,18 @@ def polar_to_cart(
     origin : Tensor
         3D antenna phase center of the old image in with respect to new image.
         Units in meters [nbatch, 3] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
-    grid_cart : dict
-        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-            - "x": (x0, x1), tuple of min and max x-axis (range),
-            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
-            - "nx": number of x-axis pixels.
-            - "ny": number of y-axis pixels.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
+    grid_cart : CartesianGrid or dict
+        Cartesian grid definition. Can be:
+
+        - CartesianGrid object: ``CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny)``
+        - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -981,8 +992,8 @@ def polar_to_cart(
 def _prepare_polar_to_cart_linear_args(
     img: Tensor,
     origin: Tensor,
-    grid_polar: dict,
-    grid_cart: dict,
+    grid_polar: "PolarGrid | dict",
+    grid_cart: "CartesianGrid | dict",
     fc: float,
     rotation: float = 0,
     alias_fmod: float = 0
@@ -1003,8 +1014,8 @@ def _prepare_polar_to_cart_linear_args(
 def polar_to_cart_linear(
     img: Tensor,
     origin: Tensor,
-    grid_polar: dict,
-    grid_cart: dict,
+    grid_polar: "PolarGrid | dict",
+    grid_cart: "CartesianGrid | dict",
     fc: float,
     rotation: float = 0,
     alias_fmod: float = 0
@@ -1023,18 +1034,18 @@ def polar_to_cart_linear(
     origin : Tensor
         3D antenna phase center of the old image in with respect to new image.
         Units in meters [nbatch, 3] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
-    grid_cart : dict
-        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-            - "x": (x0, x1), tuple of min and max x-axis (range),
-            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
-            - "nx": number of x-axis pixels.
-            - "ny": number of y-axis pixels.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
+    grid_cart : CartesianGrid or dict
+        Cartesian grid definition. Can be:
+
+        - CartesianGrid object: ``CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny)``
+        - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
         RF center frequency in Hz.
     rotation : float
@@ -1056,8 +1067,8 @@ def polar_to_cart_linear(
 def polar_to_cart_lanczos(
     img: Tensor,
     origin: Tensor,
-    grid_polar: dict,
-    grid_cart: dict,
+    grid_polar: "PolarGrid | dict",
+    grid_cart: "CartesianGrid | dict",
     fc: float,
     rotation: float = 0,
     alias_fmod: float = 0,
@@ -1077,18 +1088,18 @@ def polar_to_cart_lanczos(
     origin : Tensor
         3D antenna phase center of the old image in with respect to new image.
         Units in meters [nbatch, 3] if img shape is 3D.
-    grid_polar : dict
-        Grid definition. Dictionary with keys "r", "theta", "nr", "ntheta".
-            - "r": (r0, r1), tuple of min and max range,
-            - "theta": (theta0, theta1), sin of min and max angle. (-1, 1) for 180 degree view.
-            - "nr": nr, number of range bins.
-            - "ntheta": number of angle bins.
-    grid_cart : dict
-        Grid definition. Dictionary with keys "x", "y", "nx", "ny".
-            - "x": (x0, x1), tuple of min and max x-axis (range),
-            - "y": (y0, y1), tuple of min and max y-axis (cross-range),
-            - "nx": number of x-axis pixels.
-            - "ny": number of y-axis pixels.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
+    grid_cart : CartesianGrid or dict
+        Cartesian grid definition. Can be:
+
+        - CartesianGrid object: ``CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny)``
+        - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
         RF center frequency in Hz.
     rotation : float

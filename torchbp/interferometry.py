@@ -11,7 +11,7 @@ import numpy as np
 if TYPE_CHECKING:
     from .grid import PolarGrid, CartesianGrid
 
-def _goldstein_patch(patches: Tensor, alpha: float, w: int=3):
+def _goldstein_patch(patches: Tensor, alpha: float, w: int=3) -> Tensor:
     fpatch = torch.fft.fft2(patches)
     fpatch = torch.fft.fftshift(fpatch, dim=(-2, -1))
 
@@ -35,7 +35,7 @@ def _goldstein_patch(patches: Tensor, alpha: float, w: int=3):
     return filtered
 
 
-def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1, overlap: float=0.75):
+def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1, overlap: float=0.75) -> Tensor:
     """
     Goldstein phase filter. [1]_
 
@@ -50,7 +50,7 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
     alpha : float
         Smoothing exponent.
     overlap : float
-        Overlap between patches.
+        Overlap between patches as fraction of patch_size.
 
     References
     ----------
@@ -152,7 +152,7 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
     return phase_to_elevation(unw, coords, origin1, origin2, fc)
 
 
-def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid) -> Tensor:
+def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "CartesianGrid | dict") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -187,7 +187,7 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
     return phase_to_elevation(unw, coords, origin1, origin2, fc)
 
 
-def subpixel_correlation(im_m: Tensor, im_s: Tensor):
+def subpixel_correlation(im_m: Tensor, im_s: Tensor) -> tuple[Tensor, Tensor]:
     """
     Solve for subpixel offset that maximize coherent correlation between the two
     input images. [1]_
