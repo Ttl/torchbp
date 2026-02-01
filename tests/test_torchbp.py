@@ -1164,5 +1164,421 @@ class TestFFBPMerge2Poly(TestCase):
                 self.assertEqual(result.shape, expected_shape)
 
 
+class TestBackprojectionPolar2DTxPower(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=torch.float32
+            )
+            return x
+
+        def make_pos_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=torch.float32
+            )
+            x = x - torch.max(x[:, 0]) - 2
+            return x
+
+        nbatch = 2
+        nsweeps = 4
+        grid = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 8, "ntheta": 8}
+        g_extent = [-0.5, -1.0, 0.5, 1.0]  # [g_el0, g_az0, g_el1, g_az1]
+        args = {
+            "wa": make_tensor((nbatch, nsweeps)),
+            "g": make_tensor((16, 16)),
+            "g_extent": g_extent,
+            "grid": grid,
+            "r_res": 0.15,
+            "pos": make_pos_tensor((nbatch, nsweeps, 3)),
+            "att": make_tensor((nbatch, nsweeps, 3)),
+            "normalization": "sigma",
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        from torchbp.ops.backproj import _prepare_backprojection_polar_2d_tx_power_args
+
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = _prepare_backprojection_polar_2d_tx_power_args(**args)
+            opcheck(
+                torch.ops.torchbp.backprojection_polar_2d_tx_power,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestProjectionCart2D(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=False, dtype=dtype
+            )
+            return x
+
+        def make_pos_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=False, dtype=dtype
+            )
+            x = x - torch.max(x[:, 0]) - 2
+            return x
+
+        nbatch = 1
+        nsweeps = 2
+        sweep_samples = 8
+        grid = {"x": (-2, 2), "y": (-2, 2), "nx": 4, "ny": 4}
+        args = {
+            "img": make_tensor((nbatch, 4, 4), dtype=torch.complex64),
+            "pos": make_pos_tensor((nbatch, nsweeps, 3), dtype=torch.float32),
+            "grid": grid,
+            "fc": 6e9,
+            "fs": 2e6,
+            "gamma": 1e12,
+            "sweep_samples": sweep_samples,
+            "d0": 0.2,
+            "normalization": "sigma",
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        from torchbp.ops.backproj import _prepare_projection_cart_2d_args
+
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = _prepare_projection_cart_2d_args(**args)
+            opcheck(
+                torch.ops.torchbp.projection_cart_2d,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestPolarInterpLanczos(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=False, dtype=dtype
+            )
+            return x
+
+        grid = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 8, "ntheta": 8}
+        grid_new = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 16, "ntheta": 16}
+        args = {
+            "img": make_tensor((8, 8), dtype=torch.complex64),
+            "dorigin": make_tensor((3,), dtype=torch.float32) * 0.1,
+            "grid_polar": grid,
+            "fc": 6e9,
+            "rotation": 0.0,
+            "grid_polar_new": grid_new,
+            "z0": 0.0,
+            "order": 6,
+            "alias_fmod": 0.0,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            # Prepare C++ operator arguments
+            img = args["img"]
+            dorigin = args["dorigin"]
+            fc = args["fc"]
+            rotation = args["rotation"]
+            z0 = args["z0"]
+            order = args["order"]
+            alias_fmod = args["alias_fmod"]
+
+            grid = args["grid_polar"]
+            r1_0, r1_1 = grid["r"]
+            theta1_0, theta1_1 = grid["theta"]
+            ntheta1 = grid["ntheta"]
+            nr1 = grid["nr"]
+            dtheta1 = (theta1_1 - theta1_0) / ntheta1
+            dr1 = (r1_1 - r1_0) / nr1
+
+            grid_new = args["grid_polar_new"]
+            r3_0, r3_1 = grid_new["r"]
+            theta3_0, theta3_1 = grid_new["theta"]
+            ntheta3 = grid_new["ntheta"]
+            nr3 = grid_new["nr"]
+            dtheta3 = (theta3_1 - theta3_0) / ntheta3
+            dr3 = (r3_1 - r3_0) / nr3
+
+            nbatch = 1
+
+            cpp_args = (img, dorigin, nbatch, rotation, fc,
+                       r1_0, dr1, theta1_0, dtheta1, nr1, ntheta1,
+                       r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3,
+                       z0, order, alias_fmod)
+
+            opcheck(
+                torch.ops.torchbp.polar_interp_lanczos,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestPolarToCartLanczos(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=False, dtype=dtype
+            )
+            return x
+
+        grid_polar = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 8, "ntheta": 8}
+        grid_cart = {"x": (-5, 5), "y": (-5, 5), "nx": 16, "ny": 16}
+        args = {
+            "img": make_tensor((8, 8), dtype=torch.complex64),
+            "origin": make_tensor((3,), dtype=torch.float32) * 0.1,
+            "grid_polar": grid_polar,
+            "grid_cart": grid_cart,
+            "fc": 6e9,
+            "rotation": 0.0,
+            "alias_fmod": 0.0,
+            "order": 6,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            # Prepare C++ operator arguments
+            img = args["img"]
+            origin = args["origin"]
+            fc = args["fc"]
+            rotation = args["rotation"]
+            alias_fmod = args["alias_fmod"]
+            order = args["order"]
+
+            grid_polar = args["grid_polar"]
+            r0, r1 = grid_polar["r"]
+            theta0, theta1 = grid_polar["theta"]
+            ntheta = grid_polar["ntheta"]
+            nr = grid_polar["nr"]
+            dtheta = (theta1 - theta0) / ntheta
+            dr = (r1 - r0) / nr
+
+            grid_cart = args["grid_cart"]
+            x0, x1 = grid_cart["x"]
+            y0, y1 = grid_cart["y"]
+            nx = grid_cart["nx"]
+            ny = grid_cart["ny"]
+            dx = (x1 - x0) / nx
+            dy = (y1 - y0) / ny
+
+            nbatch = 1
+
+            cpp_args = (img, origin, nbatch, rotation, fc,
+                       r0, dr, theta0, dtheta, nr, ntheta,
+                       x0, y0, dx, dy, nx, ny, alias_fmod, order)
+
+            opcheck(
+                torch.ops.torchbp.polar_to_cart_lanczos,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestFFBPMerge2Lanczos(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=False, dtype=dtype
+            )
+            return x
+
+        grid0 = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 8, "ntheta": 8}
+        grid1 = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 8, "ntheta": 8}
+        grid_new = {"r": (1, 10), "theta": (-0.9, 0.9), "nr": 16, "ntheta": 16}
+        args = {
+            "img0": make_tensor((8, 8), dtype=torch.complex64),
+            "img1": make_tensor((8, 8), dtype=torch.complex64),
+            "dorigin0": make_tensor((3,), dtype=torch.float32) * 0.1,
+            "dorigin1": make_tensor((3,), dtype=torch.float32) * 0.1,
+            "grid_polars": [grid0, grid1],
+            "fc": 6e9,
+            "grid_polar_new": grid_new,
+            "z0": 0.0,
+            "order": 6,
+            "alias": False,
+            "alias_fmod": 0.0,
+            "output_alias": True,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            # Prepare C++ operator arguments
+            img0 = args["img0"]
+            img1 = args["img1"]
+            dorigin0 = args["dorigin0"]
+            dorigin1 = args["dorigin1"]
+            fc = args["fc"]
+            z0 = args["z0"]
+            order = args["order"]
+            alias = args["alias"]
+            alias_fmod = args["alias_fmod"]
+            output_alias = args["output_alias"]
+
+            nimages = 2
+            r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+            dr0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+            theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+            dtheta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+            Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+            Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+
+            for i, grid in enumerate(args["grid_polars"]):
+                r1_0, r1_1 = grid["r"]
+                theta1_0, theta1_1 = grid["theta"]
+                ntheta1 = grid["ntheta"]
+                nr1 = grid["nr"]
+                dtheta1 = (theta1_1 - theta1_0) / ntheta1
+                dr1 = (r1_1 - r1_0) / nr1
+                r0[i] = r1_0
+                dr0[i] = dr1
+                theta0[i] = theta1_0
+                dtheta0[i] = dtheta1
+                Nr0[i] = nr1
+                Ntheta0[i] = ntheta1
+
+            grid_new = args["grid_polar_new"]
+            r3_0, r3_1 = grid_new["r"]
+            theta3_0, theta3_1 = grid_new["theta"]
+            ntheta3 = grid_new["ntheta"]
+            nr3 = grid_new["nr"]
+            dtheta3 = (theta3_1 - theta3_0) / ntheta3
+            dr3 = (r3_1 - r3_0) / nr3
+
+            dorigin = torch.stack((dorigin0, dorigin1), dim=0)
+
+            alias_mode = 0
+            if alias:
+                if not output_alias:
+                    alias_mode = 1
+                else:
+                    alias_mode = 2
+            elif not output_alias:
+                alias_mode = 3
+
+            cpp_args = (img0, img1, dorigin, fc,
+                       r0, dr0, theta0, dtheta0, Nr0, Ntheta0,
+                       r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3,
+                       z0, order, alias_mode, alias_fmod)
+
+            opcheck(
+                torch.ops.torchbp.ffbp_merge2_lanczos,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestGPGABackprojection2DLanczos(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=False, dtype=dtype
+            )
+            return x
+
+        def make_pos_tensor(size, dtype=torch.float32):
+            x = torch.randn(
+                size, device=device, requires_grad=False, dtype=dtype
+            )
+            x = x - torch.max(x[:, 0]) - 2
+            return x
+
+        nsweeps = 4
+        sweep_samples = 64
+        ntargets = 3
+        args = {
+            "target_pos": make_tensor((ntargets, 3), dtype=torch.float32),
+            "data": make_tensor((nsweeps, sweep_samples), dtype=torch.complex64),
+            "pos": make_pos_tensor((nsweeps, 3), dtype=torch.float32),
+            "fc": 6e9,
+            "r_res": 0.15,
+            "d0": 0.2,
+            "order": 6,
+            "data_fmod": 0.0,
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            # Prepare C++ operator arguments
+            target_pos = args["target_pos"]
+            data = args["data"]
+            pos = args["pos"]
+            fc = args["fc"]
+            r_res = args["r_res"]
+            d0 = args["d0"]
+            order = args["order"]
+            data_fmod = args["data_fmod"]
+
+            nsweeps = data.shape[0]
+            sweep_samples = data.shape[1]
+            ntargets = target_pos.shape[0]
+
+            cpp_args = (target_pos, data, pos, sweep_samples, nsweeps,
+                       fc, r_res, ntargets, d0, order, data_fmod)
+
+            opcheck(
+                torch.ops.torchbp.gpga_backprojection_2d_lanczos,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
 if __name__ == "__main__":
     unittest.main()

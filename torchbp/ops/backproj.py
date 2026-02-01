@@ -493,6 +493,76 @@ def backprojection_cart_2d(
     return torch.ops.torchbp.backprojection_cart_2d.default(*cpp_args)
 
 
+def _prepare_projection_cart_2d_args(
+    img: Tensor,
+    pos: Tensor,
+    grid: "CartesianGrid | dict",
+    fc: float,
+    fs: float,
+    gamma: float,
+    sweep_samples: int,
+    d0: float = 0.0,
+    dem: Tensor | None = None,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    use_rvp: bool = True,
+    normalization: str = "beta",
+    vel: Tensor | None = None,
+) -> tuple:
+    """Prepare arguments for C++ projection_cart_2d operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by projection_cart_2d and for testing.
+    """
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+
+    if img.dim() == 2:
+        nbatch = 1
+        nsweeps = pos.shape[0]
+        if img.shape[0] != nx:
+            raise ValueError("grid and img have different number of points in x")
+        if img.shape[1] != ny:
+            raise ValueError("grid and img have different number of points in y")
+        if list(pos.shape) != [nsweeps, 3]:
+            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nsweeps, 3]}")
+    else:
+        nbatch = img.shape[0]
+        nsweeps = pos.shape[1]
+        if img.shape[1] != nx:
+            raise ValueError("grid and img have different number of points in x")
+        if img.shape[2] != ny:
+            raise ValueError("grid and img have different number of points in y")
+        if list(pos.shape) != [nbatch, nsweeps, 3]:
+            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nbatch, nsweeps, 3]}")
+
+    if normalization == "sigma":
+        norm = 0
+    elif normalization == "gamma":
+        norm = 1
+    else:
+        raise ValueError(f"Unknown normalization: {normalization}")
+
+    if dem is not None and list(dem.shape) != [nx, ny]:
+        raise ValueError("img and dem shapes are different")
+
+    antenna = AntennaPattern(g, g_extent)
+
+    if vel is not None:
+        if vel.shape != pos.shape:
+            raise ValueError(f"vel shape {vel.shape} doesn't match with pos shape {pos.shape}")
+    else:
+        vel = torch.zeros_like(pos)
+
+    if dem is None:
+        dem = torch.zeros((nx, ny), device=img.device, dtype=torch.float32)
+
+    return (img, dem, pos, vel, att, nbatch, sweep_samples, nsweeps,
+            fc, fs, gamma, x0, dx, y0, dy, nx, ny, d0,
+            *antenna.to_cpp_args(),
+            use_rvp, norm)
+
+
 def projection_cart_2d(
     img: Tensor,
     pos: Tensor,
@@ -564,88 +634,11 @@ def projection_cart_2d(
     data : Tensor
         FMCW radar data at each position. Shape [nbatch, nsweeps, nsamples].
     """
-
-    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
-
-    if img.dim() == 2:
-        nbatch = 1
-        nsweeps = pos.shape[0]
-        if img.shape[0] != nx:
-            raise ValueError("grid and img have different number of points in x")
-        if img.shape[1] != ny:
-            raise ValueError("grid and img have different number of points in y")
-        if list(pos.shape) != [nsweeps, 3]:
-            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nsweeps, 3]}")
-    else:
-        nbatch = img.shape[0]
-        nsweeps = pos.shape[1]
-        if img.shape[1] != nx:
-            raise ValueError("grid and img have different number of points in x")
-        if img.shape[2] != ny:
-            raise ValueError("grid and img have different number of points in y")
-
-        if list(pos.shape) != [nbatch, nsweeps, 3]:
-            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nbatch, nsweeps, 3]}")
-
-    if normalization == "sigma":
-        norm = 0
-    elif normalization == "gamma":
-        norm = 1
-    else:
-        raise ValueError(f"Unknown normalization: {normalization}")
-
-    if dem is not None and list(dem.shape) != [nx, ny]:
-        raise ValueError("img and dem shapes are different")
-
-    if att is None or g is None:
-        att = None
-        g = None
-        g_nel = 0
-        g_naz = 0
-        g_daz = 0
-        g_del = 0
-        g_el0, g_az0, g_el1, g_az1 = 0, 0, 0, 0
-    else:
-        g_nel = g.shape[0]
-        g_naz = g.shape[1]
-        assert g.shape == torch.Size([g_nel, g_naz])
-        g_el0, g_az0, g_el1, g_az1 = g_extent
-        g_daz = (g_az1 - g_az0) / g_naz
-        g_del = (g_el1 - g_el0) / g_nel
-
-    if vel is not None:
-        if vel.shape != pos.shape:
-            raise ValueError(f"vel shape {vel.shape} doesn't match with pos shape {pos.shape}")
-
-    return torch.ops.torchbp.projection_cart_2d.default(
-        img,
-        dem,
-        pos,
-        vel,
-        att,
-        nbatch,
-        sweep_samples,
-        nsweeps,
-        fc,
-        fs,
-        gamma,
-        x0,
-        dx,
-        y0,
-        dy,
-        nx,
-        ny,
-        d0,
-        g,
-        g_az0,
-        g_el0,
-        g_daz,
-        g_del,
-        g_naz,
-        g_nel,
-        use_rvp,
-        norm
+    cpp_args = _prepare_projection_cart_2d_args(
+        img, pos, grid, fc, fs, gamma, sweep_samples, d0,
+        dem, att, g, g_extent, use_rvp, normalization, vel
     )
+    return torch.ops.torchbp.projection_cart_2d.default(*cpp_args)
 
 
 def gpga_backprojection_2d_core(
@@ -724,6 +717,56 @@ def gpga_backprojection_2d_core(
         raise ValueError(f"Unknown interp_method f{interp_method}")
 
 
+def _prepare_backprojection_polar_2d_tx_power_args(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "PolarGrid | dict",
+    r_res: float,
+    pos: Tensor,
+    att: Tensor,
+    normalization: str | None = None,
+) -> tuple:
+    """Prepare arguments for C++ backprojection_polar_2d_tx_power operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by backprojection_polar_2d_tx_power and for testing.
+    """
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+
+    if wa.dim() == 1:
+        nbatch = 1
+        nsweeps = wa.shape[0]
+        assert pos.shape == (nsweeps, 3)
+        assert att.shape == (nsweeps, 3)
+    else:
+        nbatch = wa.shape[0]
+        nsweeps = wa.shape[1]
+        assert pos.shape == (nbatch, nsweeps, 3)
+        assert att.shape == (nbatch, nsweeps, 3)
+
+    g_nel = g.shape[0]
+    g_naz = g.shape[1]
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_daz = (g_az1 - g_az0) / g_naz
+    g_del = (g_el1 - g_el0) / g_nel
+
+    if normalization == "beta" or normalization is None:
+        norm = 0
+    elif normalization == "sigma":
+        norm = 1
+    elif normalization == "gamma":
+        norm = 2
+    elif normalization == "point":
+        norm = 3
+    else:
+        raise ValueError(f"Invalid normalization {normalization}.")
+
+    return (wa, pos, att, g, nbatch, g_az0, g_el0, g_daz, g_del,
+            g_naz, g_nel, nsweeps, r_res, r0, dr, theta0, dtheta,
+            nr, ntheta, norm)
+
+
 def backprojection_polar_2d_tx_power(
     wa: Tensor,
     g: Tensor,
@@ -789,59 +832,10 @@ def backprojection_polar_2d_tx_power(
         Pseudo-polar format image of square root of power returned from each
         pixel assuming constant reflectivity.
     """
-
-    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
-
-    if wa.dim() == 1:
-        nbatch = 1
-        nsweeps = wa.shape[0]
-        assert pos.shape == (nsweeps, 3)
-        assert att.shape == (nsweeps, 3)
-    else:
-        nbatch = wa.shape[0]
-        nsweeps = wa.shape[1]
-        assert pos.shape == (nbatch, nsweeps, 3)
-        assert att.shape == (nbatch, nsweeps, 3)
-
-    g_nel = g.shape[0]
-    g_naz = g.shape[1]
-    g_el0, g_az0, g_el1, g_az1 = g_extent
-    g_daz = (g_az1 - g_az0) / g_naz
-    g_del = (g_el1 - g_el0) / g_nel
-
-    if normalization == "beta" or normalization is None:
-        norm = 0
-    elif normalization == "sigma":
-        norm = 1
-    elif normalization == "gamma":
-        norm = 2
-    elif normalization == "point":
-        norm = 3
-    else:
-        raise ValueError(f"Invalid normalization {normalization}.")
-
-    return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(
-        wa,
-        pos,
-        att,
-        g,
-        nbatch,
-        g_az0,
-        g_el0,
-        g_daz,
-        g_del,
-        g_naz,
-        g_nel,
-        nsweeps,
-        r_res,
-        r0,
-        dr,
-        theta0,
-        dtheta,
-        nr,
-        ntheta,
-        norm,
+    cpp_args = _prepare_backprojection_polar_2d_tx_power_args(
+        wa, g, g_extent, grid, r_res, pos, att, normalization
     )
+    return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(*cpp_args)
 
 
 @torch.library.register_fake("torchbp::backprojection_polar_2d")
