@@ -2,7 +2,7 @@ from __future__ import annotations
 import torch
 import numpy as np
 from torch import Tensor
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union, Tuple
 from .grid import unpack_polar_grid
 
 if TYPE_CHECKING:
@@ -105,8 +105,8 @@ def pga(
     remove_trend: bool = True,
     offload: bool = False,
     estimator: str = "wls",
-    eps=1e-6,
-) -> (Tensor, Tensor):
+    eps: float = 1e-6,
+) -> tuple[Tensor, Tensor]:
     """
     Phase gradient autofocus
 
@@ -202,7 +202,7 @@ def gpga_bp_polar(
     eps: float = 1e-6,
     interp_method: str = "linear",
     data_fmod: float = 0
-) -> (Tensor, Tensor):
+) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus using 2D polar coordinate
     backprojection image formation. [1]_
@@ -351,7 +351,7 @@ def gpga_bp_polar_tde(
     ffbp_opts: dict | None = None,
     verbose: bool = False,
     data_fmod: float = 0
-) -> (Tensor, Tensor):
+) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus [1]_ using 2D polar coordinate
     backprojection image formation.
@@ -647,7 +647,7 @@ def minimum_entropy_grad_autofocus(
     fixed_pos: int = 0,
     minimize_only: bool = False,
     data_fmod: float = 0
-) -> (Tensor, Tensor, Tensor, int):
+) -> tuple[Tensor, Tensor, Tensor, int]:
     """
     Minimum entropy autofocus using backpropagation optimization through image
     formation.
@@ -833,7 +833,7 @@ def bp_polar_grad_minimum_entropy(
     grad_limit_quantile: float = 0.9,
     fixed_pos: int = 0,
     data_fmod: float = 0
-):
+) -> tuple[Tensor, Tensor, Tensor, int]:
     """
     Minimum entropy autofocus optimization autofocus.
 
@@ -922,7 +922,7 @@ def bp_cart_grad_minimum_entropy(
     grad_limit_quantile: float = 0.9,
     fixed_pos: int = 0,
     data_fmod: float = 0
-):
+) -> tuple[Tensor, Tensor, Tensor, int]:
     """
     Minimum entropy autofocus optimization autofocus.
 

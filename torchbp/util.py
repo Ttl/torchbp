@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 
 def bp_polar_range_dealias(
-    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict", alias_fmod=0
+    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict", alias_fmod: float = 0
 ) -> Tensor:
     """
     De-alias range-axis spectrum of polar SAR image processed with backprojection. [1]_
@@ -150,7 +150,7 @@ def unwrap(phi: Tensor, dim: int = -1) -> Tensor:
     return phi_wrap + phi_adj.cumsum(dim)
 
 
-def unwrap_ref(x: Tensor, y: Tensor):
+def unwrap_ref(x: Tensor, y: Tensor) -> Tensor:
     """
     Solve for integer array k such that x + k*2pi is closest to y.
     `k = round((y - x) / (2pi))`.
@@ -187,7 +187,7 @@ def quad_interp(a: Tensor, v: int) -> Tensor:
 
     Returns
     -------
-    f : float
+    f : Tensor
         Estimated fractional peak index.
     """
     a1 = a[(v - 1) % len(a)]
@@ -196,7 +196,7 @@ def quad_interp(a: Tensor, v: int) -> Tensor:
     return 0.5 * (a1 - a3) / (a1 - 2 * a2 + a3)
 
 
-def argmax_nd(x: Tensor):
+def argmax_nd(x: Tensor) -> tuple[int, ...]:
     """
     `torch.argmax` but returns N-dimensional index of the peak
     """
@@ -216,14 +216,14 @@ def find_image_shift_1d(x: Tensor, y: Tensor, dim: int = -1) -> Tensor:
     ----------
     x : Tensor
         Input tensor.
-    y : int
+    y : Tensor
         Input tensor. Should have same shape as x.
     dim : int
         Dimensions to shift.
 
     Returns
     -------
-    c : int
+    c : Tensor
         Estimated shift.
     """
     if x.shape != y.shape:
@@ -293,15 +293,15 @@ def subset_cart(
 
 def subset_polar(
     img: Tensor, grid_polar: "PolarGrid | dict", r0: float, r1: float, theta0: float, theta1: float
-) -> (Tensor, dict):
+) -> tuple[Tensor, dict]:
     """Polar image subset.
 
     Parameters
     ----------
     img : Tensor
         Input image.
-    grid_cart : CartesianGrid or dict
-        Cartesian grid dictionary.
+    grid_polar : PolarGrid or dict
+        Polar grid definition. PolarGrid object or dictionary.
     r0 : float
         Subset r0.
     r1 : float
@@ -309,7 +309,7 @@ def subset_polar(
     theta0 : float
         Subset theta0.
     theta1 : float
-        Subset tehta1.
+        Subset theta1.
 
     Returns
     -------
@@ -664,7 +664,7 @@ def generate_fmcw_data(
 
 def make_polar_grid(
     r0: float, r1: float, nr: int, ntheta: int, theta_limit: int = 1, squint: float = 0
-):
+) -> "PolarGrid":
     """
     Generate PolarGrid object.
 
@@ -715,9 +715,9 @@ def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     c0 = 299792458
     return c0 * p / (4 * torch.pi * fc)
 
-def next_fast_len(n):
+def next_fast_len(n: int) -> int:
     """CuFFT-friendly length (powers of 2,3,5,7)"""
-    def is_fast(k):
+    def is_fast(k: int) -> bool:
         for p in (2,3,5,7):
             while k % p == 0:
                 k //= p
@@ -808,7 +808,7 @@ def fft_lowpass_filter_window(
     return filtered_data
 
 
-def center_pos(pos: Tensor):
+def center_pos(pos: Tensor) -> tuple[Tensor, Tensor]:
     """
     Center position to origin. Centers X and Y coordinates, but doesn't modify Z.
     Useful for preparing positions for polar backprojection
@@ -824,8 +824,6 @@ def center_pos(pos: Tensor):
         Centered positions.
     origin : Tensor
         Position subtracted from the pos.
-    h : Tensor
-        Mean height.
     """
     origin = torch.tensor(
         [torch.mean(pos[:, 0]), torch.mean(pos[:, 1]), 0],
@@ -892,7 +890,7 @@ def bounding_cart_grid(
     return grid_cart
 
 
-def create_triangular_weights(patch_size, overlap, device="cpu"):
+def create_triangular_weights(patch_size: int, overlap: int, device: str = "cpu") -> Tensor:
     """
     Create triangular weights for smooth blending of overlapping patches.
 
@@ -937,7 +935,7 @@ def create_triangular_weights(patch_size, overlap, device="cpu"):
     return weights_2d
 
 
-def extract_overlapping_patches(img, patch_size, overlap):
+def extract_overlapping_patches(img: Tensor, patch_size: int, overlap: int) -> tuple[Tensor, tuple[int, ...]]:
     """
     Extract overlapping patches from a tensor.
 
@@ -987,8 +985,8 @@ def extract_overlapping_patches(img, patch_size, overlap):
 
 
 def merge_patches_with_triangular_weights(
-    patches, original_shape, patch_size, overlap, padded_shape=None
-):
+    patches: Tensor, original_shape: tuple[int, int], patch_size: int, overlap: int, padded_shape: tuple[int, int] | None = None
+) -> Tensor:
     """
     Merge overlapping patches back into an image using triangular weighting.
 
@@ -998,6 +996,8 @@ def merge_patches_with_triangular_weights(
         Tensor of shape [C, P, K, K] containing patches
     original_shape : tuple
         Original shape of the image (N, M).
+    patch_size : int
+        Side length of square patches (K).
     overlap : int
         Overlap between patches.
     padded_shape : tuple
@@ -1100,7 +1100,7 @@ def merge_patches_with_triangular_weights(
     return reconstructed
 
 
-def process_image_with_patches(img, patch_size, overlap, process_fn):
+def process_image_with_patches(img: Tensor, patch_size: int, overlap: int, process_fn) -> Tensor:
     """
     Process an image by extracting patches, applying a function, and merging back.
 
@@ -1110,8 +1110,8 @@ def process_image_with_patches(img, patch_size, overlap, process_fn):
         Input tensor of shape [C, N, M] or [N, M].
     patch_size : int
         Side length of square patches.
-    overlap : float
-        Overlap between patches as fraction.
+    overlap : int
+        Overlap between patches.
     process_fn : function
         Function to apply to patches.
 
