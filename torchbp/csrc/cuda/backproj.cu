@@ -49,7 +49,6 @@ __global__ void backprojection_polar_2d_kernel(
     const int idr_base = (idx / Ntheta) * PIXELS_PER_THREAD;
     const int idbatch = blockIdx.y;
 
-    // Bounds check
     if (idr_base >= Nr || idtheta >= Ntheta) return;
 
     // Precompute theta sin/cos once (shared by all pixels in this thread)
@@ -62,7 +61,8 @@ __global__ void backprojection_polar_2d_kernel(
     float y[PIXELS_PER_THREAD];
     float pixel_re[PIXELS_PER_THREAD] = {0};
     float pixel_im[PIXELS_PER_THREAD] = {0};
-    float w_sum[PIXELS_PER_THREAD] = {0};
+    float w_sum2[PIXELS_PER_THREAD] = {0};
+    float w_sum1[PIXELS_PER_THREAD] = {0};
 
     #pragma unroll
     for(int k=0; k<PIXELS_PER_THREAD; ++k) {
@@ -82,7 +82,6 @@ __global__ void backprojection_polar_2d_kernel(
     // This way we compute d_eff = d + d0 once and use it for both sx and phase
     const float phase_offset2 = phase_offset - phase_coef * d0;
 
-    // Direct L1 cache path - no shared memory overhead
     for (int i = 0; i < nsweeps; i++) {
         // Load pos directly via __ldg (L1 cached, broadcast across warp)
         const int pos_idx = pos_batch_offset + i * 3;
@@ -90,7 +89,6 @@ __global__ void backprojection_polar_2d_kernel(
         float pos_y = __ldg(&pos[pos_idx + 1]);
         float pos_z = __ldg(&pos[pos_idx + 2]);
 
-        // Precompute pos_z² outside pixel loop
         float pz2 = pos_z * pos_z;
         int sweep_offset = data_batch_stride + i * sweep_samples;
 
@@ -179,7 +177,8 @@ __global__ void backprojection_polar_2d_kernel(
                         float ws_im = w * s_im;
                         pixel_re[k] = fmaf(ws_re, ref_cos, fmaf(-ws_im, ref_sin, pixel_re[k]));
                         pixel_im[k] = fmaf(ws_re, ref_sin, fmaf(ws_im, ref_cos, pixel_im[k]));
-                        w_sum[k] += w * w;
+                        w_sum2[k] += w * w;
+                        w_sum1[k] += w;
                     }
                 } else {
                     pixel_re[k] = fmaf(s_re, ref_cos, fmaf(-s_im, ref_sin, pixel_re[k]));
@@ -189,15 +188,18 @@ __global__ void backprojection_polar_2d_kernel(
         }
     }
 
-    // Write output
     #pragma unroll
     for(int k=0; k<PIXELS_PER_THREAD; ++k) {
         if(idr_base + k < Nr) {
             complex64_t pixel = {pixel_re[k], pixel_im[k]};
 
+            // Normalize to same average as without antenna pattern.
+            // Unweighted: Σs = scene * Σg (signal has g)
+            // Weighted: Σ(s * g) = scene * Σg²
+            // To match: normalize by Σg / Σg²
             if constexpr (HasAntennaPattern) {
-                if (w_sum[k] > 0.0f) {
-                    pixel *= nsweeps / sqrtf(w_sum[k]);
+                if (w_sum2[k] > 0.0f) {
+                    pixel *= w_sum1[k] / w_sum2[k];
                 }
             }
 

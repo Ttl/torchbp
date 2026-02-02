@@ -507,14 +507,14 @@ static void backprojection_polar_2d_kernel_cpu(
             const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
 
             pixel += w * s * ref;
-            w_sum += w*w;
+            w_sum += w;
         } else {
             pixel += s * ref;
         }
     }
     if (g != nullptr) {
         if (w_sum > 0.0f) {
-            pixel *= nsweeps / sqrtf(w_sum);
+            pixel *= nsweeps / w_sum;
         }
     }
     if (dealias) {

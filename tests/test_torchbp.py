@@ -506,6 +506,62 @@ class TestBackprojectionPolar(TestCase):
         self._opcheck("cuda")
 
 
+class TestBackprojectionPolarAntennaPattern(TestCase):
+    """Test that antenna pattern weighting is correctly normalized."""
+
+    def _test_uniform_pattern_normalization(self, device):
+        """Test that uniform antenna pattern (g=1) is correctly normalized.
+
+        With uniform pattern g=1, when all sweeps contribute, we should get the
+        same result as without antenna pattern normalization.
+        """
+        nbatch = 1
+        sweep_samples = 64
+        nsweeps = 10
+        fc = 1e9
+        grid = {"r": (5, 10), "theta": (0.-1, 0.1), "nr": 4, "ntheta": 4}
+
+        pos = torch.zeros([nbatch, nsweeps, 3], dtype=torch.float32, device=device)
+        pos[:,:,1] = torch.linspace(-nsweeps/2, nsweeps/2, nsweeps) * 0.25 * 3e8 / fc
+
+        # Random data
+        data = torch.randn(nbatch, nsweeps, sweep_samples, device=device, dtype=torch.complex64)
+
+        # Create uniform antenna pattern (two-way gain = 1)
+        g = torch.ones(10, 10, device=device, dtype=torch.float32)
+        g_extent = [-torch.pi/2, -torch.pi, torch.pi/2, torch.pi]
+        att = torch.zeros(nbatch, nsweeps, 3, device=device, dtype=torch.float32)
+
+        result_no_pattern = torchbp.ops.backprojection_polar_2d(
+            data=data,
+            grid=grid,
+            fc=6e9,
+            r_res=0.15,
+            pos=pos
+        )
+
+        result_pattern = torchbp.ops.backprojection_polar_2d(
+            data=data,
+            grid=grid,
+            fc=6e9,
+            r_res=0.15,
+            pos=pos,
+            att=att,
+            g=g,
+            g_extent=g_extent
+        )
+
+        torch.testing.assert_close(result_pattern, result_no_pattern, atol=1e-5, rtol=1e-4)
+
+    @unittest.skip("CPU implementation not available")
+    def test_uniform_pattern_normalization_cpu(self):
+        self._test_uniform_pattern_normalization("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_uniform_pattern_normalization_cuda(self):
+        self._test_uniform_pattern_normalization("cuda")
+
+
 class TestBackprojectionPolarLanczos(TestCase):
     def sample_inputs(self, device, *, requires_grad=False):
         def make_tensor(size, dtype=torch.float32):

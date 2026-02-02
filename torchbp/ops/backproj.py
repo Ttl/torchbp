@@ -32,6 +32,17 @@ def _prepare_backprojection_polar_2d_args(
     nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
     antenna = AntennaPattern(g, g_extent)
 
+    # Validate and normalize att shape when antenna pattern is used
+    if g is not None:
+        if att is None:
+            raise ValueError("att must be provided when antenna pattern g is specified")
+        # Accept [nsweeps, 3] for nbatch=1
+        expected_shape = (nbatch, nsweeps, 3)
+        if nbatch == 1 and att.ndim == 2 and att.shape == (nsweeps, 3):
+            expected_shape = (nsweeps, 3)
+        if att.shape != expected_shape:
+            raise ValueError(f"att must have shape {expected_shape} when g is provided, got {att.shape}")
+
     z0 = 0
     if dealias:
         if nbatch != 1:
@@ -64,20 +75,12 @@ def _prepare_backprojection_polar_2d_lanczos_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by backprojection_polar_2d_lanczos and for testing.
     """
-    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
-    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
-    antenna = AntennaPattern(g, g_extent)
-
-    z0 = 0
-    if dealias:
-        if nbatch != 1:
-            raise ValueError("Only nbatch=1 supported with dealias")
-        z0 = torch.mean(pos[..., 2])
-
-    return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
-            r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0, order,
-            *antenna.to_cpp_args(),
-            data_fmod, alias_fmod)
+    # Reuse linear preparation and insert order parameter
+    base_args = _prepare_backprojection_polar_2d_args(
+        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod
+    )
+    # Insert order after z0 (index 17)
+    return base_args[:17] + (order,) + base_args[17:]
 
 
 def _prepare_backprojection_polar_2d_knab_args(
@@ -101,20 +104,12 @@ def _prepare_backprojection_polar_2d_knab_args(
     Returns tuple of arguments matching C++ operator signature.
     Used internally by backprojection_polar_2d_knab and for testing.
     """
-    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
-    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
-    antenna = AntennaPattern(g, g_extent)
-
-    z0 = 0
-    if dealias:
-        if nbatch != 1:
-            raise ValueError("Only nbatch=1 supported with dealias")
-        z0 = torch.mean(pos[..., 2])
-
-    return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
-            r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0, order, oversample,
-            *antenna.to_cpp_args(),
-            data_fmod, alias_fmod)
+    # Reuse linear preparation and insert order and oversample parameters
+    base_args = _prepare_backprojection_polar_2d_args(
+        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod
+    )
+    # Insert order and oversample after z0 (index 17)
+    return base_args[:17] + (order, oversample) + base_args[17:]
 
 
 def backprojection_polar_2d(
@@ -170,8 +165,8 @@ def backprojection_polar_2d(
         out data outside the antenna beam.
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
-        If TX antenna equals RX antenna, then this should be just antenna gain.
-        (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
+-       If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1].
         g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
@@ -270,38 +265,11 @@ def backprojection_polar_2d_lanczos(
     img : Tensor
         Pseudo-polar format radar image.
     """
-
-    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
-    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
-    antenna = AntennaPattern(g, g_extent)
-
-    z0 = 0
-    if dealias:
-        z0 = torch.mean(pos[:, 2])
-
-    return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(
-        data,
-        pos,
-        att,
-        nbatch,
-        sweep_samples,
-        nsweeps,
-        fc,
-        r_res,
-        r0,
-        dr,
-        theta0,
-        dtheta,
-        nr,
-        ntheta,
-        d0,
-        dealias,
-        z0,
-        order,
-        *antenna.to_cpp_args(),
-        data_fmod,
-        alias_fmod
+    cpp_args = _prepare_backprojection_polar_2d_lanczos_args(
+        data, grid, fc, r_res, pos, d0, dealias, order, att, g, g_extent,
+        data_fmod, alias_fmod
     )
+    return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(*cpp_args)
 
 
 def backprojection_polar_2d_knab(
@@ -363,7 +331,7 @@ def backprojection_polar_2d_knab(
         Antenna rotation tensor.
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
         out data outside the antenna beam.
-    g : Tensor
+    g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
@@ -383,39 +351,11 @@ def backprojection_polar_2d_knab(
     img : Tensor
         Pseudo-polar format radar image.
     """
-
-    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
-    nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
-    antenna = AntennaPattern(g, g_extent)
-
-    z0 = 0
-    if dealias:
-        z0 = torch.mean(pos[:, 2])
-
-    return torch.ops.torchbp.backprojection_polar_2d_knab.default(
-        data,
-        pos,
-        att,
-        nbatch,
-        sweep_samples,
-        nsweeps,
-        fc,
-        r_res,
-        r0,
-        dr,
-        theta0,
-        dtheta,
-        nr,
-        ntheta,
-        d0,
-        dealias,
-        z0,
-        order,
-        oversample,
-        *antenna.to_cpp_args(),
-        data_fmod,
-        alias_fmod
+    cpp_args = _prepare_backprojection_polar_2d_knab_args(
+        data, grid, fc, r_res, pos, d0, dealias, order, oversample, att, g, g_extent,
+        data_fmod, alias_fmod
     )
+    return torch.ops.torchbp.backprojection_polar_2d_knab.default(*cpp_args)
 
 
 def _prepare_backprojection_cart_2d_args(
@@ -611,8 +551,8 @@ def projection_cart_2d(
         [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
-        If TX antenna equals RX antenna, then this should be just antenna gain.
-        (0, 0) angle is at the beam center. Isotropic antenna is assumed if g is None.
+-       If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1].
         g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
