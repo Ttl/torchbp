@@ -92,6 +92,12 @@ __global__ void backprojection_polar_2d_kernel(
         float pz2 = pos_z * pos_z;
         int sweep_offset = data_batch_stride + i * sweep_samples;
 
+        float att_el, att_az;
+        if constexpr (HasAntennaPattern) {
+            att_el = __ldg(&att[pos_idx + 0]);
+            att_az = __ldg(&att[pos_idx + 2]);
+        }
+
         #pragma unroll
         for(int k=0; k<PIXELS_PER_THREAD; ++k) {
             if(idr_base + k >= Nr) continue;
@@ -159,8 +165,8 @@ __global__ void backprojection_polar_2d_kernel(
 
                 if constexpr (HasAntennaPattern) {
                     const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
-                    const float el_deg = look_angle - __ldg(&att[pos_idx + 0]);
-                    const float az_deg = atan2f(py, px) - __ldg(&att[pos_idx + 2]);
+                    const float el_deg = look_angle - att_el;
+                    const float az_deg = atan2f(py, px) - att_az;
 
                     const float el_idx = (el_deg - g_el0) / g_del;
                     const float az_idx = (az_deg - g_az0) / g_daz;
@@ -173,11 +179,11 @@ __global__ void backprojection_polar_2d_kernel(
                         const float az_frac = az_idx - az_int;
                         const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
 
-                        float ws_re = w * s_re;
-                        float ws_im = w * s_im;
+                        const float ws_re = w * s_re;
+                        const float ws_im = w * s_im;
                         pixel_re[k] = fmaf(ws_re, ref_cos, fmaf(-ws_im, ref_sin, pixel_re[k]));
                         pixel_im[k] = fmaf(ws_re, ref_sin, fmaf(ws_im, ref_cos, pixel_im[k]));
-                        w_sum2[k] += w * w;
+                        w_sum2[k] = fmaf(w, w, w_sum2[k]);
                         w_sum1[k] += w;
                     }
                 } else {
