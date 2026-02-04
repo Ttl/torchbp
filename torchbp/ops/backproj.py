@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     from ..grid import PolarGrid, CartesianGrid
 
 cart_2d_nargs = 16
-polar_2d_nargs = 26
+polar_2d_nargs = 27
 
 def _prepare_backprojection_polar_2d_args(
     data: Tensor,
@@ -21,7 +21,8 @@ def _prepare_backprojection_polar_2d_args(
     g: Tensor | None = None,
     g_extent: list | None = None,
     data_fmod: float = 0,
-    alias_fmod: float = 0
+    alias_fmod: float = 0,
+    normalize: bool = True
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d operator.
 
@@ -52,7 +53,7 @@ def _prepare_backprojection_polar_2d_args(
     return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
             r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0,
             *antenna.to_cpp_args(),
-            data_fmod, alias_fmod)
+            data_fmod, alias_fmod, normalize)
 
 
 def _prepare_backprojection_polar_2d_lanczos_args(
@@ -68,7 +69,8 @@ def _prepare_backprojection_polar_2d_lanczos_args(
     g: Tensor | None = None,
     g_extent: list | None = None,
     data_fmod: float = 0,
-    alias_fmod: float = 0
+    alias_fmod: float = 0,
+    normalize: bool = True
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d_lanczos operator.
 
@@ -77,7 +79,7 @@ def _prepare_backprojection_polar_2d_lanczos_args(
     """
     # Reuse linear preparation and insert order parameter
     base_args = _prepare_backprojection_polar_2d_args(
-        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod
+        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod, normalize
     )
     # Insert order after z0 (index 17)
     return base_args[:17] + (order,) + base_args[17:]
@@ -97,7 +99,8 @@ def _prepare_backprojection_polar_2d_knab_args(
     g: Tensor | None = None,
     g_extent: list | None = None,
     data_fmod: float = 0,
-    alias_fmod: float = 0
+    alias_fmod: float = 0,
+    normalize: bool = True
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d_knab operator.
 
@@ -106,7 +109,7 @@ def _prepare_backprojection_polar_2d_knab_args(
     """
     # Reuse linear preparation and insert order and oversample parameters
     base_args = _prepare_backprojection_polar_2d_args(
-        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod
+        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod, normalize
     )
     # Insert order and oversample after z0 (index 17)
     return base_args[:17] + (order, oversample) + base_args[17:]
@@ -124,7 +127,8 @@ def backprojection_polar_2d(
     g: Tensor | None = None,
     g_extent: list | None = None,
     data_fmod: float = 0,
-    alias_fmod: float = 0
+    alias_fmod: float = 0,
+    normalize: bool = True
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
@@ -177,6 +181,9 @@ def backprojection_polar_2d(
         Range modulation frequency applied to input data.
     alias_fmod : float
         Range modulation frequency applied to SAR image.
+    normalize : bool
+        If True (default), apply W1/W2 normalization when antenna pattern is used.
+        Set to False for FFBP to output unnormalized accumulation.
 
     Returns
     -------
@@ -185,7 +192,7 @@ def backprojection_polar_2d(
     """
     cpp_args = _prepare_backprojection_polar_2d_args(
         data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent,
-        data_fmod, alias_fmod
+        data_fmod, alias_fmod, normalize
     )
     return torch.ops.torchbp.backprojection_polar_2d.default(*cpp_args)
 
@@ -806,6 +813,7 @@ def _fake_polar_2d(
     g_nel: int,
     data_fmod: float,
     alias_fmod: float,
+    normalize: bool,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
@@ -841,6 +849,7 @@ def _fake_polar_2d_grad(
     g_nel: int,
     data_fmod: float,
     alias_fmod: float,
+    normalize: bool,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)

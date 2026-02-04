@@ -991,6 +991,184 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
 }
 
 
+// FFBP merge kernel with antenna pattern weighting using both W1 and W2 maps
+// Weight maps contain W1 (sum of gains) and W2 (sum of squared gains) from each subaperture
+// Input images are unnormalized accumulation A (backprojection called with normalize=False)
+// Merge formula:
+//   A_total = A0 + A1 (sum unnormalized accumulations)
+//   merged = A_total * (W1_total / W2_total) (normalize only at final output)
+// Output weight maps can be decimated to save VRAM (write every D-th pixel)
+template<int N_COEFS>
+__global__ void ffbp_merge2_kernel_poly_weighted(
+        const complex64_t *img0, const complex64_t *img1,
+        complex64_t *out,
+        float *w1_out,  // Output W1 map (sum of w1 contributions), can be null
+        float *w2_out,  // Output W2 map (sum of w2 contributions), can be null
+        const float *dorigin,
+        float ref_phase,
+        const float *r0, const float *dr, const float *theta0, const float *dtheta,
+        const int *Nr, const int *Ntheta,
+        float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
+        float z1, int order, int alias, float alias_fmod,
+        // Weight map parameters for img0
+        const float *w1_map0, const float *w2_map0,
+        float w_r0_0, float w_dr0, float w_theta0_0, float w_dtheta0,
+        int w_nr0, int w_ntheta0,
+        // Weight map parameters for img1
+        const float *w1_map1, const float *w2_map1,
+        float w_r0_1, float w_dr1, float w_theta0_1, float w_dtheta1,
+        int w_nr1, int w_ntheta1,
+        // Output weight map decimation (1 = no decimation, 4 = write every 4th pixel)
+        int output_weight_decimation) {
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    if (idx >= Nr1 * Ntheta1) {
+        return;
+    }
+
+    const float d = r1 + dr1 * idr;
+    const float t = theta1 + dtheta1 * idtheta;
+
+    // Compute decimated output weight map dimensions and check if this pixel should write
+    const int dec = output_weight_decimation;
+    const int out_ntheta_dec = (Ntheta1 + dec - 1) / dec;
+    const bool should_write_weight = (w1_out != nullptr) &&
+                                     (idr % dec == 0) && (idtheta % dec == 0);
+    const int w_out_idx = should_write_weight ?
+                          (idr / dec) * out_ntheta_dec + (idtheta / dec) : 0;
+
+    if (t < -1.0f || t > 1.0f) {
+        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+        if (should_write_weight) {
+            w1_out[w_out_idx] = 0.0f;
+            w2_out[w_out_idx] = 0.0f;
+        }
+        return;
+    }
+
+    const float sint = t;
+    const float cost = sqrtf(fmaf(-t, t, 1.0f));
+    const float dz = hypotf(z1, d);
+
+    // Accumulate unnormalized A values and total W1, W2
+    complex64_t A_total{};
+    float W1_total = 0.0f;
+    float W2_total = 0.0f;
+
+    // Weight map pointers and parameters as arrays for loop
+    const float *w1_maps[2] = {w1_map0, w1_map1};
+    const float *w2_maps[2] = {w2_map0, w2_map1};
+    const float w_r0[2] = {w_r0_0, w_r0_1};
+    const float w_dr[2] = {w_dr0, w_dr1};
+    const float w_theta0[2] = {w_theta0_0, w_theta0_1};
+    const float w_dtheta[2] = {w_dtheta0, w_dtheta1};
+    const int w_nr[2] = {w_nr0, w_nr1};
+    const int w_ntheta[2] = {w_ntheta0, w_ntheta1};
+
+    #pragma unroll
+    for (int id=0; id < 2; id++) {
+        const complex64_t *img = id == 0 ? img0 : img1;
+        const float dorig0 = __ldg(&dorigin[id * 3 + 0]);
+        const float dorig1 = __ldg(&dorigin[id * 3 + 1]);
+        const float dorig2 = __ldg(&dorigin[id * 3 + 2]);
+
+        const float d_dorig0 = d * cost;
+        const float d_dorig1 = d * sint;
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float r0_val = __ldg(&r0[id]);
+        const float dr_val = __ldg(&dr[id]);
+        const float theta0_val = __ldg(&theta0[id]);
+        const float dtheta_val = __ldg(&dtheta[id]);
+        const int Nr_val = __ldg(&Nr[id]);
+        const int Ntheta_val = __ldg(&Ntheta[id]);
+
+        const float dri = (rp - r0_val) / dr_val;
+        const float dti = (tp - theta0_val) / dtheta_val;
+
+        if (dri >= 0 && dri < Nr_val-1 && dti >= 0 && dti < Ntheta_val-1) {
+            complex64_t v = interp_2d_poly<complex64_t, complex64_t, N_COEFS>(
+                    img, Nr_val, Ntheta_val, dri, dti, order);
+
+            float ref_sin, ref_cos;
+            const float z0 = z1 + dorig2;
+            const float rpz = hypotf(z0, rp);
+            const float phase_angle = fmaf(ref_phase, rpz - dz, -alias_fmod * (dri - idr)) * M_PI;
+            __sincosf(phase_angle, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+
+            // Interpolate W1 and W2 from weight maps (using same rp, tp coordinates)
+            // Weight maps are in the subaperture's local coordinate system
+            float w1 = 0.0f;
+            float w2 = 0.0f;
+            if (w1_maps[id] != nullptr && w2_maps[id] != nullptr) {
+                const float w_ri = (rp - w_r0[id]) / w_dr[id];
+                const float w_ti = (tp - w_theta0[id]) / w_dtheta[id];
+
+                // Clamp coordinates to valid range to avoid edge artifacts
+                const int w_ri_int = max(0, min((int)w_ri, w_nr[id] - 2));
+                const int w_ti_int = max(0, min((int)w_ti, w_ntheta[id] - 2));
+                const float w_ri_frac = fmaxf(0.0f, fminf(w_ri - (float)w_ri_int, 1.0f));
+                const float w_ti_frac = fmaxf(0.0f, fminf(w_ti - (float)w_ti_int, 1.0f));
+
+                w1 = interp2d<float>(w1_maps[id], w_nr[id], w_ntheta[id],
+                                     w_ri_int, w_ri_frac, w_ti_int, w_ti_frac);
+                w2 = interp2d<float>(w2_maps[id], w_nr[id], w_ntheta[id],
+                                     w_ri_int, w_ri_frac, w_ti_int, w_ti_frac);
+            }
+
+            if (w1 > 0.0f && w2 > 0.0f) {
+                // v is already unnormalized A (backprojection called with normalize=False)
+                // Simply accumulate A and the weights
+                A_total += v * ref;
+                W1_total += w1;
+                W2_total += w2;
+            } else if (w1_maps[id] == nullptr) {
+                // Only add unweighted if no weight map is provided at all
+                A_total += v * ref;
+            }
+            // If weight map exists but weights are zero/invalid, skip this contribution
+        }
+    }
+
+    // Apply normalization only at final merge (when not outputting weight maps)
+    // For intermediate merges, keep unnormalized A_total for next level
+    complex64_t pixel = A_total;
+    if (w1_out == nullptr && W2_total > 0.0f) {
+        // Final merge: apply W1/W2 normalization
+        pixel = A_total * (W1_total / W2_total);
+    }
+
+    if (alias) {
+        float ref_sin, ref_cos;
+        float af = alias_fmod;
+        float rp = ref_phase;
+        if (alias == 2) {
+            af = 0.0f;
+        }
+        if (alias == 3) {
+            rp = 0.0f;
+        }
+        const float alias_angle = fmaf(rp, dz, -af * idr) * M_PI;
+        __sincosf(alias_angle, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
+    }
+    out[idr*Ntheta1 + idtheta] = pixel;
+
+    // Write decimated weight maps (only every D-th pixel in both dimensions)
+    if (should_write_weight) {
+        w1_out[w_out_idx] = W1_total;
+        w2_out[w_out_idx] = W2_total;
+    }
+}
+
+
 std::vector<at::Tensor> polar_interp_linear_grad_cuda(
           const at::Tensor &grad,
           const at::Tensor &img,
@@ -1454,6 +1632,186 @@ at::Tensor ffbp_merge2_poly_cuda(
 	return out;
 }
 
+std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          const at::Tensor &dorigin,
+          double fc,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z1,
+          int64_t order,
+          const at::Tensor &poly_coefs,
+          int64_t alias,
+          double alias_fmod,
+          // Weight maps for img0 (W1 and W2)
+          const at::Tensor &w1_map0,
+          const at::Tensor &w2_map0,
+          double w_r0_0, double w_dr0, double w_theta0_0, double w_dtheta0,
+          int64_t w_nr0, int64_t w_ntheta0,
+          // Weight maps for img1 (W1 and W2)
+          const at::Tensor &w1_map1,
+          const at::Tensor &w2_map1,
+          double w_r0_1, double w_dr1, double w_theta0_1, double w_dtheta1,
+          int64_t w_nr1, int64_t w_ntheta1,
+          int64_t output_weight_map,
+          int64_t output_weight_decimation) {
+	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+	TORCH_CHECK(dorigin.dtype() == at::kFloat);
+	TORCH_CHECK(r0.dtype() == at::kFloat);
+	TORCH_CHECK(dr0.dtype() == at::kFloat);
+	TORCH_CHECK(theta0.dtype() == at::kFloat);
+	TORCH_CHECK(dtheta0.dtype() == at::kFloat);
+	TORCH_CHECK(Nr0.dtype() == at::kInt);
+	TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+	TORCH_CHECK(poly_coefs.dtype() == at::kFloat);
+	TORCH_CHECK(order >= 2 && order <= 8,
+		"ffbp_merge2_poly_weighted requires order in [2, 8], got ", order);
+	int64_t n_coefs = poly_coefs.size(0);
+	TORCH_CHECK(n_coefs <= POLY_COEF_MAX,
+		"ffbp_merge2_poly_weighted: poly_coefs has ", n_coefs, " coefficients, max is ", POLY_COEF_MAX);
+	TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(r0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dr0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(theta0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(dtheta0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(Nr0.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(Ntheta0.device().type() == at::DeviceType::CUDA);
+
+	// Check weight maps (both W1 and W2 must be provided together)
+	bool has_weight0 = w1_map0.defined() && w1_map0.numel() > 0 && w2_map0.defined() && w2_map0.numel() > 0;
+	bool has_weight1 = w1_map1.defined() && w1_map1.numel() > 0 && w2_map1.defined() && w2_map1.numel() > 0;
+	if (has_weight0) {
+		TORCH_CHECK(w1_map0.dtype() == at::kFloat);
+		TORCH_CHECK(w2_map0.dtype() == at::kFloat);
+		TORCH_INTERNAL_ASSERT(w1_map0.device().type() == at::DeviceType::CUDA);
+		TORCH_INTERNAL_ASSERT(w2_map0.device().type() == at::DeviceType::CUDA);
+	}
+	if (has_weight1) {
+		TORCH_CHECK(w1_map1.dtype() == at::kFloat);
+		TORCH_CHECK(w2_map1.dtype() == at::kFloat);
+		TORCH_INTERNAL_ASSERT(w1_map1.device().type() == at::DeviceType::CUDA);
+		TORCH_INTERNAL_ASSERT(w2_map1.device().type() == at::DeviceType::CUDA);
+	}
+
+	at::Tensor dorigin_contig = dorigin.contiguous();
+	at::Tensor img0_contig = img0.contiguous();
+	at::Tensor img1_contig = img1.contiguous();
+	at::Tensor r0_contig = r0.contiguous();
+	at::Tensor dr0_contig = dr0.contiguous();
+	at::Tensor theta0_contig = theta0.contiguous();
+	at::Tensor dtheta0_contig = dtheta0.contiguous();
+	at::Tensor Nr0_contig = Nr0.contiguous();
+	at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+	at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+	const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    c10::complex<float>* img0_ptr = img0_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* img1_ptr = img1_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+
+	// Weight map pointers (both W1 and W2)
+	at::Tensor w1_map0_contig, w2_map0_contig, w1_map1_contig, w2_map1_contig;
+	const float* w1_map0_ptr = nullptr;
+	const float* w2_map0_ptr = nullptr;
+	const float* w1_map1_ptr = nullptr;
+	const float* w2_map1_ptr = nullptr;
+	if (has_weight0) {
+		w1_map0_contig = w1_map0.contiguous();
+		w2_map0_contig = w2_map0.contiguous();
+		w1_map0_ptr = w1_map0_contig.data_ptr<float>();
+		w2_map0_ptr = w2_map0_contig.data_ptr<float>();
+	}
+	if (has_weight1) {
+		w1_map1_contig = w1_map1.contiguous();
+		w2_map1_contig = w2_map1.contiguous();
+		w1_map1_ptr = w1_map1_contig.data_ptr<float>();
+		w2_map1_ptr = w2_map1_contig.data_ptr<float>();
+	}
+
+	// Output weight maps (both W1 and W2) - allocated at decimated resolution
+	at::Tensor w1_out, w2_out;
+	float* w1_out_ptr = nullptr;
+	float* w2_out_ptr = nullptr;
+	int64_t out_nr_dec = Nr1;
+	int64_t out_ntheta_dec = Ntheta1;
+	if (output_weight_map) {
+		// Compute decimated dimensions
+		int64_t dec = output_weight_decimation > 0 ? output_weight_decimation : 1;
+		out_nr_dec = (Nr1 + dec - 1) / dec;
+		out_ntheta_dec = (Ntheta1 + dec - 1) / dec;
+		w1_out = torch::empty({out_nr_dec, out_ntheta_dec}, torch::TensorOptions().dtype(at::kFloat).device(img0.device()));
+		w2_out = torch::empty({out_nr_dec, out_ntheta_dec}, torch::TensorOptions().dtype(at::kFloat).device(img0.device()));
+		w1_out_ptr = w1_out.data_ptr<float>();
+		w2_out_ptr = w2_out.data_ptr<float>();
+	}
+
+    // Copy polynomial coefficients to constant memory
+    at::Tensor poly_coefs_cpu = poly_coefs.contiguous().cpu();
+    cudaMemcpyToSymbol(d_poly_coefs, poly_coefs_cpu.data_ptr<float>(),
+                       n_coefs * sizeof(float), 0, cudaMemcpyHostToDevice);
+
+	dim3 thread_per_block = {256, 1};
+    int blocks = Nr1 * Ntheta1;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, 1, 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int dec = output_weight_decimation > 0 ? output_weight_decimation : 1;
+    #define LAUNCH_WEIGHTED_KERNEL(N) \
+        ffbp_merge2_kernel_poly_weighted<N><<<block_count, thread_per_block, 0, stream>>>( \
+            (const complex64_t*)img0_ptr, (const complex64_t*)img1_ptr, \
+            (complex64_t*)out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase, \
+            r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
+            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI, \
+            w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0, \
+            w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1, \
+            dec)
+
+    switch (n_coefs) {
+        case 4: LAUNCH_WEIGHTED_KERNEL(4); break;
+        case 5: LAUNCH_WEIGHTED_KERNEL(5); break;
+        case 6: LAUNCH_WEIGHTED_KERNEL(6); break;
+        case 7: LAUNCH_WEIGHTED_KERNEL(7); break;
+        case 8: LAUNCH_WEIGHTED_KERNEL(8); break;
+        case 9: LAUNCH_WEIGHTED_KERNEL(9); break;
+        case 10: LAUNCH_WEIGHTED_KERNEL(10); break;
+        case 11: LAUNCH_WEIGHTED_KERNEL(11); break;
+        case 12: LAUNCH_WEIGHTED_KERNEL(12); break;
+        case 13: LAUNCH_WEIGHTED_KERNEL(13); break;
+        case 14: LAUNCH_WEIGHTED_KERNEL(14); break;
+        default:
+            TORCH_CHECK(false, "ffbp_merge2_poly_weighted: n_coefs must be 4-14, got ", n_coefs);
+    }
+    #undef LAUNCH_WEIGHTED_KERNEL
+
+	std::vector<at::Tensor> ret;
+	ret.push_back(out);
+	ret.push_back(w1_out);
+	ret.push_back(w2_out);
+	return ret;
+}
+
 // Registers CUDA implementations
 TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("polar_interp_linear", &polar_interp_linear_cuda);
@@ -1462,6 +1820,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("ffbp_merge2_lanczos", &ffbp_merge2_lanczos_cuda);
   m.impl("ffbp_merge2_knab", &ffbp_merge2_knab_cuda);
   m.impl("ffbp_merge2_poly", &ffbp_merge2_poly_cuda);
+  m.impl("ffbp_merge2_poly_weighted", &ffbp_merge2_poly_weighted_cuda);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cuda);
   m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cuda);
   m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cuda);

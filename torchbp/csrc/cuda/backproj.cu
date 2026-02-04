@@ -9,7 +9,7 @@ enum class InterpMethod {
     KNAB
 };
 
-template<typename T, bool HasAntennaPattern, InterpMethod Method = InterpMethod::LINEAR>
+template<typename T, bool HasAntennaPattern, bool Normalize = true, InterpMethod Method = InterpMethod::LINEAR>
 __global__ void backprojection_polar_2d_kernel(
           const T* __restrict__ data,
           const float* __restrict__ pos,
@@ -177,7 +177,7 @@ __global__ void backprojection_polar_2d_kernel(
                     if (el_int >= 0 && el_int + 1 < g_nel && az_int >= 0 && az_int + 1 < g_naz) {
                         const float el_frac = el_idx - el_int;
                         const float az_frac = az_idx - az_int;
-                        const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+                        const float w = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
 
                         const float ws_re = w * s_re;
                         const float ws_im = w * s_im;
@@ -203,7 +203,8 @@ __global__ void backprojection_polar_2d_kernel(
             // Unweighted: Σs = scene * Σg (signal has g)
             // Weighted: Σ(s * g) = scene * Σg²
             // To match: normalize by Σg / Σg²
-            if constexpr (HasAntennaPattern) {
+            // When Normalize=false, skip this normalization (used in FFBP)
+            if constexpr (HasAntennaPattern && Normalize) {
                 if (w_sum2[k] > 0.0f) {
                     pixel *= w_sum1[k] / w_sum2[k];
                 }
@@ -561,7 +562,7 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         if (az_int < 0 || az_int+1 >= g_naz) {
             continue;
         }
-        float g_i = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
         float sinl = 1.0f;
 
         if (normalization == 1) {
@@ -858,7 +859,7 @@ __global__ void projection_cart_2d_kernel(
             if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz) {
                 w = 0.0f;
             } else {
-                w *= interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+                w *= interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
             }
         }
 
@@ -1059,7 +1060,8 @@ at::Tensor backprojection_polar_2d_cuda(
           int64_t g_naz,
           int64_t g_nel,
           double data_fmod,
-          double alias_fmod) {
+          double alias_fmod,
+          bool normalize) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
@@ -1111,9 +1113,9 @@ at::Tensor backprojection_polar_2d_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Use template specialization to eliminate antenna pattern branch
-    #define LAUNCH_KERNEL(T, has_antenna) \
-        backprojection_polar_2d_kernel<T, has_antenna> \
+    // Use template specialization to eliminate antenna pattern and normalize branches
+    #define LAUNCH_KERNEL(T, has_antenna, do_normalize) \
+        backprojection_polar_2d_kernel<T, has_antenna, do_normalize> \
               <<<block_count, thread_per_block, 0, stream>>>( \
                       (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
                       sweep_samples, nsweeps, \
@@ -1124,17 +1126,21 @@ at::Tensor backprojection_polar_2d_cuda(
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
-        if (antenna_pattern) {
-            LAUNCH_KERNEL(complex64_t, true);
+        if (antenna_pattern && normalize) {
+            LAUNCH_KERNEL(complex64_t, true, true);
+        } else if (antenna_pattern && !normalize) {
+            LAUNCH_KERNEL(complex64_t, true, false);
         } else {
-            LAUNCH_KERNEL(complex64_t, false);
+            LAUNCH_KERNEL(complex64_t, false, true);
         }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
-        if (antenna_pattern) {
-            LAUNCH_KERNEL(half2, true);
+        if (antenna_pattern && normalize) {
+            LAUNCH_KERNEL(half2, true, true);
+        } else if (antenna_pattern && !normalize) {
+            LAUNCH_KERNEL(half2, true, false);
         } else {
-            LAUNCH_KERNEL(half2, false);
+            LAUNCH_KERNEL(half2, false, true);
         }
     }
 
@@ -1169,7 +1175,8 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
           int64_t g_naz,
           int64_t g_nel,
           double data_fmod,
-          double alias_fmod) {
+          double alias_fmod,
+          bool normalize) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
@@ -1389,7 +1396,8 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
           int64_t g_naz,
           int64_t g_nel,
           double data_fmod,
-          double alias_fmod) {
+          double alias_fmod,
+          bool normalize) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
@@ -1443,9 +1451,9 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Use template specialization to eliminate antenna pattern branch
-    #define LAUNCH_KERNEL(T, has_antenna) \
-        backprojection_polar_2d_kernel<T, has_antenna, InterpMethod::LANCZOS> \
+    // Use template specialization to eliminate antenna pattern and normalize branches
+    #define LAUNCH_KERNEL(T, has_antenna, do_normalize) \
+        backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::LANCZOS> \
               <<<block_count, thread_per_block, 0, stream>>>( \
                       (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
                       sweep_samples, nsweeps, \
@@ -1457,17 +1465,21 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
-        if (antenna_pattern) {
-            LAUNCH_KERNEL(complex64_t, true);
+        if (antenna_pattern && normalize) {
+            LAUNCH_KERNEL(complex64_t, true, true);
+        } else if (antenna_pattern && !normalize) {
+            LAUNCH_KERNEL(complex64_t, true, false);
         } else {
-            LAUNCH_KERNEL(complex64_t, false);
+            LAUNCH_KERNEL(complex64_t, false, true);
         }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
-        if (antenna_pattern) {
-            LAUNCH_KERNEL(half2, true);
+        if (antenna_pattern && normalize) {
+            LAUNCH_KERNEL(half2, true, true);
+        } else if (antenna_pattern && !normalize) {
+            LAUNCH_KERNEL(half2, true, false);
         } else {
-            LAUNCH_KERNEL(half2, false);
+            LAUNCH_KERNEL(half2, false, true);
         }
     }
 
@@ -1504,7 +1516,8 @@ at::Tensor backprojection_polar_2d_knab_cuda(
           int64_t g_naz,
           int64_t g_nel,
           double data_fmod,
-          double alias_fmod) {
+          double alias_fmod,
+          bool normalize) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
@@ -1559,9 +1572,9 @@ at::Tensor backprojection_polar_2d_knab_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Use template specialization to eliminate antenna pattern branch
-    #define LAUNCH_KERNEL(T, has_antenna) \
-        backprojection_polar_2d_kernel<T, has_antenna, InterpMethod::KNAB> \
+    // Use template specialization to eliminate antenna pattern and normalize branches
+    #define LAUNCH_KERNEL(T, has_antenna, do_normalize) \
+        backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::KNAB> \
               <<<block_count, thread_per_block, 0, stream>>>( \
                       (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
                       sweep_samples, nsweeps, \
@@ -1573,17 +1586,21 @@ at::Tensor backprojection_polar_2d_knab_cuda(
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
-        if (antenna_pattern) {
-            LAUNCH_KERNEL(complex64_t, true);
+        if (antenna_pattern && normalize) {
+            LAUNCH_KERNEL(complex64_t, true, true);
+        } else if (antenna_pattern && !normalize) {
+            LAUNCH_KERNEL(complex64_t, true, false);
         } else {
-            LAUNCH_KERNEL(complex64_t, false);
+            LAUNCH_KERNEL(complex64_t, false, true);
         }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
-        if (antenna_pattern) {
-            LAUNCH_KERNEL(half2, true);
+        if (antenna_pattern && normalize) {
+            LAUNCH_KERNEL(half2, true, true);
+        } else if (antenna_pattern && !normalize) {
+            LAUNCH_KERNEL(half2, true, false);
         } else {
-            LAUNCH_KERNEL(half2, false);
+            LAUNCH_KERNEL(half2, false, true);
         }
     }
 
@@ -2011,6 +2028,166 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cuda(
 }
 
 
+// CUDA kernel to compute subaperture illumination weight maps (W1, W2)
+__global__ void compute_illumination_kernel(
+          const float* __restrict__ pos,  // [nsweeps, 3]
+          const float* __restrict__ att,  // [nsweeps, 3] or nullptr
+          const float* __restrict__ g,    // [g_nel, g_naz] antenna pattern
+          float* __restrict__ w1_out,     // [nr, ntheta] output W1 map
+          float* __restrict__ w2_out,     // [nr, ntheta] output W2 map
+          int nsweeps,
+          // Grid parameters
+          float r0, float dr, float theta0, float dtheta, int nr, int ntheta,
+          // Antenna pattern parameters
+          float g_el0, float g_del, float g_az0, float g_daz, int g_nel, int g_naz,
+          // Decimation factor (1 = no decimation)
+          int decimation) {
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Output dimensions are decimated
+    const int out_ntheta = (ntheta + decimation - 1) / decimation;
+    const int out_nr = (nr + decimation - 1) / decimation;
+
+    if (idx >= out_nr * out_ntheta) return;
+
+    const int out_idtheta = idx % out_ntheta;
+    const int out_idr = idx / out_ntheta;
+
+    // Map to full grid coordinates (sample center of decimated cell)
+    const int full_idr = out_idr * decimation;
+    const int full_idtheta = out_idtheta * decimation;
+
+    // Compute pixel coordinates
+    const float r = r0 + dr * full_idr;
+    const float t = theta0 + dtheta * full_idtheta;  // t is sin(theta)
+    const float cost = sqrtf(1.0f - t*t);
+    const float x = r * cost;
+    const float y = r * t;
+
+    float w1 = 0.0f;
+    float w2 = 0.0f;
+
+    for (int i = 0; i < nsweeps; i++) {
+        const float pos_x = pos[i * 3 + 0];
+        const float pos_y = pos[i * 3 + 1];
+        const float pos_z = pos[i * 3 + 2];
+
+        const float px = x - pos_x;
+        const float py = y - pos_y;
+        const float pz = -pos_z;
+        const float d = sqrtf(px*px + py*py + pz*pz);
+
+        const float look_angle = asinf(fmaxf(-1.0f, fminf(1.0f, -pos_z / d)));
+
+        float att_el = 0.0f;
+        float att_az = 0.0f;
+        if (att != nullptr) {
+            att_el = att[i * 3 + 0];
+            att_az = att[i * 3 + 2];
+        }
+
+        // Antenna-relative angles
+        const float el = look_angle - att_el;
+        const float az = atan2f(py, px) - att_az;
+
+        // Antenna pattern interpolation
+        const float el_idx = (el - g_el0) / g_del;
+        const float az_idx = (az - g_az0) / g_daz;
+
+        if (el_idx >= 0 && el_idx < g_nel - 1 && az_idx >= 0 && az_idx < g_naz - 1) {
+            // Bilinear interpolation
+            const int el_int = (int)el_idx;
+            const int az_int = (int)az_idx;
+            const float el_frac = el_idx - el_int;
+            const float az_frac = az_idx - az_int;
+
+            const float gain = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+
+            w1 += gain;
+            w2 += gain * gain;
+        }
+    }
+
+    w1_out[idx] = w1;
+    w2_out[idx] = w2;
+}
+
+
+std::vector<at::Tensor> compute_illumination_cuda(
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t nr,
+          int64_t ntheta,
+          int64_t decimation) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(g.dtype() == at::kFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+    TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+
+    const int64_t nsweeps = pos.size(0);
+    const int64_t g_nel = g.size(0);
+    const int64_t g_naz = g.size(1);
+
+    // Check att tensor (can be undefined)
+    const float* att_ptr = nullptr;
+    at::Tensor att_contig;
+    if (att.defined() && att.numel() > 0) {
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+        att_contig = att.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+    }
+
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor g_contig = g.contiguous();
+
+    // Compute decimated output dimensions
+    const int64_t dec = decimation > 0 ? decimation : 1;
+    const int64_t out_nr = (nr + dec - 1) / dec;
+    const int64_t out_ntheta = (ntheta + dec - 1) / dec;
+
+    // Allocate output tensors at decimated resolution
+    at::Tensor w1_out = torch::empty({out_nr, out_ntheta},
+                                     torch::TensorOptions().dtype(at::kFloat).device(pos.device()));
+    at::Tensor w2_out = torch::empty({out_nr, out_ntheta},
+                                     torch::TensorOptions().dtype(at::kFloat).device(pos.device()));
+
+    dim3 thread_per_block = {256, 1};
+    int blocks = out_nr * out_ntheta;
+    unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+    dim3 block_count = {block_x, 1, 1};
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    compute_illumination_kernel<<<block_count, thread_per_block, 0, stream>>>(
+        pos_contig.data_ptr<float>(),
+        att_ptr,
+        g_contig.data_ptr<float>(),
+        w1_out.data_ptr<float>(),
+        w2_out.data_ptr<float>(),
+        nsweeps,
+        r0, dr, theta0, dtheta, nr, ntheta,
+        g_el0, g_del, g_az0, g_daz, g_nel, g_naz,
+        dec
+    );
+
+    std::vector<at::Tensor> ret;
+    ret.push_back(w1_out);
+    ret.push_back(w2_out);
+    return ret;
+}
+
+
 // Registers CUDA implementations
 TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cuda);
@@ -2023,6 +2200,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("gpga_backprojection_2d_lanczos", &gpga_backprojection_2d_lanczos_cuda);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
   m.impl("projection_cart_2d", &projection_cart_2d_cuda);
+  m.impl("compute_illumination", &compute_illumination_cuda);
 }
 
 }

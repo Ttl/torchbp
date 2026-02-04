@@ -817,6 +817,242 @@ def ffbp_merge2_poly(
     )
 
 
+def ffbp_merge2_poly_weighted(
+    img0: Tensor,
+    img1: Tensor,
+    dorigin0: Tensor,
+    dorigin1: Tensor,
+    grid_polars: list["PolarGrid | dict"],
+    fc: float,
+    grid_polar_new: "PolarGrid | dict" = None,
+    z0: float = 0,
+    order: int = 6,
+    oversample: float = 1.5,
+    alias: bool = False,
+    alias_fmod: float = 0,
+    output_alias: bool = True,
+    poly_coefs: Tensor = None,
+    w1_map0: Tensor = None,
+    w2_map0: Tensor = None,
+    weight_grid0: "PolarGrid | dict" = None,
+    w1_map1: Tensor = None,
+    w2_map1: Tensor = None,
+    weight_grid1: "PolarGrid | dict" = None,
+    output_weight_map: bool = False,
+    output_weight_decimation: int = 1,
+) -> tuple[Tensor, Tensor | None, Tensor | None, "dict | None"]:
+    """
+    Interpolate two pseudo-polar radar images to new grid with antenna pattern weighting.
+
+    This is the weighted version of ffbp_merge2_poly that applies antenna pattern
+    weights during the merge. Uses both W1 (sum of gains) and W2 (sum of squared gains)
+    to correctly reconstruct the direct backprojection result.
+
+    The merge formula recovers the unnormalized accumulation A from normalized images
+    (img = A * W1/W2) using:
+        A = img * W2 / W1
+    Then combines:
+        merged = (A0 + A1) * (W1_0 + W1_1) / (W2_0 + W2_1)
+
+    Gradient not supported.
+
+    Parameters
+    ----------
+    img0 : Tensor
+        2D radar image in [range, angle] format.
+    img1 : Tensor
+        Same format as img0.
+    dorigin0 : Tensor
+        Origin offset for img0. Shape: [3].
+    dorigin1 : Tensor
+        Origin offset for img1. Shape: [3].
+    grid_polars : list of PolarGrid or dict
+        List of polar grid definitions for each input image.
+    fc : float
+        RF center frequency in Hz.
+    grid_polar_new : PolarGrid or dict, optional
+        Grid definition of the output image.
+    z0 : float
+        Height of the antenna phase center in the new image.
+    order : int
+        Interpolation order. Must be in [2, 8].
+    oversample : float
+        Oversampling factor in the input data.
+    alias : bool
+        Add back range dependent phase.
+    alias_fmod : float
+        Range modulation frequency applied to input.
+    output_alias : bool
+        If True and alias is True, apply alias_fmod to output.
+    poly_coefs : Tensor, optional
+        Precomputed polynomial coefficients.
+    w1_map0 : Tensor, optional
+        W1 weight map (sum of gains) for img0. Shape: [w_nr0, w_ntheta0].
+    w2_map0 : Tensor, optional
+        W2 weight map (sum of squared gains) for img0. Shape: [w_nr0, w_ntheta0].
+    weight_grid0 : PolarGrid or dict, optional
+        Grid definition for weight maps of img0.
+    w1_map1 : Tensor, optional
+        W1 weight map (sum of gains) for img1. Shape: [w_nr1, w_ntheta1].
+    w2_map1 : Tensor, optional
+        W2 weight map (sum of squared gains) for img1. Shape: [w_nr1, w_ntheta1].
+    weight_grid1 : PolarGrid or dict, optional
+        Grid definition for weight maps of img1.
+    output_weight_map : bool
+        If True, return merged weight maps for propagation through hierarchy.
+    output_weight_decimation : int
+        Decimation factor for output weight maps (1 = no decimation, 4 = 1/16 size).
+        Higher values reduce VRAM usage but may reduce weight accuracy.
+
+    Returns
+    -------
+    out : Tensor
+        Interpolated radar image.
+    w1_out : Tensor or None
+        Merged W1 weight map if output_weight_map is True, else None.
+        Shape is [nr // decimation, ntheta // decimation].
+    w2_out : Tensor or None
+        Merged W2 weight map if output_weight_map is True, else None.
+        Shape is [nr // decimation, ntheta // decimation].
+    merged_weight_grid : dict or None
+        Grid definition for the output weight maps if output_weight_map is True, else None.
+    """
+    device = img0.device
+    nimages = 2
+
+    if order > 8:
+        raise ValueError(f"Polynomial interpolation knab order must be <= 8, got {order}")
+
+    # Use precomputed coefficients if provided, otherwise compute them
+    if poly_coefs is None:
+        poly_degree = select_knab_poly_degree(oversample, order)
+        poly_coefs = compute_knab_poly_coefs_full(order, oversample, poly_degree).to(device)
+    else:
+        poly_coefs = poly_coefs.to(device)
+
+    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dr0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
+    theta0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dtheta0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
+    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    for i in range(nimages):
+        r1_0, r1_1 = grid_polars[i]["r"]
+        theta1_0, theta1_1 = grid_polars[i]["theta"]
+        ntheta1 = grid_polars[i]["ntheta"]
+        nr1 = grid_polars[i]["nr"]
+        dtheta1 = (theta1_1 - theta1_0) / ntheta1
+        dr1 = (r1_1 - r1_0) / nr1
+        r0[i] = r1_0
+        dr0_t[i] = dr1
+        theta0_t[i] = theta1_0
+        dtheta0_t[i] = dtheta1
+        Nr0[i] = nr1
+        Ntheta0[i] = ntheta1
+
+    if grid_polar_new is None:
+        r3_0 = r1_0
+        r3_1 = r1_1
+        theta3_0 = theta1_0
+        theta3_1 = theta1_1
+        nr3 = nr1
+        ntheta3 = 2 * ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    assert dorigin0.shape == (3,)
+    assert dorigin1.shape == (3,)
+    dorigin = torch.stack((dorigin0, dorigin1), dim=0)
+
+    alias_mode = 0
+    if alias:
+        if not output_alias:
+            alias_mode = 1
+        else:
+            alias_mode = 2
+    elif not output_alias:
+        alias_mode = 3
+
+    # Prepare weight map parameters
+    def get_weight_grid_params(w1_map, w2_map, wgrid):
+        if w1_map is None or w2_map is None or wgrid is None:
+            empty = torch.empty(0, device=device)
+            return empty, empty, 0.0, 1.0, 0.0, 1.0, 0, 0
+        w_r0, w_r1 = wgrid["r"]
+        w_theta0, w_theta1 = wgrid["theta"]
+        w_nr = wgrid["nr"]
+        w_ntheta = wgrid["ntheta"]
+        w_dr = (w_r1 - w_r0) / w_nr
+        w_dtheta = (w_theta1 - w_theta0) / w_ntheta
+        return w1_map, w2_map, w_r0, w_dr, w_theta0, w_dtheta, w_nr, w_ntheta
+
+    w1m0, w2m0, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0 = get_weight_grid_params(w1_map0, w2_map0, weight_grid0)
+    w1m1, w2m1, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1 = get_weight_grid_params(w1_map1, w2_map1, weight_grid1)
+
+    result = torch.ops.torchbp.ffbp_merge2_poly_weighted.default(
+        img0,
+        img1,
+        dorigin,
+        fc,
+        r0,
+        dr0_t,
+        theta0_t,
+        dtheta0_t,
+        Nr0,
+        Ntheta0,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        z0,
+        order,
+        poly_coefs,
+        alias_mode,
+        alias_fmod,
+        w1m0,
+        w2m0,
+        w_r0_0,
+        w_dr0,
+        w_theta0_0,
+        w_dtheta0,
+        w_nr0,
+        w_ntheta0,
+        w1m1,
+        w2m1,
+        w_r0_1,
+        w_dr1,
+        w_theta0_1,
+        w_dtheta1,
+        w_nr1,
+        w_ntheta1,
+        1 if output_weight_map else 0,
+        output_weight_decimation,
+    )
+
+    if output_weight_map:
+        # Compute decimated grid parameters for the output weight maps
+        dec = output_weight_decimation
+        out_nr_dec = (nr3 + dec - 1) // dec
+        out_ntheta_dec = (ntheta3 + dec - 1) // dec
+        out_dr_dec = dr3 * dec
+        out_dtheta_dec = dtheta3 * dec
+        merged_weight_grid = {
+            "r": (r3_0, r3_0 + out_dr_dec * out_nr_dec),
+            "theta": (theta3_0, theta3_0 + out_dtheta_dec * out_ntheta_dec),
+            "nr": out_nr_dec,
+            "ntheta": out_ntheta_dec,
+        }
+        return result[0], result[1], result[2], merged_weight_grid
+    return result[0], None, None, None
+
+
 def ffbp_merge2(
     img0: Tensor,
     img1: Tensor,
@@ -896,7 +1132,8 @@ def ffbp_merge2(
         if len(method_params) != 2:
             raise ValueError("Knab interpolation needs sample length and oversampling factor as argument")
         order = method_params[0]
-        knab_func = ffbp_merge2_poly if (use_poly and order <= 8) else ffbp_merge2_knab
+        use_poly = use_poly and order <= 8
+        knab_func = ffbp_merge2_poly if use_poly else ffbp_merge2_knab
         kwargs = dict(
             order=order,
             oversample=method_params[1],
@@ -906,6 +1143,8 @@ def ffbp_merge2(
         )
         if use_poly and poly_coefs is not None:
             kwargs['poly_coefs'] = poly_coefs
+        if not use_poly:
+            kwargs.pop('poly_coefs', None)
         return knab_func(
             img0,
             img1,
@@ -1122,19 +1361,8 @@ def polar_to_cart_lanczos(
         nbatch = 1
         assert origin.shape == (3,)
 
-    r0, r1 = grid_polar["r"]
-    theta0, theta1 = grid_polar["theta"]
-    ntheta = grid_polar["ntheta"]
-    nr = grid_polar["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
-
-    x0, x1 = grid_cart["x"]
-    y0, y1 = grid_cart["y"]
-    nx = grid_cart["nx"]
-    ny = grid_cart["ny"]
-    dx = (x1 - x0) / nx
-    dy = (y1 - y0) / ny
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid_cart)
 
     return torch.ops.torchbp.polar_to_cart_lanczos.default(
         img,
