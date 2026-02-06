@@ -348,10 +348,13 @@ def gpga_bp_polar_tde(
     eps: float = 1e-6,
     interp_method: str = "linear",
     estimate_z: bool = True,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
     use_ffbp: bool = False,
     ffbp_opts: dict | None = None,
     verbose: bool = False,
-    data_fmod: float = 0
+    data_fmod: float = 0,
 ) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus [1]_ using 2D polar coordinate
@@ -420,6 +423,20 @@ def gpga_bp_polar_tde(
         ("lanczos", N): Lanczos interpolation with order 2*N+1.
     estimate_z : bool
         Estimate Z-axis position error. Default is True.
+    att : Tensor
+        Antenna rotation tensor.
+        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
+        out data outside the antenna beam.
+    g : Tensor or None
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+-       If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center.
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1].
+        g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
+        in radians. -pi/2 + +pi/2 if including data over the whole sphere.
+        g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
+        radians. -pi to +pi if including data over the whole sphere.
     use_ffbp : bool
         Use fast factorized backprojection for image formation.
     ffbp_opts : dict
@@ -428,6 +445,7 @@ def gpga_bp_polar_tde(
         Print progress stats.
     data_fmod : float
         Range modulation frequency applied to input data.
+
 
     References
     ----------
@@ -604,11 +622,13 @@ def gpga_bp_polar_tde(
             opts = {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}
             if ffbp_opts is not None:
                 opts.update(ffbp_opts)
-            img = ffbp(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod, **opts)
+            img = ffbp(data, grid_polar, fc, r_res, pos_new, d0=d0,
+                    data_fmod=data_fmod, g=g, g_extent=g_extent, att=att,
+                    **opts)
         else:
-            img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[
-                0
-            ]
+            img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new,
+                    d0=d0, data_fmod=data_fmod, g=g, g_extent=g_extent,
+                    att=att)[0]
         window_width = int(window_width * window_exp)
         if window_width < min_window:
             if verbose:
