@@ -785,6 +785,46 @@ def backprojection_polar_2d_tx_power(
     return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(*cpp_args)
 
 
+def backprojection_polar_2d_tx_power_slant(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "PolarGrid | dict",
+    r_res: float,
+    pos: Tensor,
+    att: Tensor,
+    altitude: float,
+    normalization: str | None = None,
+) -> Tensor:
+    """
+    Slant-range variant of :func:`backprojection_polar_2d_tx_power`.
+
+    For slant-range BP images (BP origin at sensor altitude, pos z ≈ 0),
+    the standard tx_power kernel gets wrong elevation angles because
+    pos_z ≈ 0.  This variant maps each polar pixel (r, θ) to its ground
+    position ``(sqrt(r²cos²θ − H²), r·sinθ)`` and uses the supplied
+    altitude *H* for all elevation / distance / normalization calculations.
+
+    Parameters
+    ----------
+    wa, g, g_extent, grid, r_res, pos, att, normalization
+        Same as :func:`backprojection_polar_2d_tx_power`.
+    altitude : float
+        Sensor altitude above ground (metres).  Must be > 0.
+
+    Returns
+    -------
+    tx_power : Tensor
+        Same as :func:`backprojection_polar_2d_tx_power`.
+    """
+    cpp_args = _prepare_backprojection_polar_2d_tx_power_args(
+        wa, g, g_extent, grid, r_res, pos, att, normalization
+    )
+    return torch.ops.torchbp.backprojection_polar_2d_tx_power_slant.default(
+        *cpp_args, altitude
+    )
+
+
 @torch.library.register_fake("torchbp::backprojection_polar_2d")
 def _fake_polar_2d(
     data: Tensor,
