@@ -183,6 +183,9 @@ class PolarGrid(Grid):
             ntheta if ntheta is not None else self.ntheta
         )
 
+    def __getitem__(self, key):
+        return self.to_dict()[key]
+
     def __repr__(self) -> str:
         return (
             f"PolarGrid(r=({self.r0:.1f}, {self.r1:.1f}), "
