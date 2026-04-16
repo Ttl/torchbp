@@ -103,19 +103,16 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
     c0 = 299792458
     wl = c0 / fc
 
-    w = (origin2 - origin1)[:,None,None]
-    v = coords - origin1[:,None,None]
-    w_dot_v = torch.sum(w*v, dim=0)
-    r1 = torch.linalg.norm(v, dim=0)
+    v1 = coords - origin1[:,None,None]
+    v2 = coords - origin2[:,None,None]
+    r1 = torch.linalg.norm(v1, dim=0)
+    r2 = torch.linalg.norm(v2, dim=0)
 
-    look_angle = torch.arccos(origin1[2] / r1)
+    # First-order height sensitivity for flat imaging plane:
+    #   dphi/dh = (4pi/lambda) · (origin2_z/r2 − origin1_z/r1)
+    sensitivity = origin2[2] / r2 - origin1[2] / r1
 
-    # All these equations are equal
-    #bt = torch.linalg.norm(torch.cross(w, v, dim=0), dim=0) / r1
-    #bt = torch.sqrt(torch.linalg.norm(w, dim=0)**2 - w_dot_v**2 / r1**2)
-    bt = torch.linalg.norm(w - w_dot_v * v / r1**2, dim=0)
-
-    z = -wl * r1 * torch.sin(look_angle) * unw / (4 * torch.pi * bt)
+    z = -wl * unw / (4 * torch.pi * sensitivity)
     return z
 
 
@@ -185,6 +182,191 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
     coords = coords[..., 0]
 
     return phase_to_elevation(unw, coords, origin1, origin2, fc)
+
+
+def flat_earth_phase_polar(origin1: Tensor, origin2: Tensor, fc: float, grid: "PolarGrid | dict") -> Tensor:
+    """
+    Compute flat earth interferometric phase for a polar grid.
+
+    For images formed by backprojection on a flat (z=0) grid, the
+    interferometric phase contains baseline geometry fringes even over
+    flat terrain. This function computes that phase so it can be removed,
+    isolating the topographic signal.
+
+    Parameters
+    ----------
+    origin1 : Tensor
+        3D antenna phase center of the master image [x, y, z].
+    origin2 : Tensor
+        3D antenna phase center of the slave image [x, y, z].
+    fc : float
+        RF center frequency in Hz.
+    grid : PolarGrid or dict
+        Polar grid definition.
+
+    Returns
+    -------
+    phase : Tensor
+        Flat earth phase tensor. Shape: [nr, ntheta].
+    """
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    device = origin1.device
+
+    r = r0 + dr * torch.arange(nr, device=device)
+    theta = theta0 + dtheta * torch.arange(ntheta, device=device)
+    x = r[:, None] * torch.sqrt(1 - theta[None, :] ** 2)
+    y = r[:, None] * theta[None, :]
+
+    c0 = 299792458
+    d1 = torch.sqrt((x - origin1[0]) ** 2 + (y - origin1[1]) ** 2 + origin1[2] ** 2)
+    d2 = torch.sqrt((x - origin2[0]) ** 2 + (y - origin2[1]) ** 2 + origin2[2] ** 2)
+    return 4 * torch.pi * fc / c0 * (d1 - d2)
+
+
+def flat_earth_phase_cart(origin1: Tensor, origin2: Tensor, fc: float, grid: "CartesianGrid | dict") -> Tensor:
+    """
+    Compute flat earth interferometric phase for a Cartesian grid.
+
+    Parameters
+    ----------
+    origin1 : Tensor
+        3D antenna phase center of the master image [x, y, z].
+    origin2 : Tensor
+        3D antenna phase center of the slave image [x, y, z].
+    fc : float
+        RF center frequency in Hz.
+    grid : CartesianGrid or dict
+        Cartesian grid definition.
+
+    Returns
+    -------
+    phase : Tensor
+        Flat earth phase tensor. Shape: [nx, ny].
+    """
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+    device = origin1.device
+
+    x = x0 + dx * torch.arange(nx, device=device)
+    y = y0 + dy * torch.arange(ny, device=device)
+
+    c0 = 299792458
+    d1 = torch.sqrt((x[:, None] - origin1[0]) ** 2 + (y[None, :] - origin1[1]) ** 2 + origin1[2] ** 2)
+    d2 = torch.sqrt((x[:, None] - origin2[0]) ** 2 + (y[None, :] - origin2[1]) ** 2 + origin2[2] ** 2)
+    return 4 * torch.pi * fc / c0 * (d1 - d2)
+
+
+def elevation_to_phase_slant_polar(
+    z: "Tensor | float", origin1: Tensor, origin2: Tensor, fc: float,
+    grid: "PolarGrid | dict"
+) -> Tensor:
+    """
+    Compute traditional (slant-range) interferometric phase at given elevation.
+
+    For scatterers at height z above the imaging plane::
+
+        phi = (4pi fc/c0)*(r1 − r2)
+
+    where r_n = slant range in nth image
+
+    Reduces to :func:`flat_earth_phase_polar` when z = 0.
+
+    Parameters
+    ----------
+    z : Tensor or float
+        Elevation map [nr, ntheta] or scalar height.
+    origin1 : Tensor
+        Master APC [x, y, z].
+    origin2 : Tensor
+        Slave APC [x, y, z].
+    fc : float
+        RF center frequency (Hz).
+    grid : PolarGrid or dict
+        Polar grid definition.
+
+    Returns
+    -------
+    phase : Tensor
+        Interferometric phase [nr, ntheta].
+    """
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    device = origin1.device
+
+    r = r0 + dr * torch.arange(nr, device=device)
+    theta = theta0 + dtheta * torch.arange(ntheta, device=device)
+    x = r[:, None] * torch.sqrt(1 - theta[None, :] ** 2)
+    y = r[:, None] * theta[None, :]
+
+    c0 = 299792458
+    d1 = torch.sqrt((x - origin1[0]) ** 2 + (y - origin1[1]) ** 2 + (origin1[2] - z) ** 2)
+    d2 = torch.sqrt((x - origin2[0]) ** 2 + (y - origin2[1]) ** 2 + (origin2[2] - z) ** 2)
+    return 4 * torch.pi * fc / c0 * (d1 - d2)
+
+
+def phase_to_elevation_slant_polar(
+    unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float,
+    grid: "PolarGrid | dict", n_iter: int = 5
+) -> Tensor:
+    """
+    Convert unwrapped topographic phase to elevation via Newton iteration.
+
+    Inverts the traditional interferometric relationship::
+
+        phi_topo(z) = elevation_to_phase_slant_polar(z, ...)
+                   − elevation_to_phase_slant_polar(0, ...)
+
+    Starts from the linearised BP-interferometry estimate and refines
+    with Newton's method.
+
+    Parameters
+    ----------
+    unw : Tensor
+        Unwrapped topographic phase (flat-earth removed) [nr, ntheta].
+    origin1 : Tensor
+        Master APC [x, y, z].
+    origin2 : Tensor
+        Slave APC [x, y, z].
+    fc : float
+        RF center frequency (Hz).
+    grid : PolarGrid or dict
+        Polar grid definition.
+    n_iter : int
+        Number of Newton iterations (default 5).
+
+    Returns
+    -------
+    z : Tensor
+        Estimated elevation [nr, ntheta].
+    """
+    # Linearised initial estimate.
+    # phase_to_elevation_polar uses z = -wl*unw/(4*pi*sens) which has
+    # a negation for the BP conjugate-phase convention. Here the
+    # phase is in the direct convention, so negate the initial guess.
+    z = -phase_to_elevation_polar(unw, origin1, origin2, fc, grid)
+
+    phi_flat = elevation_to_phase_slant_polar(0.0, origin1, origin2, fc, grid)
+
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    device = unw.device
+    r = r0 + dr * torch.arange(nr, device=device)
+    theta = theta0 + dtheta * torch.arange(ntheta, device=device)
+    x = r[:, None] * torch.sqrt(1 - theta[None, :] ** 2)
+    y = r[:, None] * theta[None, :]
+
+    c0 = 299792458
+    k = 4 * torch.pi * fc / c0
+    a1 = (x - origin1[0]) ** 2 + (y - origin1[1]) ** 2
+    a2 = (x - origin2[0]) ** 2 + (y - origin2[1]) ** 2
+
+    for _ in range(n_iter):
+        d1 = torch.sqrt(a1 + (origin1[2] - z) ** 2)
+        d2 = torch.sqrt(a2 + (origin2[2] - z) ** 2)
+        phi_z = k * (d1 - d2)
+        residual = unw - (phi_z - phi_flat)
+        # dphi/dz = k * ((h2 - z)/r2 - (h1 - z)/r1)
+        sensitivity = k * ((origin2[2] - z) / d2 - (origin1[2] - z) / d1)
+        z = z + residual / sensitivity
+
+    return z
 
 
 def subpixel_correlation(im_m: Tensor, im_s: Tensor) -> tuple[Tensor, Tensor]:
