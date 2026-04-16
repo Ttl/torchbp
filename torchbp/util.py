@@ -563,6 +563,7 @@ def generate_fmcw_data(
     g_extent: list | None = None,
     att: Tensor = None,
     rvp: bool = True,
+    vel: Tensor | None = None,
 ) -> Tensor:
     """
     Generate FMCW radar time-domain IF signal.
@@ -574,7 +575,8 @@ def generate_fmcw_data(
     target_rcs : Tensor
         [ntargets, 1] tensor of target reflectivity.
     pos : Tensor
-        [nsweeps, 3] tensor of platform positions.
+        [nsweeps, 3] tensor of platform positions. When `vel` is provided,
+        `pos[s]` is the platform position at the midpoint of sweep `s`.
     fc : float
         RF center frequency in Hz.
     bw : float
@@ -600,6 +602,12 @@ def generate_fmcw_data(
         [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
     rvp : bool
         True to include residual video phase term.
+    vel : Tensor or None
+        [nsweeps, 3] tensor of platform velocities in m/s. When given, the
+        two-way delay is evaluated per intra-sweep sample at the instantaneous
+        platform position `pos[s] + vel[s] * (t_sample - tsweep/2)`, i.e. the
+        stop-and-go approximation is removed. None (default) reproduces the
+        stop-and-go model where `pos[s]` is held fixed across the chirp.
 
     Returns
     -------
@@ -610,6 +618,9 @@ def generate_fmcw_data(
         raise ValueError("pos tensor should have 2 dimensions")
     if pos.shape[1] != 3:
         raise ValueError("positions should be 3 dimensional")
+    if vel is not None:
+        if vel.shape != pos.shape:
+            raise ValueError("vel must have the same shape as pos")
     npos = pos.shape[0]
     nsamples = int(fs * tsweep)
 
@@ -635,14 +646,27 @@ def generate_fmcw_data(
         g_batch = g.unsqueeze(0).unsqueeze(0)
 
     t = t[None, :]
+    # Sample-time offset from sweep midpoint, used only for non-stop-and-go.
+    t_rel = (t - 0.5 * tsweep) if vel is not None else None
+
     for e, target in enumerate(target_pos):
         rcs_phase = torch.angle(target_rcs[e])
         rcs_abs = torch.sqrt(torch.abs(target_rcs[e]))
 
-        d = torch.linalg.vector_norm(pos - target[None, :], dim=-1)[:, None] + d0
+        dpos = pos - target[None, :]                               # [nsweeps, 3]
+        if vel is None:
+            d = torch.linalg.vector_norm(dpos, dim=-1)[:, None] + d0  # [nsweeps, 1]
+        else:
+            # |dpos + vel * t_rel|^2 = |dpos|^2 + 2<dpos,vel> t_rel + |vel|^2 t_rel^2
+            dp_sq = (dpos * dpos).sum(dim=-1, keepdim=True)        # [nsweeps, 1]
+            dp_v = (dpos * vel).sum(dim=-1, keepdim=True)          # [nsweeps, 1]
+            v_sq = (vel * vel).sum(dim=-1, keepdim=True)           # [nsweeps, 1]
+            d = torch.sqrt(dp_sq + 2.0 * dp_v * t_rel + v_sq * t_rel**2) + d0  # [nsweeps, nsamples]
         tau = 2 * d / c0
         if antenna_gain:
-            look_angle = torch.asin(pos[:, 2] / d[:, 0])
+            # Antenna gain evaluated at sweep midpoint (slow-varying across chirp).
+            d_mid = torch.linalg.vector_norm(dpos, dim=-1)[:, None] + d0
+            look_angle = torch.asin(pos[:, 2] / d_mid[:, 0])
             el_deg = -look_angle - att[:, 0]
             az_deg = (
                 torch.atan2(target[1] - pos[:, 1], target[0] - pos[:, 0]) - att[:, 2]
@@ -662,7 +686,7 @@ def generate_fmcw_data(
                 align_corners=False,
             )
 
-            g_a = g_a.reshape(d.shape)
+            g_a = g_a.reshape(d_mid.shape)
         else:
             g_a = 1
 
