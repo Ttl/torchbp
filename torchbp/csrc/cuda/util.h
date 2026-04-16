@@ -297,7 +297,7 @@ __device__ T lanczos_interp_2d(const T2 *img, int nx, int ny, float x, float y, 
     return sum;
 }
 
-inline __device__ float knab_kernel_norm(int order, float v) {
+inline __host__ __device__ float knab_kernel_norm(int order, float v) {
     float a = 0.5f * order;
     return expf(-2.0f*a*kPI*v);
 }

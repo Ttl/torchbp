@@ -41,7 +41,8 @@ __global__ void coherence_2d_kernel(
     corr /= Navg;
     p0 /= Navg;
     p1 /= Navg;
-    v = abs(corr) / sqrtf(p0 * p1);
+    float denom = sqrtf(p0 * p1);
+    v = denom > 0.0f ? abs(corr) / denom : 0.0f;
     out[idbatch * N0 * N1 + idy * N1 + idx] = v;
 }
 
@@ -86,11 +87,17 @@ __global__ void coherence_2d_grad_kernel(
     corr /= Navg;
     p0 /= Navg;
     p1 /= Navg;
-    float dout2 = (corr.real()*corr.real() + corr.imag()*corr.imag()) / (p0 * p1);
+    float p0p1 = p0 * p1;
+    if (p0p1 <= 0.0f) {
+        return;
+    }
+    float dout2 = (corr.real()*corr.real() + corr.imag()*corr.imag()) / p0p1;
     float dout = sqrtf(dout2);
 
-    float dout_ddout2 = grad[idbatch * N0 * N1 + idy * N1 + idx] * 1.0f/dout;
-    complex64_t dout_dc = dout_ddout2 * corr/(p0 * p1) / static_cast<float>(Navg);
+    float dout_ddout2 = dout > 0.0f
+        ? grad[idbatch * N0 * N1 + idy * N1 + idx] / dout
+        : 0.0f;
+    complex64_t dout_dc = dout_ddout2 * corr / p0p1 / static_cast<float>(Navg);
     float dout_dnorm1 = dout_ddout2 * (-dout2 / p0) / static_cast<float>(Navg);
     float dout_dnorm2 = dout_ddout2 * (-dout2 / p1) / static_cast<float>(Navg);
 
@@ -268,7 +275,8 @@ __global__ void power_coherence_2d_kernel(
         }
     }
     float v;
-    v = corr / sqrtf(p0 * p1);
+    float denom = sqrtf(p0 * p1);
+    v = denom > 0.0f ? corr / denom : 0.0f;
     if (corr_output) {
         v = v > 0.5f ? sqrtf(2.0f*v - 1.0f) : 0.0f;
     }
