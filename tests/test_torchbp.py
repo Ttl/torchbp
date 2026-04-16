@@ -1636,5 +1636,258 @@ class TestGPGABackprojection2DLanczos(TestCase):
         self._opcheck("cuda")
 
 
+class TestResample2DLanczos(TestCase):
+    """Test generic 2D Lanczos resampling."""
+
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            return torch.randn(size, device=device, requires_grad=requires_grad, dtype=dtype)
+
+        args = {
+            "img": make_tensor((2, 16, 16), dtype=dtype),
+            "shift_r": torch.zeros(16, 16, device=device, dtype=torch.float32),
+            "shift_az": torch.zeros(16, 16, device=device, dtype=torch.float32),
+            "order": 6,
+        }
+        return [args]
+
+    def _test_zero_shift_identity(self, device, dtype):
+        """Zero shift should return the input unchanged (within kernel boundary effects)."""
+        Nr, Naz = 32, 32
+        img = torch.randn(1, Nr, Naz, device=device, dtype=dtype)
+        shift_r = torch.zeros(Nr, Naz, device=device, dtype=torch.float32)
+        shift_az = torch.zeros(Nr, Naz, device=device, dtype=torch.float32)
+        out = torchbp.ops.resample_2d_lanczos(img, shift_r, shift_az, order=6)
+        # Interior pixels should match (boundary pixels affected by kernel support)
+        margin = 4
+        err = torch.max(torch.abs(out[0, margin:-margin, margin:-margin] - img[0, margin:-margin, margin:-margin]))
+        self.assertLess(err.item(), 1e-5)
+
+    def _test_smooth_function(self, device, dtype):
+        """Interpolate a smooth analytical function and verify error is small.
+
+        Uses f(r, az) = exp(j * (0.3*r + 0.2*az)) for complex,
+        or f(r, az) = cos(0.3*r) * cos(0.2*az) for real.
+        These are smooth, band-limited functions that Lanczos should interpolate well.
+        """
+        Nr, Naz = 64, 64
+        r = torch.arange(Nr, device=device, dtype=torch.float32)
+        az = torch.arange(Naz, device=device, dtype=torch.float32)
+
+        # Shift: constant sub-pixel shift
+        shift_val_r = 0.37
+        shift_val_az = -0.23
+        shift_r = torch.full((Nr, Naz), shift_val_r, device=device, dtype=torch.float32)
+        shift_az = torch.full((Nr, Naz), shift_val_az, device=device, dtype=torch.float32)
+
+        if dtype == torch.complex64:
+            # Complex exponential: exact values at shifted coordinates
+            freq_r, freq_az = 0.1, 0.07
+            img = torch.exp(1j * (freq_r * r[:, None] + freq_az * az[None, :]))
+            img = img.unsqueeze(0).to(dtype=dtype, device=device)
+            expected = torch.exp(1j * (freq_r * (r[:, None] + shift_val_r) + freq_az * (az[None, :] + shift_val_az)))
+            expected = expected.to(dtype=dtype, device=device)
+        else:
+            freq_r, freq_az = 0.1, 0.07
+            img = torch.cos(freq_r * r[:, None]) * torch.cos(freq_az * az[None, :])
+            img = img.unsqueeze(0).to(dtype=dtype, device=device)
+            expected = (torch.cos(freq_r * (r[:, None] + shift_val_r))
+                        * torch.cos(freq_az * (az[None, :] + shift_val_az)))
+            expected = expected.to(dtype=dtype, device=device)
+
+        out = torchbp.ops.resample_2d_lanczos(img, shift_r, shift_az, order=6)
+
+        # Check interior (avoid boundary effects from kernel support)
+        margin = 6
+        err = torch.abs(out[0, margin:-margin, margin:-margin] - expected[margin:-margin, margin:-margin])
+        max_err = err.max().item()
+        rms_err = torch.sqrt(torch.mean(err ** 2)).item()
+        # Unnormalized Lanczos-6 has ~0.01 max error from kernel weight sum != 1
+        self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for smooth function")
+        self.assertLess(rms_err, 0.01, f"RMS error {rms_err:.6f} too large for smooth function")
+
+    def _test_varying_shift(self, device, dtype):
+        """Test with a spatially varying shift field."""
+        Nr, Naz = 64, 64
+        r = torch.arange(Nr, device=device, dtype=torch.float32)
+        az = torch.arange(Naz, device=device, dtype=torch.float32)
+
+        freq_r, freq_az = 0.1, 0.07
+        if dtype == torch.complex64:
+            img = torch.exp(1j * (freq_r * r[:, None] + freq_az * az[None, :]))
+            img = img.unsqueeze(0).to(dtype=dtype, device=device)
+        else:
+            img = torch.cos(freq_r * r[:, None]) * torch.cos(freq_az * az[None, :])
+            img = img.unsqueeze(0).to(dtype=dtype, device=device)
+
+        # Varying shift: 0 to 2 pixels across the image
+        shift_r = 2.0 * r[:, None].expand(Nr, Naz) / Nr
+        shift_az = torch.zeros(Nr, Naz, device=device, dtype=torch.float32)
+        shift_r = shift_r.to(device=device)
+
+        # Compute expected by evaluating the analytical function at shifted coords
+        r_shifted = r[:, None] + shift_r
+        if dtype == torch.complex64:
+            expected = torch.exp(1j * (freq_r * r_shifted + freq_az * az[None, :]))
+            expected = expected.to(dtype=dtype, device=device)
+        else:
+            expected = torch.cos(freq_r * r_shifted) * torch.cos(freq_az * az[None, :])
+            expected = expected.to(dtype=dtype, device=device)
+
+        out = torchbp.ops.resample_2d_lanczos(img, shift_r, shift_az, order=6)
+
+        margin = 6
+        err = torch.abs(out[0, margin:-margin, margin:-margin] - expected[margin:-margin, margin:-margin])
+        max_err = err.max().item()
+        self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for varying shift")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_zero_shift_complex(self):
+        self._test_zero_shift_identity("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_zero_shift_float(self):
+        self._test_zero_shift_identity("cuda", torch.float32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_complex(self):
+        self._test_smooth_function("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_float(self):
+        self._test_smooth_function("cuda", torch.float32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_varying_shift_complex(self):
+        self._test_varying_shift("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_varying_shift_float(self):
+        self._test_varying_shift("cuda", torch.float32)
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = (
+                args["img"],
+                args["shift_r"],
+                args["shift_az"],
+                args["img"].shape[0],  # nbatch
+                args["img"].shape[1],  # Nr
+                args["img"].shape[2],  # Naz
+                args["order"],
+            )
+            opcheck(
+                torch.ops.torchbp.resample_2d_lanczos,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestResample2DKnab(TestCase):
+    """Test generic 2D Knab resampling."""
+
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            return torch.randn(size, device=device, requires_grad=requires_grad, dtype=dtype)
+
+        args = {
+            "img": make_tensor((2, 16, 16), dtype=dtype),
+            "shift_r": torch.zeros(16, 16, device=device, dtype=torch.float32),
+            "shift_az": torch.zeros(16, 16, device=device, dtype=torch.float32),
+            "order": 6,
+            "oversample": 1.5,
+        }
+        return [args]
+
+    def _test_zero_shift_identity(self, device, dtype):
+        Nr, Naz = 32, 32
+        img = torch.randn(1, Nr, Naz, device=device, dtype=dtype)
+        shift_r = torch.zeros(Nr, Naz, device=device, dtype=torch.float32)
+        shift_az = torch.zeros(Nr, Naz, device=device, dtype=torch.float32)
+        out = torchbp.ops.resample_2d_knab(img, shift_r, shift_az, order=6, oversample=1.5)
+        margin = 4
+        err = torch.max(torch.abs(out[0, margin:-margin, margin:-margin] - img[0, margin:-margin, margin:-margin]))
+        self.assertLess(err.item(), 1e-5)
+
+    def _test_smooth_function(self, device, dtype):
+        Nr, Naz = 64, 64
+        r = torch.arange(Nr, device=device, dtype=torch.float32)
+        az = torch.arange(Naz, device=device, dtype=torch.float32)
+
+        shift_val_r = 0.37
+        shift_val_az = -0.23
+        shift_r = torch.full((Nr, Naz), shift_val_r, device=device, dtype=torch.float32)
+        shift_az = torch.full((Nr, Naz), shift_val_az, device=device, dtype=torch.float32)
+
+        freq_r, freq_az = 0.1, 0.07
+        if dtype == torch.complex64:
+            img = torch.exp(1j * (freq_r * r[:, None] + freq_az * az[None, :])).unsqueeze(0).to(dtype=dtype)
+            expected = torch.exp(1j * (freq_r * (r[:, None] + shift_val_r) + freq_az * (az[None, :] + shift_val_az))).to(dtype=dtype)
+        else:
+            img = (torch.cos(freq_r * r[:, None]) * torch.cos(freq_az * az[None, :])).unsqueeze(0).to(dtype=dtype)
+            expected = (torch.cos(freq_r * (r[:, None] + shift_val_r)) * torch.cos(freq_az * (az[None, :] + shift_val_az))).to(dtype=dtype)
+
+        out = torchbp.ops.resample_2d_knab(img, shift_r, shift_az, order=6, oversample=1.5)
+
+        margin = 6
+        err = torch.abs(out[0, margin:-margin, margin:-margin] - expected[margin:-margin, margin:-margin])
+        max_err = err.max().item()
+        rms_err = torch.sqrt(torch.mean(err ** 2)).item()
+        self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for smooth function")
+        self.assertLess(rms_err, 0.01, f"RMS error {rms_err:.6f} too large for smooth function")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_zero_shift_complex(self):
+        self._test_zero_shift_identity("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_zero_shift_float(self):
+        self._test_zero_shift_identity("cuda", torch.float32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_complex(self):
+        self._test_smooth_function("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_float(self):
+        self._test_smooth_function("cuda", torch.float32)
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = (
+                args["img"],
+                args["shift_r"],
+                args["shift_az"],
+                args["img"].shape[0],
+                args["img"].shape[1],
+                args["img"].shape[2],
+                args["order"],
+                args["oversample"],
+            )
+            opcheck(
+                torch.ops.torchbp.resample_2d_knab,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
 if __name__ == "__main__":
     unittest.main()
