@@ -813,132 +813,186 @@ __global__ void backprojection_cart_2d_grad_kernel(
 }
 
 
+// Forward projection kernel.
+//
+// Grid:  (ceil(sweep_samples / (blockDim.x * NSAMP)), nsweeps, nbatch)
+// Block: (256, 1, 1)
+// Shared memory (bytes): (HAS_VEL ? 4 : 3) * blockDim.x * sizeof(float)
+//
+// Each thread owns NSAMP consecutive output samples and accumulates
+// contributions from all pixels via cooperative tiling.
+//
+// Template parameters:
+//   NSAMP:     output samples per thread (4 is optimal: fills the 16-cycle
+//              SFU latency window with independent sincospif calls)
+//   HAS_VEL:   enables per-sample Doppler range correction; requires
+//              `vel` pointer and stores (d, vel_proj) per pixel in smem
+//   USE_RVP:   adds the residual video phase term gamma*tau^2
+template <int NSAMP, bool HAS_VEL, bool USE_RVP>
 __global__ void projection_cart_2d_kernel(
-          const complex64_t* img,
-          const float* dem,
-          const float* pos,
-          const float* vel,
-          const float* att,
-          complex64_t* data,
-          int sweep_samples,
-          int nsweeps,
-          float fc,
-          float fs,
-          float gamma,
-          float x0,
-          float dx,
-          float y0,
-          float dy,
-          int Nx,
-          int Ny,
-          float d0,
-          const float *g,
-          float g_az0,
-          float g_el0,
-          float g_daz,
-          float g_del,
-          int g_naz,
-          int g_nel,
-          bool use_rvp,
+          const complex64_t* __restrict__ img,
+          const float* __restrict__ dem,
+          const float* __restrict__ pos,
+          const float* __restrict__ vel,   // may be nullptr when !HAS_VEL
+          const float* __restrict__ att,   // may be nullptr when g == nullptr
+          complex64_t* __restrict__ data,
+          int sweep_samples, int nsweeps,
+          float fc, float fs, float gamma,
+          float x0, float dx, float y0, float dy, int Nx, int Ny, float d0,
+          const float* __restrict__ g,
+          float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel,
           int normalization) {
-    const int idt = blockIdx.x * blockDim.x + threadIdx.x;
-    const int idy = idt % Ny;
-    const int idx = idt / Ny;
-    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+    const int j_base   = (blockIdx.x * blockDim.x + threadIdx.x) * NSAMP;
+    const int i        = blockIdx.y;
+    const int idbatch  = blockIdx.z;
+    const int tid      = threadIdx.x;
+    const int TILE     = blockDim.x;
 
-    unsigned mask = __ballot_sync(FULL_MASK, idt < Nx * Ny);
+    // Shared memory layout (per block):
+    //   [0..TILE)       sh_w_re  – pixel weight real part
+    //   [TILE..2TILE)   sh_w_im  – pixel weight imaginary part
+    //   [2TILE..3TILE)  sh_tau (HAS_VEL=false) or sh_d (HAS_VEL=true)
+    //   [3TILE..4TILE)  sh_vel_proj (HAS_VEL=true only)
+    extern __shared__ float smem[];
+    float* sh_w_re = smem;
+    float* sh_w_im = smem + TILE;
+    float* sh_a    = smem + 2 * TILE;  // tau (!HAS_VEL) or d (HAS_VEL)
+    float* sh_b    = smem + 3 * TILE;  // vel_proj (HAS_VEL only)
 
-    if (idx >= Nx || idy >= Ny) {
-        return;
+    // phase = tau * phase_slope  where  phase_slope = -2*gamma*j/fs - 2*fc
+    // Works for both HAS_VEL=false (tau constant per pixel) and HAS_VEL=true
+    // (tau_s computed from sh_a/sh_b in Phase 2 but multiplied by same slope).
+    float phase_slopes[NSAMP];
+    float s_re[NSAMP], s_im[NSAMP];
+    #pragma unroll
+    for (int s = 0; s < NSAMP; s++) {
+        const int j = j_base + s;
+        phase_slopes[s] = (j < sweep_samples)
+            ? (-2.0f * gamma * (float)j / fs - 2.0f * fc) : 0.0f;
+        s_re[s] = s_im[s] = 0.0f;
     }
 
-    const float x = x0 + idx * dx;
-    const float y = y0 + idy * dy;
-    const float z = (dem != nullptr) ? dem[idx * Ny + idy] : 0.0f;
-    const complex64_t w_img = img[idbatch * Nx * Ny + idx * Ny + idy];
+    // j - sweep_samples/2: the Doppler range correction uses this offset.
+    // Declared unconditionally; only read inside if constexpr (HAS_VEL).
+    float j_half[NSAMP];
+    #pragma unroll
+    for (int s = 0; s < NSAMP; s++)
+        j_half[s] = (float)(j_base + s) - 0.5f * (float)sweep_samples;
 
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
-        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
-        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
-        float px = (x - pos_x);
-        float py = (y - pos_y);
-        float pz = (z - pos_z);
+    const float pos_x    = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+    const float pos_y    = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+    const float pos_z    = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+    const float att_roll = (g != nullptr) ? att[idbatch * nsweeps * 3 + 3*i + 0] : 0.0f;
+    const float att_yaw  = (g != nullptr) ? att[idbatch * nsweeps * 3 + 3*i + 2] : 0.0f;
 
-        float d = sqrtf(px * px + py * py + pz * pz);
-        float tau = 2.0f * (d + d0) / kC0;
+    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+    if constexpr (HAS_VEL) {
+        vx = vel[idbatch * nsweeps * 3 + i * 3 + 0];
+        vy = vel[idbatch * nsweeps * 3 + i * 3 + 1];
+        vz = vel[idbatch * nsweeps * 3 + i * 3 + 2];
+    }
 
-        complex64_t w = w_img / (d * d);
+    const int total_pixels = Nx * Ny;
 
-        if (g != nullptr) {
-            const float look_angle = asinf(fmaxf(pz / d, -1.0f));
-            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
-            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+    for (int p_base = 0; p_base < total_pixels; p_base += TILE) {
+        // Phase 1: each thread computes geometry for one pixel in this tile
+        const int p_idx = p_base + tid;
+        float my_w_re = 0.0f, my_w_im = 0.0f, my_a = 0.0f, my_b = 0.0f;
 
-            const float el_idx = (el_deg - g_el0) / g_del;
-            const float az_idx = (az_deg - g_az0) / g_daz;
+        if (p_idx < total_pixels) {
+            const int px_y = p_idx % Ny;
+            const int px_x = p_idx / Ny;
+            const float x = x0 + px_x * dx;
+            const float y = y0 + px_y * dy;
+            const float z = (dem != nullptr) ? dem[px_x * Ny + px_y] : 0.0f;
 
-            const int el_int = el_idx;
-            const int az_int = az_idx;
-            const float el_frac = el_idx - el_int;
-            const float az_frac = az_idx - az_int;
+            const complex64_t w_img = img[idbatch * total_pixels + p_idx];
 
-            if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz) {
-                w = 0.0f;
+            const float dpx = x - pos_x;
+            const float dpy = y - pos_y;
+            const float dpz = z - pos_z;
+            const float d2  = dpx*dpx + dpy*dpy + dpz*dpz;
+            const float d   = sqrtf(d2);
+
+            float norm = 1.0f / d2;
+            if (g != nullptr) {
+                const float look   = asinf(fmaxf(dpz / d, -1.0f));
+                const float el_deg = look - att_roll;
+                const float az_deg = atan2f(dpy, dpx) - att_yaw;
+                const float el_idx = (el_deg - g_el0) / g_del;
+                const float az_idx = (az_deg - g_az0) / g_daz;
+                const int el_int = (int)el_idx, az_int = (int)az_idx;
+                if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+                    norm = 0.0f;
+                else
+                    norm *= interp2d<float>(g, g_nel, g_naz,
+                                            el_int, el_idx - el_int,
+                                            az_int, az_idx - az_int);
+            }
+            if (normalization == 1) norm *= sqrtf(-dpz / d);
+
+            my_w_re = w_img.real() * norm;
+            my_w_im = w_img.imag() * norm;
+
+            if constexpr (HAS_VEL) {
+                my_a = d;
+                my_b = (dpx * vx + dpy * vy + dpz * vz) / d / fs;
             } else {
-                w *= interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+                my_a = 2.0f * (d + d0) / kC0;  // tau
             }
         }
 
-        if (normalization == 1) {
-            // gamma_0
-            // sin of look_angle.
-            // Square root because this is amplitude.
-            w *= sqrtf(-pz / d);
-        }
-        // sigma_0 otherwise
+        __syncthreads();
+        sh_w_re[tid] = my_w_re;
+        sh_w_im[tid] = my_w_im;
+        sh_a[tid]    = my_a;
+        if constexpr (HAS_VEL) sh_b[tid] = my_b;
+        __syncthreads();
 
-        float vel_proj;
-        if (vel != nullptr) {
-            const float vx = vel[idbatch * nsweeps * 3 + i * 3 + 0];
-            const float vy = vel[idbatch * nsweeps * 3 + i * 3 + 1];
-            const float vz = vel[idbatch * nsweeps * 3 + i * 3 + 2];
-            vel_proj = (px * vx + py * vy + pz * vz) / d;
-            vel_proj /= fs;
-        }
+        // Phase 2: accumulate TILE pixels into each of NSAMP sample outputs
+        // NSAMP independent sincospif calls per pixel fill the 16-cycle SFU
+        // latency window.
+        const int limit = min(TILE, total_pixels - p_base);
+        #pragma unroll 4
+        for (int k = 0; k < limit; k++) {
+            const float wr = sh_w_re[k];
+            const float wi = sh_w_im[k];
 
-        for (int j = 0; j < sweep_samples; j++) {
-            if (vel != nullptr) {
-                tau = 2.0f * (d + d0 + vel_proj * (j - sweep_samples/2)) / kC0;
-            }
-            float phase0 = -2.0f * (fc * tau);
-            if (use_rvp) {
-                phase0 += gamma * tau * tau;
-            }
-            const float freq = -2.0f * gamma * tau / fs;
-            const float phase = freq * j + phase0;
+            // RVP term: gamma*tau^2. For HAS_VEL=false, tau is constant per
+            // pixel so it can be hoisted out of the s-loop.
+            float rvp_nv = 0.0f;
+            if constexpr (!HAS_VEL && USE_RVP) rvp_nv = gamma * sh_a[k] * sh_a[k];
 
-            float ref_sin, ref_cos;
-            sincospif(phase, &ref_sin, &ref_cos);
-            complex64_t p = {ref_cos, ref_sin};
-            const complex64_t s = w * p;
-
-            float s_re = s.real();
-            float s_im = s.imag();
-
-            __syncwarp();
-            for (int offset = 16; offset > 0; offset /= 2) {
-                s_re += __shfl_down_sync(mask, s_re, offset);
-                s_im += __shfl_down_sync(mask, s_im, offset);
+            float ss[NSAMP], cs[NSAMP];
+            #pragma unroll
+            for (int s = 0; s < NSAMP; s++) {
+                float phase;
+                if constexpr (HAS_VEL) {
+                    const float tau_s =
+                        2.0f * (sh_a[k] + d0 + sh_b[k] * j_half[s]) / kC0;
+                    phase = tau_s * phase_slopes[s];
+                    if constexpr (USE_RVP) phase += gamma * tau_s * tau_s;
+                } else {
+                    phase = sh_a[k] * phase_slopes[s] + rvp_nv;
+                }
+                sincospif(phase, &ss[s], &cs[s]);
             }
 
-            if (threadIdx.x % 32 == 0) {
-                float2 *x0 = (float2*)&data[idbatch * sweep_samples * nsweeps + i * sweep_samples + j];
-                atomicAdd(&x0->x, s_re);
-                atomicAdd(&x0->y, s_im);
+            #pragma unroll
+            for (int s = 0; s < NSAMP; s++) {
+                s_re[s] += wr * cs[s] - wi * ss[s];
+                s_im[s] += wr * ss[s] + wi * cs[s];
             }
         }
+    }
+
+    // One direct write per sample
+    #pragma unroll
+    for (int s = 0; s < NSAMP; s++) {
+        const int j = j_base + s;
+        if (j < sweep_samples)
+            data[idbatch * sweep_samples * nsweeps + i * sweep_samples + j] =
+                complex64_t(s_re[s], s_im[s]);
     }
 }
 
@@ -1024,39 +1078,40 @@ at::Tensor projection_cart_2d_cuda(
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
     c10::complex<float>* data_ptr = data.data_ptr<c10::complex<float>>();
 
-	dim3 thread_per_block = {256, 1};
-	// Up-rounding division.
-    int blocks = Nx * Ny;
-	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
-	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    projection_cart_2d_kernel
-          <<<block_count, thread_per_block, 0, stream>>>(
-                  (complex64_t*)img_ptr,
-                  dem_ptr,
-                  pos_ptr,
-                  vel_ptr,
-                  att_ptr,
-                  (complex64_t*)data_ptr,
-                  sweep_samples,
-                  nsweeps,
-                  fc,
-                  fs,
-                  gamma,
-                  x0, dx,
-                  y0, dy,
-                  Nx, Ny,
-                  d0,
-                  g_ptr,
-                  g_az0,
-                  g_el0,
-                  g_daz,
-                  g_del,
-                  g_naz,
-                  g_nel,
-                  use_rvp,
-                  normalization);
+
+    // One kernel for all cases, templated on (NSAMP, HAS_VEL, USE_RVP).
+    // NSAMP=4: 4 independent sincospif per pixel fills the 16-cycle SFU latency
+    // window
+    const int  BLOCK = 256;
+    const int  NSAMP = 4;
+    const bool hv    = (vel_ptr != nullptr);
+    const bool rv    = (bool)use_rvp;
+
+    // Shared memory: 3 arrays of BLOCK floats (!HAS_VEL) or 4 (HAS_VEL).
+    const size_t smem = (hv ? 4 : 3) * BLOCK * sizeof(float);
+
+    dim3 tpb  = {static_cast<unsigned int>(BLOCK), 1, 1};
+    dim3 grid = {
+        static_cast<unsigned int>((sweep_samples + BLOCK * NSAMP - 1) / (BLOCK * NSAMP)),
+        static_cast<unsigned int>(nsweeps),
+        static_cast<unsigned int>(nbatch)
+    };
+
+#define LAUNCH(HV, URV) \
+    projection_cart_2d_kernel<NSAMP, HV, URV> \
+        <<<grid, tpb, smem, stream>>>( \
+            (complex64_t*)img_ptr, dem_ptr, pos_ptr, vel_ptr, att_ptr, \
+            (complex64_t*)data_ptr, sweep_samples, nsweeps, \
+            fc, fs, gamma, x0, dx, y0, dy, Nx, Ny, d0, \
+            g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, normalization)
+
+    if      (!hv && !rv) { LAUNCH(false, false); }
+    else if (!hv &&  rv) { LAUNCH(false, true);  }
+    else if ( hv && !rv) { LAUNCH(true,  false); }
+    else                 { LAUNCH(true,  true);  }
+
+#undef LAUNCH
 
     return data;
 }

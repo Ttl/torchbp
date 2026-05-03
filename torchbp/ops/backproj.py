@@ -498,8 +498,8 @@ def _prepare_projection_cart_2d_args(
     if vel is not None:
         if vel.shape != pos.shape:
             raise ValueError(f"vel shape {vel.shape} doesn't match with pos shape {pos.shape}")
-    else:
-        vel = torch.zeros_like(pos)
+    # vel=None is passed through as None so the C++ layer sees an undefined tensor
+    # (vel_ptr=nullptr), enabling the faster no-velocity kernel path.
 
     if dem is None:
         dem = torch.zeros((nx, ny), device=img.device, dtype=torch.float32)
