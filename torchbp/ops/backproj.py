@@ -498,8 +498,6 @@ def _prepare_projection_cart_2d_args(
     if vel is not None:
         if vel.shape != pos.shape:
             raise ValueError(f"vel shape {vel.shape} doesn't match with pos shape {pos.shape}")
-    # vel=None is passed through as None so the C++ layer sees an undefined tensor
-    # (vel_ptr=nullptr), enabling the faster no-velocity kernel path.
 
     if dem is None:
         dem = torch.zeros((nx, ny), device=img.device, dtype=torch.float32)
@@ -586,6 +584,95 @@ def projection_cart_2d(
         dem, att, g, g_extent, use_rvp, normalization, vel
     )
     return torch.ops.torchbp.projection_cart_2d.default(*cpp_args)
+
+
+def _prepare_projection_cart_2d_nufft_args(
+    img: Tensor,
+    pos: Tensor,
+    grid: "CartesianGrid | dict",
+    fc: float,
+    fs: float,
+    gamma: float,
+    sweep_samples: int,
+    d0: float = 0.0,
+    dem: Tensor | None = None,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    use_rvp: bool = True,
+    normalization: str = "beta",
+) -> tuple:
+    """Prepare arguments for C++ projection_cart_2d_nufft operator."""
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+
+    if img.dim() == 2:
+        nbatch = 1
+        nsweeps = pos.shape[0]
+        if img.shape[0] != nx:
+            raise ValueError("grid and img have different number of points in x")
+        if img.shape[1] != ny:
+            raise ValueError("grid and img have different number of points in y")
+        if list(pos.shape) != [nsweeps, 3]:
+            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nsweeps, 3]}")
+    else:
+        nbatch = img.shape[0]
+        nsweeps = pos.shape[1]
+        if img.shape[1] != nx:
+            raise ValueError("grid and img have different number of points in x")
+        if img.shape[2] != ny:
+            raise ValueError("grid and img have different number of points in y")
+        if list(pos.shape) != [nbatch, nsweeps, 3]:
+            raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nbatch, nsweeps, 3]}")
+
+    if normalization == "sigma":
+        norm = 0
+    elif normalization == "gamma":
+        norm = 1
+    else:
+        raise ValueError(f"Unknown normalization: {normalization}")
+
+    if dem is not None and list(dem.shape) != [nx, ny]:
+        raise ValueError("img and dem shapes are different")
+
+    antenna = AntennaPattern(g, g_extent)
+
+    if dem is None:
+        dem = torch.zeros((nx, ny), device=img.device, dtype=torch.float32)
+
+    return (img, dem, pos, att, nbatch, sweep_samples, nsweeps,
+            fc, fs, gamma, x0, dx, y0, dy, nx, ny, d0,
+            *antenna.to_cpp_args(),
+            use_rvp, norm)
+
+
+def projection_cart_2d_nufft(
+    img: Tensor,
+    pos: Tensor,
+    grid: "CartesianGrid | dict",
+    fc: float,
+    fs: float,
+    gamma: float,
+    sweep_samples: int,
+    d0: float = 0.0,
+    dem: Tensor | None = None,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    use_rvp: bool = True,
+    normalization: str = "beta",
+) -> Tensor:
+    """
+    NUFFT-based forward projection. Equivalent to :func:`projection_cart_2d`
+    without velocity (vel=None) but uses a Type-1 NUFFT for O(N log M) cost
+    instead of O(N·M).
+
+    Parameters match :func:`projection_cart_2d` except ``vel`` is not accepted.
+    """
+    cpp_args = _prepare_projection_cart_2d_nufft_args(
+        img, pos, grid, fc, fs, gamma, sweep_samples, d0,
+        dem, att, g, g_extent, use_rvp, normalization
+    )
+    return torch.ops.torchbp.projection_cart_2d_nufft.default(*cpp_args)
 
 
 def gpga_backprojection_2d_core(
@@ -963,6 +1050,75 @@ def _fake_cart_2d_grad(
     else:
         ret.append(None)
     return ret
+
+
+@torch.library.register_fake("torchbp::projection_cart_2d")
+def _fake_projection_cart_2d(
+    img: Tensor,
+    dem: Tensor,
+    pos: Tensor,
+    vel: Tensor,
+    att: Tensor,
+    nbatch: int,
+    sweep_samples: int,
+    nsweeps: int,
+    fc: float,
+    fs: float,
+    gamma: float,
+    x0: float,
+    dx: float,
+    y0: float,
+    dy: float,
+    Nx: int,
+    Ny: int,
+    d0: float,
+    g: Tensor,
+    g_az0: float,
+    g_el0: float,
+    g_daz: float,
+    g_del: float,
+    g_naz: int,
+    g_nel: int,
+    use_rvp: int,
+    normalization: int,
+):
+    torch._check(img.dtype == torch.complex64)
+    torch._check(pos.dtype == torch.float32)
+    return torch.empty((nbatch, nsweeps, sweep_samples), dtype=torch.complex64, device=img.device)
+
+
+@torch.library.register_fake("torchbp::projection_cart_2d_nufft")
+def _fake_projection_cart_2d_nufft(
+    img: Tensor,
+    dem: Tensor,
+    pos: Tensor,
+    att: Tensor,
+    nbatch: int,
+    sweep_samples: int,
+    nsweeps: int,
+    fc: float,
+    fs: float,
+    gamma: float,
+    x0: float,
+    dx: float,
+    y0: float,
+    dy: float,
+    Nx: int,
+    Ny: int,
+    d0: float,
+    g: Tensor,
+    g_az0: float,
+    g_el0: float,
+    g_daz: float,
+    g_del: float,
+    g_naz: int,
+    g_nel: int,
+    use_rvp: int,
+    normalization: int,
+):
+    torch._check(img.dtype == torch.complex64)
+    torch._check(pos.dtype == torch.float32)
+    return torch.empty((nbatch, nsweeps, sweep_samples), dtype=torch.complex64, device=img.device)
 
 
 def _setup_context_polar_2d(ctx, inputs, output):

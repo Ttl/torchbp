@@ -1,4 +1,8 @@
 #include "util.h"
+#include <ATen/ops/fft_ifft.h>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 namespace torchbp {
 
@@ -526,10 +530,10 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
 
     // Pixel ground position and effective altitude for angle/distance computation.
     // altitude > 0: slant-range grid (BP origin at sensor altitude, pos z ≈ 0).
-    //   Map pixel to ground: x_g = sqrt(r²cos²θ - H²), y_g = r·sinθ.
+    //   Map pixel to ground: x_g = sqrt(r²cos²θ - H²), y_g = r sinθ.
     //   Use H for all vertical distance / angle calculations.
     // altitude == 0: ground-range grid (pos z = real altitude).
-    //   Pixel at (r·cosθ, r·sinθ, 0), use per-sweep pos_z.
+    //   Pixel at (r cosθ, r sinθ, 0), use per-sweep pos_z.
     float px_base, py_base, z_eff;
     if (altitude > 0.0f) {
         float r2cos2 = r * r * cos2;
@@ -997,6 +1001,364 @@ __global__ void projection_cart_2d_kernel(
 }
 
 
+/*
+NUFFT-based forward projection (vel=None path)
+
+Reformulates the direct sum as a Type-1 NUFFT:
+  A_p = w_p exp(-j 2pi fc tau_p)          Complex amplitude
+  nu_p = gamma tau_p / fs                 Normalised frequency
+  data[k] = Sum_p A_p exp(-j 2pi nu_p k)  IFFT of spread grid
+
+Three kernels: geometry, spread, deconvolve (after IFFT via PyTorch).
+*/
+
+// Kaiser-Bessel helper (host side)
+static float bessel_i0_host(float x) {
+    if (x < 3.75f) {
+        float t = (x / 3.75f) * (x / 3.75f);
+        return 1.0f + t*(3.5156229f + t*(3.0899424f + t*(1.2067492f
+             + t*(0.2659732f + t*(0.0360768f + t*0.0045813f)))));
+    }
+    float t = 3.75f / x;
+    return (expf(x) / sqrtf(x)) * (0.39894228f + t*(0.01328592f
+         + t*(0.00225319f + t*(-0.00157565f + t*(0.00916281f
+         + t*(-0.02057706f + t*(0.02635537f + t*(-0.01647633f
+         + t*0.00392377f))))))));
+}
+
+// KB LUT: N_LUT samples of psi_KB(t) for t in [0, W/2]
+static at::Tensor make_kb_lut(int N_LUT, float W, float beta, at::Device dev) {
+    at::Tensor lut = at::zeros({N_LUT},
+        at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+    float* p = lut.data_ptr<float>();
+    float i0b = bessel_i0_host(beta);
+    for (int i = 0; i < N_LUT; ++i) {
+        float t  = (float)i / (float)(N_LUT - 1) * (W * 0.5f);  // [0, W/2]
+        float u  = 2.0f * t / W;                                // [0, 1]
+        float sq = 1.0f - u * u;
+        p[i] = (sq > 0.0f) ? bessel_i0_host(beta * sqrtf(sq)) / i0b : 0.0f;
+    }
+    return lut.to(dev);
+}
+
+// Deconvolution window for centered extraction: correction[j] = M_ext / conj(phi_fwd[k])
+// where k = j - M/2  (centered bin index, k in [-M/2, M/2-1]).
+// Using centered bins keeps |k/M_ext| <= 0.25, well within the KB passband
+// where |phi_fwd[k]| >= 0.93 (vs ~0.15 at the one-sided edge j=M-1).
+// phi_fwd[k] = Sum_{delta=-(W/2-1)}^{W/2} psi_KB(|delta|) * exp(-j 2pi k delta/M_ext)
+static at::Tensor make_deconv_window(int M, int M_ext, float W, float beta,
+                                     at::Device dev) {
+    int half_W = (int)(W * 0.5f);          // = 3
+    float i0b  = bessel_i0_host(beta);
+    // psi_KB values for delta=0..half_W
+    std::vector<float> psi(half_W + 1);
+    for (int d = 0; d <= half_W; ++d) {
+        float u  = (float)d / (float)half_W;
+        float sq = 1.0f - u * u;
+        psi[d] = (sq > 0.0f) ? bessel_i0_host(beta * sqrtf(sq)) / i0b : 0.0f;
+    }
+    at::Tensor win = at::zeros({M},
+        at::TensorOptions().dtype(at::kComplexFloat).device(at::kCPU));
+    c10::complex<float>* w = win.data_ptr<c10::complex<float>>();
+    for (int j = 0; j < M; ++j) {
+        // Centered bin: k = j - M/2, evaluated at k for deconvolution.
+        int k = j - M / 2;
+        float re = 0.0f, im = 0.0f;
+        // delta in {-(half_W-1), ..., half_W}  = {-2,-1,0,1,2,3} for W=6
+        for (int d = -(half_W - 1); d <= half_W; ++d) {
+            float angle = -2.0f * (float)M_PI * (float)k * (float)d / (float)M_ext;
+            float kb    = psi[abs(d)];
+            re += kb * cosf(angle);
+            im += kb * sinf(angle);
+        }
+        // correction = M_ext / conj(phi_fwd[k]) = M_ext phi_fwd[k] / |phi_fwd[k]|^2
+        float denom = re * re + im * im;
+        float scale = (float)M_ext / denom;
+        w[j] = c10::complex<float>(re * scale, +im * scale);
+    }
+    return win.to(dev);
+}
+
+// Static cache: keyed on (sweep_samples, M_ext, device_index)
+struct NufftCache { at::Tensor kb_lut, deconv_win; };
+static std::mutex                                       g_nufft_cache_mutex;
+static std::map<std::tuple<int,int,int>, NufftCache>   g_nufft_cache;
+
+static std::pair<at::Tensor, at::Tensor>
+get_nufft_tables(int sweep_samples, int M_ext, float W, float beta,
+                 int N_LUT, at::Device dev) {
+    std::lock_guard<std::mutex> lock(g_nufft_cache_mutex);
+    auto key = std::make_tuple(sweep_samples, M_ext, dev.index());
+    auto it  = g_nufft_cache.find(key);
+    if (it != g_nufft_cache.end())
+        return {it->second.kb_lut, it->second.deconv_win};
+    NufftCache c;
+    c.kb_lut    = make_kb_lut(N_LUT, W, beta, dev);
+    c.deconv_win = make_deconv_window(sweep_samples, M_ext, W, beta, dev);
+    g_nufft_cache[key] = c;
+    return {c.kb_lut, c.deconv_win};
+}
+
+// Kernel 1: geometry
+// Computes complex amplitude A_p and
+// the unsigned grid position u_p = M_ext - gamma tau / fs for each pixel.
+template <bool USE_RVP>
+__global__ void projection_nufft_geometry_kernel(
+          const complex64_t* __restrict__ img,      // [N]
+          const float*       __restrict__ dem,      // [Nx*Ny] or nullptr
+          const float*       __restrict__ pos_s,    // [3] this sweep pos
+          const float*       __restrict__ att_s,    // [3] or nullptr
+          float* __restrict__ A_re,
+          float* __restrict__ A_im,
+          float* __restrict__ u_out,                // unsigned grid position
+          int N, float fc, float gamma_f, float fs_f, float d0,
+          float x0, float dx, float y0, float dy, int Nx, int Ny,
+          float M_ext_f,
+          const float* __restrict__ g,
+          float g_az0, float g_el0, float g_daz, float g_del,
+          int g_naz, int g_nel, int normalization) {
+
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= N) return;
+
+    const int px_y = p % Ny;
+    const int px_x = p / Ny;
+    const float x = x0 + px_x * dx;
+    const float y = y0 + px_y * dy;
+    const float z = (dem != nullptr) ? dem[p] : 0.0f;
+
+    const float dpx = x - pos_s[0];
+    const float dpy = y - pos_s[1];
+    const float dpz = z - pos_s[2];
+    const float d2  = dpx*dpx + dpy*dpy + dpz*dpz;
+    const float d   = sqrtf(d2);
+
+    float norm = 1.0f / d2;
+    if (g != nullptr) {
+        const float look   = asinf(fmaxf(dpz / d, -1.0f));
+        const float el_deg = look - att_s[0];
+        const float az_deg = atan2f(dpy, dpx) - att_s[2];
+        const float el_idx = (el_deg - g_el0) / g_del;
+        const float az_idx = (az_deg - g_az0) / g_daz;
+        const int el_int = (int)el_idx, az_int = (int)az_idx;
+        if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+            norm = 0.0f;
+        else
+            norm *= interp2d<float>(g, g_nel, g_naz,
+                                    el_int, el_idx - el_int,
+                                    az_int, az_idx - az_int);
+    }
+    if (normalization == 1) norm *= sqrtf(-dpz / d);
+
+    const complex64_t w_img = img[p];
+    const float wr = w_img.real() * norm;
+    const float wi = w_img.imag() * norm;
+
+    const float tau   = 2.0f * (d + d0) / kC0;
+    const float nu_p  = gamma_f * tau / fs_f;
+
+    // Grid position: u_p = M_ext - nu_p * M_ext
+    // exp(+j*2pi*u_p*k/M_ext) = exp(-j*2pi*nu_p*k) for integer k (via periodicity)
+    u_out[p] = M_ext_f - nu_p * M_ext_f;
+
+    // Carrier phase: -2fc*tau [+ gamma*tau^2 if USE_RVP]
+    // Centered extraction adds exp(-j*pi*nu_p*M) to amplitude for spectral centering
+    float phase = -2.0f * fc * tau;
+    if constexpr (USE_RVP) phase += gamma_f * tau * tau;
+    phase -= nu_p * M_ext_f * 0.5f;  // add exp(-j*pi*nu_p*M), M = M_ext/2
+    float cs, sn;
+    sincospif(phase, &sn, &cs);
+    A_re[p] = wr * cs - wi * sn;
+    A_im[p] = wr * sn + wi * cs;
+}
+
+// Kernel 2: spreading
+// Scatter each pixel's amplitude onto the oversampled grid using
+// W=6 Kaiser-Bessel taps.
+__global__ void projection_nufft_spread_kernel(
+          const float* __restrict__ A_re,
+          const float* __restrict__ A_im,
+          const float* __restrict__ u,
+          float2*      __restrict__ grid,   // [M_ext], zeroed externally
+          const float* __restrict__ kb_lut,
+          int N, int M_ext, int N_LUT, float W) {
+
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= N) return;
+
+    const float ar  = A_re[p];
+    const float ai  = A_im[p];
+    if (ar == 0.0f && ai == 0.0f) return;
+
+    const float up  = u[p];
+    const int   j0  = (int)rintf(up);              // nearest grid bin
+    const float frc = up - (float)j0;              // fractional offset
+    const float lut_scale = (float)(N_LUT - 1) * 2.0f / W;
+
+    // delta in {-W/2+1, ..., W/2} = {-2,-1,0,1,2,3} for W=6
+    const int half_W = (int)(W * 0.5f);
+    #pragma unroll
+    for (int delta = -(half_W - 1); delta <= half_W; ++delta) {
+        float dist    = fabsf(frc - (float)delta);
+        int   lut_idx = min((int)(dist * lut_scale), N_LUT - 1);
+        float kb      = kb_lut[lut_idx];
+
+        int gidx = ((j0 + delta) % M_ext + M_ext) % M_ext;
+        atomicAdd(&grid[gidx].x, ar * kb);
+        atomicAdd(&grid[gidx].y, ai * kb);
+    }
+}
+
+// Kernel 3: deconvolve + extract
+// Multiply IFFT output by precomputed correction and copy the
+// first sweep_samples bins to the output tensor.
+__global__ void projection_nufft_deconvolve_kernel(
+          const complex64_t* __restrict__ Z,       // [nbatch, nsweeps, M_ext]
+          const complex64_t* __restrict__ deconv,  // [sweep_samples]
+          complex64_t*       __restrict__ data,    // [nbatch, nsweeps, sweep_samples]
+          int sweep_samples, int nsweeps, int M_ext) {
+
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = blockIdx.y;   // sweep index
+    const int b = blockIdx.z;   // batch index
+    if (j >= sweep_samples) return;
+
+    // Centered extraction: IFFT bin k = j - M/2 (mapped into [0, M_ext-1]).
+    // This keeps all bins in the flat KB passband (|k/M_ext| <= 0.25).
+    const int k = ((j - sweep_samples / 2) % M_ext + M_ext) % M_ext;
+    const int z_idx   = (b * nsweeps + i) * M_ext + k;
+    const int out_idx = (b * nsweeps + i) * sweep_samples + j;
+    const complex64_t z = Z[z_idx];
+    const complex64_t w = deconv[j];
+    data[out_idx] =
+        complex64_t(z.real()*w.real() - z.imag()*w.imag(),
+                    z.real()*w.imag() + z.imag()*w.real());
+}
+
+// NUFFT launcher
+at::Tensor projection_cart_2d_nufft_cuda(
+          const at::Tensor &img,
+          const at::Tensor &dem,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double fs,
+          double gamma,
+          double x0, double dx, double y0, double dy,
+          int64_t Nx, int64_t Ny, double d0,
+          const at::Tensor &g,
+          double g_az0, double g_el0, double g_daz, double g_del,
+          int64_t g_naz, int64_t g_nel,
+          int64_t use_rvp, int64_t normalization) {
+
+    const int N      = (int)(Nx * Ny);
+    const int M      = (int)sweep_samples;
+    const int M_ext  = 2 * M;           // oversampled grid size
+    const float W    = 6.0f;
+    const float beta = 2.34f * W;       // KB parameter
+    const int N_LUT  = 8192;
+
+    auto dev  = img.device();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Retrieve or build KB LUT and deconvolution window
+    auto [kb_lut, deconv_win] = get_nufft_tables(M, M_ext, W, beta, N_LUT, dev);
+
+    // Allocate buffers
+    auto float_opts = at::TensorOptions().dtype(at::kFloat).device(dev);
+    auto cplx_opts  = at::TensorOptions().dtype(at::kComplexFloat).device(dev);
+
+    at::Tensor A_re  = at::empty({N}, float_opts);
+    at::Tensor A_im  = at::empty({N}, float_opts);
+    at::Tensor u_buf = at::empty({N}, float_opts);
+    at::Tensor grid  = at::zeros({nbatch, nsweeps, M_ext}, cplx_opts);
+    at::Tensor data  = at::empty({nbatch, nsweeps, M},     cplx_opts);
+
+    // Raw pointers (contiguous guaranteed by callers)
+    const complex64_t* img_raw  = (const complex64_t*)img.data_ptr<c10::complex<float>>();
+    const float*       dem_raw  = dem.defined()  ? dem.contiguous().data_ptr<float>() : nullptr;
+    const float*       pos_raw  = pos.contiguous().data_ptr<float>();
+    const float*       att_raw  = (g.defined() && att.defined())
+                                   ? att.contiguous().data_ptr<float>() : nullptr;
+    const float*       g_raw    = g.defined() ? g.contiguous().data_ptr<float>() : nullptr;
+    const float*       lut_raw  = kb_lut.data_ptr<float>();
+    float2*            grid_raw = (float2*)grid.data_ptr<c10::complex<float>>();
+    float*             ar       = A_re.data_ptr<float>();
+    float*             ai       = A_im.data_ptr<float>();
+    float*             up       = u_buf.data_ptr<float>();
+
+    const int BLOCK = 256;
+    dim3 geom_tpb  = {BLOCK, 1, 1};
+    dim3 geom_grid = {(unsigned)((N + BLOCK - 1) / BLOCK), 1, 1};
+    dim3 sprd_grid = {(unsigned)((N + BLOCK - 1) / BLOCK), 1, 1};
+
+    // Per-sweep geometry + spreading
+    for (int64_t b = 0; b < nbatch; ++b) {
+        const complex64_t* img_b  = img_raw  + b * N;
+        float2*            grid_b = grid_raw + (b * nsweeps) * M_ext;
+
+        for (int64_t i = 0; i < nsweeps; ++i) {
+            const float* pos_si = pos_raw + (b * nsweeps + i) * 3;
+            const float* att_si = att_raw ? att_raw + (b * nsweeps + i) * 3 : nullptr;
+
+            // Geometry
+            if (use_rvp) {
+                projection_nufft_geometry_kernel<true>
+                    <<<geom_grid, geom_tpb, 0, stream>>>(
+                    img_b, dem_raw, pos_si, att_si,
+                    ar, ai, up, N,
+                    (float)fc, (float)gamma, (float)fs, (float)d0,
+                    (float)x0, (float)dx, (float)y0, (float)dy, (int)Nx, (int)Ny,
+                    (float)M_ext,
+                    g_raw, (float)g_az0, (float)g_el0, (float)g_daz, (float)g_del,
+                    (int)g_naz, (int)g_nel, (int)normalization);
+            } else {
+                projection_nufft_geometry_kernel<false>
+                    <<<geom_grid, geom_tpb, 0, stream>>>(
+                    img_b, dem_raw, pos_si, att_si,
+                    ar, ai, up, N,
+                    (float)fc, (float)gamma, (float)fs, (float)d0,
+                    (float)x0, (float)dx, (float)y0, (float)dy, (int)Nx, (int)Ny,
+                    (float)M_ext,
+                    g_raw, (float)g_az0, (float)g_el0, (float)g_daz, (float)g_del,
+                    (int)g_naz, (int)g_nel, (int)normalization);
+            }
+
+            // Spreading into the grid slice for this sweep
+            projection_nufft_spread_kernel
+                <<<sprd_grid, geom_tpb, 0, stream>>>(
+                ar, ai, up, grid_b + i * M_ext, lut_raw,
+                N, M_ext, N_LUT, W);
+        }
+    }
+
+    // Batched IFFT over last dimension
+    at::Tensor Z = at::fft_ifft(grid, std::optional<int64_t>(M_ext), -1);
+
+    // Deconvolve + extract sweep_samples bins per row
+    {
+        const complex64_t* Z_raw    = (const complex64_t*)Z.data_ptr<c10::complex<float>>();
+        const complex64_t* dw_raw   = (const complex64_t*)deconv_win.data_ptr<c10::complex<float>>();
+        complex64_t*       data_raw = (complex64_t*)data.data_ptr<c10::complex<float>>();
+
+        dim3 dconv_tpb  = {BLOCK, 1, 1};
+        dim3 dconv_grid = {
+            (unsigned)((M + BLOCK - 1) / BLOCK),
+            (unsigned)nsweeps,
+            (unsigned)nbatch
+        };
+        projection_nufft_deconvolve_kernel
+            <<<dconv_grid, dconv_tpb, 0, stream>>>(
+            Z_raw, dw_raw, data_raw, M, (int)nsweeps, M_ext);
+    }
+
+    return data;
+}
+
+
 at::Tensor projection_cart_2d_cuda(
           const at::Tensor &img,
           const at::Tensor &dem,
@@ -1080,6 +1442,7 @@ at::Tensor projection_cart_2d_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    // Direct kernel: templated on (NSAMP, HAS_VEL, USE_RVP).
     // One kernel for all cases, templated on (NSAMP, HAS_VEL, USE_RVP).
     // NSAMP=4: 4 independent sincospif per pixel fills the 16-cycle SFU latency
     // window
@@ -2363,6 +2726,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
   m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cuda);
   m.impl("projection_cart_2d", &projection_cart_2d_cuda);
+  m.impl("projection_cart_2d_nufft", &projection_cart_2d_nufft_cuda);
   m.impl("compute_illumination", &compute_illumination_cuda);
 }
 

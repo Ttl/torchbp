@@ -1273,27 +1273,49 @@ class TestBackprojectionPolar2DTxPower(TestCase):
 
 
 class TestProjectionCart2D(TestCase):
+    """Tests for projection_cart_2d (direct scatter kernel) and
+    projection_cart_2d_nufft (NUFFT-based O(N log M) kernel)."""
+
+    # SAR parameters matching realistic interferometry use
+    FC   = 6.1e9
+    BW   = 500e6
+    TSWEEP = 200e-6
+    FS   = 30e6
+    GAMMA = BW / TSWEEP       # 2.5e12
+
+    def _make_inputs(self, device, *, nx=8, ny=16, nsweeps=4, nbatch=1,
+                     x_range=(30.0, 200.0), y_range=(-100.0, 100.0),
+                     altitude=100.0, seed=42):
+        torch.manual_seed(seed)
+        sweep_samples = int(self.FS * self.TSWEEP)
+        grid = {"x": x_range, "y": y_range, "nx": nx, "ny": ny}
+
+        if nbatch == 1:
+            img = torch.randn(nx, ny, dtype=torch.complex64, device=device)
+            pos = torch.zeros(nsweeps, 3, dtype=torch.float32, device=device)
+            pos[:, 1] = torch.linspace(-5.0, 5.0, nsweeps)
+            pos[:, 2] = altitude
+        else:
+            img = torch.randn(nbatch, nx, ny, dtype=torch.complex64, device=device)
+            pos = torch.zeros(nbatch, nsweeps, 3, dtype=torch.float32, device=device)
+            pos[:, :, 1] = torch.linspace(-5.0, 5.0, nsweeps)
+            pos[:, :, 2] = altitude
+
+        return dict(img=img, pos=pos, grid=grid,
+                    fc=self.FC, fs=self.FS, gamma=self.GAMMA,
+                    sweep_samples=sweep_samples, d0=0.0,
+                    use_rvp=False, normalization="gamma")
+
     def sample_inputs(self, device, *, requires_grad=False):
-        def make_tensor(size, dtype=torch.float32):
-            x = torch.randn(
-                size, device=device, requires_grad=False, dtype=dtype
-            )
-            return x
-
-        def make_pos_tensor(size, dtype=torch.float32):
-            x = torch.randn(
-                size, device=device, requires_grad=False, dtype=dtype
-            )
-            x = x - torch.max(x[:, 0]) - 2
-            return x
-
-        nbatch = 1
-        nsweeps = 2
-        sweep_samples = 8
-        grid = {"x": (-2, 2), "y": (-2, 2), "nx": 4, "ny": 4}
-        args = {
-            "img": make_tensor((nbatch, 4, 4), dtype=torch.complex64),
-            "pos": make_pos_tensor((nbatch, nsweeps, 3), dtype=torch.float32),
+        """Minimal inputs for opcheck (small sweep_samples avoids timeout)."""
+        torch.manual_seed(0)
+        nx, ny, nsweeps, sweep_samples = 4, 4, 2, 8
+        grid = {"x": (-2, 2), "y": (-2, 2), "nx": nx, "ny": ny}
+        pos = torch.zeros(nsweeps, 3, dtype=torch.float32, device=device)
+        pos[:, 2] = 5.0
+        return [{
+            "img": torch.randn(nx, ny, dtype=torch.complex64, device=device),
+            "pos": pos,
             "grid": grid,
             "fc": 6e9,
             "fs": 2e6,
@@ -1301,19 +1323,22 @@ class TestProjectionCart2D(TestCase):
             "sweep_samples": sweep_samples,
             "d0": 0.2,
             "normalization": "sigma",
-        }
-        return [args]
+        }]
+
+    # ------------------------------------------------------------------
+    # opcheck for both ops
+    # ------------------------------------------------------------------
 
     def _opcheck(self, device):
         from torchbp.ops.backproj import _prepare_projection_cart_2d_args
 
-        samples = self.sample_inputs(device, requires_grad=False)
+        samples = self.sample_inputs(device)
         for args in samples:
             cpp_args = _prepare_projection_cart_2d_args(**args)
             opcheck(
                 torch.ops.torchbp.projection_cart_2d,
                 cpp_args,
-                test_utils=["test_schema"]
+                test_utils=["test_schema", "test_faketensor"],
             )
 
     @unittest.skip("CPU implementation not available")
@@ -1323,6 +1348,200 @@ class TestProjectionCart2D(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
+
+    def _opcheck_nufft(self, device):
+        from torchbp.ops.backproj import _prepare_projection_cart_2d_nufft_args
+
+        samples = self.sample_inputs(device)
+        for args in samples:
+            args_nufft = {k: v for k, v in args.items() if k != "vel"}
+            cpp_args = _prepare_projection_cart_2d_nufft_args(**args_nufft)
+            opcheck(
+                torch.ops.torchbp.projection_cart_2d_nufft,
+                cpp_args,
+                test_utils=["test_schema", "test_faketensor"],
+            )
+
+    @unittest.skip("CPU implementation not available")
+    def test_opcheck_nufft_cpu(self):
+        self._opcheck_nufft("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_nufft_cuda(self):
+        self._opcheck_nufft("cuda")
+
+    # ------------------------------------------------------------------
+    # Output shape
+    # ------------------------------------------------------------------
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_output_shape(self):
+        """Both ops produce [nbatch, nsweeps, sweep_samples] output."""
+        inputs = self._make_inputs("cuda", nx=8, ny=16, nsweeps=4, nbatch=1)
+        M = inputs["sweep_samples"]
+        nsweeps = inputs["pos"].shape[0]
+
+        out_direct = torchbp.ops.projection_cart_2d(
+            **inputs, vel=torch.zeros_like(inputs["pos"])
+        )
+        out_nufft = torchbp.ops.projection_cart_2d_nufft(**inputs)
+
+        self.assertEqual(out_direct.shape, (1, nsweeps, M))
+        self.assertEqual(out_nufft.shape,  (1, nsweeps, M))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_output_shape_batched(self):
+        """Batched inputs produce [nbatch, nsweeps, sweep_samples] output."""
+        nbatch = 3
+        inputs = self._make_inputs("cuda", nx=8, ny=16, nsweeps=4, nbatch=nbatch)
+        M = inputs["sweep_samples"]
+        nsweeps = inputs["pos"].shape[1]
+
+        out_direct = torchbp.ops.projection_cart_2d(
+            **inputs, vel=torch.zeros_like(inputs["pos"])
+        )
+        out_nufft = torchbp.ops.projection_cart_2d_nufft(**inputs)
+
+        self.assertEqual(out_direct.shape, (nbatch, nsweeps, M))
+        self.assertEqual(out_nufft.shape,  (nbatch, nsweeps, M))
+
+    # ------------------------------------------------------------------
+    # NUFFT vs direct kernel agreement
+    # ------------------------------------------------------------------
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_nufft_matches_direct(self):
+        """NUFFT output must agree with direct kernel to within 5e-3 relative."""
+        inputs = self._make_inputs("cuda")
+        out_direct = torchbp.ops.projection_cart_2d(
+            **inputs, vel=torch.zeros_like(inputs["pos"])
+        )
+        out_nufft = torchbp.ops.projection_cart_2d_nufft(**inputs)
+
+        ref_scale = out_direct.abs().max()
+        rel_err = (out_direct - out_nufft).abs().max() / (ref_scale + 1e-30)
+        self.assertLess(rel_err.item(), 5e-3,
+                        f"NUFFT relative error {rel_err.item():.2e} exceeds 5e-3")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_nufft_matches_direct_batched(self):
+        """NUFFT / direct agreement holds for nbatch > 1."""
+        inputs = self._make_inputs("cuda", nbatch=2)
+        out_direct = torchbp.ops.projection_cart_2d(
+            **inputs, vel=torch.zeros_like(inputs["pos"])
+        )
+        out_nufft = torchbp.ops.projection_cart_2d_nufft(**inputs)
+
+        ref_scale = out_direct.abs().max()
+        rel_err = (out_direct - out_nufft).abs().max() / (ref_scale + 1e-30)
+        self.assertLess(rel_err.item(), 5e-3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_nufft_matches_direct_rvp(self):
+        """NUFFT / direct agreement holds with use_rvp=True."""
+        inputs = self._make_inputs("cuda")
+        inputs["use_rvp"] = True
+        out_direct = torchbp.ops.projection_cart_2d(
+            **inputs, vel=torch.zeros_like(inputs["pos"])
+        )
+        out_nufft = torchbp.ops.projection_cart_2d_nufft(**inputs)
+
+        ref_scale = out_direct.abs().max()
+        rel_err = (out_direct - out_nufft).abs().max() / (ref_scale + 1e-30)
+        self.assertLess(rel_err.item(), 5e-3)
+
+    # ------------------------------------------------------------------
+    # Direct formula check (single pixel)
+    # ------------------------------------------------------------------
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_single_pixel_direct_formula(self):
+        """Projection of a single bright pixel matches the analytical sum.
+
+        For a scene with one non-zero pixel at position (x_p, y_p, 0) the
+        projected signal at sweep i, sample j is:
+
+            data[i, j] = (1/d^2) * exp(-2πi * (fc + γ*j/fs) * τ)
+
+        where τ = 2d/c (sigma normalization, no RVP).
+        The reference must use the same c = 299792458 as the CUDA kernel.
+        """
+        import math
+        device = "cuda"
+        c = 299792458.0  # must match kC0 in util.h
+
+        x_p, y_p = 100.0, 0.0
+        grid = {"x": (x_p, x_p + 1.0), "y": (y_p, y_p + 1.0), "nx": 1, "ny": 1}
+        amp = torch.tensor([[1.0 + 0.0j]], dtype=torch.complex64, device=device)
+
+        nsweeps = 3
+        pos = torch.zeros(nsweeps, 3, dtype=torch.float32, device=device)
+        pos[:, 0] = x_p
+        pos[:, 1] = torch.linspace(-10.0, 10.0, nsweeps)
+        pos[:, 2] = 80.0
+
+        sweep_samples = 512
+        out = torchbp.ops.projection_cart_2d(
+            img=amp, pos=pos, grid=grid,
+            fc=self.FC, fs=self.FS, gamma=self.GAMMA,
+            sweep_samples=sweep_samples, d0=0.0,
+            use_rvp=False, normalization="sigma",
+            vel=torch.zeros_like(pos),
+        )[0]  # [nsweeps, sweep_samples]
+
+        j = torch.arange(sweep_samples, dtype=torch.float64, device=device)
+        ref = torch.zeros(nsweeps, sweep_samples, dtype=torch.complex128, device=device)
+        for i in range(nsweeps):
+            dx = x_p - pos[i, 0].item()
+            dy = y_p - pos[i, 1].item()
+            dz = 0.0  - pos[i, 2].item()
+            d  = math.sqrt(dx*dx + dy*dy + dz*dz)
+            tau = 2.0 * d / c
+            w   = 1.0 / (d * d)
+            # Kernel: exp(iπ·τ(-2γj/fs - 2fc)) = exp(-2πi(fc + γj/fs)τ)
+            phase = self.FC * tau + self.GAMMA * tau / self.FS * j
+            ref[i] = w * torch.exp(-2j * torch.pi * phase)
+
+        out_d = out.to(torch.complex128)
+        rel = (out_d - ref).abs().max() / (ref.abs().max() + 1e-30)
+        # float32 arithmetic in the kernel introduces ~1e-3 relative error
+        self.assertLess(rel.item(), 3e-3,
+                        f"Single-pixel formula error {rel.item():.2e} exceeds 3e-3")
+
+    # ------------------------------------------------------------------
+    # DEM support
+    # ------------------------------------------------------------------
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_dem_changes_output(self):
+        """Passing a non-zero DEM changes the projected output."""
+        inputs = self._make_inputs("cuda", nx=8, ny=16)
+        nx, ny = inputs["img"].shape[-2], inputs["img"].shape[-1]
+
+        out_flat = torchbp.ops.projection_cart_2d_nufft(**inputs)
+
+        inputs_dem = {**inputs,
+                      "dem": torch.full((nx, ny), 10.0,
+                                        dtype=torch.float32, device="cuda")}
+        out_dem = torchbp.ops.projection_cart_2d_nufft(**inputs_dem)
+
+        self.assertFalse(torch.allclose(out_flat, out_dem),
+                         "DEM had no effect on projection output")
+
+    # ------------------------------------------------------------------
+    # Normalization modes
+    # ------------------------------------------------------------------
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_normalizations_differ(self):
+        """sigma and gamma normalization produce different results."""
+        inputs_sigma = self._make_inputs("cuda")
+        inputs_gamma = {**inputs_sigma, "normalization": "sigma"}
+
+        out_sigma = torchbp.ops.projection_cart_2d_nufft(**inputs_sigma)
+        out_gamma = torchbp.ops.projection_cart_2d_nufft(**inputs_gamma)
+
+        self.assertFalse(torch.allclose(out_sigma, out_gamma))
 
 
 class TestPolarInterpLanczos(TestCase):
