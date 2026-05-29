@@ -66,5 +66,6 @@ def main(device):
 
 
 if __name__ == "__main__":
-    main("cuda")
+    if torch.cuda.is_available():
+        main("cuda")
     main("cpu")

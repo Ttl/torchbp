@@ -3,6 +3,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 #include <vector>
+#include <cmath>
+#include <type_traits>
 #include <omp.h>
 
 extern "C" {
@@ -68,8 +70,35 @@ static T interp2d_grady(const T *img, int nx, int ny,
 
 template <typename T>
 static void sincospi(T x, T *sinx, T *cosx) {
-    *sinx = sin(static_cast<T>(kPI) * x);
-    *cosx = cos(static_cast<T>(kPI) * x);
+    if constexpr (std::is_same_v<T, float>) {
+        // Fast float (sin(pi*x), cos(pi*x)). Working in "pi units" makes range
+        // reduction exact and cheap: the period in x is 2, so a single rintf
+        // + subtract maps x to r in [-0.5, 0.5].
+        // CPU analogue of CUDA's __sincosf.
+        const float k = rintf(x); // nearest integer, ties to even
+        const float r = x - k;    // r in [-0.5, 0.5]
+        const float u = r * r;
+        // sinpi(r) = r * Ps(r^2)
+        float s = 0.0778885794857989f;
+        s = s * u - 0.5983952894635156f;
+        s = s * u + 2.550091904145188f;
+        s = s * u - 5.167710704395367f;
+        s = s * u + 3.1415926441706428f;
+        s *= r;
+        // cospi(r) = Pc(r^2)
+        float c = 0.22049100664642599f;
+        c = c * u - 1.3322375115287677f;
+        c = c * u + 4.058461261992171f;
+        c = c * u - 4.934794985432785f;
+        c = c * u + 0.9999999672684953f;
+        // Odd integer part of x flips the sign of both sinpi and cospi.
+        if (((int)k) & 1) { s = -s; c = -c; }
+        *sinx = s;
+        *cosx = c;
+    } else {
+        *sinx = sin(static_cast<T>(kPI) * x);
+        *cosx = cos(static_cast<T>(kPI) * x);
+    }
 }
 
 template <typename T>
@@ -261,9 +290,11 @@ at::Tensor polar_interp_linear_cpu(
     at::Tensor out = torch::empty({nbatch, nr1, ntheta1}, img_contig.options());
     at::Tensor dorigin_contig = dorigin.contiguous();
 
-    // FIXME openmp hack to use more than 1 thread.
-    int num_threads = at::get_num_interop_threads();
-    omp_set_num_threads(num_threads);
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
 
     if (img.dtype() == at::kComplexFloat) {
         TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -332,9 +363,11 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
     at::Tensor img_grad;
     at::Tensor dorigin_grad;
 
-    // FIXME openmp hack to use more than 1 thread.
-    int num_threads = at::get_num_interop_threads();
-    omp_set_num_threads(num_threads);
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
 
     if (img.dtype() == at::kComplexFloat) {
         TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -593,9 +626,11 @@ at::Tensor backprojection_polar_2d_cpu(
     const float ref_phase = 4.0f * fc / kC0;
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
 
-    // FIXME openmp hack to use more than 1 thread.
-    int num_threads = at::get_num_interop_threads();
-    omp_set_num_threads(num_threads);
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
 
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
@@ -827,9 +862,11 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
 
-    // FIXME openmp hack to use more than 1 thread.
-    int num_threads = at::get_num_interop_threads();
-    omp_set_num_threads(num_threads);
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
 
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
@@ -947,9 +984,11 @@ at::Tensor polar_to_cart_linear_cpu(
 
     const float ref_phase = 4.0f * fc / kC0;
 
-    // FIXME openmp hack to use more than 1 thread.
-    int num_threads = at::get_num_interop_threads();
-    omp_set_num_threads(num_threads);
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
 
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {

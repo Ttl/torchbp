@@ -54,6 +54,11 @@ def get_extensions():
     extra_compile_args = {
         "cxx": [
             "-O3" if not debug_mode else "-O0",
+            # Tune for the build host's ISA. torchbp is always compiled from
+            # source against the local torch (see pyproject.toml), so the build
+            # machine is the run machine, it is safe to use its full
+            # instruction set. Helps with CPU ops.
+            f"-march=native",
             "-fdiagnostics-color=always",
             "-fopenmp",
             # Min Python version 3.9; only meaningful for an abi3 build.
