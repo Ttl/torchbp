@@ -849,9 +849,12 @@ def ffbp_merge2_poly_weighted(
     to correctly reconstruct the direct backprojection result.
 
     The merge formula recovers the unnormalized accumulation A from normalized images
-    (img = A * W1/W2) using:
+    (img = A * W1/W2) using::
+
         A = img * W2 / W1
-    Then combines:
+
+    Then combines::
+
         merged = (A0 + A1) * (W1_0 + W1_1) / (W2_0 + W2_1)
 
     Gradient not supported.

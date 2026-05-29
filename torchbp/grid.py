@@ -157,7 +157,7 @@ class PolarGrid(Grid):
         Returns
         -------
         PolarGrid
-            New grid with ntheta *= 2
+            New grid with ``ntheta *= 2``
         """
         return PolarGrid(self.r_range, self.theta_range, self.nr, 2 * self.ntheta)
 

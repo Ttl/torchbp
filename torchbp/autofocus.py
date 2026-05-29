@@ -429,7 +429,7 @@ def gpga_bp_polar_tde(
         out data outside the antenna beam.
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
--       If TX antenna equals RX antenna, then this should be just antenna gain.
+        If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1].
@@ -979,8 +979,8 @@ def insar_rme_blocksvd(
     Estimates per-slave-sweep range-direction position errors by combining
     per-block coherent statistics computed against an existing master image.
 
-    Algorithm
-    ---------
+    Notes
+    -----
     The image is tiled into `n_r_blocks x n_az_blocks` non-overlapping
     blocks. For each block `b`:
 
@@ -991,7 +991,7 @@ def insar_rme_blocksvd(
        pixels. Master is never demodulated to targets.
     2. The per-block per-sweep statistic is the inner product against the
        existing master image patch:
-         ``alpha^{(b)}_m = Sum_k conj(img_m[pix_k]) * B[k, m]``.
+       ``alpha^{(b)}_m = Sum_k conj(img_m[pix_k]) * B[k, m]``.
        This is the closed-form maximizer (over per-sweep phase) of the
        block's coherent inner product, with the master image acting as the
        optimal pixel weighting.
@@ -1000,7 +1000,7 @@ def insar_rme_blocksvd(
     Each block has an unknown complex constant ``c_b`` (per-block baseline
     + topo phase). With ``align_blocks=True``, each block's
     alpha is divided by its mean phase to absorb ``c_b``, and the aligned alphas
-    are coherently summed:
+    are coherently summed::
 
         alpha_combined_m = Sum_b alpha^{(b)}_m / e^{j angle(Sum_m alpha^{(b)}_m)}
         phi_m = +angle(alpha_combined_m) (data is corrected by exp(-j phi))

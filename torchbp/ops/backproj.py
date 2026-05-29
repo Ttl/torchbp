@@ -169,7 +169,7 @@ def backprojection_polar_2d(
         out data outside the antenna beam.
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
--       If TX antenna equals RX antenna, then this should be just antenna gain.
+        If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1].
@@ -414,6 +414,7 @@ def backprojection_cart_2d(
 
         - CartesianGrid object: ``CartesianGrid(x_range=(-50, 50), y_range=(-50, 50), nx=200, ny=200)``
         - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
+
     fc : float
         RF center frequency in Hz.
     r_res : float
@@ -538,6 +539,7 @@ def projection_cart_2d(
 
         - CartesianGrid object: ``CartesianGrid(x_range=(-50, 50), y_range=(-50, 50), nx=200, ny=200)``
         - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
+
     fc : float
         RF center frequency in Hz.
     fs : float
@@ -556,7 +558,7 @@ def projection_cart_2d(
         [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
--       If TX antenna equals RX antenna, then this should be just antenna gain.
+        If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1].
