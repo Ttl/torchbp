@@ -1,9 +1,12 @@
+# NOTE: torch is intentionally NOT listed here. The extension links
+# non-ABI-stable libtorch symbols, so it must be built against the exact torch
+# you run at import time. Listing torch would let PEP 517 build isolation pull
+# a different (newer, possibly different C++ ABI) torch into a throwaway build
+# env, producing a .so that fails to import with "undefined symbol" errors.
+#
+# Install torch yourself first, then build with isolation disabled:
+#     pip install torch
+#     pip install --no-build-isolation .
 [build-system]
-requires = [
-    "setuptools",
-    "torch",
-    "numpy",
-    "scipy",
-    "safetensors",
-]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"

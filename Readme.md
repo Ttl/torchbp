@@ -16,18 +16,29 @@ Tested with CUDA version 12.9.
 
 ### From source
 
+Install PyTorch first, then build torchbp against that same torch with
+build isolation disabled:
+
 ```bash
+pip install torch
 git clone https://github.com/Ttl/torchbp.git
 cd torchbp
 pip install --no-build-isolation -e .
 ```
+
+`--no-build-isolation` is required. The extension links libtorch C++ symbols
+that are not ABI-stable across torch versions, so it must be compiled against
+the exact torch you run at import time. Without the flag, pip builds in an
+isolated environment with a different (freshly downloaded) torch, producing
+a `.so` that fails to import with an `undefined symbol` error. For the same
+reason, rebuild torchbp whenever you change your torch version.
 
 ## Documentation
 
 API documentation and examples can be built with sphinx.
 
 ```bash
-pip install .[docs]
+pip install --no-build-isolation .[docs]
 cd docs
 make html
 ```
