@@ -4,6 +4,7 @@
 #include <torch/library.h>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 #include <type_traits>
 #include <omp.h>
 
@@ -899,6 +900,342 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
 	return ret;
 }
 
+static void backprojection_cart_2d_kernel_cpu(
+          const complex64_t* data,
+          const float* pos,
+          complex64_t* img,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          float beamwidth,
+          float d0,
+          float data_fmod,
+          int idt,
+          int idbatch) {
+    const int idy = idt % Ny;
+    const int idx = idt / Ny;
+
+    if (idx >= Nx || idy >= Ny) {
+        return;
+    }
+
+    const float x = x0 + idx * dx;
+    const float y = y0 + idy * dy;
+
+    complex64_t pixel{};
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        float pz2 = pos_z * pos_z;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        float sx = delta_r * (d + d0);
+
+        // Linear interpolation.
+        int id0 = sx;
+        int id1 = id0 + 1;
+        if (id0 >= 0 && id1 < sweep_samples) {
+            complex64_t s0 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id0];
+            complex64_t s1 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id1];
+
+            float interp_idx = sx - id0;
+            complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+            float ref_sin, ref_cos;
+            sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            pixel += s * ref;
+        }
+    }
+    img[idbatch * Nx * Ny + idx * Ny + idy] = pixel;
+}
+
+at::Tensor backprojection_cart_2d_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double beamwidth,
+          double d0,
+          double data_fmod) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(data.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor data_contig = data.contiguous();
+    at::Tensor img = torch::zeros({nbatch, Nx, Ny}, data_contig.options());
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const complex64_t* data_ptr = data_contig.data_ptr<complex64_t>();
+    complex64_t* img_ptr = img.data_ptr<complex64_t>();
+
+    const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+    // Divide by 2 to get angle from the center.
+    const float beamwidth_f = beamwidth / 2.0f;
+
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idt = 0; idt < Nx * Ny; idt++) {
+            backprojection_cart_2d_kernel_cpu(
+                          data_ptr,
+                          pos_ptr,
+                          img_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          x0, dx,
+                          y0, dy,
+                          Nx, Ny,
+                          beamwidth_f, d0,
+                          data_fmod/kPI,
+                          idt, idbatch);
+        }
+    }
+    return img;
+}
+
+static void backprojection_cart_2d_grad_kernel_cpu(
+          const complex64_t* data,
+          const float* pos,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          float beamwidth,
+          float d0,
+          float data_fmod,
+          const complex64_t* grad,
+          float* pos_grad,
+          complex64_t *data_grad,
+          int idt,
+          int idbatch) {
+    const int idy = idt % Ny;
+    const int idx = idt / Ny;
+
+    if (idx >= Nx || idy >= Ny) {
+        return;
+    }
+
+    bool have_pos_grad = pos_grad != nullptr;
+    bool have_data_grad = data_grad != nullptr;
+
+    const float x = x0 + idx * dx;
+    const float y = y0 + idy * dy;
+
+    complex64_t g = grad[idbatch * Nx * Ny + idx * Ny + idy];
+
+    complex64_t I = {0.0f, 1.0f};
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        float pz2 = pos_z * pos_z;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        float sx = delta_r * (d + d0);
+
+        float gx = 0.0f;
+        float gy = 0.0f;
+        float gz = 0.0f;
+        complex64_t ds0 = 0.0f;
+        complex64_t ds1 = 0.0f;
+
+        // Linear interpolation.
+        int id0 = sx;
+        int id1 = id0 + 1;
+        if (id0 >= 0 && id1 < sweep_samples) {
+            complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
+            complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
+
+            float interp_idx = sx - id0;
+            complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+            float ref_sin, ref_cos;
+            sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+
+            if (have_pos_grad) {
+                complex64_t dout = ref * (I * (kPI * (ref_phase - delta_r * data_fmod)) * s + (s1 - s0) * delta_r);
+                complex64_t gdout = g * std::conj(dout);
+
+                // Take real part
+                float gd = std::real(gdout);
+
+                gx = -px / d;
+                gy = -py / d;
+                // Different from x,y because pos_z is handled differently.
+                gz = pos_z / d;
+                gx *= gd;
+                gy *= gd;
+                gz *= gd;
+                // Avoid issues with zero range
+                if (!isfinite(gx)) gx = 0.0f;
+                if (!isfinite(gy)) gy = 0.0f;
+                if (!isfinite(gz)) gz = 0.0f;
+            }
+
+            if (have_data_grad) {
+                ds0 = g * std::conj((1.0f - interp_idx) * ref);
+                ds1 = g * std::conj(interp_idx * ref);
+            }
+        }
+
+        if (have_pos_grad) {
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 0] += gx;
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 1] += gy;
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 2] += gz;
+        }
+
+        if (have_data_grad) {
+            if (id0 >= 0 && id1 < sweep_samples) {
+                size_t data_idx = idbatch * sweep_samples * nsweeps + i * sweep_samples;
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id0])[0] += std::real(ds0);
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id0])[1] += std::imag(ds0);
+
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id1])[0] += std::real(ds1);
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id1])[1] += std::imag(ds1);
+            }
+        }
+    }
+}
+
+std::vector<at::Tensor> backprojection_cart_2d_grad_cpu(
+          const at::Tensor &grad,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double beamwidth,
+          double d0,
+          double data_fmod) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(data.dtype() == at::kComplexFloat);
+    TORCH_CHECK(grad.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor data_contig = data.contiguous();
+    at::Tensor grad_contig = grad.contiguous();
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const complex64_t* data_ptr = data_contig.data_ptr<complex64_t>();
+    const complex64_t* grad_ptr = grad_contig.data_ptr<complex64_t>();
+
+    at::Tensor pos_grad;
+    float* pos_grad_ptr = nullptr;
+    if (pos.requires_grad()) {
+        pos_grad = torch::zeros_like(pos);
+        pos_grad_ptr = pos_grad.data_ptr<float>();
+    } else {
+        pos_grad = torch::Tensor();
+    }
+
+    at::Tensor data_grad;
+    complex64_t* data_grad_ptr = nullptr;
+    if (data.requires_grad()) {
+        data_grad = torch::zeros_like(data);
+        data_grad_ptr = data_grad.data_ptr<complex64_t>();
+    } else {
+        data_grad = torch::Tensor();
+    }
+
+    const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+    // Divide by 2 to get angle from the center.
+    const float beamwidth_f = beamwidth / 2.0f;
+
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idt = 0; idt < Nx * Ny; idt++) {
+            backprojection_cart_2d_grad_kernel_cpu(
+                          data_ptr,
+                          pos_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          x0, dx,
+                          y0, dy,
+                          Nx, Ny,
+                          beamwidth_f, d0,
+                          data_fmod/kPI,
+                          grad_ptr,
+                          pos_grad_ptr,
+                          data_grad_ptr,
+                          idt, idbatch);
+        }
+    }
+    std::vector<at::Tensor> ret;
+    ret.push_back(data_grad);
+    ret.push_back(pos_grad);
+    return ret;
+}
+
 template<typename T>
 static void polar_to_cart_kernel_linear_cpu(const T *img, T
         *out, const float *origin, float rotation, float ref_phase, float r0,
@@ -1049,6 +1386,1006 @@ at::Tensor polar_to_cart_linear_cpu(
 	return out;
 }
 
+// ---------------------------------------------------------------------------
+// CPU implementations of the lanczos / knab / polynomial interpolation kernels
+// and the FFBP merge operators. These mirror the CUDA versions in
+// cuda/polar_interp.cu and cuda/util.h so that ffbp() and polar_to_cart()
+// (lanczos / antenna-pattern paths) work on the CPU as well.
+// ---------------------------------------------------------------------------
+
+static inline float sinpi_f(float x) {
+    float s, c;
+    sincospi<float>(x, &s, &c);
+    return s;
+}
+
+static inline float lanczos_kernel_cpu(float x, float a) {
+    if (x == 0.0f) {
+        return 1.0f;
+    }
+    return sinpi_f(x) / (kPI * x) * sinpi_f(x/a) / (kPI * x / a);
+}
+
+template<class T>
+static T lanczos_interp_1d_cpu(const T *img, int n, float pos, int order) {
+    float a = 0.5f * order;
+    int start = std::max(0, (int)ceilf(pos - a));
+    int end = std::min(n-1, (int)floorf(pos + a));
+    T sum{};
+    for (int i = start; i <= end; i++) {
+        float dx = pos - i;
+        float w = lanczos_kernel_cpu(dx, a);
+        sum += img[i] * w;
+    }
+    return sum;
+}
+
+template<class T>
+static T lanczos_interp_2d_cpu(const T *img, int nx, int ny, float x, float y, int order) {
+    float a = 0.5f * order;
+    int start_x = std::max(0, (int)ceilf(x - a));
+    int end_x = std::min(nx-1, (int)floorf(x + a));
+    T sum{};
+    for (int i = start_x; i <= end_x; i++) {
+        float dx = x - i;
+        float wx = lanczos_kernel_cpu(dx, a);
+        T row_val = lanczos_interp_1d_cpu<T>(img + i * ny, ny, y, order);
+        sum += row_val * wx;
+    }
+    return sum;
+}
+
+static inline float knab_kernel_norm_cpu(int order, float v) {
+    float a = 0.5f * order;
+    return expf(-2.0f*a*kPI*v);
+}
+
+static inline float knab_kernel_cpu(float x, float a, float v, float norm) {
+    if (fabsf(x) >= a) {
+        return 0.0f;
+    }
+    if (x == 0.0f) {
+        return 1.0f;
+    }
+    float xa = x / a;
+    float n = expf(kPI * a * v * (sqrtf(1.0f - xa*xa) - 1.0f));
+    return (sinpi_f(x) / (kPI * x)) * (norm/(n*(norm + 1.0f)) + n/(norm + 1.0f));
+}
+
+template<class T>
+static T knab_interp_1d_cpu(const T *img, int n, float pos, int order, float v, float norm) {
+    float a = 0.5f * order;
+    int start = std::max(0, (int)ceilf(pos - a));
+    int end = std::min(n-1, (int)floorf(pos + a));
+    T sum{};
+    for (int i = start; i <= end; i++) {
+        float dx = pos - i;
+        float w = knab_kernel_cpu(dx, a, v, norm);
+        sum += img[i] * w;
+    }
+    return sum;
+}
+
+template<class T>
+static T knab_interp_2d_cpu(const T *img, int nx, int ny, float x, float y, int order, float v, float norm) {
+    float a = 0.5f * order;
+    int start_x = std::max(0, (int)ceilf(x - a));
+    int end_x = std::min(nx-1, (int)floorf(x + a));
+    T sum{};
+    for (int i = start_x; i <= end_x; i++) {
+        float dx = x - i;
+        float wx = knab_kernel_cpu(dx, a, v, norm);
+        T row_val = knab_interp_1d_cpu<T>(img + i * ny, ny, y, order, v, norm);
+        sum += row_val * wx;
+    }
+    return sum;
+}
+
+// Evaluates 1 + c1*x + c2*x^2 + ... + cn*x^n using Horner's method.
+static inline float polyval_c0_one_cpu(const float *coefs, int n_coefs, float x) {
+    float inner = coefs[n_coefs - 1];
+    for (int i = n_coefs - 2; i >= 0; i--) {
+        inner = inner * x + coefs[i];
+    }
+    return x * inner + 1.0f;
+}
+
+static inline float poly_interp_kernel_cpu(const float *coefs, int n_coefs, float x, float inv_a2) {
+    float x2 = x * x;
+    float t = x2 * inv_a2;
+    return polyval_c0_one_cpu(coefs, n_coefs, t);
+}
+
+template<class T>
+static T interp_2d_poly_cpu(const T *img, int nx, int ny, float x, float y,
+        int order, const float *coefs, int n_coefs) {
+    float a = 0.5f * order;
+    float inv_a2 = 1.0f / (a * a);
+
+    int start_x = std::max(0, (int)ceilf(x - a));
+    int end_x = std::min(nx-1, (int)floorf(x + a));
+    int start_y = std::max(0, (int)ceilf(y - a));
+    int end_y = std::min(ny-1, (int)floorf(y + a));
+
+    T sum{};
+    for (int i = start_x; i <= end_x; i++) {
+        float dx = x - (float)i;
+        float wx = poly_interp_kernel_cpu(coefs, n_coefs, dx, inv_a2);
+        const T *row = img + i * ny;
+        for (int j = start_y; j <= end_y; j++) {
+            float dy = y - (float)j;
+            float wy = poly_interp_kernel_cpu(coefs, n_coefs, dy, inv_a2);
+            sum += row[j] * (wx * wy);
+        }
+    }
+    return sum;
+}
+
+// Applies the optional output-alias phase common to all merge kernels.
+static inline void apply_merge_alias(complex64_t &pixel, int alias,
+        float ref_phase, float alias_fmod, float dz, int idr) {
+    if (!alias) {
+        return;
+    }
+    float af = alias_fmod;
+    float rp = ref_phase;
+    if (alias == 2) {
+        af = 0.0f;
+    }
+    if (alias == 3) {
+        rp = 0.0f;
+    }
+    float ref_sin, ref_cos;
+    sincospi<float>(rp * dz - af * idr, &ref_sin, &ref_cos);
+    complex64_t ref = {ref_cos, ref_sin};
+    pixel *= ref;
+}
+
+static void ffbp_merge2_kernel_lanczos_cpu(const complex64_t *img0, const complex64_t *img1,
+        complex64_t *out, const float *dorigin,
+        float ref_phase, const float *r0, const float *dr, const float *theta0,
+        const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod,
+        int idx) {
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    const float d = r1 + dr1 * idr;
+    const float t = theta1 + dtheta1 * idtheta;
+    if (t < -1.0f || t > 1.0f) {
+        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+        return;
+    }
+
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    const float dz = sqrtf(z1*z1 + d*d);
+
+    complex64_t pixel{};
+
+    for (int id=0; id < 2; id++) {
+        const complex64_t *img = id == 0 ? img0 : img1;
+        const float dorig0 = dorigin[id * 3 + 0];
+        const float dorig1 = dorigin[id * 3 + 1];
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float dri = (rp - r0[id]) / dr[id];
+        const float dti = (tp - theta0[id]) / dtheta[id];
+
+        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+            complex64_t v = lanczos_interp_2d_cpu<complex64_t>(
+                    img, Nr[id], Ntheta[id], dri, dti, order);
+
+            float ref_sin, ref_cos;
+            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float rpz = sqrtf(z0*z0 + rp*rp);
+            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            pixel += v * ref;
+        }
+    }
+    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
+    out[idr*Ntheta1 + idtheta] = pixel;
+}
+
+static void ffbp_merge2_kernel_knab_cpu(const complex64_t *img0, const complex64_t *img1,
+        complex64_t *out, const float *dorigin,
+        float ref_phase, const float *r0, const float *dr, const float *theta0,
+        const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v, int alias,
+        float alias_fmod, int idx) {
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    const float d = r1 + dr1 * idr;
+    const float t = theta1 + dtheta1 * idtheta;
+    if (t < -1.0f || t > 1.0f) {
+        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+        return;
+    }
+
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    const float dz = sqrtf(z1*z1 + d*d);
+
+    complex64_t pixel{};
+    const float knab_norm = knab_kernel_norm_cpu(order, knab_v);
+
+    for (int id=0; id < 2; id++) {
+        const complex64_t *img = id == 0 ? img0 : img1;
+        const float dorig0 = dorigin[id * 3 + 0];
+        const float dorig1 = dorigin[id * 3 + 1];
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float dri = (rp - r0[id]) / dr[id];
+        const float dti = (tp - theta0[id]) / dtheta[id];
+
+        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+            complex64_t v = knab_interp_2d_cpu<complex64_t>(
+                    img, Nr[id], Ntheta[id], dri, dti, order, knab_v, knab_norm);
+
+            float ref_sin, ref_cos;
+            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float rpz = sqrtf(z0*z0 + rp*rp);
+            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            pixel += v * ref;
+        }
+    }
+    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
+    out[idr*Ntheta1 + idtheta] = pixel;
+}
+
+static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64_t *img1,
+        complex64_t *out, const float *dorigin,
+        float ref_phase, const float *r0, const float *dr, const float *theta0,
+        const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, const float *coefs, int n_coefs,
+        int alias, float alias_fmod, int idx) {
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    const float d = r1 + dr1 * idr;
+    const float t = theta1 + dtheta1 * idtheta;
+    if (t < -1.0f || t > 1.0f) {
+        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+        return;
+    }
+
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    const float dz = sqrtf(z1*z1 + d*d);
+
+    complex64_t pixel{};
+
+    for (int id=0; id < 2; id++) {
+        const complex64_t *img = id == 0 ? img0 : img1;
+        const float dorig0 = dorigin[id * 3 + 0];
+        const float dorig1 = dorigin[id * 3 + 1];
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float dri = (rp - r0[id]) / dr[id];
+        const float dti = (tp - theta0[id]) / dtheta[id];
+
+        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+            complex64_t v = interp_2d_poly_cpu<complex64_t>(
+                    img, Nr[id], Ntheta[id], dri, dti, order, coefs, n_coefs);
+
+            float ref_sin, ref_cos;
+            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float rpz = sqrtf(z0*z0 + rp*rp);
+            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            pixel += v * ref;
+        }
+    }
+    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
+    out[idr*Ntheta1 + idtheta] = pixel;
+}
+
+at::Tensor ffbp_merge2_lanczos_cpu(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          const at::Tensor &dorigin,
+          double fc,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z1,
+          int64_t order,
+          int64_t alias,
+          double alias_fmod) {
+    TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+    TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+    TORCH_CHECK(dorigin.dtype() == at::kFloat);
+    TORCH_CHECK(r0.dtype() == at::kFloat);
+    TORCH_CHECK(Nr0.dtype() == at::kInt);
+    TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+    TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CPU);
+    at::Tensor dorigin_contig = dorigin.contiguous();
+    at::Tensor img0_contig = img0.contiguous();
+    at::Tensor img1_contig = img1.contiguous();
+    at::Tensor r0_contig = r0.contiguous();
+    at::Tensor dr0_contig = dr0.contiguous();
+    at::Tensor theta0_contig = theta0.contiguous();
+    at::Tensor dtheta0_contig = dtheta0.contiguous();
+    at::Tensor Nr0_contig = Nr0.contiguous();
+    at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+    at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+    const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    const complex64_t* img0_ptr = img0_contig.data_ptr<complex64_t>();
+    const complex64_t* img1_ptr = img1_contig.data_ptr<complex64_t>();
+    complex64_t* out_ptr = out.data_ptr<complex64_t>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
+        ffbp_merge2_kernel_lanczos_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
+                ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
+                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI, idx);
+    }
+    return out;
+}
+
+at::Tensor ffbp_merge2_knab_cpu(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          const at::Tensor &dorigin,
+          double fc,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z1,
+          int64_t order,
+          double oversample,
+          int64_t alias,
+          double alias_fmod) {
+    TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+    TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+    TORCH_CHECK(dorigin.dtype() == at::kFloat);
+    TORCH_CHECK(r0.dtype() == at::kFloat);
+    TORCH_CHECK(Nr0.dtype() == at::kInt);
+    TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+    TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CPU);
+    at::Tensor dorigin_contig = dorigin.contiguous();
+    at::Tensor img0_contig = img0.contiguous();
+    at::Tensor img1_contig = img1.contiguous();
+    at::Tensor r0_contig = r0.contiguous();
+    at::Tensor dr0_contig = dr0.contiguous();
+    at::Tensor theta0_contig = theta0.contiguous();
+    at::Tensor dtheta0_contig = dtheta0.contiguous();
+    at::Tensor Nr0_contig = Nr0.contiguous();
+    at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+    at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+    const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    const complex64_t* img0_ptr = img0_contig.data_ptr<complex64_t>();
+    const complex64_t* img1_ptr = img1_contig.data_ptr<complex64_t>();
+    complex64_t* out_ptr = out.data_ptr<complex64_t>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+
+    const float ref_phase = 4.0f * fc / kC0;
+    const float v = 1.0f - 1.0f / oversample;
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
+        ffbp_merge2_kernel_knab_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
+                ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
+                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, v, alias, alias_fmod/kPI, idx);
+    }
+    return out;
+}
+
+at::Tensor ffbp_merge2_poly_cpu(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          const at::Tensor &dorigin,
+          double fc,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z1,
+          int64_t order,
+          const at::Tensor &poly_coefs,
+          int64_t alias,
+          double alias_fmod) {
+    TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+    TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+    TORCH_CHECK(dorigin.dtype() == at::kFloat);
+    TORCH_CHECK(r0.dtype() == at::kFloat);
+    TORCH_CHECK(Nr0.dtype() == at::kInt);
+    TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+    TORCH_CHECK(poly_coefs.dtype() == at::kFloat);
+    TORCH_CHECK(order >= 2 && order <= 8,
+        "ffbp_merge2_poly requires order in [2, 8], got ", order);
+    TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CPU);
+    at::Tensor dorigin_contig = dorigin.contiguous();
+    at::Tensor img0_contig = img0.contiguous();
+    at::Tensor img1_contig = img1.contiguous();
+    at::Tensor r0_contig = r0.contiguous();
+    at::Tensor dr0_contig = dr0.contiguous();
+    at::Tensor theta0_contig = theta0.contiguous();
+    at::Tensor dtheta0_contig = dtheta0.contiguous();
+    at::Tensor Nr0_contig = Nr0.contiguous();
+    at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+    at::Tensor poly_coefs_contig = poly_coefs.contiguous();
+    at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+    const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    const complex64_t* img0_ptr = img0_contig.data_ptr<complex64_t>();
+    const complex64_t* img1_ptr = img1_contig.data_ptr<complex64_t>();
+    complex64_t* out_ptr = out.data_ptr<complex64_t>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+    const float* coefs_ptr = poly_coefs_contig.data_ptr<float>();
+    const int n_coefs = poly_coefs_contig.size(0);
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
+        ffbp_merge2_kernel_poly_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
+                ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
+                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, n_coefs,
+                alias, alias_fmod/kPI, idx);
+    }
+    return out;
+}
+
+static void ffbp_merge2_kernel_poly_weighted_cpu(
+        const complex64_t *img0, const complex64_t *img1,
+        complex64_t *out,
+        float *w1_out,
+        float *w2_out,
+        const float *dorigin,
+        float ref_phase,
+        const float *r0, const float *dr, const float *theta0, const float *dtheta,
+        const int *Nr, const int *Ntheta,
+        float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
+        float z1, int order, const float *coefs, int n_coefs, int alias, float alias_fmod,
+        const float *w1_map0, const float *w2_map0,
+        float w_r0_0, float w_dr0, float w_theta0_0, float w_dtheta0,
+        int w_nr0, int w_ntheta0,
+        const float *w1_map1, const float *w2_map1,
+        float w_r0_1, float w_dr1, float w_theta0_1, float w_dtheta1,
+        int w_nr1, int w_ntheta1,
+        int output_weight_decimation, int idx) {
+
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    const float d = r1 + dr1 * idr;
+    const float t = theta1 + dtheta1 * idtheta;
+
+    const int dec = output_weight_decimation;
+    const int out_ntheta_dec = (Ntheta1 + dec - 1) / dec;
+    const bool should_write_weight = (w1_out != nullptr) &&
+                                     (idr % dec == 0) && (idtheta % dec == 0);
+    const int w_out_idx = should_write_weight ?
+                          (idr / dec) * out_ntheta_dec + (idtheta / dec) : 0;
+
+    if (t < -1.0f || t > 1.0f) {
+        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+        if (should_write_weight) {
+            w1_out[w_out_idx] = 0.0f;
+            w2_out[w_out_idx] = 0.0f;
+        }
+        return;
+    }
+
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    const float dz = sqrtf(z1*z1 + d*d);
+
+    complex64_t A_total{};
+    float W1_total = 0.0f;
+    float W2_total = 0.0f;
+
+    const float *w1_maps[2] = {w1_map0, w1_map1};
+    const float *w2_maps[2] = {w2_map0, w2_map1};
+    const float w_r0[2] = {w_r0_0, w_r0_1};
+    const float w_dr[2] = {w_dr0, w_dr1};
+    const float w_theta0[2] = {w_theta0_0, w_theta0_1};
+    const float w_dtheta[2] = {w_dtheta0, w_dtheta1};
+    const int w_nr[2] = {w_nr0, w_nr1};
+    const int w_ntheta[2] = {w_ntheta0, w_ntheta1};
+
+    for (int id=0; id < 2; id++) {
+        const complex64_t *img = id == 0 ? img0 : img1;
+        const float dorig0 = dorigin[id * 3 + 0];
+        const float dorig1 = dorigin[id * 3 + 1];
+        const float dorig2 = dorigin[id * 3 + 2];
+
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float dri = (rp - r0[id]) / dr[id];
+        const float dti = (tp - theta0[id]) / dtheta[id];
+
+        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+            complex64_t v = interp_2d_poly_cpu<complex64_t>(
+                    img, Nr[id], Ntheta[id], dri, dti, order, coefs, n_coefs);
+
+            float ref_sin, ref_cos;
+            const float z0 = z1 + dorig2;
+            const float rpz = sqrtf(z0*z0 + rp*rp);
+            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod * (dri - idr), &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+
+            float w1 = 0.0f;
+            float w2 = 0.0f;
+            if (w1_maps[id] != nullptr && w2_maps[id] != nullptr) {
+                const float w_ri = (rp - w_r0[id]) / w_dr[id];
+                const float w_ti = (tp - w_theta0[id]) / w_dtheta[id];
+
+                const int w_ri_int = std::max(0, std::min((int)w_ri, w_nr[id] - 2));
+                const int w_ti_int = std::max(0, std::min((int)w_ti, w_ntheta[id] - 2));
+                const float w_ri_frac = std::max(0.0f, std::min(w_ri - (float)w_ri_int, 1.0f));
+                const float w_ti_frac = std::max(0.0f, std::min(w_ti - (float)w_ti_int, 1.0f));
+
+                w1 = interp2d<float>(w1_maps[id], w_nr[id], w_ntheta[id],
+                                     w_ri_int, w_ri_frac, w_ti_int, w_ti_frac);
+                w2 = interp2d<float>(w2_maps[id], w_nr[id], w_ntheta[id],
+                                     w_ri_int, w_ri_frac, w_ti_int, w_ti_frac);
+            }
+
+            if (w1 > 0.0f && w2 > 0.0f) {
+                A_total += v * ref;
+                W1_total += w1;
+                W2_total += w2;
+            } else if (w1_maps[id] == nullptr) {
+                A_total += v * ref;
+            }
+        }
+    }
+
+    complex64_t pixel = A_total;
+    if (w1_out == nullptr && W2_total > 0.0f) {
+        pixel = A_total * (W1_total / W2_total);
+    }
+
+    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
+    out[idr*Ntheta1 + idtheta] = pixel;
+
+    if (should_write_weight) {
+        w1_out[w_out_idx] = W1_total;
+        w2_out[w_out_idx] = W2_total;
+    }
+}
+
+std::vector<at::Tensor> ffbp_merge2_poly_weighted_cpu(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          const at::Tensor &dorigin,
+          double fc,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double z1,
+          int64_t order,
+          const at::Tensor &poly_coefs,
+          int64_t alias,
+          double alias_fmod,
+          const at::Tensor &w1_map0,
+          const at::Tensor &w2_map0,
+          double w_r0_0, double w_dr0, double w_theta0_0, double w_dtheta0,
+          int64_t w_nr0, int64_t w_ntheta0,
+          const at::Tensor &w1_map1,
+          const at::Tensor &w2_map1,
+          double w_r0_1, double w_dr1, double w_theta0_1, double w_dtheta1,
+          int64_t w_nr1, int64_t w_ntheta1,
+          int64_t output_weight_map,
+          int64_t output_weight_decimation) {
+    TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+    TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+    TORCH_CHECK(dorigin.dtype() == at::kFloat);
+    TORCH_CHECK(r0.dtype() == at::kFloat);
+    TORCH_CHECK(Nr0.dtype() == at::kInt);
+    TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+    TORCH_CHECK(poly_coefs.dtype() == at::kFloat);
+    TORCH_CHECK(order >= 2 && order <= 8,
+        "ffbp_merge2_poly_weighted requires order in [2, 8], got ", order);
+    TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CPU);
+
+    bool has_weight0 = w1_map0.defined() && w1_map0.numel() > 0 && w2_map0.defined() && w2_map0.numel() > 0;
+    bool has_weight1 = w1_map1.defined() && w1_map1.numel() > 0 && w2_map1.defined() && w2_map1.numel() > 0;
+
+    at::Tensor dorigin_contig = dorigin.contiguous();
+    at::Tensor img0_contig = img0.contiguous();
+    at::Tensor img1_contig = img1.contiguous();
+    at::Tensor r0_contig = r0.contiguous();
+    at::Tensor dr0_contig = dr0.contiguous();
+    at::Tensor theta0_contig = theta0.contiguous();
+    at::Tensor dtheta0_contig = dtheta0.contiguous();
+    at::Tensor Nr0_contig = Nr0.contiguous();
+    at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+    at::Tensor poly_coefs_contig = poly_coefs.contiguous();
+    at::Tensor out = torch::empty({Nr1, Ntheta1}, img0_contig.options());
+    const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    const complex64_t* img0_ptr = img0_contig.data_ptr<complex64_t>();
+    const complex64_t* img1_ptr = img1_contig.data_ptr<complex64_t>();
+    complex64_t* out_ptr = out.data_ptr<complex64_t>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+    const float* coefs_ptr = poly_coefs_contig.data_ptr<float>();
+    const int n_coefs = poly_coefs_contig.size(0);
+
+    at::Tensor w1_map0_contig, w2_map0_contig, w1_map1_contig, w2_map1_contig;
+    const float* w1_map0_ptr = nullptr;
+    const float* w2_map0_ptr = nullptr;
+    const float* w1_map1_ptr = nullptr;
+    const float* w2_map1_ptr = nullptr;
+    if (has_weight0) {
+        TORCH_CHECK(w1_map0.dtype() == at::kFloat);
+        TORCH_CHECK(w2_map0.dtype() == at::kFloat);
+        w1_map0_contig = w1_map0.contiguous();
+        w2_map0_contig = w2_map0.contiguous();
+        w1_map0_ptr = w1_map0_contig.data_ptr<float>();
+        w2_map0_ptr = w2_map0_contig.data_ptr<float>();
+    }
+    if (has_weight1) {
+        TORCH_CHECK(w1_map1.dtype() == at::kFloat);
+        TORCH_CHECK(w2_map1.dtype() == at::kFloat);
+        w1_map1_contig = w1_map1.contiguous();
+        w2_map1_contig = w2_map1.contiguous();
+        w1_map1_ptr = w1_map1_contig.data_ptr<float>();
+        w2_map1_ptr = w2_map1_contig.data_ptr<float>();
+    }
+
+    at::Tensor w1_out, w2_out;
+    float* w1_out_ptr = nullptr;
+    float* w2_out_ptr = nullptr;
+    int dec = output_weight_decimation > 0 ? output_weight_decimation : 1;
+    if (output_weight_map) {
+        int64_t out_nr_dec = (Nr1 + dec - 1) / dec;
+        int64_t out_ntheta_dec = (Ntheta1 + dec - 1) / dec;
+        w1_out = torch::empty({out_nr_dec, out_ntheta_dec},
+                torch::TensorOptions().dtype(at::kFloat).device(img0.device()));
+        w2_out = torch::empty({out_nr_dec, out_ntheta_dec},
+                torch::TensorOptions().dtype(at::kFloat).device(img0.device()));
+        w1_out_ptr = w1_out.data_ptr<float>();
+        w2_out_ptr = w2_out.data_ptr<float>();
+    }
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
+        ffbp_merge2_kernel_poly_weighted_cpu(
+                img0_ptr, img1_ptr, out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase,
+                r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
+                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, n_coefs,
+                alias, alias_fmod/kPI,
+                w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0,
+                w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1,
+                dec, idx);
+    }
+
+    std::vector<at::Tensor> ret;
+    ret.push_back(out);
+    ret.push_back(w1_out);
+    ret.push_back(w2_out);
+    return ret;
+}
+
+template<typename T>
+static void polar_to_cart_kernel_lanczos_cpu(const T *img, T
+        *out, const float *origin, float rotation, float ref_phase, float r0,
+        float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
+        float dx, float y0, float dy, int Nx, int Ny, float alias_fmod, int order,
+        int id1, int idbatch) {
+    const int idy = id1 % Ny;
+    const int idx = id1 / Ny;
+
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
+    const float x = x0 + dx * idx;
+    const float y = y0 + dy * idy;
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    const float dz = sqrtf(d*d + orig2*orig2);
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
+    float rs = sinf(rotation);
+    float rc = cosf(rotation);
+    float cosa = t*rs  + tc*rc;
+    if (rotation != 0.0f) {
+        t = rc * t - rs * tc;
+    }
+    const float dri = (d - r0) / dr;
+    const float dti = (t - theta0) / dtheta;
+
+    const int dri_int = dri;
+    const int dti_int = dti;
+
+    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+        T v = lanczos_interp_2d_cpu<T>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
+        if constexpr (std::is_same_v<T, complex64_t>) {
+            float ref_sin, ref_cos;
+            sincospi<float>(ref_phase * dz - alias_fmod * dri, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            out[idbatch * Nx * Ny + idx*Ny + idy] = v * ref;
+        } else {
+            out[idbatch * Nx * Ny + idx*Ny + idy] = v;
+        }
+    } else {
+        if constexpr (std::is_same_v<T, complex64_t>) {
+            out[idbatch * Nx * Ny + idx*Ny + idy] = {0.0f, 0.0f};
+        } else {
+            out[idbatch * Nx * Ny + idx*Ny + idy] = 0.0f;
+        }
+    }
+}
+
+at::Tensor polar_to_cart_lanczos_cpu(
+          const at::Tensor &img,
+          const at::Tensor &origin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double x0,
+          double y0,
+          double dx,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double alias_fmod,
+          int64_t order) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
+    TORCH_CHECK(origin.dtype() == at::kFloat);
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CPU);
+    at::Tensor origin_contig = origin.contiguous();
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor out = torch::empty({nbatch, Nx, Ny}, img_contig.options());
+    const float* origin_ptr = origin_contig.data_ptr<float>();
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int id1 = 0; id1 < Nx * Ny; id1++) {
+            if (img.dtype() == at::kComplexFloat) {
+                const complex64_t* img_ptr = img_contig.data_ptr<complex64_t>();
+                complex64_t* out_ptr = out.data_ptr<complex64_t>();
+                polar_to_cart_kernel_lanczos_cpu<complex64_t>(
+                        img_ptr, out_ptr, origin_ptr, rotation, ref_phase,
+                        r0, dr, theta0, dtheta, Nr, Ntheta,
+                        x0, dx, y0, dy, Nx, Ny, alias_fmod/kPI, order, id1, idbatch);
+            } else {
+                const float* img_ptr = img_contig.data_ptr<float>();
+                float* out_ptr = out.data_ptr<float>();
+                polar_to_cart_kernel_lanczos_cpu<float>(
+                        img_ptr, out_ptr, origin_ptr, rotation, ref_phase,
+                        r0, dr, theta0, dtheta, Nr, Ntheta,
+                        x0, dx, y0, dy, Nx, Ny, alias_fmod/kPI, order, id1, idbatch);
+            }
+        }
+    }
+    return out;
+}
+
+static void compute_illumination_kernel_cpu(
+          const float* pos,
+          const float* att,
+          const float* g,
+          float* w1_out,
+          float* w2_out,
+          int nsweeps,
+          float r0, float dr, float theta0, float dtheta, int nr, int ntheta,
+          float g_el0, float g_del, float g_az0, float g_daz, int g_nel, int g_naz,
+          int decimation, int idx) {
+
+    const int out_ntheta = (ntheta + decimation - 1) / decimation;
+    const int out_nr = (nr + decimation - 1) / decimation;
+
+    if (idx >= out_nr * out_ntheta) return;
+
+    const int out_idtheta = idx % out_ntheta;
+    const int out_idr = idx / out_ntheta;
+
+    const int full_idr = out_idr * decimation;
+    const int full_idtheta = out_idtheta * decimation;
+
+    const float r = r0 + dr * full_idr;
+    const float t = theta0 + dtheta * full_idtheta;  // t is sin(theta)
+    const float cost = sqrtf(1.0f - t*t);
+    const float x = r * cost;
+    const float y = r * t;
+
+    float w1 = 0.0f;
+    float w2 = 0.0f;
+
+    for (int i = 0; i < nsweeps; i++) {
+        const float pos_x = pos[i * 3 + 0];
+        const float pos_y = pos[i * 3 + 1];
+        const float pos_z = pos[i * 3 + 2];
+
+        const float px = x - pos_x;
+        const float py = y - pos_y;
+        const float pz = -pos_z;
+        const float d = sqrtf(px*px + py*py + pz*pz);
+
+        const float look_angle = asinf(std::max(-1.0f, std::min(1.0f, -pos_z / d)));
+
+        float att_el = 0.0f;
+        float att_az = 0.0f;
+        if (att != nullptr) {
+            att_el = att[i * 3 + 0];
+            att_az = att[i * 3 + 2];
+        }
+
+        const float el = look_angle - att_el;
+        const float az = atan2f(py, px) - att_az;
+
+        const float el_idx = (el - g_el0) / g_del;
+        const float az_idx = (az - g_az0) / g_daz;
+
+        if (el_idx >= 0 && el_idx < g_nel - 1 && az_idx >= 0 && az_idx < g_naz - 1) {
+            const int el_int = (int)el_idx;
+            const int az_int = (int)az_idx;
+            const float el_frac = el_idx - el_int;
+            const float az_frac = az_idx - az_int;
+
+            const float gain = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+
+            w1 += gain;
+            w2 += gain * gain;
+        }
+    }
+
+    w1_out[idx] = w1;
+    w2_out[idx] = w2;
+}
+
+std::vector<at::Tensor> compute_illumination_cpu(
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t nr,
+          int64_t ntheta,
+          int64_t decimation) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(g.dtype() == at::kFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+
+    const int64_t nsweeps = pos.size(0);
+    const int64_t g_nel = g.size(0);
+    const int64_t g_naz = g.size(1);
+
+    const float* att_ptr = nullptr;
+    at::Tensor att_contig;
+    if (att.defined() && att.numel() > 0) {
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+        att_contig = att.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+    }
+
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor g_contig = g.contiguous();
+
+    const int64_t dec = decimation > 0 ? decimation : 1;
+    const int64_t out_nr = (nr + dec - 1) / dec;
+    const int64_t out_ntheta = (ntheta + dec - 1) / dec;
+
+    at::Tensor w1_out = torch::empty({out_nr, out_ntheta},
+                                     torch::TensorOptions().dtype(at::kFloat).device(pos.device()));
+    at::Tensor w2_out = torch::empty({out_nr, out_ntheta},
+                                     torch::TensorOptions().dtype(at::kFloat).device(pos.device()));
+
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const float* g_ptr = g_contig.data_ptr<float>();
+    float* w1_out_ptr = w1_out.data_ptr<float>();
+    float* w2_out_ptr = w2_out.data_ptr<float>();
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for (int idx = 0; idx < out_nr * out_ntheta; idx++) {
+        compute_illumination_kernel_cpu(
+                pos_ptr, att_ptr, g_ptr, w1_out_ptr, w2_out_ptr, nsweeps,
+                r0, dr, theta0, dtheta, nr, ntheta,
+                g_el0, g_del, g_az0, g_daz, g_nel, g_naz, dec, idx);
+    }
+
+    std::vector<at::Tensor> ret;
+    ret.push_back(w1_out);
+    ret.push_back(w2_out);
+    return ret;
+}
+
 // Defines the operators
 TORCH_LIBRARY(torchbp, m) {
   m.def("backprojection_polar_2d(Tensor data, Tensor pos, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel, float data_fmod, float alias_fmod, bool normalize) -> Tensor");
@@ -1093,9 +2430,17 @@ TORCH_LIBRARY(torchbp, m) {
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
   m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cpu);
+  m.impl("backprojection_cart_2d", &backprojection_cart_2d_cpu);
+  m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cpu);
   m.impl("polar_interp_linear", &polar_interp_linear_cpu);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cpu);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cpu);
+  m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cpu);
+  m.impl("ffbp_merge2_lanczos", &ffbp_merge2_lanczos_cpu);
+  m.impl("ffbp_merge2_knab", &ffbp_merge2_knab_cpu);
+  m.impl("ffbp_merge2_poly", &ffbp_merge2_poly_cpu);
+  m.impl("ffbp_merge2_poly_weighted", &ffbp_merge2_poly_weighted_cpu);
+  m.impl("compute_illumination", &compute_illumination_cpu);
 }
 
 }

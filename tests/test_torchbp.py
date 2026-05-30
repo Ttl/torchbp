@@ -793,8 +793,8 @@ class TestBackprojectionCart(TestCase):
                 atol=0.05,
             )
 
-    # def test_gradients_cpu(self):
-    #    self._test_gradients("cpu")
+    def test_gradients_cpu(self):
+        self._test_gradients("cpu")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_gradients_cuda(self):
@@ -814,7 +814,6 @@ class TestBackprojectionCart(TestCase):
                 test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
@@ -1158,10 +1157,9 @@ class TestFFBPMerge2Poly(TestCase):
         }
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
-    def test_poly_vs_knab_reference(self):
+    def _poly_vs_knab_reference(self, device):
         """Compare polynomial approximation against reference Knab implementation."""
-        samples = self.sample_inputs("cuda")
+        samples = self.sample_inputs(device)
 
         for args in samples:
             # Run reference Knab implementation
@@ -1179,6 +1177,13 @@ class TestFFBPMerge2Poly(TestCase):
                 rtol=0.05,
                 atol=1e-3
             )
+
+    def test_poly_vs_knab_reference_cpu(self):
+        self._poly_vs_knab_reference("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_poly_vs_knab_reference(self):
+        self._poly_vs_knab_reference("cuda")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_poly_with_precomputed_coefs(self):
@@ -1218,6 +1223,128 @@ class TestFFBPMerge2Poly(TestCase):
                     args["grid_polar_new"]["ntheta"]
                 )
                 self.assertEqual(result.shape, expected_shape)
+
+
+class TestComputeIllumination(TestCase):
+    """Test antenna pattern illumination map computation (compute_illumination op)."""
+
+    def _make_inputs(self, device):
+        torch.manual_seed(0)
+        nsweeps = 8
+        pos = torch.randn(nsweeps, 3, device=device, dtype=torch.float32)
+        att = torch.zeros(nsweeps, 3, device=device, dtype=torch.float32)
+        g = torch.ones(16, 16, device=device, dtype=torch.float32)
+        g_extent = [-0.5, -1.0, 0.5, 1.0]
+        grid = {"r": (100, 200), "theta": (-0.8, 0.8), "nr": 50, "ntheta": 40}
+        return pos, att, g, g_extent, grid
+
+    def _test_basic(self, device):
+        from torchbp.ops import compute_subaperture_illumination
+
+        pos, att, g, g_extent, grid = self._make_inputs(device)
+        w1_map, w2_map = compute_subaperture_illumination(
+            pos, att, g, g_extent, grid, decimation=1
+        )
+        # Output shape matches the (undecimated) polar grid
+        self.assertEqual(tuple(w1_map.shape), (grid["nr"], grid["ntheta"]))
+        self.assertEqual(tuple(w2_map.shape), (grid["nr"], grid["ntheta"]))
+        for m in (w1_map, w2_map):
+            self.assertFalse(torch.isnan(m).any())
+            self.assertFalse(torch.isinf(m).any())
+        # With a uniform unit gain pattern the sum of squared gains never exceeds
+        # the sum of gains.
+        self.assertTrue(torch.all(w2_map <= w1_map + 1e-4))
+
+    def test_basic_cpu(self):
+        self._test_basic("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_basic_cuda(self):
+        self._test_basic("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_and_gpu(self):
+        from torchbp.ops import compute_subaperture_illumination
+
+        pos, att, g, g_extent, grid = self._make_inputs("cuda")
+        w1_gpu, w2_gpu = compute_subaperture_illumination(
+            pos, att, g, g_extent, grid, decimation=1
+        )
+        w1_cpu, w2_cpu = compute_subaperture_illumination(
+            pos.cpu(), att.cpu(), g.cpu(), g_extent, grid, decimation=1
+        )
+        torch.testing.assert_close(w1_cpu, w1_gpu.cpu(), atol=1e-4, rtol=1e-3)
+        torch.testing.assert_close(w2_cpu, w2_gpu.cpu(), atol=1e-4, rtol=1e-3)
+
+
+class TestFFBPMerge2PolyWeighted(TestCase):
+    """Test antenna-pattern-weighted polynomial FFBP merge (ffbp_merge2_poly_weighted op)."""
+
+    def _make_inputs(self, device):
+        from torchbp.ops import compute_subaperture_illumination
+
+        torch.manual_seed(0)
+        nsweeps = 8
+        g = torch.ones(16, 16, device=device, dtype=torch.float32)
+        g_extent = [-0.5, -1.0, 0.5, 1.0]
+        grid0 = {"r": (100, 200), "theta": (-0.8, 0.8), "nr": 50, "ntheta": 40}
+        grid1 = {"r": (105, 195), "theta": (-0.75, 0.75), "nr": 48, "ntheta": 38}
+        grid_new = {"r": (100, 200), "theta": (-0.8, 0.8), "nr": 60, "ntheta": 50}
+
+        def illum(grid):
+            pos = torch.randn(nsweeps, 3, device=device, dtype=torch.float32)
+            att = torch.zeros(nsweeps, 3, device=device, dtype=torch.float32)
+            return compute_subaperture_illumination(
+                pos, att, g, g_extent, grid, decimation=1
+            )
+
+        w1_0, w2_0 = illum(grid0)
+        w1_1, w2_1 = illum(grid1)
+        img0 = torch.randn(grid0["nr"], grid0["ntheta"], device=device, dtype=torch.complex64)
+        img1 = torch.randn(grid1["nr"], grid1["ntheta"], device=device, dtype=torch.complex64)
+        dorigin0 = 0.1 * torch.randn(3, device=device, dtype=torch.float32)
+        dorigin1 = 0.1 * torch.randn(3, device=device, dtype=torch.float32)
+        return dict(
+            img0=img0, img1=img1, dorigin0=dorigin0, dorigin1=dorigin1,
+            grid_polars=[grid0, grid1], fc=10e9, grid_polar_new=grid_new,
+            z0=1.0, order=6, oversample=1.5,
+            w1_map0=w1_0, w2_map0=w2_0, weight_grid0=grid0,
+            w1_map1=w1_1, w2_map1=w2_1, weight_grid1=grid1,
+            output_weight_map=False,
+        ), grid_new
+
+    def _test_basic(self, device):
+        from torchbp.ops import ffbp_merge2_poly_weighted
+
+        args, grid_new = self._make_inputs(device)
+        merged, w1_out, w2_out, weight_grid = ffbp_merge2_poly_weighted(**args)
+        self.assertEqual(tuple(merged.shape), (grid_new["nr"], grid_new["ntheta"]))
+        self.assertFalse(torch.isnan(merged).any())
+        self.assertFalse(torch.isinf(merged).any())
+        # No weight map requested
+        self.assertIsNone(w1_out)
+        self.assertIsNone(w2_out)
+
+    def test_basic_cpu(self):
+        self._test_basic("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_basic_cuda(self):
+        self._test_basic("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_and_gpu(self):
+        from torchbp.ops import ffbp_merge2_poly_weighted
+
+        args_gpu, _ = self._make_inputs("cuda")
+        merged_gpu, *_ = ffbp_merge2_poly_weighted(**args_gpu)
+
+        def to_cpu(v):
+            return v.cpu() if isinstance(v, torch.Tensor) else v
+
+        args_cpu = {k: to_cpu(v) for k, v in args_gpu.items()}
+        merged_cpu, *_ = ffbp_merge2_poly_weighted(**args_cpu)
+        torch.testing.assert_close(merged_cpu, merged_gpu.cpu(), atol=1e-3, rtol=5e-2)
 
 
 class TestBackprojectionPolar2DTxPower(TestCase):
@@ -1678,7 +1805,6 @@ class TestPolarToCartLanczos(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
@@ -1781,7 +1907,6 @@ class TestFFBPMerge2Lanczos(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
