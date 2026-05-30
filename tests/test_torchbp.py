@@ -1468,7 +1468,6 @@ class TestProjectionCart2D(TestCase):
                 test_utils=["test_schema", "test_faketensor"],
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
@@ -1669,6 +1668,68 @@ class TestProjectionCart2D(TestCase):
         out_gamma = torchbp.ops.projection_cart_2d_nufft(**inputs_gamma)
 
         self.assertFalse(torch.allclose(out_sigma, out_gamma))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_matches_cuda(self):
+        """CPU projection_cart_2d output matches the CUDA kernel.
+
+        Both kernels do float32 math and feed an identically-computed
+        float32 phase into sin/cos, so the only real difference is the CPU
+        fast-polynomial sincospi vs CUDA's sincospif. Covers the vel /
+        use_rvp / normalization / antenna-pattern branches the two
+        implementations share. Tolerance matches the other parity tests.
+        """
+        base = self._make_inputs("cpu", nx=8, ny=16, nsweeps=4)
+        img, pos = base["img"], base["pos"]
+        common = dict(grid=base["grid"], fc=base["fc"], fs=base["fs"],
+                      gamma=base["gamma"], sweep_samples=base["sweep_samples"],
+                      d0=base["d0"])
+
+        # Nonzero along-track velocity exercises the HAS_VEL path.
+        vel = torch.zeros_like(pos)
+        vel[..., 0] = 20.0
+
+        # Uniform unit gain over the full sphere keeps every pixel in-bounds,
+        # so the antenna branch (asin/atan2 geometry, bounds check, interp2d)
+        # runs without the result depending on interpolation noise.
+        nsweeps = pos.shape[0]
+        att = torch.zeros(nsweeps, 3, dtype=torch.float32)
+        g = torch.ones(16, 16, dtype=torch.float32)
+        g_extent = [-torch.pi / 2, -torch.pi, torch.pi / 2, torch.pi]
+
+        configs = [
+            dict(name="sigma",         use_rvp=False, normalization="sigma", vel=None),
+            dict(name="sigma+rvp",     use_rvp=True,  normalization="sigma", vel=None),
+            dict(name="gamma",         use_rvp=False, normalization="gamma", vel=None),
+            dict(name="vel",           use_rvp=False, normalization="sigma", vel=vel),
+            dict(name="vel+rvp+gamma", use_rvp=True,  normalization="gamma", vel=vel),
+            dict(name="antenna",       use_rvp=False, normalization="gamma", vel=None,
+                 g=g, att=att, g_extent=g_extent),
+        ]
+
+        for cfg in configs:
+            vel_c = cfg.get("vel")
+            extra_cpu, extra_cuda = {}, {}
+            if "g" in cfg:
+                extra_cpu = dict(g=cfg["g"], att=cfg["att"], g_extent=cfg["g_extent"])
+                extra_cuda = dict(g=cfg["g"].cuda(), att=cfg["att"].cuda(),
+                                  g_extent=cfg["g_extent"])
+
+            out_cpu = torchbp.ops.projection_cart_2d(
+                img=img, pos=pos, **common,
+                use_rvp=cfg["use_rvp"], normalization=cfg["normalization"],
+                vel=vel_c, **extra_cpu)
+
+            out_cuda = torchbp.ops.projection_cart_2d(
+                img=img.cuda(), pos=pos.cuda(), **common,
+                use_rvp=cfg["use_rvp"], normalization=cfg["normalization"],
+                vel=(vel_c.cuda() if vel_c is not None else None),
+                **extra_cuda).cpu()
+
+            ref_scale = out_cuda.abs().max()
+            rel = (out_cpu - out_cuda).abs().max() / (ref_scale + 1e-30)
+            self.assertLess(rel.item(), 5e-3,
+                f"CPU/CUDA mismatch {rel.item():.2e} for config '{cfg['name']}'")
 
 
 class TestPolarInterpLanczos(TestCase):
