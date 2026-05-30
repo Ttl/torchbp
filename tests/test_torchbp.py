@@ -1488,7 +1488,6 @@ class TestProjectionCart2D(TestCase):
                 test_utils=["test_schema", "test_faketensor"],
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_nufft_cpu(self):
         self._opcheck_nufft("cpu")
 
@@ -1575,6 +1574,34 @@ class TestProjectionCart2D(TestCase):
         ref_scale = out_direct.abs().max()
         rel_err = (out_direct - out_nufft).abs().max() / (ref_scale + 1e-30)
         self.assertLess(rel_err.item(), 5e-3)
+
+    def test_nufft_matches_direct_cpu(self):
+        """CPU NUFFT agrees with the CPU direct kernel across branches.
+
+        Runs without CUDA, so it validates the CPU NUFFT op directly. Covers
+        use_rvp on/off, both normalizations, and the antenna-pattern path.
+        """
+        nsweeps = 4
+        base = self._make_inputs("cpu", nx=16, ny=24, nsweeps=nsweeps)
+        att = torch.zeros(nsweeps, 3, dtype=torch.float32)
+        g = torch.ones(16, 16, dtype=torch.float32)
+        g_extent = [-torch.pi / 2, -torch.pi, torch.pi / 2, torch.pi]
+
+        configs = [
+            dict(use_rvp=False, normalization="sigma"),
+            dict(use_rvp=True,  normalization="sigma"),
+            dict(use_rvp=False, normalization="gamma"),
+            dict(use_rvp=True,  normalization="gamma"),
+            dict(use_rvp=False, normalization="gamma", g=g, att=att, g_extent=g_extent),
+        ]
+        for cfg in configs:
+            inputs = {**base, **cfg}
+            out_direct = torchbp.ops.projection_cart_2d(**inputs, vel=None)
+            out_nufft = torchbp.ops.projection_cart_2d_nufft(**inputs)
+            ref_scale = out_direct.abs().max()
+            rel_err = (out_direct - out_nufft).abs().max() / (ref_scale + 1e-30)
+            self.assertLess(rel_err.item(), 5e-3,
+                f"NUFFT/direct CPU mismatch {rel_err.item():.2e} for {cfg}")
 
     # ------------------------------------------------------------------
     # Direct formula check (single pixel)

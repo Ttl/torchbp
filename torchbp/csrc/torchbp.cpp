@@ -1,11 +1,15 @@
 #include <Python.h>
 #include <ATen/Operators.h>
+#include <ATen/ops/fft_ifft.h>
 #include <torch/all.h>
 #include <torch/library.h>
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <type_traits>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <omp.h>
 
 extern "C" {
@@ -2386,6 +2390,294 @@ std::vector<at::Tensor> compute_illumination_cpu(
     return ret;
 }
 
+/*
+NUFFT-based forward projection (vel=None path). CPU analogue of
+projection_cart_2d_nufft_cuda in cuda/backproj.cu.
+
+Reformulates the direct O(N*M) sum as a Type-1 NUFFT:
+  A_p  = w_p exp(-j 2pi fc tau_p)          complex amplitude per pixel
+  nu_p = gamma tau_p / fs                  normalised frequency
+  data[k] = Sum_p A_p exp(-j 2pi nu_p k)   = IFFT of the KB-spread grid
+Cost is O(N*W) spreading + O(M log M) IFFT per sweep instead of O(N*M).
+
+The KB look-up table and deconvolution window are bit-identical to the CUDA
+build (same host-side formulas), so CPU and CUDA outputs match to float
+precision.
+*/
+
+// Kaiser-Bessel helper (matches bessel_i0_host in cuda/backproj.cu).
+static float bessel_i0_cpu(float x) {
+    if (x < 3.75f) {
+        float t = (x / 3.75f) * (x / 3.75f);
+        return 1.0f + t*(3.5156229f + t*(3.0899424f + t*(1.2067492f
+             + t*(0.2659732f + t*(0.0360768f + t*0.0045813f)))));
+    }
+    float t = 3.75f / x;
+    return (expf(x) / sqrtf(x)) * (0.39894228f + t*(0.01328592f
+         + t*(0.00225319f + t*(-0.00157565f + t*(0.00916281f
+         + t*(-0.02057706f + t*(0.02635537f + t*(-0.01647633f
+         + t*0.00392377f))))))));
+}
+
+// KB LUT: N_LUT samples of psi_KB(t) for t in [0, W/2].
+static at::Tensor make_kb_lut_cpu(int N_LUT, float W, float beta) {
+    at::Tensor lut = at::zeros({N_LUT},
+        at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+    float* p = lut.data_ptr<float>();
+    float i0b = bessel_i0_cpu(beta);
+    for (int i = 0; i < N_LUT; ++i) {
+        float t  = (float)i / (float)(N_LUT - 1) * (W * 0.5f);  // [0, W/2]
+        float u  = 2.0f * t / W;                                // [0, 1]
+        float sq = 1.0f - u * u;
+        p[i] = (sq > 0.0f) ? bessel_i0_cpu(beta * sqrtf(sq)) / i0b : 0.0f;
+    }
+    return lut;
+}
+
+// Deconvolution window for centered extraction (see cuda/backproj.cu for the
+// derivation): correction[j] = M_ext / conj(phi_fwd[k]), k = j - M/2.
+static at::Tensor make_deconv_window_cpu(int M, int M_ext, float W, float beta) {
+    int half_W = (int)(W * 0.5f);
+    float i0b  = bessel_i0_cpu(beta);
+    std::vector<float> psi(half_W + 1);
+    for (int d = 0; d <= half_W; ++d) {
+        float u  = (float)d / (float)half_W;
+        float sq = 1.0f - u * u;
+        psi[d] = (sq > 0.0f) ? bessel_i0_cpu(beta * sqrtf(sq)) / i0b : 0.0f;
+    }
+    at::Tensor win = at::zeros({M},
+        at::TensorOptions().dtype(at::kComplexFloat).device(at::kCPU));
+    complex64_t* w = win.data_ptr<complex64_t>();
+    for (int j = 0; j < M; ++j) {
+        int k = j - M / 2;
+        float re = 0.0f, im = 0.0f;
+        for (int d = -(half_W - 1); d <= half_W; ++d) {
+            float angle = -2.0f * (float)M_PI * (float)k * (float)d / (float)M_ext;
+            float kb    = psi[abs(d)];
+            re += kb * cosf(angle);
+            im += kb * sinf(angle);
+        }
+        float denom = re * re + im * im;
+        float scale = (float)M_ext / denom;
+        w[j] = complex64_t(re * scale, +im * scale);
+    }
+    return win;
+}
+
+// Static cache keyed on (sweep_samples, M_ext); W/beta/N_LUT are fixed.
+struct NufftCacheCpu { at::Tensor kb_lut, deconv_win; };
+static std::mutex                               g_nufft_cpu_cache_mutex;
+static std::map<std::tuple<int,int>, NufftCacheCpu> g_nufft_cpu_cache;
+
+static std::pair<at::Tensor, at::Tensor>
+get_nufft_tables_cpu(int sweep_samples, int M_ext, float W, float beta, int N_LUT) {
+    std::lock_guard<std::mutex> lock(g_nufft_cpu_cache_mutex);
+    auto key = std::make_tuple(sweep_samples, M_ext);
+    auto it  = g_nufft_cpu_cache.find(key);
+    if (it != g_nufft_cpu_cache.end())
+        return {it->second.kb_lut, it->second.deconv_win};
+    NufftCacheCpu c;
+    c.kb_lut     = make_kb_lut_cpu(N_LUT, W, beta);
+    c.deconv_win = make_deconv_window_cpu(sweep_samples, M_ext, W, beta);
+    g_nufft_cpu_cache[key] = c;
+    return {c.kb_lut, c.deconv_win};
+}
+
+// Geometry + KB spreading for one sweep row. This thread owns grid_row
+// (M_ext bins) exclusively, so the scatter needs no atomics.
+static void projection_nufft_spread_row_cpu(
+          const complex64_t* img,   // [N] this batch's image
+          const float* dem,         // [N] or nullptr
+          const float* pos_s,       // [3] this sweep
+          const float* att_s,       // [3] or nullptr
+          complex64_t* grid_row,    // [M_ext] zeroed
+          const float* kb_lut,
+          int N, int Nx, int Ny, int M_ext, int N_LUT,
+          float fc, float gamma, float fs, float d0,
+          float x0, float dx, float y0, float dy,
+          float W, bool use_rvp,
+          const float* g,
+          float g_az0, float g_el0, float g_daz, float g_del,
+          int g_naz, int g_nel, int normalization) {
+
+    const float M_ext_f   = (float)M_ext;
+    const float lut_scale = (float)(N_LUT - 1) * 2.0f / W;
+    const int   half_W    = (int)(W * 0.5f);
+
+    for (int p = 0; p < N; p++) {
+        const int px_y = p % Ny;
+        const int px_x = p / Ny;
+        const float x = x0 + px_x * dx;
+        const float y = y0 + px_y * dy;
+        const float z = (dem != nullptr) ? dem[p] : 0.0f;
+
+        const float dpx = x - pos_s[0];
+        const float dpy = y - pos_s[1];
+        const float dpz = z - pos_s[2];
+        const float d2  = dpx*dpx + dpy*dpy + dpz*dpz;
+        const float d   = sqrtf(d2);
+
+        float norm = 1.0f / d2;
+        if (g != nullptr) {
+            const float look   = asinf(fmaxf(dpz / d, -1.0f));
+            const float el_deg = look - att_s[0];
+            const float az_deg = atan2f(dpy, dpx) - att_s[2];
+            const float el_idx = (el_deg - g_el0) / g_del;
+            const float az_idx = (az_deg - g_az0) / g_daz;
+            const int el_int = (int)el_idx, az_int = (int)az_idx;
+            if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+                norm = 0.0f;
+            else
+                norm *= interp2d<float>(g, g_nel, g_naz,
+                                        el_int, el_idx - el_int,
+                                        az_int, az_idx - az_int);
+        }
+        if (normalization == 1) norm *= sqrtf(-dpz / d);
+
+        if (norm == 0.0f) continue;
+
+        const complex64_t w_img = img[p];
+        const float wr = w_img.real() * norm;
+        const float wi = w_img.imag() * norm;
+
+        const float tau  = 2.0f * (d + d0) / kC0;
+        const float nu_p = gamma * tau / fs;
+
+        // exp(+j 2pi u_p k/M_ext) = exp(-j 2pi nu_p k) for integer k.
+        const float up = M_ext_f - nu_p * M_ext_f;
+
+        // Carrier phase + centering term exp(-j pi nu_p M).
+        float phase = -2.0f * fc * tau;
+        if (use_rvp) phase += gamma * tau * tau;
+        phase -= nu_p * M_ext_f * 0.5f;
+        float sn, cs;
+        sincospi(phase, &sn, &cs);
+        const float ar = wr * cs - wi * sn;
+        const float ai = wr * sn + wi * cs;
+
+        const int   j0  = (int)rintf(up);
+        const float frc = up - (float)j0;
+
+        for (int delta = -(half_W - 1); delta <= half_W; ++delta) {
+            float dist    = fabsf(frc - (float)delta);
+            int   lut_idx = (int)(dist * lut_scale);
+            if (lut_idx > N_LUT - 1) lut_idx = N_LUT - 1;
+            float kb = kb_lut[lut_idx];
+
+            int gidx = ((j0 + delta) % M_ext + M_ext) % M_ext;
+            grid_row[gidx] += complex64_t(ar * kb, ai * kb);
+        }
+    }
+}
+
+at::Tensor projection_cart_2d_nufft_cpu(
+          const at::Tensor &img,
+          const at::Tensor &dem,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double fs,
+          double gamma,
+          double x0, double dx, double y0, double dy,
+          int64_t Nx, int64_t Ny, double d0,
+          const at::Tensor &g,
+          double g_az0, double g_el0, double g_daz, double g_del,
+          int64_t g_naz, int64_t g_nel,
+          int64_t use_rvp, int64_t normalization) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(img.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+
+    bool antenna_pattern = g.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+    }
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+    }
+
+    const int N     = (int)(Nx * Ny);
+    const int M     = (int)sweep_samples;
+    const int M_ext = 2 * M;            // oversampled grid size
+    const float W   = 6.0f;
+    const float beta = 2.34f * W;       // KB parameter
+    const int N_LUT = 8192;
+
+    auto [kb_lut, deconv_win] = get_nufft_tables_cpu(M, M_ext, W, beta, N_LUT);
+
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor pos_contig = pos.contiguous();
+    auto cplx_opts = at::TensorOptions().dtype(at::kComplexFloat).device(at::kCPU);
+    at::Tensor grid = at::zeros({nbatch, nsweeps, M_ext}, cplx_opts);
+
+    at::Tensor dem_contig, att_contig, g_contig;
+    const float* dem_ptr = nullptr;
+    if (dem.defined()) { dem_contig = dem.contiguous(); dem_ptr = dem_contig.data_ptr<float>(); }
+    const float* att_ptr = nullptr;
+    const float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
+
+    const complex64_t* img_ptr = img_contig.data_ptr<complex64_t>();
+    const float*       pos_ptr = pos_contig.data_ptr<float>();
+    const float*       lut_ptr = kb_lut.data_ptr<float>();
+    complex64_t*       grid_ptr = grid.data_ptr<complex64_t>();
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+    // Each (batch, sweep) spreads into its own grid row -> no atomics.
+#pragma omp parallel for collapse(2)
+    for (int b = 0; b < nbatch; b++) {
+        for (int i = 0; i < nsweeps; i++) {
+            const float* pos_si = pos_ptr + (b * nsweeps + i) * 3;
+            const float* att_si = att_ptr ? att_ptr + (b * nsweeps + i) * 3 : nullptr;
+            projection_nufft_spread_row_cpu(
+                img_ptr + b * N, dem_ptr, pos_si, att_si,
+                grid_ptr + (b * nsweeps + (size_t)i) * M_ext, lut_ptr,
+                N, Nx, Ny, M_ext, N_LUT,
+                fc, gamma, fs, d0, x0, dx, y0, dy, W, (bool)use_rvp,
+                g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, normalization);
+        }
+    }
+
+    // Batched IFFT over the last dimension (same call/normalization as CUDA).
+    at::Tensor Z = at::fft_ifft(grid, std::optional<int64_t>(M_ext), -1);
+    at::Tensor Z_contig = Z.contiguous();
+
+    at::Tensor data = at::empty({nbatch, nsweeps, M}, cplx_opts);
+    const complex64_t* Z_ptr  = Z_contig.data_ptr<complex64_t>();
+    const complex64_t* dw_ptr = deconv_win.data_ptr<complex64_t>();
+    complex64_t*       data_ptr = data.data_ptr<complex64_t>();
+
+    // Deconvolve + centered extraction: out[j] = Z[(j - M/2) mod M_ext] * deconv[j].
+#pragma omp parallel for collapse(2)
+    for (int b = 0; b < nbatch; b++) {
+        for (int i = 0; i < nsweeps; i++) {
+            const complex64_t* z_row = Z_ptr + (b * nsweeps + (size_t)i) * M_ext;
+            complex64_t* out_row = data_ptr + (b * nsweeps + (size_t)i) * M;
+            for (int j = 0; j < M; j++) {
+                int k = ((j - M / 2) % M_ext + M_ext) % M_ext;
+                out_row[j] = z_row[k] * dw_ptr[j];
+            }
+        }
+    }
+
+    return data;
+}
+
 // Number of samples between exact (sincospi) re-anchors of the chirp
 // recurrence below. The float32 phasor magnitude drifts by ~1e-6 per step, so
 // re-pinning every RESYNC samples keeps the accumulated error well under the
@@ -2727,6 +3019,7 @@ TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("backprojection_cart_2d", &backprojection_cart_2d_cpu);
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cpu);
   m.impl("projection_cart_2d", &projection_cart_2d_cpu);
+  m.impl("projection_cart_2d_nufft", &projection_cart_2d_nufft_cpu);
   m.impl("polar_interp_linear", &polar_interp_linear_cpu);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cpu);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cpu);
