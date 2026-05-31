@@ -2972,6 +2972,705 @@ at::Tensor projection_cart_2d_cpu(
     return data;
 }
 
+// ---------------------------------------------------------------------------
+// CPU implementations of the element-wise interp combine, coherence, resample
+// and GPGA operators. These mirror the CUDA versions in cuda/util.cu,
+// cuda/coherence.cu, cuda/resample.cu and cuda/backproj.cu so that the
+// polarimetry / interferometry / autofocus paths run on the CPU as well.
+// ---------------------------------------------------------------------------
+
+// Element-wise a (*|/) interp2d(b). Output grid [Na0, Na1] is mapped onto the
+// input grid [Nb0, Nb1] with bilinear interpolation, matching the CUDA kernel
+// in cuda/util.cu bit-for-bit.
+template<typename T, typename T2>
+static void interp2d_combine_kernel_cpu(const T* a, const T2* b, T* out,
+        int Na0, int Na1, int Nb0, int Nb1, bool is_div, int idx, int idbatch) {
+    const int id0 = idx / Na1;
+    const int id1 = idx % Na1;
+
+    if (id0 >= Na0 || id1 >= Na1) return;
+
+    // Map from output grid [0, Na0-1] x [0, Na1-1] to input grid [0, Nb0-1] x [0, Nb1-1]
+    float b0_float = (float)id0 * (Nb0 - 1) / (Na0 - 1);
+    float b1_float = (float)id1 * (Nb1 - 1) / (Na1 - 1);
+
+    int b0_int = (int)floorf(b0_float);
+    int b1_int = (int)floorf(b1_float);
+    float b0_frac = b0_float - b0_int;
+    float b1_frac = b1_float - b1_int;
+
+    // Clamp to valid range
+    b0_int = std::min(b0_int, Nb0 - 2);
+    b1_int = std::min(b1_int, Nb1 - 2);
+    b0_int = std::max(b0_int, 0);
+    b1_int = std::max(b1_int, 0);
+
+    const T2 v = interp2d<T2>(&b[idbatch * Nb1 * Nb0], Nb0, Nb1, b0_int, b0_frac, b1_int, b1_frac);
+    const int oidx = idbatch * Na1 * Na0 + id0 * Na1 + id1;
+    if (is_div) {
+        out[oidx] = a[oidx] / static_cast<T>(v);
+    } else {
+        out[oidx] = a[oidx] * static_cast<T>(v);
+    }
+}
+
+static at::Tensor interp2d_combine_cpu(
+          const at::Tensor &a,
+          const at::Tensor &b,
+          int64_t nbatch,
+          int64_t Na0,
+          int64_t Na1,
+          int64_t Nb0,
+          int64_t Nb1,
+          bool is_div) {
+    TORCH_INTERNAL_ASSERT(a.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(b.device().type() == at::DeviceType::CPU);
+
+    at::Tensor a_contig = a.contiguous();
+    at::Tensor b_contig = b.contiguous();
+    at::Tensor out = torch::zeros({nbatch, Na0, Na1}, a_contig.options());
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+    const bool a_complex = a.scalar_type() == at::ScalarType::ComplexFloat;
+    const bool b_complex = b.scalar_type() == at::ScalarType::ComplexFloat;
+
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int idx = 0; idx < Na0 * Na1; idx++) {
+            if (a_complex && b_complex) {
+                interp2d_combine_kernel_cpu<complex64_t, complex64_t>(
+                        (const complex64_t*)a_contig.data_ptr<c10::complex<float>>(),
+                        (const complex64_t*)b_contig.data_ptr<c10::complex<float>>(),
+                        (complex64_t*)out.data_ptr<c10::complex<float>>(),
+                        Na0, Na1, Nb0, Nb1, is_div, idx, idbatch);
+            } else if (a_complex && !b_complex) {
+                interp2d_combine_kernel_cpu<complex64_t, float>(
+                        (const complex64_t*)a_contig.data_ptr<c10::complex<float>>(),
+                        b_contig.data_ptr<float>(),
+                        (complex64_t*)out.data_ptr<c10::complex<float>>(),
+                        Na0, Na1, Nb0, Nb1, is_div, idx, idbatch);
+            } else if (!a_complex && !b_complex) {
+                interp2d_combine_kernel_cpu<float, float>(
+                        a_contig.data_ptr<float>(),
+                        b_contig.data_ptr<float>(),
+                        out.data_ptr<float>(),
+                        Na0, Na1, Nb0, Nb1, is_div, idx, idbatch);
+            } else {
+                AT_ERROR("Unsupported dtype combination for interp2d combine");
+            }
+        }
+    }
+    return out;
+}
+
+at::Tensor div_2d_interp_linear_cpu(
+          const at::Tensor &a, const at::Tensor &b,
+          int64_t nbatch, int64_t Na0, int64_t Na1, int64_t Nb0, int64_t Nb1) {
+    return interp2d_combine_cpu(a, b, nbatch, Na0, Na1, Nb0, Nb1, /*is_div=*/true);
+}
+
+at::Tensor mul_2d_interp_linear_cpu(
+          const at::Tensor &a, const at::Tensor &b,
+          int64_t nbatch, int64_t Na0, int64_t Na1, int64_t Nb0, int64_t Nb1) {
+    return interp2d_combine_cpu(a, b, nbatch, Na0, Na1, Nb0, Nb1, /*is_div=*/false);
+}
+
+// "Quick and dirty" power coherence over a moving window. Mirrors
+// power_coherence_2d_kernel in cuda/coherence.cu.
+static void power_coherence_2d_kernel_cpu(
+          const complex64_t* img0, const complex64_t* img1, float* out,
+          int N0, int N1, int w0, int w1, bool corr_output, int id0_, int idbatch) {
+    const int idx = id0_ % N1;
+    const int idy = id0_ / N1;
+
+    if (id0_ >= N0 * N1) return;
+
+    float corr = 0.0f;
+    float p0 = 0.0f;
+    float p1 = 0.0f;
+    int start_i = std::max(-w0, -idx);
+    int end_i = std::min(w0, N1 - 1 - idx);
+    int start_j = std::max(-w1, -idy);
+    int end_j = std::min(w1, N0 - 1 - idy);
+    for (int y = idy + start_j; y <= idy + end_j; y++) {
+        for (int x = idx + start_i; x <= idx + end_i; x++) {
+            complex64_t v0 = img0[idbatch * N0 * N1 + y * N1 + x];
+            complex64_t v1 = img1[idbatch * N0 * N1 + y * N1 + x];
+            float v0_abs2 = v0.real() * v0.real() + v0.imag() * v0.imag();
+            float v1_abs2 = v1.real() * v1.real() + v1.imag() * v1.imag();
+            p0 += v0_abs2 * v0_abs2;
+            p1 += v1_abs2 * v1_abs2;
+            corr += v0_abs2 * v1_abs2;
+        }
+    }
+    float denom = sqrtf(p0 * p1);
+    float v = denom > 0.0f ? corr / denom : 0.0f;
+    if (corr_output) {
+        v = v > 0.5f ? sqrtf(2.0f * v - 1.0f) : 0.0f;
+    }
+    out[idbatch * N0 * N1 + idy * N1 + idx] = v;
+}
+
+at::Tensor power_coherence_2d_cpu(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          int64_t nbatch,
+          int64_t N0,
+          int64_t N1,
+          int64_t w0,
+          int64_t w1,
+          int64_t corr_output) {
+    TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+    TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CPU);
+    at::Tensor img0_contig = img0.contiguous();
+    at::Tensor img1_contig = img1.contiguous();
+
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(img0.device());
+    at::Tensor out = torch::empty({nbatch, N0, N1}, options);
+
+    const complex64_t* img0_ptr = (const complex64_t*)img0_contig.data_ptr<c10::complex<float>>();
+    const complex64_t* img1_ptr = (const complex64_t*)img1_contig.data_ptr<c10::complex<float>>();
+    float* out_ptr = out.data_ptr<float>();
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int id0 = 0; id0 < N0 * N1; id0++) {
+            power_coherence_2d_kernel_cpu(
+                    img0_ptr, img1_ptr, out_ptr,
+                    N0, N1, w0, w1, (bool)corr_output, id0, idbatch);
+        }
+    }
+    return out;
+}
+
+// Generic 2D image resampling. Each output pixel (ir, iaz) reads from input at
+// (ir + shift_r, iaz + shift_az). Mirrors resample_2d_*_kernel in
+// cuda/resample.cu. interp_2d is a callable (img_row_base, x, y) -> T.
+template<typename T, typename Interp>
+static void resample_2d_kernel_cpu(
+        const T* img, const float* shift_r, const float* shift_az, T* out,
+        int Nr, int Naz, int order, Interp interp_2d, int id1, int idbatch) {
+    const int iaz = id1 % Naz;
+    const int ir = id1 / Naz;
+
+    if (id1 >= Nr * Naz) return;
+
+    const int shift_idx = ir * Naz + iaz;
+    const float src_r = ir + shift_r[shift_idx];
+    const float src_az = iaz + shift_az[shift_idx];
+
+    const float a = 0.5f * order;
+    if (src_r >= -a && src_r < Nr + a && src_az >= -a && src_az < Naz + a) {
+        out[idbatch * Nr * Naz + shift_idx] =
+            interp_2d(&img[idbatch * Nr * Naz], src_r, src_az);
+    } else {
+        out[idbatch * Nr * Naz + shift_idx] = T{};
+    }
+}
+
+template<typename T, typename Interp>
+static at::Tensor resample_2d_cpu_impl(
+          const at::Tensor &img,
+          const at::Tensor &shift_r,
+          const at::Tensor &shift_az,
+          int64_t nbatch, int64_t Nr, int64_t Naz, int64_t order,
+          Interp interp_2d) {
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor shift_r_contig = shift_r.contiguous();
+    at::Tensor shift_az_contig = shift_az.contiguous();
+    at::Tensor out = torch::empty({nbatch, Nr, Naz}, img_contig.options());
+
+    const float* shift_r_ptr = shift_r_contig.data_ptr<float>();
+    const float* shift_az_ptr = shift_az_contig.data_ptr<float>();
+    const T* img_ptr = (const T*)img_contig.template data_ptr<T>();
+    T* out_ptr = (T*)out.template data_ptr<T>();
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int id1 = 0; id1 < Nr * Naz; id1++) {
+            resample_2d_kernel_cpu<T>(
+                    img_ptr, shift_r_ptr, shift_az_ptr, out_ptr,
+                    Nr, Naz, order, interp_2d, id1, idbatch);
+        }
+    }
+    return out;
+}
+
+at::Tensor resample_2d_lanczos_cpu(
+          const at::Tensor &img,
+          const at::Tensor &shift_r,
+          const at::Tensor &shift_az,
+          int64_t nbatch, int64_t Nr, int64_t Naz, int64_t order) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat,
+                "resample_2d_lanczos: img must be complex64 or float32");
+    TORCH_CHECK(shift_r.dtype() == at::kFloat, "resample_2d_lanczos: shift_r must be float32");
+    TORCH_CHECK(shift_az.dtype() == at::kFloat, "resample_2d_lanczos: shift_az must be float32");
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(shift_r.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(shift_az.device().type() == at::DeviceType::CPU);
+
+    if (img.dtype() == at::kComplexFloat) {
+        auto interp = [Nr, Naz, order](const complex64_t* base, float x, float y) {
+            return lanczos_interp_2d_cpu<complex64_t>(base, Nr, Naz, x, y, order);
+        };
+        return resample_2d_cpu_impl<complex64_t>(img, shift_r, shift_az, nbatch, Nr, Naz, order, interp);
+    } else {
+        auto interp = [Nr, Naz, order](const float* base, float x, float y) {
+            return lanczos_interp_2d_cpu<float>(base, Nr, Naz, x, y, order);
+        };
+        return resample_2d_cpu_impl<float>(img, shift_r, shift_az, nbatch, Nr, Naz, order, interp);
+    }
+}
+
+at::Tensor resample_2d_knab_cpu(
+          const at::Tensor &img,
+          const at::Tensor &shift_r,
+          const at::Tensor &shift_az,
+          int64_t nbatch, int64_t Nr, int64_t Naz, int64_t order,
+          double oversample) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat,
+                "resample_2d_knab: img must be complex64 or float32");
+    TORCH_CHECK(shift_r.dtype() == at::kFloat, "resample_2d_knab: shift_r must be float32");
+    TORCH_CHECK(shift_az.dtype() == at::kFloat, "resample_2d_knab: shift_az must be float32");
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(shift_r.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(shift_az.device().type() == at::DeviceType::CPU);
+
+    // Knab window parameter: v = 1 - 1/oversample
+    const float v = 1.0f - 1.0f / static_cast<float>(oversample);
+    const float norm = knab_kernel_norm_cpu(order, v);
+
+    if (img.dtype() == at::kComplexFloat) {
+        auto interp = [Nr, Naz, order, v, norm](const complex64_t* base, float x, float y) {
+            return knab_interp_2d_cpu<complex64_t>(base, Nr, Naz, x, y, order, v, norm);
+        };
+        return resample_2d_cpu_impl<complex64_t>(img, shift_r, shift_az, nbatch, Nr, Naz, order, interp);
+    } else {
+        auto interp = [Nr, Naz, order, v, norm](const float* base, float x, float y) {
+            return knab_interp_2d_cpu<float>(base, Nr, Naz, x, y, order, v, norm);
+        };
+        return resample_2d_cpu_impl<float>(img, shift_r, shift_az, nbatch, Nr, Naz, order, interp);
+    }
+}
+
+// Generalized phase gradient autofocus: demodulated phase of each target for
+// every sweep. Mirrors gpga_backprojection_2d_kernel in cuda/backproj.cu
+// (complex64 data, linear range interpolation).
+static void gpga_backprojection_2d_kernel_cpu(
+          const float* target_pos, const complex64_t* data, const float* pos,
+          complex64_t* data_out, int sweep_samples, int nsweeps,
+          float ref_phase, float delta_r, int Ntarget, float d0, float data_fmod,
+          int idtarget, int idsweep) {
+    if (idtarget >= Ntarget || idsweep >= nsweeps) return;
+
+    const float x = target_pos[idtarget * 3 + 0];
+    const float y = target_pos[idtarget * 3 + 1];
+    const float z = target_pos[idtarget * 3 + 2];
+
+    float pos_x = pos[idsweep * 3 + 0];
+    float pos_y = pos[idsweep * 3 + 1];
+    float pos_z = pos[idsweep * 3 + 2];
+    float px = (x - pos_x);
+    float py = (y - pos_y);
+    float pz = (z - pos_z);
+
+    const float d = sqrtf(px * px + py * py + pz * pz);
+
+    float sx = delta_r * (d + d0);
+
+    int id0 = sx;
+    int id1 = id0 + 1;
+    if (id0 < 0 || id1 >= sweep_samples) {
+        data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
+    } else {
+        complex64_t s0 = data[idsweep * sweep_samples + id0];
+        complex64_t s1 = data[idsweep * sweep_samples + id1];
+        float interp_idx = sx - id0;
+        complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+        float ref_sin, ref_cos;
+        sincospi<float>(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        data_out[idtarget * nsweeps + idsweep] = s * ref;
+    }
+}
+
+at::Tensor gpga_backprojection_2d_cpu(
+          const at::Tensor &target_pos,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          int64_t Ntarget,
+          double d0,
+          double data_fmod) {
+    TORCH_CHECK(target_pos.dtype() == at::kFloat);
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(data.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(target_pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+
+    at::Tensor target_pos_contig = target_pos.contiguous();
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor data_contig = data.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+    at::Tensor data_out = torch::zeros({Ntarget, nsweeps}, options);
+
+    const float* target_pos_ptr = target_pos_contig.data_ptr<float>();
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const complex64_t* data_ptr = (const complex64_t*)data_contig.data_ptr<c10::complex<float>>();
+    complex64_t* data_out_ptr = (complex64_t*)data_out.data_ptr<c10::complex<float>>();
+
+    const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for (int idtarget = 0; idtarget < Ntarget; idtarget++) {
+        for (int idsweep = 0; idsweep < nsweeps; idsweep++) {
+            gpga_backprojection_2d_kernel_cpu(
+                    target_pos_ptr, data_ptr, pos_ptr, data_out_ptr,
+                    sweep_samples, nsweeps, ref_phase, delta_r, Ntarget, d0,
+                    data_fmod / kPI, idtarget, idsweep);
+        }
+    }
+    return data_out;
+}
+
+// Interferometric coherence over a moving window. Mirrors coherence_2d_kernel
+// in cuda/coherence.cu.
+static void coherence_2d_kernel_cpu(
+          const complex64_t* img0, const complex64_t* img1, float* out,
+          int N0, int N1, int w0, int w1, int id0_, int idbatch) {
+    const int idx = id0_ % N1;
+    const int idy = id0_ / N1;
+
+    if (id0_ >= N0 * N1) return;
+
+    complex64_t corr{};
+    float p0 = 0.0f;
+    float p1 = 0.0f;
+    int Navg = 0;
+    int start_i = std::max(-w0, -idx);
+    int end_i = std::min(w0, N1 - 1 - idx);
+    int start_j = std::max(-w1, -idy);
+    int end_j = std::min(w1, N0 - 1 - idy);
+    for (int y = idy + start_j; y <= idy + end_j; y++) {
+        for (int x = idx + start_i; x <= idx + end_i; x++) {
+            complex64_t v0 = img0[idbatch * N0 * N1 + y * N1 + x];
+            complex64_t v1 = img1[idbatch * N0 * N1 + y * N1 + x];
+            p0 += v0.real() * v0.real() + v0.imag() * v0.imag();
+            p1 += v1.real() * v1.real() + v1.imag() * v1.imag();
+            corr += v0 * std::conj(v1);
+            Navg += 1;
+        }
+    }
+    corr /= static_cast<float>(Navg);
+    p0 /= static_cast<float>(Navg);
+    p1 /= static_cast<float>(Navg);
+    float denom = sqrtf(p0 * p1);
+    float v = denom > 0.0f ? std::abs(corr) / denom : 0.0f;
+    out[idbatch * N0 * N1 + idy * N1 + idx] = v;
+}
+
+at::Tensor coherence_2d_cpu(
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          int64_t nbatch,
+          int64_t N0,
+          int64_t N1,
+          int64_t w0,
+          int64_t w1) {
+    TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+    TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CPU);
+    at::Tensor img0_contig = img0.contiguous();
+    at::Tensor img1_contig = img1.contiguous();
+
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(img0.device());
+    at::Tensor out = torch::empty({nbatch, N0, N1}, options);
+
+    const complex64_t* img0_ptr = (const complex64_t*)img0_contig.data_ptr<c10::complex<float>>();
+    const complex64_t* img1_ptr = (const complex64_t*)img1_contig.data_ptr<c10::complex<float>>();
+    float* out_ptr = out.data_ptr<float>();
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int id0 = 0; id0 < N0 * N1; id0++) {
+            coherence_2d_kernel_cpu(
+                    img0_ptr, img1_ptr, out_ptr, N0, N1, w0, w1, id0, idbatch);
+        }
+    }
+    return out;
+}
+
+// Gradient of coherence_2d. Scatters the per-output-pixel gradient back to
+// every input pixel in the window. Mirrors coherence_2d_grad_kernel in
+// cuda/coherence.cu (CUDA atomicAdd -> "#pragma omp atomic" here).
+static void coherence_2d_grad_kernel_cpu(
+          const float* grad, const complex64_t* img0, const complex64_t* img1,
+          int N0, int N1, int w0, int w1,
+          complex64_t* img0_grad, complex64_t* img1_grad,
+          int id0_, int idbatch) {
+    const int idx = id0_ % N1;
+    const int idy = id0_ / N1;
+
+    if (id0_ >= N0 * N1) return;
+
+    complex64_t corr{};
+    float p0 = 0.0f;
+    float p1 = 0.0f;
+    int Navg = 0;
+    int start_i = std::max(-w0, -idx);
+    int end_i = std::min(w0, N1 - 1 - idx);
+    int start_j = std::max(-w1, -idy);
+    int end_j = std::min(w1, N0 - 1 - idy);
+    for (int y = idy + start_j; y <= idy + end_j; y++) {
+        for (int x = idx + start_i; x <= idx + end_i; x++) {
+            complex64_t v0 = img0[idbatch * N0 * N1 + y * N1 + x];
+            complex64_t v1 = img1[idbatch * N0 * N1 + y * N1 + x];
+            p0 += v0.real() * v0.real() + v0.imag() * v0.imag();
+            p1 += v1.real() * v1.real() + v1.imag() * v1.imag();
+            corr += v0 * std::conj(v1);
+            Navg += 1;
+        }
+    }
+    corr /= static_cast<float>(Navg);
+    p0 /= static_cast<float>(Navg);
+    p1 /= static_cast<float>(Navg);
+    float p0p1 = p0 * p1;
+    if (p0p1 <= 0.0f) {
+        return;
+    }
+    float dout2 = (corr.real() * corr.real() + corr.imag() * corr.imag()) / p0p1;
+    float dout = sqrtf(dout2);
+
+    float dout_ddout2 = dout > 0.0f
+        ? grad[idbatch * N0 * N1 + idy * N1 + idx] / dout
+        : 0.0f;
+    complex64_t dout_dc = dout_ddout2 * corr / p0p1 / static_cast<float>(Navg);
+    float dout_dnorm1 = dout_ddout2 * (-dout2 / p0) / static_cast<float>(Navg);
+    float dout_dnorm2 = dout_ddout2 * (-dout2 / p1) / static_cast<float>(Navg);
+
+    for (int y = idy + start_j; y <= idy + end_j; y++) {
+        for (int x = idx + start_i; x <= idx + end_i; x++) {
+            complex64_t v0 = img0[idbatch * N0 * N1 + y * N1 + x];
+            complex64_t v1 = img1[idbatch * N0 * N1 + y * N1 + x];
+
+            if (img0_grad != nullptr) {
+                complex64_t gx1 = dout_dc * v1 + dout_dnorm1 * v0;
+                float* g0 = reinterpret_cast<float*>(&img0_grad[idbatch * N0 * N1 + y * N1 + x]);
+                #pragma omp atomic
+                g0[0] += gx1.real();
+                #pragma omp atomic
+                g0[1] += gx1.imag();
+            }
+            if (img1_grad != nullptr) {
+                complex64_t gx2 = std::conj(dout_dc) * v0 + dout_dnorm2 * v1;
+                float* g1 = reinterpret_cast<float*>(&img1_grad[idbatch * N0 * N1 + y * N1 + x]);
+                #pragma omp atomic
+                g1[0] += gx2.real();
+                #pragma omp atomic
+                g1[1] += gx2.imag();
+            }
+        }
+    }
+}
+
+std::vector<at::Tensor> coherence_2d_grad_cpu(
+          const at::Tensor &grad,
+          const at::Tensor &img0,
+          const at::Tensor &img1,
+          int64_t nbatch,
+          int64_t N0,
+          int64_t N1,
+          int64_t w0,
+          int64_t w1) {
+    TORCH_CHECK(grad.dtype() == at::kFloat);
+    TORCH_CHECK(img0.dtype() == at::kComplexFloat);
+    TORCH_CHECK(img1.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(img0.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(img1.device().type() == at::DeviceType::CPU);
+    at::Tensor img0_contig = img0.contiguous();
+    at::Tensor img1_contig = img1.contiguous();
+    at::Tensor grad_contig = grad.contiguous();
+
+    const float* grad_ptr = grad_contig.data_ptr<float>();
+    const complex64_t* img0_ptr = (const complex64_t*)img0_contig.data_ptr<c10::complex<float>>();
+    const complex64_t* img1_ptr = (const complex64_t*)img1_contig.data_ptr<c10::complex<float>>();
+
+    at::Tensor img0_grad;
+    at::Tensor img1_grad;
+    complex64_t* img0_grad_ptr = nullptr;
+    complex64_t* img1_grad_ptr = nullptr;
+
+    if (img0.requires_grad()) {
+        img0_grad = torch::zeros_like(img0);
+        img0_grad_ptr = (complex64_t*)img0_grad.data_ptr<c10::complex<float>>();
+    } else {
+        img0_grad = torch::Tensor();
+    }
+    if (img1.requires_grad()) {
+        img1_grad = torch::zeros_like(img1);
+        img1_grad_ptr = (complex64_t*)img1_grad.data_ptr<c10::complex<float>>();
+    } else {
+        img1_grad = torch::Tensor();
+    }
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int id0 = 0; id0 < N0 * N1; id0++) {
+            coherence_2d_grad_kernel_cpu(
+                    grad_ptr, img0_ptr, img1_ptr, N0, N1, w0, w1,
+                    img0_grad_ptr, img1_grad_ptr, id0, idbatch);
+        }
+    }
+
+    std::vector<at::Tensor> ret;
+    ret.push_back(img0_grad);
+    ret.push_back(img1_grad);
+    return ret;
+}
+
+// Lee speckle filter. Mirrors lee_filter_kernel in cuda/speckle_filter.cu.
+// The window statistics use Welford's online mean/variance and the same
+// boundary conventions as the CUDA kernel (note the strict-less-than upper
+// bounds and that nan pixels still advance the count).
+template<typename T>
+static void lee_filter_kernel_cpu(const T* img, float* out, int Nx, int Ny,
+        int wx, int wy, float cu, int id1, int idbatch) {
+    const int idy = id1 % Ny;
+    const int idx = id1 / Ny;
+
+    if (id1 >= Nx * Ny) return;
+
+    int count = 0;
+    float mean = 0.0f;
+    float m2 = 0.0f;
+    for (int i = std::max(idx - wx, 0); i < std::min(idx + wx, Nx - 1); i++) {
+        for (int j = std::max(idy - wy, 0); j < std::min(idy + wy, Ny - 1); j++) {
+            count++;
+            T val = img[idbatch * Nx * Ny + i * Ny + j];
+            float v;
+            if constexpr (std::is_same_v<T, complex64_t>) {
+                if (std::isnan(val.real())) {
+                    continue;
+                }
+                v = std::abs(val);
+            } else {
+                if (std::isnan(val)) {
+                    continue;
+                }
+                v = val;
+            }
+            float delta = v - mean;
+            mean += delta / count;
+            float delta2 = v - mean;
+            m2 += delta * delta2;
+        }
+    }
+    const int oidx = idbatch * Nx * Ny + idx * Ny + idy;
+    if (count == 0) {
+        T c = img[oidx];
+        if constexpr (std::is_same_v<T, complex64_t>) {
+            out[oidx] = std::abs(c);
+        } else {
+            out[oidx] = c;
+        }
+    } else {
+        float var = m2 / count;
+        float ci = sqrtf(var) / mean;
+        float w;
+        if (ci < cu) {
+            w = 0.0f;
+        } else {
+            w = 1.0f - (cu * cu) / (ci * ci);
+        }
+        T val = img[oidx];
+        if constexpr (std::is_same_v<T, complex64_t>) {
+            out[oidx] = mean + w * (std::abs(val) - mean);
+        } else {
+            out[oidx] = mean + w * (val - mean);
+        }
+    }
+}
+
+at::Tensor lee_filter_cpu(
+          const at::Tensor &img,
+          int64_t nbatch,
+          int64_t Nx,
+          int64_t Ny,
+          int64_t wx,
+          int64_t wy,
+          double cu) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+    at::Tensor img_contig = img.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(img.device());
+    at::Tensor out = torch::empty({nbatch, Nx, Ny}, options);
+    float* out_ptr = out.data_ptr<float>();
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+    const bool is_complex = img.dtype() == at::kComplexFloat;
+
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int id1 = 0; id1 < Nx * Ny; id1++) {
+            if (is_complex) {
+                lee_filter_kernel_cpu<complex64_t>(
+                        (const complex64_t*)img_contig.data_ptr<c10::complex<float>>(),
+                        out_ptr, Nx, Ny, wx, wy, cu, id1, idbatch);
+            } else {
+                lee_filter_kernel_cpu<float>(
+                        img_contig.data_ptr<float>(),
+                        out_ptr, Nx, Ny, wx, wy, cu, id1, idbatch);
+            }
+        }
+    }
+    return out;
+}
+
 // Defines the operators
 TORCH_LIBRARY(torchbp, m) {
   m.def("backprojection_polar_2d(Tensor data, Tensor pos, Tensor att, int nbatch, int sweep_samples, int nsweeps, float fc, float r_res, float r0, float dr, float theta0, float dtheta, int Nr, int Ntheta, float d0, int dealias, float z0, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel, float data_fmod, float alias_fmod, bool normalize) -> Tensor");
@@ -3029,6 +3728,15 @@ TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("ffbp_merge2_poly", &ffbp_merge2_poly_cpu);
   m.impl("ffbp_merge2_poly_weighted", &ffbp_merge2_poly_weighted_cpu);
   m.impl("compute_illumination", &compute_illumination_cpu);
+  m.impl("div_2d_interp_linear", &div_2d_interp_linear_cpu);
+  m.impl("mul_2d_interp_linear", &mul_2d_interp_linear_cpu);
+  m.impl("power_coherence_2d", &power_coherence_2d_cpu);
+  m.impl("resample_2d_lanczos", &resample_2d_lanczos_cpu);
+  m.impl("resample_2d_knab", &resample_2d_knab_cpu);
+  m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cpu);
+  m.impl("coherence_2d", &coherence_2d_cpu);
+  m.impl("coherence_2d_grad", &coherence_2d_grad_cpu);
+  m.impl("lee_filter", &lee_filter_cpu);
 }
 
 }

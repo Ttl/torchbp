@@ -37,9 +37,43 @@ class TestCoherence2D(TestCase):
                 rtol=rtol,
             )
 
+    def test_gradients_cpu(self):
+        self._test_gradients("cpu")
+
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
+
+    def test_cpu_self_coherence(self):
+        """Coherence of an image with itself is 1 everywhere."""
+        img = torch.randn(2, 16, 16, dtype=torch.complex64)
+        c = torchbp.ops.coherence_2d(img, img, (3, 3))
+        torch.testing.assert_close(c, torch.ones_like(c))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda(self):
+        for args in self.sample_inputs("cpu"):
+            img0, img1 = args["img0"], args["img1"]
+            out_cpu = torchbp.ops.coherence_2d(img0, img1, args["Navg"])
+            out_gpu = torchbp.ops.coherence_2d(
+                img0.cuda(), img1.cuda(), args["Navg"]).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_grad(self):
+        """Backward must agree between CPU and CUDA."""
+        for args in self.sample_inputs("cpu", requires_grad=False):
+            i0 = args["img0"]
+            i1 = args["img1"]
+            grads = {}
+            for dev in ("cpu", "cuda"):
+                a = i0.detach().to(dev).requires_grad_(True)
+                b = i1.detach().to(dev).requires_grad_(True)
+                out = torchbp.ops.coherence_2d(a, b, args["Navg"])
+                out.abs().sum().backward()
+                grads[dev] = (a.grad.cpu(), b.grad.cpu())
+            torch.testing.assert_close(grads["cpu"][0], grads["cuda"][0], rtol=1e-3, atol=1e-4)
+            torch.testing.assert_close(grads["cpu"][1], grads["cuda"][1], rtol=1e-3, atol=1e-4)
 
     def _opcheck(self, device):
         from torchbp.ops.coherence import _prepare_coherence_2d_args
@@ -54,7 +88,6 @@ class TestCoherence2D(TestCase):
                 test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
@@ -923,7 +956,6 @@ class TestDivMul2DInterpLinear(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_div_cpu(self):
         self._opcheck_div("cpu")
 
@@ -931,13 +963,53 @@ class TestDivMul2DInterpLinear(TestCase):
     def test_opcheck_div_cuda(self):
         self._opcheck_div("cuda")
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_mul_cpu(self):
         self._opcheck_mul("cpu")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_opcheck_mul_cuda(self):
         self._opcheck_mul("cuda")
+
+    def test_cpu_matching_shape(self):
+        """With matching shapes the op reduces to plain elementwise mul/div.
+
+        The interpolation maps output index i to b[i*(N-1)/(N-1)] = b[i], so
+        interior pixels match exactly. The last row/col differ because the CUDA
+        kernel clamps the source index to N-2 (replicated on the CPU side), so
+        compare only the interior.
+        """
+        for b_dtype in (torch.complex64, torch.float32):
+            a = torch.randn(2, 8, 8, dtype=torch.complex64)
+            b = torch.randn(2, 8, 8, dtype=b_dtype)
+            mul = torchbp.ops.mul_2d_interp_linear(a, b)
+            torch.testing.assert_close(mul[:, :-1, :-1], (a * b)[:, :-1, :-1])
+            div = torchbp.ops.div_2d_interp_linear(a, b)
+            torch.testing.assert_close(div[:, :-1, :-1], (a / b)[:, :-1, :-1])
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_div(self):
+        for args in self.sample_inputs_div("cpu"):
+            img1, img2 = args["img1"], args["img2"]
+            out_cpu = torchbp.ops.div_2d_interp_linear(img1, img2)
+            out_gpu = torchbp.ops.div_2d_interp_linear(img1.cuda(), img2.cuda()).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_mul(self):
+        for args in self.sample_inputs_mul("cpu"):
+            img1, img2 = args["img1"], args["img2"]
+            out_cpu = torchbp.ops.mul_2d_interp_linear(img1, img2)
+            out_gpu = torchbp.ops.mul_2d_interp_linear(img1.cuda(), img2.cuda()).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_mul_mixed_dtype(self):
+        """Complex image times a real weight map (the polarimetry calibration path)."""
+        a = torch.randn(2, 5, 5, dtype=torch.complex64)
+        b = torch.randn(2, 3, 3, dtype=torch.float32)
+        out_cpu = torchbp.ops.mul_2d_interp_linear(a, b)
+        out_gpu = torchbp.ops.mul_2d_interp_linear(a.cuda(), b.cuda()).cpu()
+        torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
 
 
 class TestSubpixelCorrelation(TestCase):
@@ -1014,13 +1086,30 @@ class TestLeeFilter(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
+
+    def test_cpu_constant_image(self):
+        """A constant image has zero local variance, so the filter returns it
+        unchanged (the variation weight is zero)."""
+        for dtype in (torch.float32, torch.complex64):
+            img = torch.full((1, 16, 16), 3.0, dtype=dtype)
+            out = torchbp.ops.lee_filter(img, 3, 3, 0.5)
+            torch.testing.assert_close(out, torch.full((1, 16, 16), 3.0, dtype=torch.float32))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda(self):
+        for dtype in (torch.float32, torch.complex64):
+            for args in self.sample_inputs("cpu", dtype=dtype):
+                img = args["img"]
+                kw = dict(wx=args["wx"], wy=args["wy"], cu=args["cu"])
+                out_cpu = torchbp.ops.lee_filter(img, **kw)
+                out_gpu = torchbp.ops.lee_filter(img.cuda(), **kw).cpu()
+                torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
 
 
 class TestPowerCoherence2D(TestCase):
@@ -1055,13 +1144,38 @@ class TestPowerCoherence2D(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
+
+    def test_cpu_self_coherence(self):
+        """Coherence of an image with itself is 1 everywhere."""
+        img = torch.randn(2, 16, 16, dtype=torch.complex64)
+        pc = torchbp.ops.power_coherence_2d(img, img, (3, 3), corr_output=True)
+        torch.testing.assert_close(pc, torch.ones_like(pc))
+        pc_raw = torchbp.ops.power_coherence_2d(img, img, (3, 3), corr_output=False)
+        torch.testing.assert_close(pc_raw, torch.ones_like(pc_raw))
+
+    def test_cpu_uncorrelated_bounded(self):
+        """Coherence stays within [0, 1] for uncorrelated inputs."""
+        img0 = torch.randn(1, 32, 32, dtype=torch.complex64)
+        img1 = torch.randn(1, 32, 32, dtype=torch.complex64)
+        pc = torchbp.ops.power_coherence_2d(img0, img1, (4, 4))
+        self.assertGreaterEqual(pc.min().item(), 0.0)
+        self.assertLessEqual(pc.max().item(), 1.0)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda(self):
+        for args in self.sample_inputs("cpu"):
+            img0, img1 = args["img0"], args["img1"]
+            out_cpu = torchbp.ops.power_coherence_2d(
+                img0, img1, args["Navg"], args["corr_output"])
+            out_gpu = torchbp.ops.power_coherence_2d(
+                img0.cuda(), img1.cuda(), args["Navg"], args["corr_output"]).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
 
 
 class TestGPGABackprojection2D(TestCase):
@@ -1112,13 +1226,55 @@ class TestGPGABackprojection2D(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
+
+    def test_cpu_reference(self):
+        """Compare the CPU op against a direct Python reference implementation."""
+        c0 = 299792458.0
+        ntargets, nsweeps, sweep_samples = 3, 5, 64
+        fc, r_res, d0, data_fmod = 6e9, 0.15, 0.2, 0.7
+        torch.manual_seed(1)
+        # Place targets close to the platform so ranges land inside the sweep.
+        data = torch.randn(nsweeps, sweep_samples, dtype=torch.complex64)
+        pos = torch.randn(nsweeps, 3)
+        target_pos = pos.mean(dim=0) + 0.3 * torch.randn(ntargets, 3)
+
+        out = torchbp.ops.gpga_backprojection_2d_core(
+            target_pos, data, pos, fc, r_res, d0=d0, data_fmod=data_fmod)
+
+        ref_phase = 4.0 * fc / c0
+        delta_r = 1.0 / r_res
+        ref = torch.zeros(ntargets, nsweeps, dtype=torch.complex64)
+        for t in range(ntargets):
+            for s in range(nsweeps):
+                d = torch.linalg.norm(target_pos[t] - pos[s]).item()
+                sx = delta_r * (d + d0)
+                i0 = int(sx)
+                i1 = i0 + 1
+                if i0 < 0 or i1 >= sweep_samples:
+                    continue
+                fr = sx - i0
+                sval = (1 - fr) * data[s, i0] + fr * data[s, i1]
+                angle = torch.pi * ref_phase * d - data_fmod * sx
+                ref[t, s] = sval * torch.exp(1j * torch.tensor(angle))
+        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda(self):
+        for args in self.sample_inputs("cpu"):
+            kw = dict(fc=args["fc"], r_res=args["r_res"], d0=args["d0"],
+                      data_fmod=args["data_fmod"])
+            out_cpu = torchbp.ops.gpga_backprojection_2d_core(
+                args["target_pos"], args["data"], args["pos"], **kw)
+            out_gpu = torchbp.ops.gpga_backprojection_2d_core(
+                args["target_pos"].cuda(), args["data"].cuda(),
+                args["pos"].cuda(), **kw).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
 
 
 class TestFFBPMerge2Poly(TestCase):
@@ -2197,6 +2353,42 @@ class TestResample2DLanczos(TestCase):
     def test_varying_shift_float(self):
         self._test_varying_shift("cuda", torch.float32)
 
+    def test_zero_shift_complex_cpu(self):
+        self._test_zero_shift_identity("cpu", torch.complex64)
+
+    def test_zero_shift_float_cpu(self):
+        self._test_zero_shift_identity("cpu", torch.float32)
+
+    def test_smooth_complex_cpu(self):
+        self._test_smooth_function("cpu", torch.complex64)
+
+    def test_smooth_float_cpu(self):
+        self._test_smooth_function("cpu", torch.float32)
+
+    def test_varying_shift_complex_cpu(self):
+        self._test_varying_shift("cpu", torch.complex64)
+
+    def test_varying_shift_float_cpu(self):
+        self._test_varying_shift("cpu", torch.float32)
+
+    def _test_cpu_cuda(self, dtype):
+        Nr, Naz = 32, 32
+        img = torch.randn(2, Nr, Naz, dtype=dtype)
+        shift_r = torch.full((Nr, Naz), 0.37, dtype=torch.float32)
+        shift_az = torch.full((Nr, Naz), -0.23, dtype=torch.float32)
+        out_cpu = torchbp.ops.resample_2d_lanczos(img, shift_r, shift_az, order=6)
+        out_gpu = torchbp.ops.resample_2d_lanczos(
+            img.cuda(), shift_r.cuda(), shift_az.cuda(), order=6).cpu()
+        torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_complex(self):
+        self._test_cpu_cuda(torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_float(self):
+        self._test_cpu_cuda(torch.float32)
+
     def _opcheck(self, device):
         samples = self.sample_inputs(device, requires_grad=False)
         for args in samples:
@@ -2215,7 +2407,6 @@ class TestResample2DLanczos(TestCase):
                 test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
@@ -2293,6 +2484,37 @@ class TestResample2DKnab(TestCase):
     def test_smooth_float(self):
         self._test_smooth_function("cuda", torch.float32)
 
+    def test_zero_shift_complex_cpu(self):
+        self._test_zero_shift_identity("cpu", torch.complex64)
+
+    def test_zero_shift_float_cpu(self):
+        self._test_zero_shift_identity("cpu", torch.float32)
+
+    def test_smooth_complex_cpu(self):
+        self._test_smooth_function("cpu", torch.complex64)
+
+    def test_smooth_float_cpu(self):
+        self._test_smooth_function("cpu", torch.float32)
+
+    def _test_cpu_cuda(self, dtype):
+        Nr, Naz = 32, 32
+        img = torch.randn(2, Nr, Naz, dtype=dtype)
+        shift_r = torch.full((Nr, Naz), 0.37, dtype=torch.float32)
+        shift_az = torch.full((Nr, Naz), -0.23, dtype=torch.float32)
+        out_cpu = torchbp.ops.resample_2d_knab(
+            img, shift_r, shift_az, order=6, oversample=1.5)
+        out_gpu = torchbp.ops.resample_2d_knab(
+            img.cuda(), shift_r.cuda(), shift_az.cuda(), order=6, oversample=1.5).cpu()
+        torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_complex(self):
+        self._test_cpu_cuda(torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_float(self):
+        self._test_cpu_cuda(torch.float32)
+
     def _opcheck(self, device):
         samples = self.sample_inputs(device, requires_grad=False)
         for args in samples:
@@ -2312,7 +2534,6 @@ class TestResample2DKnab(TestCase):
                 test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
