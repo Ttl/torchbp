@@ -1,0 +1,1620 @@
+#include "util.h"
+
+// CPU backprojection, projection and GPGA ops. Mirrors cuda/backproj.cu.
+namespace torchbp {
+
+static void backprojection_polar_2d_kernel_cpu(
+          const complex64_t* data,
+          const float* pos,
+          const float* att,
+          complex64_t* img,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          int Nr,
+          int Ntheta,
+          float d0,
+          bool dealias,
+          float z0,
+          const float *g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          float data_fmod,
+          float alias_fmod,
+          int idx,
+          int idbatch) {
+    const int idtheta = idx % Ntheta;
+    const int idr = idx / Ntheta;
+    if (idr >= Nr || idtheta >= Ntheta) {
+        return;
+    }
+
+    const float r = r0 + idr * dr;
+    const float theta = theta0 + idtheta * dtheta;
+    const float x = r * sqrtf(1.0f - theta*theta);
+    const float y = r * theta;
+
+    complex64_t pixel{};
+    float w_sum = 0.0f;
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        float pz2 = pos_z * pos_z;
+
+        // Calculate distance to the pixel.
+        const float d = sqrtf(px * px + py * py + pz2);
+
+        float sx = delta_r * (d + d0);
+
+        // Linear interpolation.
+        int id0 = sx;
+        int id1 = id0 + 1;
+        if (id0 < 0 || id1 >= sweep_samples) {
+            continue;
+        }
+        complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
+        complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
+
+        float interp_idx = sx - id0;
+        complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+        float ref_sin, ref_cos;
+        sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+
+        if (g != nullptr) {
+            const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+
+            const float el_idx = (el_deg - g_el0) / g_del;
+            const float az_idx = (az_deg - g_az0) / g_daz;
+
+            const int el_int = el_idx;
+            const int az_int = az_idx;
+            const float el_frac = el_idx - el_int;
+            const float az_frac = az_idx - az_int;
+
+            if (el_int < 0 || el_int+1 >= g_nel) {
+                continue;
+            }
+            if (az_int < 0 || az_int+1 >= g_naz) {
+                continue;
+            }
+            const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+
+            pixel += w * s * ref;
+            w_sum += w;
+        } else {
+            pixel += s * ref;
+        }
+    }
+    if (g != nullptr) {
+        if (w_sum > 0.0f) {
+            pixel *= nsweeps / w_sum;
+        }
+    }
+    if (dealias) {
+        const float d = sqrtf(x*x + y*y + z0*z0);
+        float ref_sin, ref_cos;
+        sincospi(-ref_phase * d + alias_fmod * idr, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        pixel *= ref;
+    }
+    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
+}
+
+
+at::Tensor backprojection_polar_2d_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          int64_t dealias,
+          double z0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          double data_fmod,
+          double alias_fmod,
+          bool normalize) {
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+
+    bool antenna_pattern = g.defined() || att.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+    }
+
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor data_contig = data.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+    c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
+
+    float* att_ptr = nullptr;
+    float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        at::Tensor att_contig = att.contiguous();
+        at::Tensor g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
+
+	const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+    const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idx = 0; idx < Nr * Ntheta; idx++) {
+            backprojection_polar_2d_kernel_cpu(
+                          data_ptr,
+                          pos_ptr,
+                          att_ptr,
+                          img_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          r0, dr,
+                          theta0, dtheta,
+                          Nr, Ntheta,
+                          d0,
+                          dealias, z0,
+                          g_ptr,
+                          g_az0,
+                          g_el0,
+                          g_daz,
+                          g_del,
+                          g_naz,
+                          g_nel,
+                          data_fmod/kPI,
+                          alias_fmod/kPI,
+                          idx, idbatch);
+        }
+    }
+	return img;
+}
+
+static void backprojection_polar_2d_grad_kernel_cpu(
+          const complex64_t* data,
+          const float* pos,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          int Nr,
+          int Ntheta,
+          float d0,
+          bool dealias,
+          float z0,
+          float data_fmod,
+          float alias_fmod,
+          const complex64_t* grad,
+          float* pos_grad,
+          complex64_t *data_grad,
+          int idx,
+          int idbatch) {
+    const int idtheta = idx % Ntheta;
+    const int idr = idx / Ntheta;
+    if (idx >= Nr * Ntheta) {
+        return;
+    }
+
+    bool have_pos_grad = pos_grad != nullptr;
+    bool have_data_grad = data_grad != nullptr;
+
+    const float r = r0 + idr * dr;
+    const float theta = theta0 + idtheta * dtheta;
+    const float x = r * sqrtf(1.0f - theta*theta);
+    const float y = r * theta;
+
+    complex64_t g = grad[idbatch * Nr * Ntheta + idr * Ntheta + idtheta];
+
+    float arg_dealias = 0.0f;
+    if (dealias) {
+        const float d = sqrtf(x*x + y*y + z0*z0);
+        arg_dealias = -ref_phase * d + alias_fmod * idr;
+        // TODO: Missing z0 gradient.
+    }
+
+    complex64_t I = {0.0f, 1.0f};
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        // Image plane is assumed to be at z=0
+        float pz2 = pos_z * pos_z;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        float sx = delta_r * (d + d0);
+
+        float dx = 0.0f;
+        float dy = 0.0f;
+        float dz = 0.0f;
+        complex64_t ds0 = 0.0f;
+        complex64_t ds1 = 0.0f;
+
+        // Linear interpolation.
+        int id0 = sx;
+        int id1 = id0 + 1;
+        if (id0 >= 0 && id1 < sweep_samples) {
+            complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
+            complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
+
+            float interp_idx = sx - id0;
+            complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+            float ref_sin, ref_cos;
+            sincospi(ref_phase * d - data_fmod * sx + arg_dealias, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+
+            if (have_pos_grad) {
+                complex64_t dout = ref * (I * (kPI * (ref_phase - delta_r * data_fmod)) * s + (s1 - s0) * delta_r);
+                complex64_t gdout = g * std::conj(dout);
+
+                // Take real part
+                float gd = std::real(gdout);
+
+                dx = -px / d;
+                dy = -py / d;
+                // Different from x,y because pos_z is handled differently.
+                dz = pos_z / d;
+                dx *= gd;
+                dy *= gd;
+                dz *= gd;
+                // Avoid issues with zero range
+                if (!std::isfinite(dx)) dx = 0.0f;
+                if (!std::isfinite(dy)) dy = 0.0f;
+                if (!std::isfinite(dz)) dz = 0.0f;
+            }
+
+            if (have_data_grad) {
+                ds0 = g * std::conj((1.0f - interp_idx) * ref);
+                ds1 = g * std::conj(interp_idx * ref);
+            }
+        }
+
+        if (have_pos_grad) {
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 0] += dx;
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 1] += dy;
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 2] += dz;
+        }
+
+        if (have_data_grad) {
+            if (id0 >= 0 && id1 < sweep_samples) {
+                size_t data_idx = idbatch * sweep_samples * nsweeps + i * sweep_samples;
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id0])[0] += std::real(ds0);
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id0])[1] += std::imag(ds0);
+
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id1])[0] += std::real(ds1);
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id1])[1] += std::imag(ds1);
+            }
+        }
+    }
+}
+
+std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
+          const at::Tensor &grad,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          int64_t dealias,
+          double z0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          double data_fmod,
+          double alias_fmod,
+          bool normalize) {
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat);
+	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor data_contig = data.contiguous();
+	at::Tensor grad_contig = grad.contiguous();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+	const c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
+
+    at::Tensor pos_grad;
+    float* pos_grad_ptr = nullptr;
+    if (pos.requires_grad()) {
+        pos_grad = torch::zeros_like(pos);
+        pos_grad_ptr = pos_grad.data_ptr<float>();
+    } else {
+        pos_grad = torch::Tensor();
+    }
+
+    at::Tensor data_grad;
+	c10::complex<float>* data_grad_ptr = nullptr;
+    if (data.requires_grad()) {
+        data_grad = torch::zeros_like(data);
+        data_grad_ptr = data_grad.data_ptr<c10::complex<float>>();
+    } else {
+        data_grad = torch::Tensor();
+    }
+
+	const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idx = 0; idx < Nr * Ntheta; idx++) {
+            backprojection_polar_2d_grad_kernel_cpu(
+                          data_ptr,
+                          pos_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          r0, dr,
+                          theta0, dtheta,
+                          Nr, Ntheta,
+                          d0,
+                          dealias, z0,
+                          data_fmod/kPI,
+                          alias_fmod/kPI,
+                          grad_ptr,
+                          pos_grad_ptr,
+                          data_grad_ptr,
+                          idx,
+                          idbatch
+                          );
+        }
+    }
+    std::vector<at::Tensor> ret;
+    ret.push_back(data_grad);
+    ret.push_back(pos_grad);
+	return ret;
+}
+
+static void backprojection_cart_2d_kernel_cpu(
+          const complex64_t* data,
+          const float* pos,
+          complex64_t* img,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          float beamwidth,
+          float d0,
+          float data_fmod,
+          int idt,
+          int idbatch) {
+    const int idy = idt % Ny;
+    const int idx = idt / Ny;
+
+    if (idx >= Nx || idy >= Ny) {
+        return;
+    }
+
+    const float x = x0 + idx * dx;
+    const float y = y0 + idy * dy;
+
+    complex64_t pixel{};
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        float pz2 = pos_z * pos_z;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        float sx = delta_r * (d + d0);
+
+        // Linear interpolation.
+        int id0 = sx;
+        int id1 = id0 + 1;
+        if (id0 >= 0 && id1 < sweep_samples) {
+            complex64_t s0 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id0];
+            complex64_t s1 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id1];
+
+            float interp_idx = sx - id0;
+            complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+            float ref_sin, ref_cos;
+            sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+            pixel += s * ref;
+        }
+    }
+    img[idbatch * Nx * Ny + idx * Ny + idy] = pixel;
+}
+
+at::Tensor backprojection_cart_2d_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double beamwidth,
+          double d0,
+          double data_fmod) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(data.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor data_contig = data.contiguous();
+    at::Tensor img = torch::zeros({nbatch, Nx, Ny}, data_contig.options());
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const complex64_t* data_ptr = data_contig.data_ptr<complex64_t>();
+    complex64_t* img_ptr = img.data_ptr<complex64_t>();
+
+    const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+    // Divide by 2 to get angle from the center.
+    const float beamwidth_f = beamwidth / 2.0f;
+
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idt = 0; idt < Nx * Ny; idt++) {
+            backprojection_cart_2d_kernel_cpu(
+                          data_ptr,
+                          pos_ptr,
+                          img_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          x0, dx,
+                          y0, dy,
+                          Nx, Ny,
+                          beamwidth_f, d0,
+                          data_fmod/kPI,
+                          idt, idbatch);
+        }
+    }
+    return img;
+}
+
+static void backprojection_cart_2d_grad_kernel_cpu(
+          const complex64_t* data,
+          const float* pos,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          float beamwidth,
+          float d0,
+          float data_fmod,
+          const complex64_t* grad,
+          float* pos_grad,
+          complex64_t *data_grad,
+          int idt,
+          int idbatch) {
+    const int idy = idt % Ny;
+    const int idx = idt / Ny;
+
+    if (idx >= Nx || idy >= Ny) {
+        return;
+    }
+
+    bool have_pos_grad = pos_grad != nullptr;
+    bool have_data_grad = data_grad != nullptr;
+
+    const float x = x0 + idx * dx;
+    const float y = y0 + idy * dy;
+
+    complex64_t g = grad[idbatch * Nx * Ny + idx * Ny + idy];
+
+    complex64_t I = {0.0f, 1.0f};
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+        float px = (x - pos_x);
+        float py = (y - pos_y);
+        float pz2 = pos_z * pos_z;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        float sx = delta_r * (d + d0);
+
+        float gx = 0.0f;
+        float gy = 0.0f;
+        float gz = 0.0f;
+        complex64_t ds0 = 0.0f;
+        complex64_t ds1 = 0.0f;
+
+        // Linear interpolation.
+        int id0 = sx;
+        int id1 = id0 + 1;
+        if (id0 >= 0 && id1 < sweep_samples) {
+            complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
+            complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
+
+            float interp_idx = sx - id0;
+            complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+            float ref_sin, ref_cos;
+            sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+            complex64_t ref = {ref_cos, ref_sin};
+
+            if (have_pos_grad) {
+                complex64_t dout = ref * (I * (kPI * (ref_phase - delta_r * data_fmod)) * s + (s1 - s0) * delta_r);
+                complex64_t gdout = g * std::conj(dout);
+
+                // Take real part
+                float gd = std::real(gdout);
+
+                gx = -px / d;
+                gy = -py / d;
+                // Different from x,y because pos_z is handled differently.
+                gz = pos_z / d;
+                gx *= gd;
+                gy *= gd;
+                gz *= gd;
+                // Avoid issues with zero range
+                if (!std::isfinite(gx)) gx = 0.0f;
+                if (!std::isfinite(gy)) gy = 0.0f;
+                if (!std::isfinite(gz)) gz = 0.0f;
+            }
+
+            if (have_data_grad) {
+                ds0 = g * std::conj((1.0f - interp_idx) * ref);
+                ds1 = g * std::conj(interp_idx * ref);
+            }
+        }
+
+        if (have_pos_grad) {
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 0] += gx;
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 1] += gy;
+#pragma omp atomic
+            pos_grad[idbatch * nsweeps * 3 + i * 3 + 2] += gz;
+        }
+
+        if (have_data_grad) {
+            if (id0 >= 0 && id1 < sweep_samples) {
+                size_t data_idx = idbatch * sweep_samples * nsweeps + i * sweep_samples;
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id0])[0] += std::real(ds0);
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id0])[1] += std::imag(ds0);
+
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id1])[0] += std::real(ds1);
+                #pragma omp atomic
+                reinterpret_cast<float*>(&data_grad[data_idx + id1])[1] += std::imag(ds1);
+            }
+        }
+    }
+}
+
+std::vector<at::Tensor> backprojection_cart_2d_grad_cpu(
+          const at::Tensor &grad,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double beamwidth,
+          double d0,
+          double data_fmod) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(data.dtype() == at::kComplexFloat);
+    TORCH_CHECK(grad.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor data_contig = data.contiguous();
+    at::Tensor grad_contig = grad.contiguous();
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const complex64_t* data_ptr = data_contig.data_ptr<complex64_t>();
+    const complex64_t* grad_ptr = grad_contig.data_ptr<complex64_t>();
+
+    at::Tensor pos_grad;
+    float* pos_grad_ptr = nullptr;
+    if (pos.requires_grad()) {
+        pos_grad = torch::zeros_like(pos);
+        pos_grad_ptr = pos_grad.data_ptr<float>();
+    } else {
+        pos_grad = torch::Tensor();
+    }
+
+    at::Tensor data_grad;
+    complex64_t* data_grad_ptr = nullptr;
+    if (data.requires_grad()) {
+        data_grad = torch::zeros_like(data);
+        data_grad_ptr = data_grad.data_ptr<complex64_t>();
+    } else {
+        data_grad = torch::Tensor();
+    }
+
+    const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+    // Divide by 2 to get angle from the center.
+    const float beamwidth_f = beamwidth / 2.0f;
+
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idt = 0; idt < Nx * Ny; idt++) {
+            backprojection_cart_2d_grad_kernel_cpu(
+                          data_ptr,
+                          pos_ptr,
+                          sweep_samples,
+                          nsweeps,
+                          ref_phase,
+                          delta_r,
+                          x0, dx,
+                          y0, dy,
+                          Nx, Ny,
+                          beamwidth_f, d0,
+                          data_fmod/kPI,
+                          grad_ptr,
+                          pos_grad_ptr,
+                          data_grad_ptr,
+                          idt, idbatch);
+        }
+    }
+    std::vector<at::Tensor> ret;
+    ret.push_back(data_grad);
+    ret.push_back(pos_grad);
+    return ret;
+}
+static void compute_illumination_kernel_cpu(
+          const float* pos,
+          const float* att,
+          const float* g,
+          float* w1_out,
+          float* w2_out,
+          int nsweeps,
+          float r0, float dr, float theta0, float dtheta, int nr, int ntheta,
+          float g_el0, float g_del, float g_az0, float g_daz, int g_nel, int g_naz,
+          int decimation, int idx) {
+
+    const int out_ntheta = (ntheta + decimation - 1) / decimation;
+    const int out_nr = (nr + decimation - 1) / decimation;
+
+    if (idx >= out_nr * out_ntheta) return;
+
+    const int out_idtheta = idx % out_ntheta;
+    const int out_idr = idx / out_ntheta;
+
+    const int full_idr = out_idr * decimation;
+    const int full_idtheta = out_idtheta * decimation;
+
+    const float r = r0 + dr * full_idr;
+    const float t = theta0 + dtheta * full_idtheta;  // t is sin(theta)
+    const float cost = sqrtf(1.0f - t*t);
+    const float x = r * cost;
+    const float y = r * t;
+
+    float w1 = 0.0f;
+    float w2 = 0.0f;
+
+    for (int i = 0; i < nsweeps; i++) {
+        const float pos_x = pos[i * 3 + 0];
+        const float pos_y = pos[i * 3 + 1];
+        const float pos_z = pos[i * 3 + 2];
+
+        const float px = x - pos_x;
+        const float py = y - pos_y;
+        const float pz = -pos_z;
+        const float d = sqrtf(px*px + py*py + pz*pz);
+
+        const float look_angle = asinf(std::max(-1.0f, std::min(1.0f, -pos_z / d)));
+
+        float att_el = 0.0f;
+        float att_az = 0.0f;
+        if (att != nullptr) {
+            att_el = att[i * 3 + 0];
+            att_az = att[i * 3 + 2];
+        }
+
+        const float el = look_angle - att_el;
+        const float az = atan2f(py, px) - att_az;
+
+        const float el_idx = (el - g_el0) / g_del;
+        const float az_idx = (az - g_az0) / g_daz;
+
+        if (el_idx >= 0 && el_idx < g_nel - 1 && az_idx >= 0 && az_idx < g_naz - 1) {
+            const int el_int = (int)el_idx;
+            const int az_int = (int)az_idx;
+            const float el_frac = el_idx - el_int;
+            const float az_frac = az_idx - az_int;
+
+            const float gain = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+
+            w1 += gain;
+            w2 += gain * gain;
+        }
+    }
+
+    w1_out[idx] = w1;
+    w2_out[idx] = w2;
+}
+
+std::vector<at::Tensor> compute_illumination_cpu(
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t nr,
+          int64_t ntheta,
+          int64_t decimation) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(g.dtype() == at::kFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+
+    const int64_t nsweeps = pos.size(0);
+    const int64_t g_nel = g.size(0);
+    const int64_t g_naz = g.size(1);
+
+    const float* att_ptr = nullptr;
+    at::Tensor att_contig;
+    if (att.defined() && att.numel() > 0) {
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+        att_contig = att.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+    }
+
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor g_contig = g.contiguous();
+
+    const int64_t dec = decimation > 0 ? decimation : 1;
+    const int64_t out_nr = (nr + dec - 1) / dec;
+    const int64_t out_ntheta = (ntheta + dec - 1) / dec;
+
+    at::Tensor w1_out = torch::empty({out_nr, out_ntheta},
+                                     torch::TensorOptions().dtype(at::kFloat).device(pos.device()));
+    at::Tensor w2_out = torch::empty({out_nr, out_ntheta},
+                                     torch::TensorOptions().dtype(at::kFloat).device(pos.device()));
+
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const float* g_ptr = g_contig.data_ptr<float>();
+    float* w1_out_ptr = w1_out.data_ptr<float>();
+    float* w2_out_ptr = w2_out.data_ptr<float>();
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for (int idx = 0; idx < out_nr * out_ntheta; idx++) {
+        compute_illumination_kernel_cpu(
+                pos_ptr, att_ptr, g_ptr, w1_out_ptr, w2_out_ptr, nsweeps,
+                r0, dr, theta0, dtheta, nr, ntheta,
+                g_el0, g_del, g_az0, g_daz, g_nel, g_naz, dec, idx);
+    }
+
+    std::vector<at::Tensor> ret;
+    ret.push_back(w1_out);
+    ret.push_back(w2_out);
+    return ret;
+}
+
+/*
+NUFFT-based forward projection (vel=None path). CPU analogue of
+projection_cart_2d_nufft_cuda in cuda/backproj.cu.
+
+Reformulates the direct O(N*M) sum as a Type-1 NUFFT:
+  A_p  = w_p exp(-j 2pi fc tau_p)          complex amplitude per pixel
+  nu_p = gamma tau_p / fs                  normalised frequency
+  data[k] = Sum_p A_p exp(-j 2pi nu_p k)   = IFFT of the KB-spread grid
+Cost is O(N*W) spreading + O(M log M) IFFT per sweep instead of O(N*M).
+
+The KB look-up table and deconvolution window are bit-identical to the CUDA
+build (same host-side formulas), so CPU and CUDA outputs match to float
+precision.
+*/
+
+// Kaiser-Bessel helper (matches bessel_i0_host in cuda/backproj.cu).
+static float bessel_i0_cpu(float x) {
+    if (x < 3.75f) {
+        float t = (x / 3.75f) * (x / 3.75f);
+        return 1.0f + t*(3.5156229f + t*(3.0899424f + t*(1.2067492f
+             + t*(0.2659732f + t*(0.0360768f + t*0.0045813f)))));
+    }
+    float t = 3.75f / x;
+    return (expf(x) / sqrtf(x)) * (0.39894228f + t*(0.01328592f
+         + t*(0.00225319f + t*(-0.00157565f + t*(0.00916281f
+         + t*(-0.02057706f + t*(0.02635537f + t*(-0.01647633f
+         + t*0.00392377f))))))));
+}
+
+// KB LUT: N_LUT samples of psi_KB(t) for t in [0, W/2].
+static at::Tensor make_kb_lut_cpu(int N_LUT, float W, float beta) {
+    at::Tensor lut = at::zeros({N_LUT},
+        at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+    float* p = lut.data_ptr<float>();
+    float i0b = bessel_i0_cpu(beta);
+    for (int i = 0; i < N_LUT; ++i) {
+        float t  = (float)i / (float)(N_LUT - 1) * (W * 0.5f);  // [0, W/2]
+        float u  = 2.0f * t / W;                                // [0, 1]
+        float sq = 1.0f - u * u;
+        p[i] = (sq > 0.0f) ? bessel_i0_cpu(beta * sqrtf(sq)) / i0b : 0.0f;
+    }
+    return lut;
+}
+
+// Deconvolution window for centered extraction (see cuda/backproj.cu for the
+// derivation): correction[j] = M_ext / conj(phi_fwd[k]), k = j - M/2.
+static at::Tensor make_deconv_window_cpu(int M, int M_ext, float W, float beta) {
+    int half_W = (int)(W * 0.5f);
+    float i0b  = bessel_i0_cpu(beta);
+    std::vector<float> psi(half_W + 1);
+    for (int d = 0; d <= half_W; ++d) {
+        float u  = (float)d / (float)half_W;
+        float sq = 1.0f - u * u;
+        psi[d] = (sq > 0.0f) ? bessel_i0_cpu(beta * sqrtf(sq)) / i0b : 0.0f;
+    }
+    at::Tensor win = at::zeros({M},
+        at::TensorOptions().dtype(at::kComplexFloat).device(at::kCPU));
+    complex64_t* w = win.data_ptr<complex64_t>();
+    for (int j = 0; j < M; ++j) {
+        int k = j - M / 2;
+        float re = 0.0f, im = 0.0f;
+        for (int d = -(half_W - 1); d <= half_W; ++d) {
+            float angle = -2.0f * (float)M_PI * (float)k * (float)d / (float)M_ext;
+            float kb    = psi[abs(d)];
+            re += kb * cosf(angle);
+            im += kb * sinf(angle);
+        }
+        float denom = re * re + im * im;
+        float scale = (float)M_ext / denom;
+        w[j] = complex64_t(re * scale, +im * scale);
+    }
+    return win;
+}
+
+// Static cache keyed on (sweep_samples, M_ext); W/beta/N_LUT are fixed.
+struct NufftCacheCpu { at::Tensor kb_lut, deconv_win; };
+static std::mutex                               g_nufft_cpu_cache_mutex;
+static std::map<std::tuple<int,int>, NufftCacheCpu> g_nufft_cpu_cache;
+
+static std::pair<at::Tensor, at::Tensor>
+get_nufft_tables_cpu(int sweep_samples, int M_ext, float W, float beta, int N_LUT) {
+    std::lock_guard<std::mutex> lock(g_nufft_cpu_cache_mutex);
+    auto key = std::make_tuple(sweep_samples, M_ext);
+    auto it  = g_nufft_cpu_cache.find(key);
+    if (it != g_nufft_cpu_cache.end())
+        return {it->second.kb_lut, it->second.deconv_win};
+    NufftCacheCpu c;
+    c.kb_lut     = make_kb_lut_cpu(N_LUT, W, beta);
+    c.deconv_win = make_deconv_window_cpu(sweep_samples, M_ext, W, beta);
+    g_nufft_cpu_cache[key] = c;
+    return {c.kb_lut, c.deconv_win};
+}
+
+// Geometry + KB spreading for one sweep row. This thread owns grid_row
+// (M_ext bins) exclusively, so the scatter needs no atomics.
+static void projection_nufft_spread_row_cpu(
+          const complex64_t* img,   // [N] this batch's image
+          const float* dem,         // [N] or nullptr
+          const float* pos_s,       // [3] this sweep
+          const float* att_s,       // [3] or nullptr
+          complex64_t* grid_row,    // [M_ext] zeroed
+          const float* kb_lut,
+          int N, int Nx, int Ny, int M_ext, int N_LUT,
+          float fc, float gamma, float fs, float d0,
+          float x0, float dx, float y0, float dy,
+          float W, bool use_rvp,
+          const float* g,
+          float g_az0, float g_el0, float g_daz, float g_del,
+          int g_naz, int g_nel, int normalization) {
+
+    const float M_ext_f   = (float)M_ext;
+    const float lut_scale = (float)(N_LUT - 1) * 2.0f / W;
+    const int   half_W    = (int)(W * 0.5f);
+
+    for (int p = 0; p < N; p++) {
+        const int px_y = p % Ny;
+        const int px_x = p / Ny;
+        const float x = x0 + px_x * dx;
+        const float y = y0 + px_y * dy;
+        const float z = (dem != nullptr) ? dem[p] : 0.0f;
+
+        const float dpx = x - pos_s[0];
+        const float dpy = y - pos_s[1];
+        const float dpz = z - pos_s[2];
+        const float d2  = dpx*dpx + dpy*dpy + dpz*dpz;
+        const float d   = sqrtf(d2);
+
+        float norm = 1.0f / d2;
+        if (g != nullptr) {
+            const float look   = asinf(fmaxf(dpz / d, -1.0f));
+            const float el_deg = look - att_s[0];
+            const float az_deg = atan2f(dpy, dpx) - att_s[2];
+            const float el_idx = (el_deg - g_el0) / g_del;
+            const float az_idx = (az_deg - g_az0) / g_daz;
+            const int el_int = (int)el_idx, az_int = (int)az_idx;
+            if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+                norm = 0.0f;
+            else
+                norm *= interp2d<float>(g, g_nel, g_naz,
+                                        el_int, el_idx - el_int,
+                                        az_int, az_idx - az_int);
+        }
+        if (normalization == 1) norm *= sqrtf(-dpz / d);
+
+        if (norm == 0.0f) continue;
+
+        const complex64_t w_img = img[p];
+        const float wr = w_img.real() * norm;
+        const float wi = w_img.imag() * norm;
+
+        const float tau  = 2.0f * (d + d0) / kC0;
+        const float nu_p = gamma * tau / fs;
+
+        // exp(+j 2pi u_p k/M_ext) = exp(-j 2pi nu_p k) for integer k.
+        const float up = M_ext_f - nu_p * M_ext_f;
+
+        // Carrier phase + centering term exp(-j pi nu_p M).
+        float phase = -2.0f * fc * tau;
+        if (use_rvp) phase += gamma * tau * tau;
+        phase -= nu_p * M_ext_f * 0.5f;
+        float sn, cs;
+        sincospi(phase, &sn, &cs);
+        const float ar = wr * cs - wi * sn;
+        const float ai = wr * sn + wi * cs;
+
+        const int   j0  = (int)rintf(up);
+        const float frc = up - (float)j0;
+
+        for (int delta = -(half_W - 1); delta <= half_W; ++delta) {
+            float dist    = fabsf(frc - (float)delta);
+            int   lut_idx = (int)(dist * lut_scale);
+            if (lut_idx > N_LUT - 1) lut_idx = N_LUT - 1;
+            float kb = kb_lut[lut_idx];
+
+            int gidx = ((j0 + delta) % M_ext + M_ext) % M_ext;
+            grid_row[gidx] += complex64_t(ar * kb, ai * kb);
+        }
+    }
+}
+
+at::Tensor projection_cart_2d_nufft_cpu(
+          const at::Tensor &img,
+          const at::Tensor &dem,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double fs,
+          double gamma,
+          double x0, double dx, double y0, double dy,
+          int64_t Nx, int64_t Ny, double d0,
+          const at::Tensor &g,
+          double g_az0, double g_el0, double g_daz, double g_del,
+          int64_t g_naz, int64_t g_nel,
+          int64_t use_rvp, int64_t normalization) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(img.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+
+    bool antenna_pattern = g.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+    }
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+    }
+
+    const int N     = (int)(Nx * Ny);
+    const int M     = (int)sweep_samples;
+    const int M_ext = 2 * M;            // oversampled grid size
+    const float W   = 6.0f;
+    const float beta = 2.34f * W;       // KB parameter
+    const int N_LUT = 8192;
+
+    auto [kb_lut, deconv_win] = get_nufft_tables_cpu(M, M_ext, W, beta, N_LUT);
+
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor pos_contig = pos.contiguous();
+    auto cplx_opts = at::TensorOptions().dtype(at::kComplexFloat).device(at::kCPU);
+    at::Tensor grid = at::zeros({nbatch, nsweeps, M_ext}, cplx_opts);
+
+    at::Tensor dem_contig, att_contig, g_contig;
+    const float* dem_ptr = nullptr;
+    if (dem.defined()) { dem_contig = dem.contiguous(); dem_ptr = dem_contig.data_ptr<float>(); }
+    const float* att_ptr = nullptr;
+    const float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
+
+    const complex64_t* img_ptr = img_contig.data_ptr<complex64_t>();
+    const float*       pos_ptr = pos_contig.data_ptr<float>();
+    const float*       lut_ptr = kb_lut.data_ptr<float>();
+    complex64_t*       grid_ptr = grid.data_ptr<complex64_t>();
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+    // Each (batch, sweep) spreads into its own grid row -> no atomics.
+#pragma omp parallel for collapse(2)
+    for (int b = 0; b < nbatch; b++) {
+        for (int i = 0; i < nsweeps; i++) {
+            const float* pos_si = pos_ptr + (b * nsweeps + i) * 3;
+            const float* att_si = att_ptr ? att_ptr + (b * nsweeps + i) * 3 : nullptr;
+            projection_nufft_spread_row_cpu(
+                img_ptr + b * N, dem_ptr, pos_si, att_si,
+                grid_ptr + (b * nsweeps + (size_t)i) * M_ext, lut_ptr,
+                N, Nx, Ny, M_ext, N_LUT,
+                fc, gamma, fs, d0, x0, dx, y0, dy, W, (bool)use_rvp,
+                g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, normalization);
+        }
+    }
+
+    // Batched IFFT over the last dimension (same call/normalization as CUDA).
+    at::Tensor Z = at::fft_ifft(grid, std::optional<int64_t>(M_ext), -1);
+    at::Tensor Z_contig = Z.contiguous();
+
+    at::Tensor data = at::empty({nbatch, nsweeps, M}, cplx_opts);
+    const complex64_t* Z_ptr  = Z_contig.data_ptr<complex64_t>();
+    const complex64_t* dw_ptr = deconv_win.data_ptr<complex64_t>();
+    complex64_t*       data_ptr = data.data_ptr<complex64_t>();
+
+    // Deconvolve + centered extraction: out[j] = Z[(j - M/2) mod M_ext] * deconv[j].
+#pragma omp parallel for collapse(2)
+    for (int b = 0; b < nbatch; b++) {
+        for (int i = 0; i < nsweeps; i++) {
+            const complex64_t* z_row = Z_ptr + (b * nsweeps + (size_t)i) * M_ext;
+            complex64_t* out_row = data_ptr + (b * nsweeps + (size_t)i) * M;
+            for (int j = 0; j < M; j++) {
+                int k = ((j - M / 2) % M_ext + M_ext) % M_ext;
+                out_row[j] = z_row[k] * dw_ptr[j];
+            }
+        }
+    }
+
+    return data;
+}
+
+// Number of samples between exact (sincospi) re-anchors of the chirp
+// recurrence below. The float32 phasor magnitude drifts by ~1e-6 per step, so
+// re-pinning every RESYNC samples keeps the accumulated error well under the
+// kernel's inherent float32 precision (~1e-3 relative).
+#define PROJ_RESYNC 256
+
+// Computes one full output row data[idbatch, i, :] (all sweep_samples of sweep
+// i) by accumulating the contribution of every image pixel. CPU analogue of
+// projection_cart_2d_kernel in cuda/backproj.cu.
+//
+// For a fixed (sweep, pixel) the phase is exactly quadratic in the sample index
+// j:  phase(j) = (a0 + a1*j) * (s0 + s1*j) [+ gamma*(a0+a1*j)^2 for RVP], where
+// tau_s(j) = a0 + a1*j and the IF slope is s0 + s1*j. So exp(i*pi*phase(j)) is a
+// chirp generated by a two-multiply recurrence (one multiply when a1 == 0, i.e.
+// no velocity). This computes the per-pixel geometry (sqrt, antenna pattern,
+// normalization) once instead of once per sample, and replaces the per-sample
+// sincospi with a complex multiply — the slow per-sample form recomputed all of
+// that sweep_samples times over.
+static void projection_cart_2d_kernel_cpu(
+          const complex64_t* img,
+          const float* dem,
+          const float* pos,
+          const float* vel,   // nullptr when !has_vel
+          const float* att,   // nullptr when g == nullptr
+          complex64_t* data,
+          int sweep_samples,
+          int nsweeps,
+          float fc,
+          float fs,
+          float gamma,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          float d0,
+          const float* g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          bool use_rvp,
+          int normalization,
+          int i,
+          int idbatch) {
+    if (i >= nsweeps) {
+        return;
+    }
+
+    const bool has_vel = (vel != nullptr);
+    const int N = sweep_samples;
+
+    // IF slope coefficients: phase_slope(j) = s0 + s1*j.
+    const float s0 = -2.0f * fc;
+    const float s1 = -2.0f * gamma / fs;
+
+    const float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+    const float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+    const float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+    const float att_roll = (g != nullptr) ? att[idbatch * nsweeps * 3 + 3*i + 0] : 0.0f;
+    const float att_yaw  = (g != nullptr) ? att[idbatch * nsweeps * 3 + 3*i + 2] : 0.0f;
+
+    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+    if (has_vel) {
+        vx = vel[idbatch * nsweeps * 3 + i * 3 + 0];
+        vy = vel[idbatch * nsweeps * 3 + i * 3 + 1];
+        vz = vel[idbatch * nsweeps * 3 + i * 3 + 2];
+    }
+
+    const int total_pixels = Nx * Ny;
+    // This thread owns the whole row, so it accumulates directly (no atomics).
+    complex64_t* row = data + (idbatch * nsweeps + (size_t)i) * N;
+
+    for (int p_idx = 0; p_idx < total_pixels; p_idx++) {
+        const int px_y = p_idx % Ny;
+        const int px_x = p_idx / Ny;
+        const float x = x0 + px_x * dx;
+        const float y = y0 + px_y * dy;
+        const float z = (dem != nullptr) ? dem[px_x * Ny + px_y] : 0.0f;
+
+        const complex64_t w_img = img[idbatch * total_pixels + p_idx];
+
+        const float dpx = x - pos_x;
+        const float dpy = y - pos_y;
+        const float dpz = z - pos_z;
+        const float d2  = dpx*dpx + dpy*dpy + dpz*dpz;
+        const float d   = sqrtf(d2);
+
+        float norm = 1.0f / d2;
+        if (g != nullptr) {
+            const float look   = asinf(fmaxf(dpz / d, -1.0f));
+            const float el_deg = look - att_roll;
+            const float az_deg = atan2f(dpy, dpx) - att_yaw;
+            const float el_idx = (el_deg - g_el0) / g_del;
+            const float az_idx = (az_deg - g_az0) / g_daz;
+            const int el_int = (int)el_idx, az_int = (int)az_idx;
+            if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+                norm = 0.0f;
+            else
+                norm *= interp2d<float>(g, g_nel, g_naz,
+                                        el_int, el_idx - el_int,
+                                        az_int, az_idx - az_int);
+        }
+        if (normalization == 1) norm *= sqrtf(-dpz / d);
+
+        // Out-of-pattern pixels contribute nothing; skip the chirp entirely.
+        if (norm == 0.0f) continue;
+
+        const complex64_t w(w_img.real() * norm, w_img.imag() * norm);
+
+        // tau_s(j) = a0 + a1*j. Without velocity a1 = 0 (tau constant per pixel).
+        float a0, a1 = 0.0f;
+        if (has_vel) {
+            const float vel_proj = (dpx * vx + dpy * vy + dpz * vz) / d / fs;
+            a1 = 2.0f * vel_proj / kC0;
+            // j_half = j - N/2, so a0 absorbs the -N/2 offset.
+            a0 = 2.0f * (d + d0) / kC0 - a1 * (0.5f * (float)N);
+        } else {
+            a0 = 2.0f * (d + d0) / kC0;
+        }
+
+        // phase(j) = A + B*j + C*j^2. B and C are small and computed directly so
+        // the per-step phase increment stays accurate (no cancellation of the
+        // huge absolute phase). The anchor phase itself is evaluated from the
+        // factored form below to match the CUDA kernel bit-for-bit.
+        float B = a0 * s1 + a1 * s0;
+        float C = a1 * s1;
+        if (use_rvp) { B += 2.0f * gamma * a0 * a1; C += gamma * a1 * a1; }
+
+        // Second-difference phasor: d1 *= d2 each step (d2 == 1 when C == 0).
+        float d2s, d2c;
+        sincospi(2.0f * C, &d2s, &d2c);
+        const complex64_t d2c1(d2c, d2s);
+
+        for (int j0 = 0; j0 < N; j0 += PROJ_RESYNC) {
+            const int jend = (j0 + PROJ_RESYNC < N) ? j0 + PROJ_RESYNC : N;
+
+            // Exact anchor phase at j0 (same expression as the per-sample form).
+            const float tau_s = a0 + a1 * (float)j0;
+            const float slope = s0 + s1 * (float)j0;
+            float phase0 = tau_s * slope;
+            if (use_rvp) phase0 += gamma * tau_s * tau_s;
+            float p0s, p0c;
+            sincospi(phase0, &p0s, &p0c);
+            complex64_t P = w * complex64_t(p0c, p0s);  // weight folded in
+
+            // First-difference phasor at j0: exp(i*pi*(phase(j0+1)-phase(j0))).
+            const float g0 = B + C * (2.0f * (float)j0 + 1.0f);
+            float g0s, g0c;
+            sincospi(g0, &g0s, &g0c);
+            complex64_t d1(g0c, g0s);
+
+            if (has_vel) {
+                for (int j = j0; j < jend; j++) {
+                    row[j] += P;
+                    P *= d1;
+                    d1 *= d2c1;
+                }
+            } else {
+                // C == 0: d1 is constant. The bare recurrence P *= d1 is a
+                // latency-bound serial chain; run 4 independent phasor lanes
+                // (offset by one sample, stepping by d1^4) so the multiply
+                // latency is hidden by instruction-level parallelism.
+                complex64_t P0 = P;
+                complex64_t P1 = P0 * d1;
+                complex64_t P2 = P1 * d1;
+                complex64_t P3 = P2 * d1;
+                const complex64_t d1_2 = d1 * d1;
+                const complex64_t step = d1_2 * d1_2;  // d1^4
+                int j = j0;
+                for (; j + 4 <= jend; j += 4) {
+                    row[j + 0] += P0;
+                    row[j + 1] += P1;
+                    row[j + 2] += P2;
+                    row[j + 3] += P3;
+                    P0 *= step;
+                    P1 *= step;
+                    P2 *= step;
+                    P3 *= step;
+                }
+                // P0 now tracks phase(j); finish the 0-3 sample tail serially.
+                for (; j < jend; j++) {
+                    row[j] += P0;
+                    P0 *= d1;
+                }
+            }
+        }
+    }
+}
+
+at::Tensor projection_cart_2d_cpu(
+          const at::Tensor &img,
+          const at::Tensor &dem,
+          const at::Tensor &pos,
+          const at::Tensor &vel,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double fs,
+          double gamma,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double d0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t use_rvp,
+          int64_t normalization) {
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(img.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+
+    bool antenna_pattern = g.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+    }
+    if (vel.defined()) {
+        TORCH_CHECK(vel.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(vel.device().type() == at::DeviceType::CPU);
+    }
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+    }
+
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor img_contig = img.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(img.device());
+    at::Tensor data = torch::zeros({nbatch, nsweeps, sweep_samples}, options);
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const complex64_t* img_ptr = img_contig.data_ptr<complex64_t>();
+    complex64_t* data_ptr = data.data_ptr<complex64_t>();
+
+    at::Tensor dem_contig, vel_contig, att_contig, g_contig;
+    const float* dem_ptr = nullptr;
+    if (dem.defined()) {
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+    }
+    const float* vel_ptr = nullptr;
+    if (vel.defined()) {
+        vel_contig = vel.contiguous();
+        vel_ptr = vel_contig.data_ptr<float>();
+    }
+    const float* att_ptr = nullptr;
+    const float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+    // Each (batch, sweep) owns one output row, so parallelize over rows: every
+    // thread accumulates all pixels into its own row without contention.
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int i = 0; i < nsweeps; i++) {
+            projection_cart_2d_kernel_cpu(
+                          img_ptr, dem_ptr, pos_ptr, vel_ptr, att_ptr,
+                          data_ptr, sweep_samples, nsweeps,
+                          fc, fs, gamma, x0, dx, y0, dy, Nx, Ny, d0,
+                          g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+                          (bool)use_rvp, normalization,
+                          i, idbatch);
+        }
+    }
+    return data;
+}
+// Generalized phase gradient autofocus: demodulated phase of each target for
+// every sweep. Mirrors gpga_backprojection_2d_kernel in cuda/backproj.cu
+// (complex64 data, linear range interpolation).
+static void gpga_backprojection_2d_kernel_cpu(
+          const float* target_pos, const complex64_t* data, const float* pos,
+          complex64_t* data_out, int sweep_samples, int nsweeps,
+          float ref_phase, float delta_r, int Ntarget, float d0, float data_fmod,
+          int idtarget, int idsweep) {
+    if (idtarget >= Ntarget || idsweep >= nsweeps) return;
+
+    const float x = target_pos[idtarget * 3 + 0];
+    const float y = target_pos[idtarget * 3 + 1];
+    const float z = target_pos[idtarget * 3 + 2];
+
+    float pos_x = pos[idsweep * 3 + 0];
+    float pos_y = pos[idsweep * 3 + 1];
+    float pos_z = pos[idsweep * 3 + 2];
+    float px = (x - pos_x);
+    float py = (y - pos_y);
+    float pz = (z - pos_z);
+
+    const float d = sqrtf(px * px + py * py + pz * pz);
+
+    float sx = delta_r * (d + d0);
+
+    int id0 = sx;
+    int id1 = id0 + 1;
+    if (id0 < 0 || id1 >= sweep_samples) {
+        data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
+    } else {
+        complex64_t s0 = data[idsweep * sweep_samples + id0];
+        complex64_t s1 = data[idsweep * sweep_samples + id1];
+        float interp_idx = sx - id0;
+        complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+        float ref_sin, ref_cos;
+        sincospi<float>(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        data_out[idtarget * nsweeps + idsweep] = s * ref;
+    }
+}
+
+at::Tensor gpga_backprojection_2d_cpu(
+          const at::Tensor &target_pos,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          int64_t Ntarget,
+          double d0,
+          double data_fmod) {
+    TORCH_CHECK(target_pos.dtype() == at::kFloat);
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(data.dtype() == at::kComplexFloat);
+    TORCH_INTERNAL_ASSERT(target_pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+
+    at::Tensor target_pos_contig = target_pos.contiguous();
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor data_contig = data.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+    at::Tensor data_out = torch::zeros({Ntarget, nsweeps}, options);
+
+    const float* target_pos_ptr = target_pos_contig.data_ptr<float>();
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const complex64_t* data_ptr = (const complex64_t*)data_contig.data_ptr<c10::complex<float>>();
+    complex64_t* data_out_ptr = (complex64_t*)data_out.data_ptr<c10::complex<float>>();
+
+    const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for (int idtarget = 0; idtarget < Ntarget; idtarget++) {
+        for (int idsweep = 0; idsweep < nsweeps; idsweep++) {
+            gpga_backprojection_2d_kernel_cpu(
+                    target_pos_ptr, data_ptr, pos_ptr, data_out_ptr,
+                    sweep_samples, nsweeps, ref_phase, delta_r, Ntarget, d0,
+                    data_fmod / kPI, idtarget, idsweep);
+        }
+    }
+    return data_out;
+}
+
+// Registers CPU implementations
+TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
+  m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
+  m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cpu);
+  m.impl("backprojection_cart_2d", &backprojection_cart_2d_cpu);
+  m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cpu);
+  m.impl("compute_illumination", &compute_illumination_cpu);
+  m.impl("projection_cart_2d", &projection_cart_2d_cpu);
+  m.impl("projection_cart_2d_nufft", &projection_cart_2d_nufft_cpu);
+  m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cpu);
+}
+
+}
