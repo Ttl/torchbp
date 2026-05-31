@@ -80,6 +80,13 @@ def get_extensions():
     extensions_dir = os.path.join(this_dir, library_name, "csrc")
     sources = list(glob.glob(os.path.join(extensions_dir, "*.cpp")))
 
+    # CPU operator implementations live in csrc/cpu/, split per category
+    # (mirroring the per-file layout of the CUDA ops in csrc/cuda/). They are
+    # always compiled, so CPU ops are available in both CPU- and CUDA-enabled
+    # builds.
+    extensions_cpu_dir = os.path.join(extensions_dir, "cpu")
+    sources += list(glob.glob(os.path.join(extensions_cpu_dir, "*.cpp")))
+
     extensions_cuda_dir = os.path.join(extensions_dir, "cuda")
     cuda_sources = list(glob.glob(os.path.join(extensions_cuda_dir, "*.cu")))
 
@@ -106,6 +113,9 @@ setup(
     ext_modules=get_extensions(),
     install_requires=["torch", "numpy", "scipy"],
     extras_require = {
+        # Test deps. expecttest is pulled in by torch.testing._internal
+        # (TestCase / opcheck), which the test suite imports.
+        'test': ["pytest", "expecttest"],
         'docs':  [
             "matplotlib >=3.5",
             "nbval >=0.9",
