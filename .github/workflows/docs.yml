@@ -1,0 +1,63 @@
+name: docs
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between the run
+# in-progress and latest queued. Do not cancel in-progress runs.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pandoc (required by nbsphinx)
+        run: sudo apt-get update && sudo apt-get install -y pandoc
+
+      - name: Install torch (CPU) and build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install ninja numpy packaging wheel setuptools
+
+      - name: Build and install torchbp extension
+        # No build isolation: the extension links non-ABI-stable libtorch
+        # symbols and must compile against the torch installed above.
+        run: pip install --no-build-isolation -e .
+
+      - name: Install documentation dependencies
+        run: |
+          pip install sphinx sphinx_rtd_theme nbsphinx numpydoc \
+            ipython ipykernel scipy matplotlib
+
+      - name: Build HTML
+        run: make -C docs html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/build/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
