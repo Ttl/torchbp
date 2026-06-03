@@ -35,6 +35,8 @@ reason, rebuild torchbp whenever you change your torch version.
 
 ## Documentation
 
+Latest documentation can be viewed at: https://ttl.github.io/torchbp/
+
 API documentation and examples can be built with sphinx.
 
 ```bash
