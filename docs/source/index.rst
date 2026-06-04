@@ -9,6 +9,8 @@ torchbp documentation
 torchbp is Pytorch library for fast differentiable synthetic radar image formation
 and autofocus with GPU and CPU support.
 
+Source code: https://github.com/Ttl/torchbp
+
 .. toctree::
    :maxdepth: 2
    :caption: Contents:

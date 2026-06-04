@@ -9,7 +9,7 @@ import sys
 import os
 import torchbp
 project = 'torchbp'
-copyright = '2024, Henrik Forstén'
+copyright = '2026, Henrik Forstén'
 author = 'Henrik Forstén'
 release = '0.0.1'
 
