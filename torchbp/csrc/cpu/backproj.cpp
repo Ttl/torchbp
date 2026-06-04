@@ -1605,10 +1605,271 @@ at::Tensor gpga_backprojection_2d_cpu(
     return data_out;
 }
 
+static void backprojection_polar_2d_tx_power_kernel_cpu(
+          const float* wa,
+          const float* pos,
+          const float* att,
+          const float* g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          float* img,
+          int nsweeps,
+          float delta_r,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          int Nr,
+          int Ntheta,
+          int normalization,
+          float altitude,
+          int idx,
+          int idbatch) {
+    const int idtheta = idx % Ntheta;
+    const int idr = idx / Ntheta;
+    if (idr >= Nr || idtheta >= Ntheta) {
+        return;
+    }
+
+    const float r = r0 + idr * dr;
+    const float theta = theta0 + idtheta * dtheta;
+    const float cos2 = 1.0f - theta * theta;
+
+    // Pixel ground position and effective altitude for angle/distance computation.
+    // altitude > 0: slant-range grid (BP origin at sensor altitude, pos z ≈ 0).
+    //   Map pixel to ground: x_g = sqrt(r²cos²θ - H²), y_g = r sinθ.
+    //   Use H for all vertical distance / angle calculations.
+    // altitude == 0: ground-range grid (pos z = real altitude).
+    //   Pixel at (r cosθ, r sinθ, 0), use per-sweep pos_z.
+    float px_base, py_base, z_eff;
+    if (altitude > 0.0f) {
+        float r2cos2 = r * r * cos2;
+        float H2 = altitude * altitude;
+        if (r2cos2 < H2) {
+            // No ground intersection (shadow zone below nadir).
+            img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = 0.0f;
+            return;
+        }
+        px_base = sqrtf(r2cos2 - H2);
+        py_base = r * theta;
+        z_eff = altitude;
+    } else {
+        px_base = r * sqrtf(cos2);
+        py_base = r * theta;
+        z_eff = 0.0f;  // will use per-sweep pos_z
+    }
+
+    // Angular size of resolution cell at nadir.
+    float h_ref = (altitude > 0.0f) ? altitude
+                  : pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2];
+    const float min_look_angle = sqrtf(2.0f * dr / h_ref);
+
+    float pixel = 0.0f;
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+
+        float px = (px_base - pos_x);
+        float py = (py_base - pos_y);
+        float h = (altitude > 0.0f) ? z_eff : pos_z;
+        float pz2 = h * h;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        // Avoid nans due to numerical precision by clamping to valid range.
+        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
+        const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+        const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+        // TODO: consider platform pitch
+
+        const float el_idx = (el_deg - g_el0) / g_del;
+        const float az_idx = (az_deg - g_az0) / g_daz;
+
+        const int el_int = el_idx;
+        const int az_int = az_idx;
+        const float el_frac = el_idx - el_int;
+        const float az_frac = az_idx - az_int;
+
+        if (el_int < 0 || el_int+1 >= g_nel) {
+            continue;
+        }
+        if (az_int < 0 || az_int+1 >= g_naz) {
+            continue;
+        }
+        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+        float sinl = 1.0f;
+
+        if (normalization == 1) {
+            // sigma_0
+            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d)));
+        } else if (normalization == 2) {
+            // gamma_0
+            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d))) * d / h;
+        } else if (normalization == 3) {
+            // point
+            // Scale as d^4 instead of d^3 for area target.
+            sinl = d;
+        }
+        // beta_0 otherwise
+
+        float w = wa[idbatch * nsweeps + i];
+        pixel += g_i * g_i * w * w / (d*d*d * sinl);
+    }
+    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = sqrtf(pixel);
+}
+
+static at::Tensor backprojection_polar_2d_tx_power_impl_cpu(
+          const at::Tensor &wa,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          int64_t nbatch,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t nsweeps,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          int64_t normalization,
+          double altitude) {
+	TORCH_CHECK(wa.dtype() == at::kFloat);
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(wa.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+
+	at::Tensor wa_contig = wa.contiguous();
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor g_contig = g.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(wa.device());
+	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
+	const float* wa_ptr = wa_contig.data_ptr<float>();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
+	float* img_ptr = img.data_ptr<float>();
+
+	const float delta_r = 1.0f / r_res;
+
+    // Torch sets the OpenMP team size for this thread to 1 to avoid nested
+    // parallelism inside its own intra-op pool, so a bare "omp parallel for"
+    // would run single threaded. Re-enable threading explicitly. Use the full
+    // logical processor count (incl. SMT/hyperthreads).
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idx = 0; idx < Nr * Ntheta; idx++) {
+            backprojection_polar_2d_tx_power_kernel_cpu(
+                          wa_ptr,
+                          pos_ptr,
+                          att_ptr,
+                          g_ptr,
+                          g_az0,
+                          g_el0,
+                          g_daz,
+                          g_del,
+                          g_naz,
+                          g_nel,
+                          img_ptr,
+                          nsweeps,
+                          delta_r,
+                          r0, dr,
+                          theta0, dtheta,
+                          Nr, Ntheta,
+                          normalization,
+                          static_cast<float>(altitude),
+                          idx, idbatch);
+        }
+    }
+	return img;
+}
+
+at::Tensor backprojection_polar_2d_tx_power_cpu(
+          const at::Tensor &wa,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          int64_t nbatch,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t nsweeps,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          int64_t normalization) {
+    return backprojection_polar_2d_tx_power_impl_cpu(
+            wa, pos, att, g, nbatch, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            nsweeps, r_res, r0, dr, theta0, dtheta, Nr, Ntheta, normalization,
+            0.0);
+}
+
+at::Tensor backprojection_polar_2d_tx_power_slant_cpu(
+          const at::Tensor &wa,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          int64_t nbatch,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t nsweeps,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          int64_t normalization,
+          double altitude) {
+    return backprojection_polar_2d_tx_power_impl_cpu(
+            wa, pos, att, g, nbatch, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            nsweeps, r_res, r0, dr, theta0, dtheta, Nr, Ntheta, normalization,
+            altitude);
+}
+
 // Registers CPU implementations
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
   m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cpu);
+  m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cpu);
+  m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cpu);
   m.impl("backprojection_cart_2d", &backprojection_cart_2d_cpu);
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cpu);
   m.impl("compute_illumination", &compute_illumination_cpu);
