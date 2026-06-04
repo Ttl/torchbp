@@ -46,7 +46,7 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
     patch_size : int
         Patch side-length.
     w : int
-        Smoothing window size.
+        Smoothing window size. Must be odd.
     alpha : float
         Smoothing exponent.
     overlap : float
@@ -64,13 +64,24 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
         Filtered interferogram.
     """
 
+    if w % 2 == 0:
+        raise ValueError(f"w must be odd, got {w}")
+
     orig_dim = igram.dim()
     if orig_dim == 2:
         igram = igram.unsqueeze(0)
 
+    # Reflect-pad by one patch on all sides so border pixels get the same
+    # multi-patch coverage as the interior. Cropped off again at the end.
+    pad = min(patch_size, igram.shape[-2] - 1, igram.shape[-1] - 1)
+    if pad > 0:
+        igram = F.pad(igram, (pad, pad, pad, pad), mode="reflect")
+
     f_patch = lambda x : _goldstein_patch(x, alpha, w)
     overlap = int(overlap * patch_size)
     filtered = process_image_with_patches(igram, patch_size, overlap, f_patch)
+    if pad > 0:
+        filtered = filtered[..., pad:filtered.shape[-2] - pad, pad:filtered.shape[-1] - pad]
     if orig_dim == 2:
         filtered = filtered.squeeze(0)
     return filtered
