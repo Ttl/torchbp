@@ -198,6 +198,11 @@ def multilook_polar(sar_img: Tensor, kernel: tuple, grid_polar: "PolarGrid | dic
     if hasattr(grid_polar, 'to_dict'):
         grid_polar = grid_polar.to_dict()
 
+    squeeze = False
+    if sar_img.dim() == 2:
+        squeeze = True
+        sar_img = sar_img.unsqueeze(0)
+
     sar_img = torch.nn.functional.avg_pool2d(
         sar_img.real, kernel, stride=None
     ) + 1j * torch.nn.functional.avg_pool2d(sar_img.imag, kernel, stride=None)
@@ -207,6 +212,8 @@ def multilook_polar(sar_img: Tensor, kernel: tuple, grid_polar: "PolarGrid | dic
         "nr": sar_img.shape[-2],
         "ntheta": sar_img.shape[-1],
     }
+    if squeeze:
+        sar_img = sar_img.squeeze(0)
     return sar_img, grid_out
 
 
