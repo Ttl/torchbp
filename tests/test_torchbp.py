@@ -1546,7 +1546,6 @@ class TestBackprojectionPolar2DTxPower(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
