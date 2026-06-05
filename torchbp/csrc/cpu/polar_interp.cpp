@@ -52,6 +52,51 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
     }
 }
 
+static void polar_interp_kernel_lanczos_cpu(const complex64_t *img, complex64_t *out, const float *dorigin,
+                  float rotation, float ref_phase, float r0, float dr, float theta0, float dtheta,
+                  int Nr, int Ntheta, float r1, float dr1, float theta1, float dtheta1,
+                  int Nr1, int Ntheta1, float z1, int order, float alias_fmod, int idx, int idbatch) {
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+
+    if (idx >= Nr1 * Ntheta1) {
+        return;
+    }
+
+    const float d = r1 + dr1 * idr;
+    float t = theta1 + dtheta1 * idtheta;
+    if (rotation != 0.0f) {
+        t = sinf(asinf(t) - rotation);
+    }
+    if (t < -1.0f || t > 1.0f) {
+        return;
+    }
+    const float dorig0 = dorigin[idbatch * 3 + 0];
+    const float dorig1 = dorigin[idbatch * 3 + 1];
+    const float sint = t;
+    const float cost = sqrtf(1.0f - t*t);
+    const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+    const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+    const float tp = arg / sqrtf(1.0f + arg*arg);
+
+    const float dri = (rp - r0) / dr;
+    const float dti = (tp - theta0) / dtheta;
+
+    if (dri >= 0 && dri < Nr-1 && dti >= 0 && dti < Ntheta-1) {
+        complex64_t v = lanczos_interp_2d_cpu<complex64_t>(
+                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
+        float ref_sin, ref_cos;
+        const float z0 = z1 + dorigin[idbatch * 3 + 2];
+        const float dz = sqrtf(z1*z1 + d*d);
+        const float rpz = sqrtf(z0*z0 + rp*rp);
+        sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = v * ref;
+    } else {
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
+    }
+}
+
 template <typename T>
 static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, const T *dorigin, T rotation,
                   T ref_phase, T r0, T dr, T theta0, T dtheta, int Nr, int Ntheta,
@@ -227,6 +272,54 @@ at::Tensor polar_interp_linear_cpu(
                       ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
                       r1, dr1, theta1, dtheta1, nr1, ntheta1, z1, alias_fmod/kPI, idx, idbatch);
             }
+        }
+    }
+	return out;
+}
+
+at::Tensor polar_interp_lanczos_cpu(
+          const at::Tensor &img,
+          const at::Tensor &dorigin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double r0,
+          double dr0,
+          double theta0,
+          double dtheta0,
+          int64_t nr0,
+          int64_t ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t nr1,
+          int64_t ntheta1,
+          double z1,
+          int64_t order,
+          double alias_fmod) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat);
+    TORCH_CHECK(dorigin.dtype() == at::kFloat);
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CPU);
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor out = torch::empty({nbatch, nr1, ntheta1}, img_contig.options());
+    at::Tensor dorigin_contig = dorigin.contiguous();
+
+    // See polar_interp_linear_cpu for why the thread count is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+    const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    complex64_t* img_ptr = img_contig.data_ptr<complex64_t>();
+    complex64_t* out_ptr = out.data_ptr<complex64_t>();
+    const float ref_phase = 4.0f * fc / kC0;
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int idx = 0; idx < nr1 * ntheta1; idx++) {
+            polar_interp_kernel_lanczos_cpu(img_ptr, out_ptr, dorigin_ptr, rotation,
+                  ref_phase, r0, dr0, theta0, dtheta0, nr0, ntheta0,
+                  r1, dr1, theta1, dtheta1, nr1, ntheta1, z1, order, alias_fmod/kPI, idx, idbatch);
         }
     }
 	return out;
@@ -1224,6 +1317,7 @@ at::Tensor polar_to_cart_lanczos_cpu(
 // Registers CPU implementations
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("polar_interp_linear", &polar_interp_linear_cpu);
+  m.impl("polar_interp_lanczos", &polar_interp_lanczos_cpu);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cpu);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cpu);
   m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cpu);
