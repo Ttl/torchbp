@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import torch
+import numpy as np
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
 import unittest
@@ -587,6 +588,176 @@ class TestBackprojectionPolarAntennaPattern(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_uniform_pattern_normalization_cuda(self):
         self._test_uniform_pattern_normalization("cuda")
+
+    @staticmethod
+    def _make_nonsymmetric_antenna(device):
+        """Inputs with a strongly non-symmetric antenna pattern.
+
+        The pattern is narrow in azimuth and wide in elevation on a non-square
+        (nel != naz) grid, so reading it transposed (swapping the el/az axes or
+        their sizes) changes the result. The yaw is swept across the aperture so
+        every sweep samples a different part of the azimuth pattern.
+        """
+        torch.manual_seed(0)
+        nsweeps = 24
+        sweep_samples = 64
+        fc = 6e9
+        r_res = 0.15
+        grid = {"r": (4, 8), "theta": (-0.3, 0.3), "nr": 16, "ntheta": 24}
+
+        pos = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        pos[:, 1] = (
+            torch.linspace(-nsweeps / 2, nsweeps / 2, nsweeps, device=device)
+            * 0.25 * 3e8 / fc
+        )
+        pos[:, 2] = 2.0   # low altitude so the scene is within sweep range
+
+        data = torch.randn(nsweeps, sweep_samples, device=device, dtype=torch.complex64)
+
+        nel, naz = 16, 24
+        el = torch.linspace(-1.2, 1.2, nel, device=device)
+        az = torch.linspace(-2.0, 2.0, naz, device=device)
+        gain = torch.exp(-(el[:, None] / 0.8) ** 2) * torch.exp(-(az[None, :] / 0.25) ** 2)
+        g = gain.to(torch.float32)
+        g_extent = [el[0].item(), az[0].item(), el[-1].item(), az[-1].item()]
+
+        att = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        att[:, 0] = -float(np.arcsin(2.0 / 6.0))   # roll: point elevation beam at scene
+        att[:, 2] = torch.linspace(-0.3, 0.3, nsweeps, device=device)              # yaw sweep
+        return dict(data=data, grid=grid, fc=fc, r_res=r_res, pos=pos,
+                    att=att, g=g, g_extent=g_extent)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_nonsymmetric_pattern_cpu_gpu(self):
+        """CPU and CUDA backprojection must agree with a non-symmetric pattern,
+        for both the normalized and unnormalized (FFBP) paths."""
+        a = self._make_nonsymmetric_antenna("cuda")
+
+        def to_cpu(v):
+            return v.cpu() if isinstance(v, torch.Tensor) else v
+
+        a_cpu = {k: to_cpu(v) for k, v in a.items()}
+        for normalize in (True, False):
+            out_gpu = torchbp.ops.backprojection_polar_2d(
+                a["data"], a["grid"], a["fc"], a["r_res"], a["pos"],
+                att=a["att"], g=a["g"], g_extent=a["g_extent"], normalize=normalize,
+            )
+            out_cpu = torchbp.ops.backprojection_polar_2d(
+                a_cpu["data"], a_cpu["grid"], a_cpu["fc"], a_cpu["r_res"], a_cpu["pos"],
+                att=a_cpu["att"], g=a_cpu["g"], g_extent=a_cpu["g_extent"],
+                normalize=normalize,
+            )
+            torch.testing.assert_close(out_cpu, out_gpu.cpu(), atol=1e-4, rtol=1e-3)
+
+
+class TestFFBPAntennaPattern(TestCase):
+    """End-to-end antenna-pattern-weighted FFBP must match between CPU and CUDA."""
+
+    @staticmethod
+    def _make_inputs(device):
+        torch.manual_seed(0)
+        nsweeps = 64
+        sweep_samples = 128
+        fc = 6e9
+        r_res = 0.15
+        grid = {"r": (4, 8), "theta": (-0.3, 0.3), "nr": 64, "ntheta": 128}
+
+        pos = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        pos[:, 1] = (
+            torch.linspace(-nsweeps / 2, nsweeps / 2, nsweeps, device=device)
+            * 0.25 * 3e8 / fc
+        )
+        pos[:, 2] = 2.0   # low altitude so the scene is within sweep range
+
+        data = torch.randn(nsweeps, sweep_samples, device=device, dtype=torch.complex64)
+
+        nel, naz = 16, 24
+        el = torch.linspace(-1.2, 1.2, nel, device=device)
+        az = torch.linspace(-2.0, 2.0, naz, device=device)
+        gain = torch.exp(-(el[:, None] / 0.8) ** 2) * torch.exp(-(az[None, :] / 0.25) ** 2)
+        g = gain.to(torch.float32)
+        g_extent = [el[0].item(), az[0].item(), el[-1].item(), az[-1].item()]
+
+        att = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        att[:, 0] = -float(np.arcsin(2.0 / 6.0))   # roll: point elevation beam at scene
+        att[:, 2] = torch.linspace(-0.3, 0.3, nsweeps, device=device)
+        return dict(data=data, grid=grid, fc=fc, r_res=r_res, pos=pos,
+                    att=att, g=g, g_extent=g_extent)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_weighted_ffbp_cpu_gpu(self):
+        a = self._make_inputs("cuda")
+
+        def to_cpu(v):
+            return v.cpu() if isinstance(v, torch.Tensor) else v
+
+        a_cpu = {k: to_cpu(v) for k, v in a.items()}
+        kw = dict(stages=2, divisions=2, dealias=True)
+        out_gpu = torchbp.ops.ffbp(
+            a["data"], a["grid"], a["fc"], a["r_res"], a["pos"],
+            att=a["att"], g=a["g"], g_extent=a["g_extent"], **kw,
+        )
+        out_cpu = torchbp.ops.ffbp(
+            a_cpu["data"], a_cpu["grid"], a_cpu["fc"], a_cpu["r_res"], a_cpu["pos"],
+            att=a_cpu["att"], g=a_cpu["g"], g_extent=a_cpu["g_extent"], **kw,
+        )
+        # Poly-Knab merge differs at the ULP level between CPU and CUDA and is
+        # amplified by the weighted normalization (cf. TestFFBPMerge2PolyWeighted).
+        torch.testing.assert_close(out_cpu, out_gpu.cpu(), atol=3e-2, rtol=5e-2)
+
+
+class TestGenerateFMCWAntennaOrientation(TestCase):
+    """generate_fmcw_data must apply the azimuth pattern in azimuth (not elevation).
+
+    This is a device-independent check: the simulator samples ``g`` with
+    ``F.grid_sample`` whose last-axis order is (x=width=azimuth, y=height=
+    elevation). Getting it wrong applies an azimuth-narrow beam in elevation, so
+    the per-sweep gain stops depending on azimuth. A CPU-vs-GPU comparison cannot
+    catch this (both devices would be transposed identically).
+    """
+
+    def test_azimuth_pattern_applied_in_azimuth(self):
+        device = "cpu"
+        fc, bw, tsweep, fs = 6e9, 200e6, 100e-6, 4e6
+        nsweeps = 41
+
+        # Target broadside; platform at origin, on the ground (look angle 0), so
+        # the elevation angle into the pattern is ~0 for every sweep and only the
+        # azimuth changes (through the swept yaw).
+        target_pos = torch.tensor([[100.0, 0.0, 0.0]], device=device)
+        target_rcs = torch.ones((1, 1), device=device)
+        pos = torch.zeros((nsweeps, 3), dtype=torch.float32, device=device)
+
+        # Pattern that varies ONLY in azimuth (constant across elevation rows).
+        nel, naz = 8, 128
+        az_axis = torch.linspace(-1.0, 1.0, naz)
+        profile = torch.exp(-(az_axis / 0.2) ** 2)          # azimuth Gaussian
+        g = profile[None, :].repeat(nel, 1).to(torch.float32)
+        g_extent = [-0.5, -1.0, 0.5, 1.0]                   # [el0, az0, el1, az1]
+
+        att = torch.zeros((nsweeps, 3), dtype=torch.float32, device=device)
+        yaw = torch.linspace(-0.7, 0.7, nsweeps)
+        att[:, 2] = yaw                                     # az_deg = -yaw
+
+        kw = dict(g_extent=g_extent, att=att)
+        data_g = torchbp.util.generate_fmcw_data(
+            target_pos, target_rcs, pos, fc, bw, tsweep, fs, g=g, **kw)
+        data_1 = torchbp.util.generate_fmcw_data(
+            target_pos, target_rcs, pos, fc, bw, tsweep, fs,
+            g=torch.ones_like(g), **kw)
+
+        applied = data_g.abs().mean(dim=-1) / data_1.abs().mean(dim=-1)
+
+        # Reference: az_deg = atan2(0, 100) - yaw = -yaw, sampled on the profile.
+        az_deg = -yaw
+        ref = torch.from_numpy(
+            np.interp(az_deg.numpy(), az_axis.numpy(), profile.numpy())
+        ).to(torch.float32)
+
+        # Applied gain must follow the azimuth profile (and therefore vary a lot
+        # across the sweep). The transposed bug makes it ~constant in azimuth.
+        self.assertGreater(applied.max() / applied.min(), 5.0)
+        torch.testing.assert_close(applied, ref, atol=2e-2, rtol=5e-2)
 
 
 class TestBackprojectionPolarLanczos(TestCase):

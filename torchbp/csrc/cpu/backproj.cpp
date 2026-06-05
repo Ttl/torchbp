@@ -30,6 +30,7 @@ static void backprojection_polar_2d_kernel_cpu(
           int g_nel,
           float data_fmod,
           float alias_fmod,
+          bool normalize,
           int idx,
           int idbatch) {
     const int idtheta = idx % Ntheta;
@@ -45,6 +46,7 @@ static void backprojection_polar_2d_kernel_cpu(
 
     complex64_t pixel{};
     float w_sum = 0.0f;
+    float w_sum2 = 0.0f;
 
     for(int i = 0; i < nsweeps; i++) {
         // Sweep reference position.
@@ -95,17 +97,23 @@ static void backprojection_polar_2d_kernel_cpu(
             if (az_int < 0 || az_int+1 >= g_naz) {
                 continue;
             }
-            const float w = interp2d<float>(g, g_naz, g_nel, az_int, az_frac, el_int, el_frac);
+            const float w = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
 
             pixel += w * s * ref;
             w_sum += w;
+            w_sum2 += w * w;
         } else {
             pixel += s * ref;
         }
     }
-    if (g != nullptr) {
-        if (w_sum > 0.0f) {
-            pixel *= nsweeps / w_sum;
+    // Normalize to same average as without antenna pattern.
+    // Unweighted: Σs = scene * Σg (signal has g)
+    // Weighted: Σ(s * g) = scene * Σg²
+    // To match: normalize by Σg / Σg²
+    // When normalize=false, skip this normalization (used in FFBP).
+    if (g != nullptr && normalize) {
+        if (w_sum2 > 0.0f) {
+            pixel *= w_sum / w_sum2;
         }
     }
     if (dealias) {
@@ -216,6 +224,7 @@ at::Tensor backprojection_polar_2d_cpu(
                           g_nel,
                           data_fmod/kPI,
                           alias_fmod/kPI,
+                          normalize,
                           idx, idbatch);
         }
     }

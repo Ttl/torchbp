@@ -675,7 +675,9 @@ def generate_fmcw_data(
             az_norm = 2.0 * (az_deg - g_az0) / (g_az1 - g_az0) - 1.0
             el_norm = 2.0 * (el_deg - g_el0) / (g_el1 - g_el0) - 1.0
 
-            grid = torch.stack([el_norm, az_norm], dim=-1)
+            # grid_sample maps grid[..., 0] -> width (azimuth) and
+            # grid[..., 1] -> height (elevation) of g, which is [nel, naz].
+            grid = torch.stack([az_norm, el_norm], dim=-1)
             grid = grid.unsqueeze(0).unsqueeze(0)  # [1, 1, N, 2]
 
             g_a = F.grid_sample(
