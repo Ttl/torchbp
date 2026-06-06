@@ -2715,17 +2715,10 @@ class TestAinsworth(TestCase):
     """Ainsworth polarimetric calibration on synthetic fully-polarimetric data
     generated with the NUFFT projector.
 
-    A patch of distributed clutter (independent scatterers obeying reflection
-    symmetry, plus one trihedral corner reflector) is passed through a known
-    polarimetric distortion ``M_true``, each channel is forward projected with
-    ``projection_cart_2d_nufft`` and backprojected, and ``ainsworth`` must
-    recover ``M_true**-1``.
-
-    Note: Ainsworth is orientation-angle preserving, so it recovers only the
-    crosstalk *differences*; the common-mode ``(u+z)/2``, ``(v+w)/2`` is
-    indistinguishable from a scene orientation angle and is left in place. The
-    distortion here therefore uses zero common-mode crosstalk (``z=-u``,
-    ``w=-v``) so it is fully recoverable.
+    A patch of distributed clutter is passed through a known
+    polarimetric distortion M_true, each channel is forward projected with
+    projection_cart_2d_nufft and backprojected, and ainsworth must
+    recover M_true.
     """
 
     # SAR parameters
@@ -2737,18 +2730,14 @@ class TestAinsworth(TestCase):
     def _distortion(self, device):
         """Known distortion matrix in [HH, HV, VH, VV] order (zero common-mode
         crosstalk, non-trivial channel imbalance k and alpha)."""
-        alpha = 1.15 * np.exp(1j * 0.20)   # cross-pol channel imbalance
-        k = 0.85 * np.exp(-1j * 0.35)      # co-pol HH/VV imbalance (needs corner)
-        u = 0.08 + 0.03j
-        v = -0.05 + 0.06j
-        w = -v                             # zero common-mode -> fully recoverable
-        z = -u
-        return torch.tensor([
-            [k * alpha,         v / alpha,     w * alpha,     v * w / (k * alpha)],
-            [z * k * alpha,     1 / alpha,     w * z * alpha, w / (k * alpha)],
-            [u * k * alpha,     u * v / alpha, alpha,         v / (k * alpha)],
-            [u * z * k * alpha, u / alpha,     z * alpha,     1 / (k * alpha)],
-        ], dtype=torch.complex64, device=device)
+        import torchbp.polarimetry as pol
+        u, v = 0.08 + 0.03j, -0.05 + 0.06j
+        return pol.distortion_matrix(
+            alpha=1.15 * np.exp(1j * 0.20),    # cross-pol channel imbalance
+            k=0.85 * np.exp(-1j * 0.35),       # co-pol HH/VV imbalance (needs corner)
+            u=u, v=v, w=-v, z=-u,              # zero common-mode -> fully recoverable
+            pol_order=["HH", "HV", "VH", "VV"],
+        ).to(device)
 
     def _make_scene(self, device, nx, ny):
         """Distributed clutter (reflection-symmetric) + one corner reflector,
@@ -2880,6 +2869,70 @@ class TestPolAntennaRotation(TestCase):
         # Rotating by +theta then -theta returns the original image.
         back = pol_antenna_rotation(rot, -0.4, pol_order=order)
         self.assertEqual(back, img, rtol=1e-5, atol=1e-5)
+
+
+class TestDistortionMatrix(TestCase):
+    """distortion_matrix builds the forward model that ainsworth inverts."""
+
+    def test_defaults_identity(self):
+        from torchbp.polarimetry import distortion_matrix
+        self.assertEqual(distortion_matrix(), torch.eye(4, dtype=torch.complex64),
+                         rtol=1e-6, atol=1e-6)
+
+    def test_inverted_by_ainsworth(self):
+        from torchbp.polarimetry import distortion_matrix, ainsworth
+        order = ["HH", "HV", "VH", "VV"]
+        u, v = 0.08 + 0.03j, -0.05 + 0.06j
+        M = distortion_matrix(alpha=1.15 * np.exp(1j * 0.20), k=0.85 * np.exp(-1j * 0.35),
+                              u=u, v=v, w=-v, z=-u, pol_order=order)   # zero common-mode
+        torch.manual_seed(0)
+        N = 300
+        g = lambda: (torch.randn(N * N) + 1j * torch.randn(N * N)) / np.sqrt(2)
+        shv = 0.4 * g()
+        S = torch.stack([g(), shv, shv.clone(), g()])
+        O = (M @ S).reshape(4, N, N)
+        Minv = ainsworth(O, pol_order=order, corner_hh_vv=(M[0, 0] / M[3, 3]).item())
+        R = Minv @ M
+        R = R / R[0, 0]
+        off = (R * (1 - torch.eye(4, dtype=R.dtype))).abs().max().item()
+        self.assertLess(off, 0.01)
+
+
+class TestOrientationAngle(TestCase):
+    """orientation_angle / orientation_angle_image must recover the rotation
+    angle applied to a reflection-symmetric scene by pol_antenna_rotation."""
+
+    order = ["HH", "HV", "VH", "VV"]
+
+    def _scene(self, n, seed=0):
+        import math
+        torch.manual_seed(seed)
+        g = lambda: (torch.randn(n, n) + 1j * torch.randn(n, n)) / math.sqrt(2)
+        shv = 0.4 * g()
+        # co-pol independent, cross-pol independent of co-pol, S_vh = S_hv.
+        return torch.stack([g(), shv, shv.clone(), g()])
+
+    def test_global_recovers_rotation(self):
+        import math
+        from torchbp.polarimetry import pol_antenna_rotation, orientation_angle
+        S = self._scene(256)
+        # An unrotated reflection-symmetric scene has ~zero orientation.
+        self.assertLess(
+            abs(math.degrees(orientation_angle(S, pol_order=self.order).item())), 1.0
+        )
+        for deg_true in [12.0, -20.0, 35.0]:
+            Sr = pol_antenna_rotation(S, math.radians(deg_true), pol_order=self.order)
+            est = math.degrees(orientation_angle(Sr, pol_order=self.order).item())
+            self.assertLess(abs(est - deg_true), 1.5)
+
+    def test_image_map(self):
+        import math
+        from torchbp.polarimetry import pol_antenna_rotation, orientation_angle_image
+        S = pol_antenna_rotation(self._scene(96), math.radians(15.0), pol_order=self.order)
+        m = orientation_angle_image(S, window=(11, 11), pol_order=self.order)
+        self.assertEqual(m.shape, (96, 96))
+        # The averaged map should be centred on the applied 15 degrees.
+        self.assertLess(abs(math.degrees(m.mean().item()) - 15.0), 3.0)
 
 
 if __name__ == "__main__":

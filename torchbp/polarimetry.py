@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from math import sin, cos
 from .ops import mul_2d_interp_linear
@@ -318,6 +319,66 @@ def ainsworth(
     return Minv
 
 
+def distortion_matrix(
+    alpha: complex = 1.0,
+    k: complex = 1.0,
+    u: complex = 0.0,
+    v: complex = 0.0,
+    w: complex = 0.0,
+    z: complex = 0.0,
+    pol_order: list = ["VV", "VH", "HV", "HH"],
+    device=None,
+    dtype: torch.dtype = torch.complex64,
+) -> Tensor:
+    """
+    Construct a polarimetric distortion matrix from channel imbalance and
+    crosstalk parameters. [1]_
+
+    Parameters
+    ----------
+    alpha : complex
+        Cross-pol (HV/VH) channel imbalance.
+    k : complex
+        Co-pol (HH/VV) channel imbalance.
+    u, v, w, z : complex
+        Crosstalk parameters. The receive crosstalk is ``[[1, w], [u, 1]]`` and
+        the transmit crosstalk ``[[1, v], [z, 1]]`` (the full crosstalk matrix is
+        their Kronecker product).
+    pol_order : list
+        Order of polarizations of the matrix rows and columns.
+    device : str
+        Pytorch device.
+    dtype : torch.dtype
+        Output dtype, normally ``torch.complex64``.
+
+    References
+    ----------
+    .. [1] T. L. Ainsworth, L. Ferro-Famil and Jong-Sen Lee, "Orientation angle
+        preserving a posteriori polarimetric SAR calibration," in IEEE Transactions
+        on Geoscience and Remote Sensing, vol. 44, no. 4, pp. 994-1003, April 2006.
+
+    Returns
+    -------
+    M : Tensor
+        4x4 polarimetric distortion matrix.
+    """
+    order = ["HH", "HV", "VH", "VV"]
+    permutation = [pol_order.index(order[i]) for i in range(4)]
+    M = torch.tensor(
+        [
+            [k * alpha,         v / alpha,     w * alpha,     v * w / (k * alpha)],
+            [z * k * alpha,     1 / alpha,     w * z * alpha, w / (k * alpha)],
+            [u * k * alpha,     u * v / alpha, alpha,         v / (k * alpha)],
+            [u * z * k * alpha, u / alpha,     z * alpha,     1 / (k * alpha)],
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    # Permutate from HH, HV, VH, VV to the requested pol_order.
+    M = M[permutation, :][:, permutation]
+    return M
+
+
 def apply_cal(sar_img: Tensor, cal: Tensor) -> Tensor:
     """
     Apply polarimetric calibration matrix to SAR image.
@@ -408,3 +469,128 @@ def pol_antenna_rotation(sar_img: Tensor, theta: float, pol_order: list = ["VV",
     # VV
     out_img[p[-1]] = svv * cost**2 + (shv + svh)*cost*sint + shh*sint**2
     return out_img
+
+
+def _orientation_coherency_fields(sar_img: Tensor, pol_order: list):
+    """Per-pixel coherency-matrix fields used by the orientation angle estimators.
+
+    Returns (t22, t33, t23) where t22 = |S_hh - S_vv|^2 / 2, t33 = 2 |S_hv|^2 and
+    t23 = (S_hh - S_vv) S_hv* (cross-pol averaged over HV and VH for reciprocity).
+    """
+    ch = sar_img.shape[0]
+    if ch not in (3, 4):
+        raise ValueError(f"SAR image has {ch} channels which doesn't match pol_order.")
+    cal_order = ["HH", "HV", "VH", "VV"] if ch == 4 else ["HH", "HV", "VV"]
+    p = [pol_order.index(o) for o in cal_order]
+    shh = sar_img[p[0]]
+    shv = sar_img[p[1]]
+    svv = sar_img[p[-1]]
+    svh = shv if ch == 3 else sar_img[p[2]]
+
+    d = shh - svv
+    sx = 0.5 * (shv + svh)   # reciprocity-symmetrized cross-pol, (S_hv + S_vh)/2
+    t22 = 0.5 * d.abs() ** 2
+    t33 = 2.0 * sx.abs() ** 2
+    t23 = d * sx.conj()
+    return t22, t33, t23
+
+
+def _orientation_from_fields(t22, t33, t23):
+    theta = 0.25 * torch.atan2(2.0 * t23.real, t22 - t33)
+    return theta
+
+
+def _orientation_boxcar(x: Tensor, window) -> Tensor:
+    """Sliding boxcar average keeping the input shape (replicate edges)."""
+    wh, ww = window
+    xp = F.pad(
+        x[None, None],
+        (ww // 2, ww - 1 - ww // 2, wh // 2, wh - 1 - wh // 2),
+        mode="replicate",
+    )
+    return F.avg_pool2d(xp, (wh, ww), stride=1)[0, 0]
+
+
+def orientation_angle(
+    sar_img: Tensor,
+    weight: Tensor | None = None,
+    pol_order: list = ["VV", "VH", "HV", "HH"],
+) -> Tensor:
+    """
+    Estimate a single global polarimetric orientation angle (POA). [1]_
+
+    Use `orientation_angle_image` for a spatially-varying orientation map.
+
+    Parameters
+    ----------
+    sar_img : Tensor
+        Input SAR image. Shape [3, M, N] or [4, M, N]. Use "HV" for the
+        cross-polarized channel if the image has three polarizations.
+    weight : Tensor or None
+        Optional spatial weight of shape [M, N] for the average.
+    pol_order : list
+        Order of polarizations in the SAR image.
+
+    References
+    ----------
+    .. [1] Jong-Sen Lee, D. L. Schuler and T. L. Ainsworth, "Polarimetric SAR
+        data compensation for terrain azimuth slope variation," in IEEE Transactions
+        on Geoscience and Remote Sensing, vol. 38, no. 5, pp. 2153-2163, Sept. 2000.
+
+    Returns
+    -------
+    theta : Tensor
+        Scalar orientation angle.
+    """
+    t22, t33, t23 = _orientation_coherency_fields(sar_img, pol_order)
+    if weight is not None:
+        wn = weight / weight.mean()
+        t22, t33, t23 = (wn * t22).mean(), (wn * t33).mean(), (wn * t23).mean()
+    else:
+        t22, t33, t23 = t22.mean(), t33.mean(), t23.mean()
+    return _orientation_from_fields(t22, t33, t23)
+
+
+def orientation_angle_image(
+    sar_img: Tensor,
+    window: "tuple | int" = (5, 5),
+    pol_order: list = ["VV", "VH", "HV", "HH"],
+) -> Tensor:
+    """
+    Estimate a per-pixel polarimetric orientation angle (POA) map. [1]_
+
+    Same estimator as `orientation_angle`, but the coherency-matrix terms are
+    averaged over a sliding boxcar window so a spatially-varying orientation
+    angle is returned (e.g. an orientation map induced by terrain slopes).
+
+    Parameters
+    ----------
+    sar_img : Tensor
+        Input SAR image. Shape [3, M, N] or [4, M, N]. Use "HV" for the
+        cross-polarized channel if the image has three polarizations.
+    window : tuple or int
+        Boxcar averaging window (height, width). A single int is used for both.
+        Larger windows reduce estimation noise but blur the map.
+    pol_order : list
+        Order of polarizations in the SAR image.
+
+    References
+    ----------
+    .. [1] Jong-Sen Lee, D. L. Schuler and T. L. Ainsworth, "Polarimetric SAR
+        data compensation for terrain azimuth slope variation," in IEEE Transactions
+        on Geoscience and Remote Sensing, vol. 38, no. 5, pp. 2153-2163, Sept. 2000.
+
+    Returns
+    -------
+    theta : Tensor
+        Orientation angle map of shape [M, N].
+    """
+    if isinstance(window, int):
+        window = (window, window)
+    t22, t33, t23 = _orientation_coherency_fields(sar_img, pol_order)
+    t22 = _orientation_boxcar(t22, window)
+    t33 = _orientation_boxcar(t33, window)
+    t23 = torch.complex(
+        _orientation_boxcar(t23.real, window), _orientation_boxcar(t23.imag, window)
+    )
+    return _orientation_from_fields(t22, t33, t23)
