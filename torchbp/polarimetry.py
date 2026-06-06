@@ -448,5 +448,5 @@ def pol_antenna_rotation(sar_img: Tensor, theta: float, pol_order: list = ["VV",
         # VH
         out_img[p[2]] = svh * cost**2  + (shh - svv)*cost*sint - shv*sint**2
     # VV
-    out_img[p[-1]] = svv * cost**2 - (shv + svh)*cost*sint + shh*sint**2
+    out_img[p[-1]] = svv * cost**2 + (shv + svh)*cost*sint + shh*sint**2
     return out_img
