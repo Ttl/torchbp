@@ -202,47 +202,39 @@ def ainsworth(
     )
     alpha = alpha.to(dtype=c.dtype)
 
-    if corner_hh_vv is not None:
-        k_guess = (corner_hh_vv / alpha**2) ** 0.5
-        if abs(k - k_guess) < abs(k + k_guess):
-            k = k_guess
-        else:
-            k = -k_guess
-
     k = k * torch.ones_like(alpha)
     uvwz = torch.zeros(4, dtype=c.dtype, device=c.device)
 
-    sigma = torch.tensor(
-        [
-            [
-                c[hh, hh] / (torch.abs(k) ** 2 * torch.abs(alpha) ** 2),
-                c[hh, hv] * alpha.conj() / (k * alpha),
-                c[hh, vh] / (k * torch.abs(alpha) ** 2),
-                c[hh, vv] * k.conj() * alpha.conj() / (k * alpha),
-            ],
-            [
-                c[hv, hh] * alpha / (k.conj() * alpha.conj()),
-                c[hv, hv] * torch.abs(alpha) ** 2,
-                c[hv, vh] * alpha / alpha.conj(),
-                c[hv, vv] * k.conj() * torch.abs(alpha) ** 2,
-            ],
-            [
-                c[vh, hh] / (k.conj() * torch.abs(alpha) ** 2),
-                c[vh, hv] * alpha.conj() / alpha,
-                c[vh, vh] / torch.abs(alpha) ** 2,
-                c[vh, vv] * k.conj() * alpha.conj() / alpha,
-            ],
-            [
-                c[vv, hh] * k * alpha / (k.conj() * alpha.conj()),
-                c[vv, hv] * k * torch.abs(alpha) ** 2,
-                c[vv, vh] * k * alpha / alpha.conj(),
-                c[vv, vv] * torch.abs(k) ** 2 * torch.abs(alpha) ** 2,
-            ],
-        ],
-        device=c.device,
-    )
+    # Remove the HH/VV channel imbalance k (resolved later from corner_hh_vv). The
+    # loop below estimates the cross-pol channel imbalance alpha and the crosstalk
+    # parameters u, v, w, z, which are insensitive to k.
+    K = torch.diag(torch.stack([k, torch.ones_like(k), torch.ones_like(k), 1 / k]))
+    # ck = inv(K) @ c @ inv(K).conj().T
+    ck = torch.linalg.solve(K, torch.linalg.solve(K.conj(), c.T).T)
 
     for i in range(max_iters):
+        u, v, w, z = uvwz[0], uvwz[1], uvwz[2], uvwz[3]
+        crosstalk = torch.tensor(
+            [[1, v, w, v * w], [z, 1, w * z, w], [u, u * v, 1, v], [u * z, u, z, 1]],
+            device=c.device,
+        )
+
+        # Remove the current crosstalk estimate, then re-estimate alpha from the
+        # de-crosstalked covariance on every iteration. Estimating alpha here,
+        # rather than once from the crosstalk-contaminated covariance, removes the
+        # alpha/crosstalk coupling that would otherwise leave a residual
+        # proportional to crosstalk * channel-imbalance.
+        # d = inv(crosstalk) @ ck @ inv(crosstalk).conj().T
+        d = torch.linalg.solve(crosstalk, torch.linalg.solve(crosstalk.conj(), ck.T).T)
+
+        alpha = torch.abs(d[vh, vh] / d[hv, hv]) ** 0.25 * torch.exp(
+            1j * torch.angle(d[vh, hv]) / 2
+        )
+        alpha = alpha.to(dtype=c.dtype)
+        a = torch.diag(torch.stack([alpha, 1 / alpha, alpha, 1 / alpha]))
+        # sigma = inv(a) @ d @ inv(a).conj().T
+        sigma = torch.linalg.solve(a, torch.linalg.solve(a.conj(), d.T).T)
+
         A = 0.5 * (sigma[hv, hh] + sigma[vh, hh])
         B = 0.5 * (sigma[hv, vv] + sigma[vh, vv])
 
@@ -290,41 +282,8 @@ def ainsworth(
         delta = delta[:4] + 1j * delta[4:]
 
         uvwz = uvwz + delta.squeeze()
-        u = uvwz[0]
-        v = uvwz[1]
-        w = uvwz[2]
-        z = uvwz[3]
 
-        crosstalk = torch.tensor(
-            [[1, v, w, v * w], [z, 1, w * z, w], [u, u * v, 1, v], [u * z, u, z, 1]],
-            device=c.device,
-        )
-
-        # sigma2 = torch.linalg.inv(crosstalk) @ sigma @ torch.linalg.inv(crosstalk.conj().T)
-        sigma2 = torch.linalg.solve(
-            crosstalk, torch.linalg.solve(crosstalk.conj(), sigma.T).T
-        )
-
-        alpha2 = torch.abs(sigma2[vh, vh] / sigma2[hv, hv]) ** 0.25 * torch.exp(
-            1j * torch.angle(sigma2[vh, hv]) / 2
-        )
-
-        a1 = torch.diag(
-            torch.tensor([alpha, 1 / alpha, alpha, 1 / alpha], device=c.device)
-        )
-        a2 = torch.diag(
-            torch.tensor([alpha2, 1 / alpha2, alpha2, 1 / alpha2], device=c.device)
-        )
-
-        M = a1 @ crosstalk @ a2
-
-        alpha = alpha * alpha2
-
-        # c = M @ sigma @ M.conj().T, solve for sigma
-        sigma = torch.linalg.solve(M, torch.linalg.solve(M.conj(), c.T).T)
-        # sigma = torch.linalg.inv(M) @ c @ torch.linalg.inv(M.conj().transpose())
-
-        if torch.abs(alpha2 - 1) < epsilon:
+        if delta.abs().max() < epsilon:
             break
 
     u = uvwz[0]
@@ -339,7 +298,6 @@ def ainsworth(
             k = k_guess
         else:
             k = -k_guess
-    print("k", torch.abs(k), torch.angle(k))
 
     M = torch.tensor(
         [
