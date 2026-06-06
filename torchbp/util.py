@@ -756,7 +756,7 @@ def wiener_normalize(
     sar: Tensor,
     tx_power: Tensor,
     eps: float | None = None,
-    noise_floor_percentile: float = 2.0,
+    calib_quantile: float = 0.1,
 ) -> Tensor:
     """
     SNR-aware radiometric normalization of a SAR image by an illumination map.
@@ -777,6 +777,15 @@ def wiener_normalize(
     as ``tx_power**2`` so the output goes to zero instead of amplifying noise. The
     SNR map itself is ``(tx_power / eps)**2``.
 
+    The regularization ``eps`` is the noise-to-signal amplitude ratio
+    :math:`\\varepsilon = \\sigma_n / \\sigma_s` **in tx_power units**, where
+    :math:`\\sigma_n` is the additive noise amplitude in the image and
+    :math:`\\sigma_s` is the reflectivity scale relating image to illumination
+    (``sar = s * tx_power + n``). It is the illumination level at which the SNR
+    equals one. Note this is *not* simply the noise level :math:`\\sigma_n`: it
+    must be divided by the reflectivity scale (which also absorbs the leftover
+    radiometric calibration constant of ``tx_power``).
+
     Parameters
     ----------
     sar : Tensor
@@ -788,24 +797,44 @@ def wiener_normalize(
         pixels) are treated as no-data and mapped to zero.
     eps : float or None
         Regularization level :math:`\\sigma_n / \\sigma_s` in ``tx_power`` units.
-        If None it is estimated automatically as the ``noise_floor_percentile``
-        percentile of ``|sar|``. For real data prefer passing an explicit value
-        from a known shadow region or the receiver noise level.
-    noise_floor_percentile : float
-        Percentile (0-100) of ``|sar|`` used to estimate ``eps`` when it is not
-        given. Default 2.0.
+        If None it is estimated from the data using the identity
+        :math:`E|\\mathrm{sar}|^2 = \\sigma_s^2\\,\\mathrm{tx\\_power}^2 +
+        \\sigma_n^2`: :math:`\\sigma_s^2` from the brightest ``calib_quantile``
+        fraction of pixels and :math:`\\sigma_n^2` from the dimmest fraction
+        (with the residual signal subtracted). For real data prefer passing an
+        explicit value from a known shadow region and a calibration target.
+    calib_quantile : float
+        Fraction (0-0.5) of pixels at each illumination extreme used to estimate
+        ``eps`` when it is not given. Default 0.1 (dimmest/brightest 10%).
 
     Returns
     -------
     s_hat : Tensor
         Normalized image, same dtype as ``sar``.
     """
-    mag = sar.abs()
-    if eps is None:
-        eps = torch.quantile(mag.flatten().float(), noise_floor_percentile / 100.0)
-    eps2 = float(eps) ** 2
     finite = torch.isfinite(tx_power)
     txp = torch.where(finite, tx_power, torch.zeros_like(tx_power))
+
+    if eps is None:
+        x = txp[finite].flatten().float()
+        y = (sar.abs()[finite].flatten().float()) ** 2  # |sar|^2
+        # torch.quantile caps at ~16M elements; subsample large images.
+        if x.numel() > 1_000_000:
+            sel = torch.randperm(x.numel(), device=x.device)[:1_000_000]
+            xq, yq = x[sel], y[sel]
+        else:
+            xq, yq = x, y
+        lo = torch.quantile(xq, calib_quantile)
+        hi = torch.quantile(xq, 1.0 - calib_quantile)
+        him = xq >= hi
+        lom = xq <= lo
+        # sigma_s^2 from bright (signal-dominated), sigma_n^2 from dim with the
+        # residual signal sigma_s^2 * tx_power^2 removed.
+        sigma_s2 = yq[him].mean() / (xq[him] ** 2).mean().clamp_min(1e-30)
+        sigma_n2 = (yq[lom].mean() - sigma_s2 * (xq[lom] ** 2).mean()).clamp_min(0.0)
+        eps = float((sigma_n2 / sigma_s2.clamp_min(1e-30)).sqrt())
+
+    eps2 = float(eps) ** 2
     s_hat = sar * txp / (txp * txp + eps2)
     # Un-illuminated (non-finite tx_power) pixels carry no signal -> zero.
     return torch.where(finite, s_hat, torch.zeros_like(s_hat))
