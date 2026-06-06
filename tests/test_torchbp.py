@@ -2743,14 +2743,15 @@ class TestAinsworth(TestCase):
         """Distributed clutter (reflection-symmetric) + one corner reflector,
         in [HH, HV, VH, VV] order."""
         def cn(scale):
-            return scale * (torch.randn(nx, ny, device=device)
-                            + 1j * torch.randn(nx, ny, device=device)) / np.sqrt(2)
+              z = scale * (torch.randn(nx, ny) + 1j*torch.randn(nx, ny)) / np.sqrt(2)
+              return z.to(device)
+
         shh, svv = cn(1.0), cn(1.0)        # co-pol, independent
         shv = cn(0.4)                      # cross-pol, independent of co-pol
         svh = shv.clone()                  # reciprocity
         # Trihedral corner reflector: HH=VV bright, HV=VH=0.
         cx, cy = nx // 2, ny // 2
-        shh[cx, cy] = svv[cx, cy] = 60.0
+        shh[cx, cy] = svv[cx, cy] = 200.0
         shv[cx, cy] = svh[cx, cy] = 0.0
         return torch.stack([shh, shv, svh, svv])
 
