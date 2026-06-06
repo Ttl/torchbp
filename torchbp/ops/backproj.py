@@ -762,6 +762,7 @@ def _prepare_backprojection_polar_2d_tx_power_args(
     pos: Tensor,
     att: Tensor,
     normalization: str | None = None,
+    azimuth_resolution: bool = True,
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d_tx_power operator.
 
@@ -800,7 +801,7 @@ def _prepare_backprojection_polar_2d_tx_power_args(
 
     return (wa, pos, att, g, nbatch, g_az0, g_el0, g_daz, g_del,
             g_naz, g_nel, nsweeps, r_res, r0, dr, theta0, dtheta,
-            nr, ntheta, norm)
+            nr, ntheta, norm, int(azimuth_resolution))
 
 
 def backprojection_polar_2d_tx_power(
@@ -812,6 +813,7 @@ def backprojection_polar_2d_tx_power(
     pos: Tensor,
     att: Tensor,
     normalization: str | None = None,
+    azimuth_resolution: bool = True,
 ) -> Tensor:
     """
     Calculate square root of transmitted power to image plane. Can be used to
@@ -861,6 +863,15 @@ def backprojection_polar_2d_tx_power(
             "gamma" to divide each value by of tan of incidence angle.
             "beta" or None for no incidence angle normalization.
             "point" to normalize to constant reflectivity (no ground patch).
+    azimuth_resolution : bool
+        If True (default), also normalize for the varying azimuth resolution.
+        The gain-weighted angular spread of the line of sight is
+        measured per pixel and folded into the returned power so that dividing a
+        SAR image by `tx_power` removes the residual azimuth brightness slope
+        (caused by the resolution cell growing toward the swath edges) in
+        addition to the antenna pattern and range falloff.
+        See :func:`backprojection_polar_2d_resolution` for the standalone map.
+        Set to False to get the pure antenna/range illumination.
 
     Returns
     -------
@@ -869,7 +880,7 @@ def backprojection_polar_2d_tx_power(
         pixel assuming constant reflectivity.
     """
     cpp_args = _prepare_backprojection_polar_2d_tx_power_args(
-        wa, g, g_extent, grid, r_res, pos, att, normalization
+        wa, g, g_extent, grid, r_res, pos, att, normalization, azimuth_resolution
     )
     return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(*cpp_args)
 
@@ -884,6 +895,7 @@ def backprojection_polar_2d_tx_power_slant(
     att: Tensor,
     altitude: float,
     normalization: str | None = None,
+    azimuth_resolution: bool = True,
 ) -> Tensor:
     """
     Slant-range variant of :func:`backprojection_polar_2d_tx_power`.
@@ -896,7 +908,7 @@ def backprojection_polar_2d_tx_power_slant(
 
     Parameters
     ----------
-    wa, g, g_extent, grid, r_res, pos, att, normalization
+    wa, g, g_extent, grid, r_res, pos, att, normalization, azimuth_resolution
         Same as :func:`backprojection_polar_2d_tx_power`.
     altitude : float
         Sensor altitude above ground (metres).  Must be > 0.
@@ -907,11 +919,169 @@ def backprojection_polar_2d_tx_power_slant(
         Same as :func:`backprojection_polar_2d_tx_power`.
     """
     cpp_args = _prepare_backprojection_polar_2d_tx_power_args(
-        wa, g, g_extent, grid, r_res, pos, att, normalization
+        wa, g, g_extent, grid, r_res, pos, att, normalization, azimuth_resolution
     )
     return torch.ops.torchbp.backprojection_polar_2d_tx_power_slant.default(
         *cpp_args, altitude
     )
+
+
+def backprojection_polar_2d_resolution(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "PolarGrid | dict",
+    fc: float,
+    pos: Tensor,
+    att: Tensor,
+    altitude: float = 0.0,
+    sweeps_chunk: int = 64,
+) -> Tensor:
+    """
+    Estimate the angular (azimuth) resolution of every polar pixel from the
+    trajectory and antenna pattern.
+
+    Parameters
+    ----------
+    wa : Tensor
+        Per-sweep amplitude weighting (window and/or transmit power), the same
+        ``wa`` passed to :func:`backprojection_polar_2d_tx_power`,
+        shape: [nsweeps] or [nbatch, nsweeps].
+    g : Tensor
+        Square-root of two-way antenna gain, shape: [elevation, azimuth].
+        See :func:`backprojection_polar_2d_tx_power`.
+    g_extent : list
+        ``[el0, az0, el1, az1]`` angular extent of ``g`` in radians.
+    grid : PolarGrid or dict
+        Polar grid definition, ``theta`` is the sine of the azimuth angle.
+    fc : float
+        Radar center frequency (Hz). Used for the wavelength ``c/fc``.
+    pos : Tensor
+        Platform position per sweep, shape: [nsweeps, 3] or [nbatch, nsweeps, 3].
+    att : Tensor
+        Antenna Euler angles [roll, pitch, yaw] per sweep, same shape as ``pos``.
+        Roll and yaw are used (pitch is ignored), matching
+        :func:`backprojection_polar_2d_tx_power`.
+    altitude : float
+        If > 0 the grid is treated as slant-range (BP origin at sensor altitude,
+        ``pos`` z ~ 0) and pixels are mapped to the ground using this altitude,
+        matching :func:`backprojection_polar_2d_tx_power_slant`. If 0 (default)
+        the grid is ground-range and the per-sweep ``pos`` z is used.
+    sweeps_chunk : int
+        Number of sweeps processed at once. Trades memory for speed, does not
+        affect the result.
+
+    Returns
+    -------
+    resolution : Tensor
+        Pseudo-polar map of the estimated angular azimuth resolution (radians),
+        shape [nr, ntheta] or [nbatch, nr, ntheta]. Pixels never illuminated by
+        any sweep are ``inf``.
+    """
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+
+    batched = wa.dim() == 2
+    if not batched:
+        wa = wa[None]
+        pos = pos[None]
+        att = att[None]
+    nbatch, nsweeps = wa.shape
+    assert pos.shape == (nbatch, nsweeps, 3)
+    assert att.shape == (nbatch, nsweeps, 3)
+
+    device = g.device
+    dtype = g.dtype
+    wl = 299792458.0 / fc
+
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_nel, g_naz = g.shape
+    g_del = (g_el1 - g_el0) / g_nel
+    g_daz = (g_az1 - g_az0) / g_naz
+
+    r = (r0 + dr * torch.arange(nr, device=device, dtype=dtype))[:, None]
+    theta = (theta0 + dtheta * torch.arange(ntheta, device=device, dtype=dtype))[None, :]
+    cos2 = 1.0 - theta * theta
+
+    # Pixel ground position, mirroring the tx_power kernel.
+    if altitude > 0.0:
+        r2cos2 = r * r * cos2
+        H2 = altitude * altitude
+        valid_pixel = r2cos2 >= H2
+        px_base = torch.sqrt(torch.clamp(r2cos2 - H2, min=0.0))
+        py_base = r * theta
+        h_all = torch.full((nbatch, 1, 1), float(altitude), device=device, dtype=dtype)
+    else:
+        valid_pixel = torch.ones((nr, ntheta), dtype=torch.bool, device=device)
+        px_base = r * torch.sqrt(torch.clamp(cos2, min=0.0))
+        py_base = r * theta
+        h_all = pos[:, :, 2]  # per sweep, filled in the loop
+
+    # Weighted moments of the line-of-sight azimuth angle.
+    W = torch.zeros((nbatch, nr, ntheta), device=device, dtype=dtype)
+    M1 = torch.zeros_like(W)
+    M2 = torch.zeros_like(W)
+
+    for s in range(0, nsweeps, sweeps_chunk):
+        e = min(s + sweeps_chunk, nsweeps)
+        # [nbatch, nchunk, 1, 1] broadcast against [nr, ntheta].
+        pos_x = pos[:, s:e, 0, None, None]
+        pos_y = pos[:, s:e, 1, None, None]
+        roll = att[:, s:e, 0, None, None]
+        yaw = att[:, s:e, 2, None, None]
+        wa_c = wa[:, s:e, None, None]
+
+        px = px_base - pos_x
+        py = py_base - pos_y
+        if altitude > 0.0:
+            h = h_all[:, :, :, None]  # broadcast scalar altitude
+        else:
+            h = pos[:, s:e, 2, None, None]
+        d = torch.sqrt(px * px + py * py + h * h)
+
+        look = torch.asin(torch.clamp(-h / d, min=-1.0, max=1.0))
+        el = look - roll
+        psi = torch.atan2(py, px)  # ground-frame LOS azimuth drives cross-range
+        az = psi - yaw             # antenna-frame azimuth selects the gain
+
+        el_idx = (el - g_el0) / g_del
+        az_idx = (az - g_az0) / g_daz
+        e0 = torch.floor(el_idx).long()
+        a0 = torch.floor(az_idx).long()
+        ef = el_idx - e0
+        af = az_idx - a0
+        inb = (e0 >= 0) & (e0 + 1 < g_nel) & (a0 >= 0) & (a0 + 1 < g_naz)
+        e0c = e0.clamp(0, g_nel - 2)
+        a0c = a0.clamp(0, g_naz - 2)
+        gf = g.reshape(-1)
+        i00 = e0c * g_naz + a0c
+        gi = (gf[i00] * (1 - ef) * (1 - af)
+              + gf[i00 + 1] * (1 - ef) * af
+              + gf[i00 + g_naz] * ef * (1 - af)
+              + gf[i00 + g_naz + 1] * ef * af)
+        gi = torch.where(inb, gi, torch.zeros_like(gi))
+
+        w = gi * gi * wa_c * wa_c / (d * d * d)
+        W += w.sum(dim=1)
+        M1 += (w * psi).sum(dim=1)
+        M2 += (w * psi * psi).sum(dim=1)
+
+    mean = M1 / W
+    var = torch.clamp(M2 / W - mean * mean, min=0.0)
+    dpsi = (12.0 ** 0.5) * torch.sqrt(var)
+    # Angular resolution: cross-range resolution lambda/(2*dpsi) divided by the
+    # pixel ground range. The range dependence of the cross-range resolution is
+    # already handled by backprojection_polar_2d_tx_power (1/d^3 weighting), so
+    # only this range-independent angular part remains as an azimuth residual.
+    r_ground = torch.sqrt(torch.clamp(px_base * px_base + py_base * py_base, min=0.0))
+    resolution = wl / (2.0 * dpsi * r_ground[None])
+    # Pixels with no illumination (or a single contributing sweep) have no
+    # measurable aperture; report them as infinite resolution.
+    resolution = torch.where((W > 0) & valid_pixel[None] & (dpsi > 0) & (r_ground[None] > 0),
+                             resolution, torch.full_like(resolution, float("inf")))
+
+    if not batched:
+        resolution = resolution[0]
+    return resolution
 
 
 @torch.library.register_fake("torchbp::backprojection_polar_2d")

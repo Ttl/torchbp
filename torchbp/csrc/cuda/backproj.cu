@@ -514,6 +514,7 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
           int Nr,
           int Ntheta,
           int normalization,
+          int azimuth_resolution,
           float altitude) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
@@ -530,10 +531,7 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
 
     // Pixel ground position and effective altitude for angle/distance computation.
     // altitude > 0: slant-range grid (BP origin at sensor altitude, pos z ≈ 0).
-    //   Map pixel to ground: x_g = sqrt(r²cos²θ - H²), y_g = r sinθ.
-    //   Use H for all vertical distance / angle calculations.
     // altitude == 0: ground-range grid (pos z = real altitude).
-    //   Pixel at (r cosθ, r sinθ, 0), use per-sweep pos_z.
     float px_base, py_base, z_eff;
     if (altitude > 0.0f) {
         float r2cos2 = r * r * cos2;
@@ -558,6 +556,11 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
     const float min_look_angle = sqrtf(2.0f * dr / h_ref);
 
     float pixel = 0.0f;
+    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
+    // used to estimate the azimuth resolution from the aperture.
+    float m_w = 0.0f;     // sum of weights
+    float m_mean = 0.0f;  // weighted mean of psi
+    float m_s = 0.0f;     // weighted sum of squared deviations
 
     for(int i = 0; i < nsweeps; i++) {
         // Sweep reference position.
@@ -571,13 +574,13 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         float pz2 = h * h;
 
         // Calculate distance to the pixel.
-
         float d = sqrtf(px * px + py * py + pz2);
 
         // Avoid nans due to numerical precision by clamping to valid range.
         const float look_angle = asinf(fmaxf(-h / d, -1.0f));
+        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
         const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
-        const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+        const float az_deg = psi - att[idbatch * nsweeps * 3 + 3 * i + 2];
         // TODO: consider platform pitch
 
         const float el_idx = (el_deg - g_el0) / g_del;
@@ -611,7 +614,28 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         // beta_0 otherwise
 
         float w = wa[idbatch * nsweeps + i];
-        pixel += g_i * g_i * w * w / (d*d*d * sinl);
+        // Plain illumination weight (no incidence term) for the moments.
+        const float wi = g_i * g_i * w * w / (d*d*d);
+        pixel += wi / sinl;
+
+        // Welford weighted update (numerically stable, handles squint).
+        const float wsum = m_w + wi;
+        const float delta = psi - m_mean;
+        m_mean += delta * wi / wsum;
+        m_s += wi * delta * (psi - m_mean);
+        m_w = wsum;
+    }
+
+    if (azimuth_resolution) {
+        const float Rg = sqrtf(px_base * px_base + py_base * py_base);
+        const float var = (m_w > 0.0f) ? m_s / m_w : 0.0f;
+        const float sigma = sqrtf(fmaxf(var, 0.0f));
+        if (sigma > 0.0f && Rg > 0.0f) {
+            pixel = pixel / (sigma * Rg);
+        } else {
+            // No measurable azimuth aperture (<=1 contributing sweep)
+            pixel = INFINITY;
+        }
     }
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = sqrtf(pixel);
 }
@@ -2228,7 +2252,8 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
           double dtheta,
           int64_t Nr,
           int64_t Ntheta,
-          int64_t normalization) {
+          int64_t normalization,
+          int64_t azimuth_resolution) {
 	TORCH_CHECK(wa.dtype() == at::kFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
@@ -2282,6 +2307,7 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
                   theta0, dtheta,
                   Nr, Ntheta,
                   normalization,
+                  azimuth_resolution,
                   0.0f);
 	return img;
 }
@@ -2307,6 +2333,7 @@ at::Tensor backprojection_polar_2d_tx_power_slant_cuda(
           int64_t Nr,
           int64_t Ntheta,
           int64_t normalization,
+          int64_t azimuth_resolution,
           double altitude) {
 	TORCH_CHECK(wa.dtype() == at::kFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
@@ -2360,6 +2387,7 @@ at::Tensor backprojection_polar_2d_tx_power_slant_cuda(
                   theta0, dtheta,
                   Nr, Ntheta,
                   normalization,
+                  azimuth_resolution,
                   static_cast<float>(altitude));
 	return img;
 }
