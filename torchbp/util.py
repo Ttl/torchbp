@@ -752,6 +752,65 @@ def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     c0 = 299792458
     return c0 * p / (4 * torch.pi * fc)
 
+def wiener_normalize(
+    sar: Tensor,
+    tx_power: Tensor,
+    eps: float | None = None,
+    noise_floor_percentile: float = 2.0,
+) -> Tensor:
+    """
+    SNR-aware radiometric normalization of a SAR image by an illumination map.
+
+    Plain division ``sar / tx_power`` inverts the illumination, but where the
+    illumination is weak (swath edges, antenna nulls) it divides receiver noise
+    by a near-zero number and the result blows up. This applies the Wiener (MMSE)
+    estimate instead:
+
+    .. math::
+
+        \\hat{s} = \\frac{\\mathrm{sar}\\cdot\\mathrm{tx\\_power}}
+                        {\\mathrm{tx\\_power}^2 + \\varepsilon^2}
+
+    which equals ``(sar / tx_power) * SNR / (1 + SNR)`` with the per-pixel power
+    SNR ``= (tx_power / eps)**2``. Where the illumination is strong it reduces to
+    the full normalization ``sar / tx_power``; where it is weak the gain rolls off
+    as ``tx_power**2`` so the output goes to zero instead of amplifying noise. The
+    SNR map itself is ``(tx_power / eps)**2``.
+
+    Parameters
+    ----------
+    sar : Tensor
+        Complex or magnitude SAR image, same pseudo-polar shape as ``tx_power``.
+    tx_power : Tensor
+        Illumination map from
+        :func:`torchbp.ops.backprojection_polar_2d_tx_power` (square root of power
+        returned for unit reflectivity). Non-finite entries (un-illuminated
+        pixels) are treated as no-data and mapped to zero.
+    eps : float or None
+        Regularization level :math:`\\sigma_n / \\sigma_s` in ``tx_power`` units.
+        If None it is estimated automatically as the ``noise_floor_percentile``
+        percentile of ``|sar|``. For real data prefer passing an explicit value
+        from a known shadow region or the receiver noise level.
+    noise_floor_percentile : float
+        Percentile (0-100) of ``|sar|`` used to estimate ``eps`` when it is not
+        given. Default 2.0.
+
+    Returns
+    -------
+    s_hat : Tensor
+        Normalized image, same dtype as ``sar``.
+    """
+    mag = sar.abs()
+    if eps is None:
+        eps = torch.quantile(mag.flatten().float(), noise_floor_percentile / 100.0)
+    eps2 = float(eps) ** 2
+    finite = torch.isfinite(tx_power)
+    txp = torch.where(finite, tx_power, torch.zeros_like(tx_power))
+    s_hat = sar * txp / (txp * txp + eps2)
+    # Un-illuminated (non-finite tx_power) pixels carry no signal -> zero.
+    return torch.where(finite, s_hat, torch.zeros_like(s_hat))
+
+
 def next_fast_len(n: int) -> int:
     """CuFFT-friendly length (powers of 2,3,5,7)"""
     def is_fast(k: int) -> bool:
