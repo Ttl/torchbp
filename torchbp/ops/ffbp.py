@@ -81,7 +81,7 @@ def ffbp(
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
-    weight_map_downsample: int = 4,
+    weight_map_downsample: int = 1,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -149,8 +149,10 @@ def ffbp(
         Antenna pattern extent: [g_el0, g_az0, g_el1, g_az1] in radians.
         Required when g is provided.
     weight_map_downsample : int
-        Downsample factor for weight maps relative to image grid. Default 4.
+        Downsample factor for weight maps relative to image grid. Default 1.
         Lower values give more accurate weights but use more memory.
+        Higher values reduce memory use and is faster to calculate, but
+        increases error especially if the antenna pattern is not wide.
 
     Returns
     -------
