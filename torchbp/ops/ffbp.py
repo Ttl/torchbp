@@ -61,6 +61,50 @@ def compute_subaperture_illumination(
     )
 
 
+def _weighted_normalize(
+    A: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    eps: float | None = None,
+    rel_floor: float = 1e-3,
+) -> Tensor:
+    """
+    Regularized (Wiener) normalization of antenna-pattern-weighted FFBP.
+
+    The weighted merge accumulates, per pixel, the gain-weighted sum
+    ``A = Sum_i g_i d_i`` and the illumination moments ``W1 = Sum_i g_i`` and
+    ``W2 = Sum_i g_i^2`` (``g_i`` is the amplitude antenna gain toward the pixel on
+    pulse ``i``). The SNR-optimal image is the matched filter ``A / W2`` rescaled
+    by ``W1`` to unweighted-backprojection brightness, i.e. ``A * W1 / W2``.
+
+    That divides by the illumination power ``W2``, which underflows to zero at
+    swath edges / antenna nulls, so a single low-gain sample blows a pixel up.
+    Regularizing the divisor fixes it::
+
+        img = A * W1 / (W2 + lambda)
+
+    ``W2 >> lambda`` (every illuminated target) recovers the matched filter
+    unchanged; ``W2 <~ lambda`` rolls off to zero instead of amplifying noise. The
+    value of ``lambda`` is not critical. It only sets how far below the signal
+    the weakly-illuminated residual sits, so by default it is a small fraction
+    ``rel_floor`` of the peak illumination power ``W2_max``.
+    """
+    # Bring decimated weight maps up to the image grid. The top-level
+    # merge already emits them at full resolution, so this is normally skipped.
+    if w1.shape != A.shape:
+        import torch.nn.functional as F
+        size = (A.shape[-2], A.shape[-1])
+        w1 = F.interpolate(w1[None, None].float(), size=size, mode="bilinear", align_corners=False)[0, 0]
+        w2 = F.interpolate(w2[None, None].float(), size=size, mode="bilinear", align_corners=False)[0, 0]
+
+    w2max = float(w2.max())
+    if w2max <= 0.0:
+        # nothing illuminated. A = 0
+        return A
+    lam = max(float(eps) ** 2 if eps is not None else 0.0, rel_floor * w2max)
+    return A * (w1 / (w2 + lam))
+
+
 def ffbp(
     data: Tensor,
     grid: "PolarGrid | dict",
@@ -82,6 +126,7 @@ def ffbp(
     g: Tensor | None = None,
     g_extent: list | None = None,
     weight_map_downsample: int = 1,
+    weight_eps: float | None = None,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -153,6 +198,14 @@ def ffbp(
         Lower values give more accurate weights but use more memory.
         Higher values reduce memory use and is faster to calculate, but
         increases error especially if the antenna pattern is not wide.
+    weight_eps : float or None
+        Regularization for the antenna-pattern (Wiener) normalization
+        ``img = A*W1/(W2 + weight_eps**2)``, in units of square-root illumination
+        power. See :func:`_weighted_normalize`. If None (default) a small fixed
+        fraction of the peak illumination power is used, which keeps illuminated
+        pixels at the matched-filter value and only suppresses weakly illuminated
+        ones. Exact value should not be critical.
+        Ignored when no antenna pattern is given.
 
     Returns
     -------
@@ -203,8 +256,13 @@ def ffbp(
         att, g, g_extent, weight_map_downsample,
         is_top_level=True
     )
-    # _ffbp_impl returns (img, weight_map, weight_grid), but ffbp() should return just img
-    return result[0]
+    # _ffbp_impl returns (img, w1_map, w2_map, weight_grid)
+    # Without an antenna pattern the image is already normalized
+    # With it the Wiener normalization is applied here
+    img = result[0]
+    if use_antenna_pattern:
+        img = _weighted_normalize(img, result[1], result[2], eps=weight_eps)
+    return img
 
 
 def _ffbp_impl(
@@ -228,7 +286,7 @@ def _ffbp_impl(
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
-    weight_map_downsample: int = 4,
+    weight_map_downsample: int = 1,
     is_top_level: bool = True,
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients."""
@@ -343,12 +401,13 @@ def _ffbp_impl(
         w1_map2, w2_map2, wgrid2 = img2[4], img2[5], img2[6]
 
         if use_antenna_pattern and w1_map1 is not None and w2_map1 is not None:
-            # Determine if we need to output weight map for next merge level
-            # Output weight maps unless this is the true top-level final merge
-            need_weight_output = not (is_top_level and is_final_merge)
+            # Carry the unnormalized accumulation A and the illumination moments
+            # W1, W2 up the tree. Wiener normalization is applied once in
+            # ffbp(). The top-level final merge emits full-resolution weight maps
+            # (decimation 1) so that normalization is exact per pixel.
+            final_top = is_top_level and is_final_merge
+            out_dec = 1 if final_top else weight_map_downsample
 
-            # Merge images with output grid 2x dense in theta
-            # Use weight_map_downsample as decimation factor for output weight maps
             img_sum, w1_out, w2_out, merged_weight_grid = ffbp_merge2_poly_weighted(
                 i1,
                 i2,
@@ -370,14 +429,9 @@ def _ffbp_impl(
                 w1_map1=w1_map2,
                 w2_map1=w2_map2,
                 weight_grid1=wgrid2,
-                output_weight_map=need_weight_output,
-                output_weight_decimation=weight_map_downsample,
+                output_weight_map=True,
+                output_weight_decimation=out_dec,
             )
-
-            if not need_weight_output:
-                w1_out = None
-                w2_out = None
-                merged_weight_grid = None
         else:
             # Standard merge (no antenna pattern)
             img_sum = ffbp_merge2(

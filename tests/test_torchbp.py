@@ -684,6 +684,56 @@ class TestFFBPAntennaPattern(TestCase):
         return dict(data=data, grid=grid, fc=fc, r_res=r_res, pos=pos,
                     att=att, g=g, g_extent=g_extent)
 
+    @staticmethod
+    def _make_narrow_beam_inputs(device):
+        """Narrow azimuth beam scanned across a wide swath. Many pixels are barely
+        illuminated, so the W1/W2 normalization divides by near-zero illumination
+        and (without regularization)."""
+        torch.manual_seed(0)
+        nsweeps = 128
+        sweep_samples = 128
+        fc = 6e9
+        r_res = 0.15
+        grid = {"r": (5, 12), "theta": (-0.5, 0.5), "nr": 96, "ntheta": 192}
+
+        pos = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        pos[:, 1] = (
+            torch.linspace(-nsweeps / 2, nsweeps / 2, nsweeps, device=device)
+            * 0.25 * 3e8 / fc
+        )
+        pos[:, 2] = 3.0
+
+        data = torch.randn(nsweeps, sweep_samples, device=device, dtype=torch.complex64)
+
+        nel, naz = 16, 64
+        el = torch.linspace(-1.2, 1.2, nel, device=device)
+        az = torch.linspace(-1.5, 1.5, naz, device=device)
+        # Very narrow azimuth beam
+        gain = torch.exp(-(el[:, None] / 0.6) ** 2) * torch.exp(-(az[None, :] / 0.04) ** 2)
+        g = gain.to(torch.float32)
+        g_extent = [el[0].item(), az[0].item(), el[-1].item(), az[-1].item()]
+
+        att = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        att[:, 0] = -float(np.arcsin(3.0 / 8.0))
+        att[:, 2] = torch.linspace(-0.45, 0.45, nsweeps, device=device) # scan
+        return dict(data=data, grid=grid, fc=fc, r_res=r_res, pos=pos,
+                    att=att, g=g, g_extent=g_extent)
+
+    def test_weighted_ffbp_no_blowup_downsample1(self):
+        """Weighted FFBP at downsample=1 must stay bounded at swath
+        edges instead of producing a large spike from dividing by near-zero
+        illumination."""
+        a = self._make_narrow_beam_inputs("cpu")
+        kw = dict(stages=3, divisions=2, dealias=True,
+                  att=a["att"], g=a["g"], g_extent=a["g_extent"])
+        img = torchbp.ops.ffbp(a["data"], a["grid"], a["fc"], a["r_res"], a["pos"],
+                               weight_map_downsample=1, **kw)
+        self.assertTrue(torch.isfinite(img).all())
+        # Output must be of the same order as the unweighted backprojection.
+        ref = torchbp.ops.backprojection_polar_2d(
+            a["data"], a["grid"], a["fc"], a["r_res"], a["pos"], dealias=True)
+        self.assertLess(float(img.abs().max()), 50.0 * float(ref.abs().max()))
+
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_weighted_ffbp_cpu_gpu(self):
         a = self._make_inputs("cuda")
