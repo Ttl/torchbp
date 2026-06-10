@@ -3,7 +3,15 @@
 // CPU backprojection, projection and GPGA ops. Mirrors cuda/backproj.cu.
 namespace torchbp {
 
-static void backprojection_polar_2d_kernel_cpu(
+// One range row of the image, theta processed in chunks.
+//
+// Structured for SIMD like projection_nufft_spread_row_cpu: per sweep, a
+// vectorizable geometry + phase pass writes per-pixel sample index, fraction
+// and reference phasor to small buffers, then a scalar pass does the
+// data-dependent sample gather and accumulates. The antenna gain path adds a
+// vectorizable angle pass (asinf_fast/atan2f_fast, a few ulp from libm) and
+// folds the bilinear gain gather into the scalar pass.
+static void backprojection_polar_2d_row_cpu(
           const complex64_t* data,
           const float* pos,
           const float* att,
@@ -31,99 +39,164 @@ static void backprojection_polar_2d_kernel_cpu(
           float data_fmod,
           float alias_fmod,
           bool normalize,
-          int idx,
+          int idr,
           int idbatch) {
-    const int idtheta = idx % Ntheta;
-    const int idr = idx / Ntheta;
-    if (idr >= Nr || idtheta >= Ntheta) {
-        return;
-    }
+    constexpr int CHUNK = 256;
+    float x_buf[CHUNK], y_buf[CHUNK];
+    float accr[CHUNK], acci[CHUNK];
+    float cs_buf[CHUNK], sn_buf[CHUNK], frac_buf[CHUNK];
+    int idx_buf[CHUNK];
+    float wsum_buf[CHUNK], wsum2_buf[CHUNK];
+    float ef_buf[CHUNK], af_buf[CHUNK];
+    int gi_buf[CHUNK];
 
     const float r = r0 + idr * dr;
-    const float theta = theta0 + idtheta * dtheta;
-    const float x = r * sqrtf(1.0f - theta*theta);
-    const float y = r * theta;
+    const complex64_t* data_b = data + (size_t)idbatch * nsweeps * sweep_samples;
+    const float* pos_b = pos + (size_t)idbatch * nsweeps * 3;
+    complex64_t* img_row = img + ((size_t)idbatch * Nr + idr) * Ntheta;
 
-    complex64_t pixel{};
-    float w_sum = 0.0f;
-    float w_sum2 = 0.0f;
+    for (int tb = 0; tb < Ntheta; tb += CHUNK) {
+        const int nchunk = std::min(CHUNK, Ntheta - tb);
 
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
-        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
-        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
-        float px = (x - pos_x);
-        float py = (y - pos_y);
-        float pz2 = pos_z * pos_z;
-
-        // Calculate distance to the pixel.
-        const float d = sqrtf(px * px + py * py + pz2);
-
-        float sx = delta_r * (d + d0);
-
-        // Linear interpolation.
-        int id0 = sx;
-        int id1 = id0 + 1;
-        if (id0 < 0 || id1 >= sweep_samples) {
-            continue;
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            const float theta = theta0 + (tb + q) * dtheta;
+            x_buf[q] = r * sqrtf(1.0f - theta*theta);
+            y_buf[q] = r * theta;
+            accr[q] = 0.0f;
+            acci[q] = 0.0f;
+            wsum_buf[q] = 0.0f;
+            wsum2_buf[q] = 0.0f;
         }
-        complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
-        complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
 
-        float interp_idx = sx - id0;
-        complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+        for(int i = 0; i < nsweeps; i++) {
+            // Sweep reference position.
+            const float pos_x = pos_b[i * 3 + 0];
+            const float pos_y = pos_b[i * 3 + 1];
+            const float pos_z = pos_b[i * 3 + 2];
+            const float pz2 = pos_z * pos_z;
+            const float* data_row = (const float*)(data_b + (size_t)i * sweep_samples);
 
-        float ref_sin, ref_cos;
-        sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
-        complex64_t ref = {ref_cos, ref_sin};
+            // Geometry + phase pass. idx = -1 marks pixels outside the data
+            // range window.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float px = x_buf[q] - pos_x;
+                const float py = y_buf[q] - pos_y;
 
-        if (g != nullptr) {
-            const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
-            const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
-            const float az_deg = atan2f(py, px) - att[idbatch * nsweeps * 3 + 3 * i + 2];
+                // Calculate distance to the pixel.
+                const float d = sqrtf(px * px + py * py + pz2);
 
-            const float el_idx = (el_deg - g_el0) / g_del;
-            const float az_idx = (az_deg - g_az0) / g_daz;
+                const float sx = delta_r * (d + d0);
+                const int id0 = (int)sx;
+                const bool ok = (id0 >= 0) & (id0 + 1 < sweep_samples);
+                idx_buf[q] = ok ? id0 : -1;
+                frac_buf[q] = sx - id0;
 
-            const int el_int = el_idx;
-            const int az_int = az_idx;
-            const float el_frac = el_idx - el_int;
-            const float az_frac = az_idx - az_int;
-
-            if (el_int < 0 || el_int+1 >= g_nel) {
-                continue;
+                float ref_sin, ref_cos;
+                sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+                cs_buf[q] = ref_cos;
+                sn_buf[q] = ref_sin;
             }
-            if (az_int < 0 || az_int+1 >= g_naz) {
-                continue;
-            }
-            const float w = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
 
-            pixel += w * s * ref;
-            w_sum += w;
-            w_sum2 += w * w;
-        } else {
-            pixel += s * ref;
+            if (g != nullptr) {
+                const float att0 = att[idbatch * nsweeps * 3 + 3 * i + 0];
+                const float att2 = att[idbatch * nsweeps * 3 + 3 * i + 2];
+                // Angle pass: bilinear antenna pattern coordinates.
+                // gi = -1 marks out-of-pattern pixels.
+#pragma omp simd
+                for (int q = 0; q < nchunk; q++) {
+                    const float px = x_buf[q] - pos_x;
+                    const float py = y_buf[q] - pos_y;
+                    const float d = sqrtf(px * px + py * py + pz2);
+                    const float sin_l = -pos_z / d;
+                    const float look_angle = asinf_fast(sin_l < -1.0f ? -1.0f : sin_l);
+                    const float el_deg = look_angle - att0;
+                    const float az_deg = atan2f_fast(py, px) - att2;
+
+                    const float el_idx = (el_deg - g_el0) / g_del;
+                    const float az_idx = (az_deg - g_az0) / g_daz;
+
+                    const int el_int = (int)el_idx;
+                    const int az_int = (int)az_idx;
+                    const bool ok = (el_int >= 0) & (el_int + 1 < g_nel) &
+                                    (az_int >= 0) & (az_int + 1 < g_naz);
+                    ef_buf[q] = el_idx - el_int;
+                    af_buf[q] = az_idx - az_int;
+                    gi_buf[q] = ok ? el_int * g_naz + az_int : -1;
+                }
+                // Scalar pass: gain and data gathers, accumulate.
+                for (int q = 0; q < nchunk; q++) {
+                    const int id0 = idx_buf[q];
+                    const int gi = gi_buf[q];
+                    if (id0 < 0 || gi < 0) {
+                        continue;
+                    }
+                    const float ef = ef_buf[q], af = af_buf[q];
+                    const float v00 = g[gi],         v01 = g[gi + 1];
+                    const float v10 = g[gi + g_naz], v11 = g[gi + g_naz + 1];
+                    const float w = v00 * (1.0f - ef) * (1.0f - af)
+                                  + v01 * (1.0f - ef) * af
+                                  + v10 * ef * (1.0f - af)
+                                  + v11 * ef * af;
+
+                    const float f = frac_buf[q];
+                    const float sr = (1.0f - f) * data_row[2*id0]     + f * data_row[2*id0 + 2];
+                    const float si = (1.0f - f) * data_row[2*id0 + 1] + f * data_row[2*id0 + 3];
+                    accr[q] += w * (sr * cs_buf[q] - si * sn_buf[q]);
+                    acci[q] += w * (sr * sn_buf[q] + si * cs_buf[q]);
+                    wsum_buf[q] += w;
+                    wsum2_buf[q] += w * w;
+                }
+            } else {
+                // Scalar pass: data gather (linear interpolation), multiply
+                // by reference and accumulate. Forcing this to vectorize
+                // with clamped indices + mask is slower: the vectorizer
+                // emulates the strided complex gather.
+                for (int q = 0; q < nchunk; q++) {
+                    const int id0 = idx_buf[q];
+                    if (id0 < 0) {
+                        continue;
+                    }
+                    const float f = frac_buf[q];
+                    const float sr = (1.0f - f) * data_row[2*id0]     + f * data_row[2*id0 + 2];
+                    const float si = (1.0f - f) * data_row[2*id0 + 1] + f * data_row[2*id0 + 3];
+                    accr[q] += sr * cs_buf[q] - si * sn_buf[q];
+                    acci[q] += sr * sn_buf[q] + si * cs_buf[q];
+                }
+            }
+        }
+        // Normalize to same average as without antenna pattern.
+        // Unweighted: Σs = scene * Σg (signal has g)
+        // Weighted: Σ(s * g) = scene * Σg²
+        // To match: normalize by Σg / Σg²
+        // When normalize=false, skip this normalization (used in FFBP).
+        if (g != nullptr && normalize) {
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float scale = wsum2_buf[q] > 0.0f ?
+                    wsum_buf[q] / wsum2_buf[q] : 1.0f;
+                accr[q] *= scale;
+                acci[q] *= scale;
+            }
+        }
+        if (dealias) {
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float d = sqrtf(x_buf[q]*x_buf[q] + y_buf[q]*y_buf[q] + z0*z0);
+                float ref_sin, ref_cos;
+                sincospi(-ref_phase * d + alias_fmod * idr, &ref_sin, &ref_cos);
+                const float pr = accr[q] * ref_cos - acci[q] * ref_sin;
+                const float pi = accr[q] * ref_sin + acci[q] * ref_cos;
+                accr[q] = pr;
+                acci[q] = pi;
+            }
+        }
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            img_row[tb + q] = complex64_t(accr[q], acci[q]);
         }
     }
-    // Normalize to same average as without antenna pattern.
-    // Unweighted: Σs = scene * Σg (signal has g)
-    // Weighted: Σ(s * g) = scene * Σg²
-    // To match: normalize by Σg / Σg²
-    // When normalize=false, skip this normalization (used in FFBP).
-    if (g != nullptr && normalize) {
-        if (w_sum2 > 0.0f) {
-            pixel *= w_sum / w_sum2;
-        }
-    }
-    if (dealias) {
-        const float d = sqrtf(x*x + y*y + z0*z0);
-        float ref_sin, ref_cos;
-        sincospi(-ref_phase * d + alias_fmod * idr, &ref_sin, &ref_cos);
-        complex64_t ref = {ref_cos, ref_sin};
-        pixel *= ref;
-    }
-    img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = pixel;
 }
 
 
@@ -200,8 +273,8 @@ at::Tensor backprojection_polar_2d_cpu(
 
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
-        for(int idx = 0; idx < Nr * Ntheta; idx++) {
-            backprojection_polar_2d_kernel_cpu(
+        for(int idr = 0; idr < Nr; idr++) {
+            backprojection_polar_2d_row_cpu(
                           data_ptr,
                           pos_ptr,
                           att_ptr,
@@ -225,7 +298,7 @@ at::Tensor backprojection_polar_2d_cpu(
                           data_fmod/kPI,
                           alias_fmod/kPI,
                           normalize,
-                          idx, idbatch);
+                          idr, idbatch);
         }
     }
 	return img;
