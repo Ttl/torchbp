@@ -59,6 +59,8 @@ def get_extensions():
             # machine is the run machine, it is safe to use its full
             # instruction set. Helps with CPU ops.
             f"-march=native",
+            "-fno-math-errno",
+            "-fno-trapping-math",
             "-fdiagnostics-color=always",
             "-fopenmp",
             # Min Python version 3.9; only meaningful for an abi3 build.

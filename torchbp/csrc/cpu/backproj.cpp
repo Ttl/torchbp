@@ -1035,6 +1035,13 @@ get_nufft_tables_cpu(int sweep_samples, int M_ext, float W, float beta, int N_LU
 
 // Geometry + KB spreading for one sweep row. This thread owns grid_row
 // (M_ext bins) exclusively, so the scatter needs no atomics.
+//
+// Structured for SIMD: pixels are processed in chunks, with geometry+phase pass
+// writing per-pixel amplitude and grid position to small buffers, followed by
+// a scatter pass into a pad-extended scratch row. The padding makes every tap
+// index in [j0*(half_W-1), j0+half_W] valid without the per-tap modulo of the
+// direct formulation, the pads are folded back once per row.  The antenna gain
+// uses asinf_fast/atan2f_fast, differing by a few ulp for libm.
 static void projection_nufft_spread_row_cpu(
           const complex64_t* img,   // [N] this batch's image
           const float* dem,         // [N] or nullptr
@@ -1054,70 +1061,151 @@ static void projection_nufft_spread_row_cpu(
     const float lut_scale = (float)(N_LUT - 1) * 2.0f / W;
     const int   half_W    = (int)(W * 0.5f);
 
-    for (int p = 0; p < N; p++) {
-        const int px_y = p % Ny;
-        const int px_x = p / Ny;
+    // Scratch row with half_W pad on both sides (tap indices span
+    // [-(half_W-1), M_ext+half_W]), sc indexes the unpadded part.
+    std::vector<complex64_t> scratch(M_ext + 2 * half_W + 1,
+                                     complex64_t(0.0f, 0.0f));
+    complex64_t* sc = scratch.data() + half_W;
+
+    constexpr int CHUNK = 256;
+    float ar_buf[CHUNK], ai_buf[CHUNK], up_buf[CHUNK];
+    float gain_buf[CHUNK], ef_buf[CHUNK], af_buf[CHUNK];
+    int gi_buf[CHUNK];
+    float zero_dem[CHUNK] = {};
+
+    const float pos_y = pos_s[1], pos_z = pos_s[2];
+    const float rvp_c = use_rvp ? gamma : 0.0f;
+
+    for (int px_x = 0; px_x < Nx; px_x++) {
         const float x = x0 + px_x * dx;
-        const float y = y0 + px_y * dy;
-        const float z = (dem != nullptr) ? dem[p] : 0.0f;
+        const float dpx  = x - pos_s[0];
+        const float dpx2 = dpx * dpx;
 
-        const float dpx = x - pos_s[0];
-        const float dpy = y - pos_s[1];
-        const float dpz = z - pos_s[2];
-        const float d2  = dpx*dpx + dpy*dpy + dpz*dpz;
-        const float d   = sqrtf(d2);
+        for (int yb = 0; yb < Ny; yb += CHUNK) {
+            const int nchunk = std::min(CHUNK, Ny - yb);
+            const float* img_f = (const float*)(img + (size_t)px_x * Ny + yb);
+            const float* dem_row = dem ? dem + (size_t)px_x * Ny + yb : nullptr;
+            const float* __restrict dem_q = dem_row ? dem_row : zero_dem;
+            const float ybase = y0 + yb * dy;
 
-        float norm = 1.0f / d2;
-        if (g != nullptr) {
-            const float look   = asinf(fmaxf(dpz / d, -1.0f));
-            const float el_deg = look - att_s[0];
-            const float az_deg = atan2f(dpy, dpx) - att_s[2];
-            const float el_idx = (el_deg - g_el0) / g_del;
-            const float az_idx = (az_deg - g_az0) / g_daz;
-            const int el_int = (int)el_idx, az_int = (int)az_idx;
-            if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
-                norm = 0.0f;
-            else
-                norm *= interp2d<float>(g, g_nel, g_naz,
-                                        el_int, el_idx - el_int,
-                                        az_int, az_idx - az_int);
-        }
-        if (normalization == 1) norm *= sqrtf(-dpz / d);
+            if (g == nullptr) {
+                for (int q = 0; q < nchunk; q++) gain_buf[q] = 1.0f;
+            } else {
+                const float att0 = att_s[0];
+                const float att2 = att_s[2];
+                float* __restrict ef_q = ef_buf;
+                float* __restrict af_q = af_buf;
+                int* __restrict gi_q = gi_buf;
+                // Vectorizable index pass: look/azimuth angles and bilinear
+                // coordinates. gi = -1 marks out-of-pattern pixels (gain 0);
+                // NaN angles (pixel exactly at or directly below the radar)
+                // convert to INT_MIN and take the same path.
+#pragma omp simd
+                for (int q = 0; q < nchunk; q++) {
+                    const float y = ybase + q * dy;
+                    const float z = dem_q[q];
+                    const float dpy = y - pos_y;
+                    const float dpz = z - pos_z;
+                    const float d = sqrtf(dpx2 + dpy*dpy + dpz*dpz);
+                    const float sin_l  = dpz / d;
+                    const float look   = asinf_fast(sin_l < -1.0f ? -1.0f : sin_l);
+                    const float el_deg = look - att0;
+                    const float az_deg = atan2f_fast(dpy, dpx) - att2;
+                    const float el_idx = (el_deg - g_el0) / g_del;
+                    const float az_idx = (az_deg - g_az0) / g_daz;
+                    const int el_int = (int)el_idx, az_int = (int)az_idx;
+                    const bool ok = (el_int >= 0) & (el_int + 1 < g_nel) &
+                                    (az_int >= 0) & (az_int + 1 < g_naz);
+                    ef_q[q] = el_idx - el_int;
+                    af_q[q] = az_idx - az_int;
+                    gi_q[q] = ok ? el_int * g_naz + az_int : -1;
+                }
+                // Scalar pass for the bilinear pattern lookup (gathers, which
+                // the vectorizer doesn't handle here).
+                for (int q = 0; q < nchunk; q++) {
+                    const int gi = gi_buf[q];
+                    if (gi < 0) { gain_buf[q] = 0.0f; continue; }
+                    const float ef = ef_buf[q], af = af_buf[q];
+                    const float v00 = g[gi],         v01 = g[gi + 1];
+                    const float v10 = g[gi + g_naz], v11 = g[gi + g_naz + 1];
+                    gain_buf[q] = v00 * (1.0f - ef) * (1.0f - af)
+                                + v01 * (1.0f - ef) * af
+                                + v10 * ef * (1.0f - af)
+                                + v11 * ef * af;
+                }
+            }
 
-        if (norm == 0.0f) continue;
+            const float* __restrict img_q = img_f;
+            const float* __restrict gain_q = gain_buf;
+            float* __restrict ar_q = ar_buf;
+            float* __restrict ai_q = ai_buf;
+            float* __restrict up_q = up_buf;
+            const bool gamma_norm = normalization == 1;
 
-        const complex64_t w_img = img[p];
-        const float wr = w_img.real() * norm;
-        const float wi = w_img.imag() * norm;
+            // Geometry + phase pass.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float y = ybase + q * dy;
+                const float z = dem_q[q];
+                const float dpy = y - pos_y;
+                const float dpz = z - pos_z;
+                const float d2  = dpx2 + dpy*dpy + dpz*dpz;
+                const float d   = sqrtf(d2);
 
-        const float tau  = 2.0f * (d + d0) / kC0;
-        const float nu_p = gamma * tau / fs;
+                float norm = gain_q[q] / d2;
+                norm *= gamma_norm ? sqrtf(-dpz / d) : 1.0f;
 
-        // exp(+j 2pi u_p k/M_ext) = exp(-j 2pi nu_p k) for integer k.
-        const float up = M_ext_f - nu_p * M_ext_f;
+                const float wr = img_q[2*q] * norm;
+                const float wi = img_q[2*q+1] * norm;
 
-        // Carrier phase + centering term exp(-j pi nu_p M).
-        float phase = -2.0f * fc * tau;
-        if (use_rvp) phase += gamma * tau * tau;
-        phase -= nu_p * M_ext_f * 0.5f;
-        float sn, cs;
-        sincospi(phase, &sn, &cs);
-        const float ar = wr * cs - wi * sn;
-        const float ai = wr * sn + wi * cs;
+                const float tau  = 2.0f * (d + d0) / kC0;
+                const float nu_p = gamma * tau / fs;
 
-        const int   j0  = (int)rintf(up);
-        const float frc = up - (float)j0;
+                // Carrier phase + centering term exp(-j pi nu_p M).
+                float phase = -2.0f * fc * tau;
+                phase += rvp_c * tau * tau;
+                phase -= nu_p * M_ext_f * 0.5f;
+                float sn, cs;
+                sincospi(phase, &sn, &cs);
 
-        for (int delta = -(half_W - 1); delta <= half_W; ++delta) {
-            float dist    = fabsf(frc - (float)delta);
-            int   lut_idx = (int)(dist * lut_scale);
-            if (lut_idx > N_LUT - 1) lut_idx = N_LUT - 1;
-            float kb = kb_lut[lut_idx];
+                ar_q[q] = wr * cs - wi * sn;
+                ai_q[q] = wr * sn + wi * cs;
 
-            int gidx = ((j0 + delta) % M_ext + M_ext) % M_ext;
-            grid_row[gidx] += complex64_t(ar * kb, ai * kb);
+                // exp(+j 2pi u_p k/M_ext) = exp(-j 2pi nu_p k) for integer k.
+                // Wrapping nu_p to [0, 1) puts j0 in [0, M_ext] so the tap
+                // loop needs no modulo (pads + fold handle the edges).
+                const float nu_w = nu_p - floorf(nu_p);
+                up_q[q] = M_ext_f - nu_w * M_ext_f;
+            }
+
+            // Scatter pass. ar = ai = 0 means a masked (or zero) pixel:
+            // amplitude is a pure rotation of w, so it vanishes only when w
+            // does, and spreading an exact zero is a no-op.
+            for (int q = 0; q < nchunk; q++) {
+                const float ar = ar_buf[q], ai = ai_buf[q];
+                if (ar == 0.0f && ai == 0.0f) continue;
+                const float up = up_buf[q];
+                const int   j0  = (int)rintf(up);
+                const float frc = up - (float)j0;
+                complex64_t* dst = sc + j0;
+                for (int delta = -(half_W - 1); delta <= half_W; ++delta) {
+                    float dist    = fabsf(frc - (float)delta);
+                    int   lut_idx = (int)(dist * lut_scale);
+                    if (lut_idx > N_LUT - 1) lut_idx = N_LUT - 1;
+                    float kb = kb_lut[lut_idx];
+                    dst[delta] += complex64_t(ar * kb, ai * kb);
+                }
+            }
         }
     }
+
+    // Fold the pads back into the periodic grid row.
+    for (int k = 0; k < M_ext; k++)
+        grid_row[k] += sc[k];
+    for (int k = -half_W; k < 0; k++)
+        grid_row[k + M_ext] += sc[k];
+    for (int k = M_ext; k <= M_ext + half_W; k++)
+        grid_row[k - M_ext] += sc[k];
 }
 
 at::Tensor projection_cart_2d_nufft_cpu(

@@ -81,13 +81,60 @@ static void sincospi(T x, T *sinx, T *cosx) {
         c = c * u - 4.934794985432785f;
         c = c * u + 0.9999999672684953f;
         // Odd integer part of x flips the sign of both sinpi and cospi.
-        if (((int)k) & 1) { s = -s; c = -c; }
-        *sinx = s;
-        *cosx = c;
+        // Branchless so the function stays vectorizable when inlined into
+        // SIMD loops (and the branch is data-dependent, i.e. unpredictable).
+        const float sgn = 1.0f - 2.0f * (float)(((int)k) & 1);
+        *sinx = s * sgn;
+        *cosx = c * sgn;
     } else {
         *sinx = sin(static_cast<T>(kPI) * x);
         *cosx = cos(static_cast<T>(kPI) * x);
     }
+}
+
+// Branchless float asin (cephes single-precision coefficients), a few ulp
+// from libm asinf. No calls or branches, so it vectorizes when inlined into
+// SIMD loops. libm asinf blocks vectorization. |x| > 1 returns NaN.
+static inline float asinf_fast(float x) {
+    const float a = fabsf(x);
+    const bool big = a > 0.5f;
+    const float z1 = 0.5f * (1.0f - a);
+    const float z = big ? z1 : a * a;
+    const float w = big ? sqrtf(z1) : a;
+    float p = 4.2163199048e-2f;
+    p = p * z + 2.4181311049e-2f;
+    p = p * z + 4.5470025998e-2f;
+    p = p * z + 7.4953002686e-2f;
+    p = p * z + 1.6666752422e-1f;
+    p = p * z * w + w;
+    p = big ? 0.5f * kPI - 2.0f * p : p;
+    return copysignf(p, x);
+}
+
+// Branchless float atan2 (cephes single-precision polynomial), a few ulp from
+// libm atan2f. Vectorizable like asinf_fast. atan2f_fast(0, 0) is NaN where
+// libm returns 0.
+static inline float atan2f_fast(float y, float x) {
+    const float ax = fabsf(x), ay = fabsf(y);
+    // a = tan(angle folded to [0, pi/4]), in [0, 1]. Ternary min/max instead
+    // of fminf/fmaxf: the libm calls have NaN semantics that don't map to
+    // vmin/vmaxps, which blocks vectorization.
+    const float mn = ax < ay ? ax : ay, mx = ax < ay ? ay : ax;
+    const float a = mn / mx;
+    // Cephes-style second reduction to |t| <= tan(pi/8)
+    const bool red = a > 0.4142135623730950f;
+    const float t = red ? (a - 1.0f) / (a + 1.0f) : a;
+    const float z = t * t;
+    float r = 8.05374449538e-2f;
+    r = r * z - 1.38776856032e-1f;
+    r = r * z + 1.99777106478e-1f;
+    r = r * z - 3.33329491539e-1f;
+    r = r * z * t + t;
+    r = red ? r + 0.25f * kPI : r;
+    // Undo the min/max fold and the quadrant fold
+    r = ay > ax ? 0.5f * kPI - r : r;
+    r = x < 0.0f ? kPI - r : r;
+    return copysignf(r, y);
 }
 
 static inline float sinpi_f(float x) {
