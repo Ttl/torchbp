@@ -75,6 +75,32 @@ def get_batch_dims_img(img: Tensor, dorigin: Tensor) -> int:
     return nbatch
 
 
+def check_polar_grid_matches_img(img: Tensor, nr: int, ntheta: int) -> None:
+    """Validate that a polar grid's dimensions match the image tensor.
+
+    Parameters
+    ----------
+    img : Tensor
+        Image tensor, shape (nr, ntheta) or (nbatch, nr, ntheta)
+    nr : int
+        Number of range bins from the polar grid.
+    ntheta : int
+        Number of angle bins from the polar grid.
+
+    Raises
+    ------
+    ValueError
+        If the image's last two dimensions don't match (nr, ntheta).
+    """
+    img_nr, img_ntheta = img.shape[-2], img.shape[-1]
+    if (img_nr, img_ntheta) != (nr, ntheta):
+        raise ValueError(
+            f"Polar grid (nr={nr}, ntheta={ntheta}) does not match image "
+            f"shape {tuple(img.shape)} (expected last two dims "
+            f"({nr}, {ntheta}))."
+        )
+
+
 class AntennaPattern:
     """Encapsulate antenna gain pattern and extent.
 

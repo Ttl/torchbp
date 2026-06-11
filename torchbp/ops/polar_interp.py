@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 import numpy as np
 from typing import TYPE_CHECKING
-from ._utils import unpack_polar_grid, unpack_cartesian_grid, get_batch_dims_img
+from ._utils import unpack_polar_grid, unpack_cartesian_grid, get_batch_dims_img, check_polar_grid_matches_img
 
 if TYPE_CHECKING:
     from ..grid import PolarGrid, CartesianGrid
@@ -1248,6 +1248,7 @@ def _prepare_polar_to_cart_linear_args(
     nbatch = get_batch_dims_img(img, origin)
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
     x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid_cart)
+    check_polar_grid_matches_img(img, nr, ntheta)
 
     return (img, origin, nbatch, rotation, fc, r0, dr, theta0, dtheta,
             nr, ntheta, x0, y0, dx, dy, nx, ny, alias_fmod)
@@ -1366,6 +1367,7 @@ def polar_to_cart_lanczos(
 
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
     x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid_cart)
+    check_polar_grid_matches_img(img, nr, ntheta)
 
     return torch.ops.torchbp.polar_to_cart_lanczos.default(
         img,
