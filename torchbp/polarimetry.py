@@ -148,8 +148,9 @@ def ainsworth(
     weight: Tensor | None = None,
     k: complex = 1,
     pol_order: list = ["VV", "VH", "HV", "HH"],
-    max_iters: int = 50,
+    max_iters: int = 200,
     epsilon: float = 1e-6,
+    damping: float = 0.5,
     corner_hh_vv: complex | None = None,
 ) -> Tensor:
     """
@@ -169,6 +170,10 @@ def ainsworth(
         Maximum number of optimization iterations.
     epsilon: float
         Optimization termination threshold.
+    damping : float
+        Step damping factor in ``(0, 1]`` applied to the Gauss-Newton update
+        each iteration. The full step can overshoot and diverges on some
+        scenes. Lower value typically converges slower, but is more robust.
     corner_hh_vv : complex or None
         Measured HH/VV ratio of corner reflector.
         Used to solve for k if not None.
@@ -205,6 +210,9 @@ def ainsworth(
 
     k = k * torch.ones_like(alpha)
     uvwz = torch.zeros(4, dtype=c.dtype, device=c.device)
+    # Smallest-residual iterate seen so far. If iteration diverges, returns best
+    # estimate.
+    best = None
 
     # Remove the HH/VV channel imbalance k (resolved later from corner_hh_vv). The
     # loop below estimates the cross-pol channel imbalance alpha and the crosstalk
@@ -282,10 +290,19 @@ def ainsworth(
         delta = torch.linalg.solve(zeta_tau, Xr)
         delta = delta[:4] + 1j * delta[4:]
 
-        uvwz = uvwz + delta.squeeze()
+        resid = delta.abs().max()
+        # uvwz/alpha here are the point delta was evaluated at, so resid
+        # is that point's residual. Track the best one.
+        if best is None or resid < best[0]:
+            best = (resid, uvwz.detach().clone(), alpha)
+        uvwz = uvwz + damping * delta.squeeze()
 
-        if delta.abs().max() < epsilon:
+        if resid < epsilon:
             break
+
+    if best is not None:
+        uvwz = best[1]
+        alpha = best[2]
 
     u = uvwz[0]
     v = uvwz[1]
