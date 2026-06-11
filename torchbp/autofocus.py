@@ -1567,6 +1567,647 @@ def insar_rme_blocksvd_strata(
     return pos_s_new, delta
 
 
+def _interp1_linear(xq: Tensor, x: Tensor, y: Tensor) -> Tensor:
+    """
+    Linear interpolation of `y` sampled at ascending `x`, evaluated at `xq`.
+    `y` shape [..., len(x)]. Values outside `x` range are clamped to the
+    edge values.
+    """
+    idx = torch.searchsorted(x.contiguous(), xq.contiguous()).clamp(
+        1, x.shape[0] - 1
+    )
+    x0 = x[idx - 1]
+    x1 = x[idx]
+    t = ((xq - x0) / (x1 - x0)).clamp(0, 1)
+    return y[..., idx - 1] + t * (y[..., idx] - y[..., idx - 1])
+
+
+def insar_rme_multisquint(
+    img_m: Tensor,
+    img_s: Tensor,
+    pos_s: Tensor,
+    fc: float,
+    grid_polar: "PolarGrid | dict",
+    n_looks: int = 32,
+    look_width: float = 2.0,
+    n_r_bands: int = 4,
+    band_spacing: str = "elevation",
+    estimate_z: bool = False,
+    n_z_basis: int = 8,
+    aperture_mask: bool = True,
+    aperture_pad: float = 1.0,
+    patch_theta: int | None = None,
+    spatial_coherence: Tensor | None = None,
+    data_s: Tensor | None = None,
+    r_res: float | None = None,
+    max_iters: int = 1,
+    d0: float = 0.0,
+    data_fmod: float = 0.0,
+    dealias: bool = False,
+    alias_fmod: float = 0.0,
+    delta_lowpass: int = 0,
+    ls_reg: float = 0.1,
+    remove_trend: bool = True,
+    altitude: float | None = None,
+    return_phi_bands: bool = False,
+    verbose: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """
+    Multisquint InSAR residual motion error estimation [1]_ [2]_.
+
+    Image-domain method: in a polar-grid backprojection image the azimuth
+    (theta) spectrum maps linearly to along-track platform position,
+    ``f_theta = -(2/wl) * cos(el) * y``, so squinted sub-looks are bandpass
+    windows of the theta-axis FFT. For each range band and each adjacent
+    pair of looks, the double difference of the per-look interferograms
+
+        ``D_j = (L_m_j * conj(L_s_j)) * conj(L_m_(j-1) * conj(L_s_(j-1)))``
+
+    cancels the look-independent topographic / baseline phase, leaving the
+    difference of the slave RME phase between the two look positions.
+    Coherently averaging ``D_j`` over the band and integrating the steps
+    gives the per-band slant-range error profile along the track; a
+    per-sweep weighted least squares across range bands separates X (and
+    optionally Z) position error using elevation angle diversity, as in
+    :func:`insar_rme_blocksvd_strata`.
+
+    Because the observable is a phase *difference* between adjacent looks,
+    no phase unwrapping is needed as long as the RME phase changes by less
+    than pi between look centers. Cost is a few FFTs per look — no
+    backprojection of slave data is required (unless ``max_iters > 1``).
+
+    The master image is assumed to be focused (autofocused first) and both
+    images must be formed on the same polar grid in the same coordinate
+    frame. Constant slant-range error is unobservable (absorbed into the
+    baseline estimate); the returned correction is zero-mean per axis.
+    Along-track (Y) error is not estimated; its first-order effect on the
+    look phases averages out over a symmetric azimuth extent.
+
+    Parameters
+    ----------
+    img_m : Tensor
+        Master image [nr, ntheta] formed on ``grid_polar``. Assumed free of
+        motion error.
+    img_s : Tensor
+        Slave image [nr, ntheta] formed on the same grid with positions
+        ``pos_s``.
+    pos_s : Tensor
+        Slave platform positions [nsweeps, 3] in the backprojection frame.
+        Along-track (Y) coordinates must be ascending.
+    fc : float
+        RF center frequency in Hz.
+    grid_polar : PolarGrid or dict
+        Polar grid definition.
+    n_looks : int
+        Number of squinted looks across the along-track extent. The
+        recovered error profile has ``n_looks`` samples along the track,
+        interpolated to sweeps; RME components faster than
+        ``nsweeps / (2 * n_looks)`` cycles per aperture are not resolved.
+    look_width : float
+        Look bandwidth in units of look spacing. Wider looks have more
+        spectral bins (less phase noise) but lower along-track
+        resolution. The double differences are taken between looks
+        ``ceil(look_width)`` apart so the differenced windows share no
+        spectral bins; shared speckle content would bias the phase
+        steps toward zero.
+    n_r_bands : int
+        Number of range bands. Must be >= 2 for ``estimate_z``.
+    band_spacing : "elevation" | "range"
+        Band edge spacing, see :func:`insar_rme_blocksvd_strata`.
+    estimate_z : bool
+        Also solve for Z position error. Requires elevation-angle
+        diversity across the range swath.
+    n_z_basis : int
+        Number of linear-interpolation basis knots for the Z error
+        profile. Z is observed only through the band-differential of the
+        look phases, which is noisier than their common mode; a coarse
+        basis trades Z bandwidth for stability. Z components faster than
+        ``n_z_basis / 2`` cycles per aperture are not resolved.
+    aperture_mask : bool
+        Zero out pixels outside a look's angular aperture (using the grid
+        theta extent as the beam proxy) when averaging the double
+        differences.
+    aperture_pad : float
+        Multiplier on the grid theta extent used by ``aperture_mask``.
+    patch_theta : int or None
+        Azimuth multilook patch length (pixels) applied to the per-look
+        interferograms before double-differencing. None (default)
+        chooses about one look azimuth-resolution cell. Must be small
+        enough that topographic phase is approximately constant over the
+        patch along theta.
+    spatial_coherence : Tensor [nr, ntheta] or None
+        Optional per-pixel coherence map; squared and used as a pixel
+        weight in the double-difference averages.
+    data_s : Tensor or None
+        Range-compressed slave data [nsweeps, samples]. Only needed when
+        ``max_iters > 1`` to reform the slave image between iterations.
+    r_res : float or None
+        Range bin resolution of ``data_s``. Required when ``max_iters > 1``.
+    max_iters : int
+        Number of estimation iterations. Iterating reforms the slave image
+        at the corrected positions, which sharpens the looks when the
+        initial error is large.
+    d0, data_fmod, dealias, alias_fmod
+        Backprojection parameters used to reform the slave image between
+        iterations. Must match how ``img_s`` was formed.
+    delta_lowpass : int
+        If > 0, Hamming-window lowpass of this width (sweeps) applied to
+        the per-sweep correction.
+    ls_reg : float
+        Ridge regularization of the per-step least squares, relative to
+        the median double-difference weight. Shrinks the correction
+        toward zero where all bands have low SNR (track edges).
+    remove_trend : bool
+        Remove the weighted mean phase step per band before solving.
+        This removes linear error trends (unobservable, absorbed into
+        the baseline estimate) together with the deterministic
+        baseline-induced ramp of the look phases, which is
+        range-dependent and would otherwise leak into a slow X/Z drift.
+    altitude : float or None
+        Sensor altitude for slant-range grids, see
+        :func:`insar_rme_blocksvd_strata`. None infers altitude from
+        ``pos_s[:, 2]`` and uses ground-range geometry.
+    return_phi_bands : bool
+        Also return the per-band slant-range error phase interpolated to
+        sweeps, shape [n_r_bands, nsweeps].
+    verbose : bool
+        Print progress.
+
+    References
+    ----------
+    .. [1] P. Prats and J. J. Mallorqui, "Estimation of azimuth phase
+        undulations with multisquint multitemporal coregistration," in IEEE
+        Geoscience and Remote Sensing Letters, vol. 1, no. 4, pp. 268-271,
+        Oct. 2004.
+    .. [2] J. M. de Macedo, R. Scheiber and A. Moreira, "An Autofocus
+        Approach for Residual Motion Errors With Application to Airborne
+        Repeat-Pass SAR Interferometry," in IEEE Transactions on Geoscience
+        and Remote Sensing, vol. 46, no. 10, pp. 3151-3162, Oct. 2008.
+
+    Returns
+    -------
+    pos_s_new : Tensor [nsweeps, 3]
+        Corrected slave positions; X always corrected, Z only when
+        ``estimate_z=True``.
+    delta : Tensor [nsweeps, 3]
+        Total per-sweep XYZ correction added to ``pos_s``. Non-estimated
+        axes are zero.
+    phi_bands : Tensor [n_r_bands, nsweeps], optional
+        Returned when ``return_phi_bands=True``. Last iteration's
+        per-band RME phase.
+    """
+    r0_full, r1_full, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(
+        grid_polar
+    )
+    c0 = 299792458.0
+    wl = c0 / fc
+    k = 4.0 * torch.pi / wl
+    device = img_s.device
+    nsweeps = pos_s.shape[0]
+    n_axes = 1 + int(estimate_z)
+
+    if img_m.dim() == 3:
+        img_m = img_m.squeeze(0)
+    if img_s.dim() == 3:
+        img_s = img_s.squeeze(0)
+    for name, im in (("img_m", img_m), ("img_s", img_s)):
+        if im.shape[0] != nr or im.shape[1] != ntheta:
+            raise ValueError(
+                f"{name} shape {tuple(im.shape)} does not match "
+                f"grid_polar ({nr}, {ntheta})"
+            )
+    if n_looks < 3:
+        raise ValueError(f"n_looks ({n_looks}) must be >= 3")
+    if n_r_bands < n_axes:
+        raise ValueError(f"n_r_bands ({n_r_bands}) must be >= {n_axes}")
+    if max_iters > 1 and (data_s is None or r_res is None):
+        raise ValueError("data_s and r_res are required when max_iters > 1")
+
+    if spatial_coherence is not None:
+        sc = (
+            spatial_coherence.squeeze()
+            if spatial_coherence.dim() > 2
+            else spatial_coherence
+        )
+        if sc.shape != (nr, ntheta):
+            raise ValueError(
+                f"spatial_coherence shape {tuple(sc.shape)} does not match "
+                f"grid_polar ({nr}, {ntheta})"
+            )
+        coh_weight = (
+            torch.nan_to_num(sc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1) ** 2
+        ).to(dtype=torch.float32, device=device)
+    else:
+        coh_weight = None
+
+    if altitude is not None:
+        h = float(altitude)
+    else:
+        h = float(pos_s[:, 2].mean().item())
+    h = max(abs(h), 1e-3)
+
+    # Range band edges in pixel rows
+    if band_spacing == "elevation":
+        r0_eff = max(float(r0_full), 1e-3)
+        r1_eff = max(float(r1_full), r0_eff + 1e-3)
+        if altitude is not None:
+            # Slant-range grid: sin(el) = h / r
+            sin_el_lo = h / r1_eff
+            sin_el_hi = min(h / r0_eff, 1.0)
+        else:
+            sin_el_lo = h / np.sqrt(r1_eff ** 2 + h ** 2)
+            sin_el_hi = h / np.sqrt(r0_eff ** 2 + h ** 2)
+        sin_edges = np.linspace(sin_el_lo, sin_el_hi, n_r_bands + 1)
+        if altitude is not None:
+            r_edges_m = h / np.clip(sin_edges, 1e-6, None)
+        else:
+            r_edges_m = h * np.sqrt(np.clip(1.0 / sin_edges ** 2 - 1.0, 0, None))
+        r_edges_m = np.sort(r_edges_m)
+        edges = np.clip(
+            np.round((r_edges_m - r0_full) / dr).astype(int), 0, nr
+        ).tolist()
+        edges[0] = 0
+        edges[-1] = nr
+    elif band_spacing == "range":
+        edges = torch.linspace(0, nr, n_r_bands + 1).to(torch.long).tolist()
+    else:
+        raise ValueError(
+            f"band_spacing must be 'elevation' or 'range', got {band_spacing!r}"
+        )
+
+    # Look centers along track. End looks are pulled in by half the look
+    # bandwidth so their windows stay supported by the track; the profile
+    # is extrapolated as constant beyond them.
+    y_lo = float(pos_s[:, 1].min().item())
+    y_hi = float(pos_s[:, 1].max().item())
+    dy_look = (y_hi - y_lo) / (n_looks - 1)
+    half_bw_y = 0.5 * look_width * dy_look
+    y_looks = torch.linspace(
+        y_lo + half_bw_y,
+        y_hi - half_bw_y,
+        n_looks,
+        device=device,
+        dtype=torch.float32,
+    )
+    dy_look = float(y_looks[1] - y_looks[0])
+    half_bw_y = 0.5 * look_width * dy_look
+    # Lag between differenced looks: smallest separation at which the
+    # two spectral windows share no bins
+    lag = max(1, int(np.ceil(look_width - 1e-6)))
+    if n_looks < lag + 2:
+        raise ValueError(
+            f"n_looks ({n_looks}) must be >= ceil(look_width) + 2 ({lag + 2})"
+        )
+
+    # Theta-spectrum frequency axis, cycles per theta-unit
+    f_grid = torch.fft.fftfreq(ntheta, d=dtheta, device=device).to(torch.float32)
+    f_nyq = 0.5 / dtheta
+    theta_axis = theta0 + dtheta * torch.arange(
+        ntheta, device=device, dtype=torch.float32
+    )
+
+    pos_s_new = pos_s.clone()
+    delta = torch.zeros((nsweeps, 3), dtype=torch.float32, device=device)
+    img_s_cur = img_s
+    S_m = torch.fft.fft(img_m, dim=1)
+    phi_bands_swp = None
+
+    for iteration in range(max_iters):
+        S_s = torch.fft.fft(img_s_cur, dim=1)
+
+        # Per-row spectral mapping scale: the contribution from a sweep
+        # at along-track position y lands at theta-frequency
+        # f = -s(r) * y, with s varying across range. Using a per-row
+        # scale (instead of a band-center constant) keeps the selected y
+        # from drifting across rows, which would smear the look phases
+        # at the track ends.
+        r_rows = r0_full + dr * (
+            torch.arange(nr, device=device, dtype=torch.float32) + 0.5
+        )
+        if altitude is not None:
+            # Slant-range grid: r is slant range
+            cos_el_rows = (
+                torch.sqrt(torch.clamp(r_rows ** 2 - h ** 2, min=0.0)) / r_rows
+            )
+        else:
+            cos_el_rows = r_rows / torch.sqrt(r_rows ** 2 + h ** 2)
+        s_rows = (2.0 / wl) * cos_el_rows                        # [nr]
+        if verbose and iteration == 0:
+            f_need = float(s_rows.max()) * (
+                float(y_looks.abs().max()) + half_bw_y
+            )
+            if f_need > f_nyq:
+                print(
+                    "  look band exceeds theta Nyquist at far range, "
+                    "edge looks will be attenuated"
+                )
+
+        # Azimuth patch length for multilooking the per-look
+        # interferograms before double-differencing. The raw per-pixel
+        # product G_j * conj(G_(j-1)) is dominated by speckle terms
+        # common to the two overlapping looks, which attenuates the
+        # phase steps; summing G over patches of about one look
+        # azimuth-resolution cell first recovers the full step (the
+        # patch sum is the multilooked interferogram of the look pair).
+        # Patch must stay small enough that topographic phase is
+        # approximately constant within it along theta.
+        if patch_theta is None:
+            s_mean = float(s_rows.mean())
+            L_patch = int(round(0.5 / (s_mean * half_bw_y * dtheta)))
+            L_patch = max(4, min(L_patch, ntheta // 8))
+        else:
+            L_patch = max(1, int(patch_theta))
+        npatch = ntheta // L_patch
+        ntheta_p = npatch * L_patch
+
+        # Double differences are taken between looks `lag` apart so the
+        # two spectral windows share no bins. Shared speckle content
+        # between overlapping looks would otherwise add a zero-phase
+        # rail to the double difference (the master and slave
+        # self-overlap terms are real positive and survive all
+        # averaging), diluting every phase step by the shared-energy
+        # fraction.
+        ndiff = n_looks - lag
+        dd_bands = torch.zeros(
+            (n_r_bands, ndiff), dtype=torch.complex64, device=device
+        )
+        P_hist = [None] * n_looks
+        for j in range(n_looks):
+            xw = (f_grid[None, :] + s_rows[:, None] * float(y_looks[j])) / (
+                s_rows[:, None] * half_bw_y
+            )
+            W = torch.where(
+                xw.abs() < 1.0,
+                0.5 * (1.0 + torch.cos(torch.pi * xw)),
+                torch.zeros_like(xw),
+            ).to(torch.complex64)                                # [nr, ntheta]
+            L_m = torch.fft.ifft(S_m * W, dim=1)
+            L_s = torch.fft.ifft(S_s * W, dim=1)
+            G = L_m * torch.conj(L_s)
+            if coh_weight is not None:
+                G = G * coh_weight
+            if aperture_mask:
+                theta_rel = (
+                    theta_axis[None, :] - float(y_looks[j]) / r_rows[:, None]
+                )
+                mask = (theta_rel >= aperture_pad * theta0) & (
+                    theta_rel <= aperture_pad * theta1
+                )
+                G = G * mask.to(G.dtype)
+            # Multilooked look interferogram: sum over azimuth patches
+            P = G[:, :ntheta_p].reshape(nr, npatch, L_patch).sum(dim=2)
+            P_hist[j] = P
+            if j >= lag:
+                # angle of the double difference = phi_err(y_j) -
+                # phi_err(y_{j-lag}) projected on the look vector;
+                # topographic / baseline phase cancels. No unwrapping
+                # needed for sub-pi differences.
+                D = P * torch.conj(P_hist[j - lag])
+                P_hist[j - lag] = None
+                Dr = torch.cumsum(torch.sum(D, dim=1), dim=0)
+                for b in range(n_r_bands):
+                    i0, i1 = int(edges[b]), int(edges[b + 1])
+                    if i1 <= i0:
+                        continue
+                    lo = Dr[i0 - 1] if i0 > 0 else 0.0
+                    dd_bands[b, j - lag] = Dr[i1 - 1] - lo
+
+        steps_bands = torch.angle(dd_bands)
+        w_steps = dd_bands.abs()
+        band_rc = torch.zeros(n_r_bands, dtype=torch.float32, device=device)
+        band_valid = torch.zeros(n_r_bands, dtype=torch.bool, device=device)
+        for b in range(n_r_bands):
+            i0, i1 = int(edges[b]), int(edges[b + 1])
+            if i1 <= i0:
+                continue
+            band_rc[b] = r0_full + dr * 0.5 * (i0 + i1)
+            band_valid[b] = True
+
+        valid_idx = torch.where(band_valid)[0]
+        K = int(len(valid_idx))
+        if K < n_axes:
+            raise ValueError(f"Only {K} valid range bands, need >= {n_axes}")
+
+        if remove_trend:
+            # A constant step per band is a linear trend in the error
+            # profile: unobservable RME (absorbed into the baseline
+            # estimate) plus the deterministic baseline-induced phase
+            # ramp, which is range-dependent and would otherwise leak
+            # into a slow X/Z drift through the LS. Remove the weighted
+            # mean difference per band.
+            wm = torch.sum(w_steps * steps_bands, dim=1, keepdim=True) / (
+                torch.sum(w_steps, dim=1, keepdim=True) + 1e-30
+            )
+            steps_bands = steps_bands - wm
+
+        # Each lag difference is the sum of `lag` adjacent look steps:
+        # S_map [ndiff, npairs] with ones on the lag-wide band.
+        npairs = n_looks - 1
+        ii = torch.arange(ndiff, device=device)
+        jj_p = torch.arange(npairs, device=device)
+        S_map = (
+            (jj_p[None, :] >= ii[:, None]) & (jj_p[None, :] < ii[:, None] + lag)
+        ).to(torch.float32)                                      # [ndiff, npairs]
+
+        if verbose or return_phi_bands:
+            # Per-band profiles for diagnostics: solve adjacent steps
+            # from the lag differences per band, then integrate.
+            S_aug = torch.cat(
+                [S_map, 0.1 * torch.eye(npairs, device=device)], dim=0
+            )
+            rhs = torch.cat(
+                [
+                    steps_bands.t(),
+                    torch.zeros((npairs, n_r_bands), device=device),
+                ],
+                dim=0,
+            )
+            steps_diag = torch.linalg.lstsq(S_aug, rhs).solution  # [npairs, nbands]
+            phi_looks = torch.cat(
+                [
+                    torch.zeros((n_r_bands, 1), device=device),
+                    torch.cumsum(steps_diag.t(), dim=1),
+                ],
+                dim=1,
+            )
+            phi_looks = phi_looks - phi_looks.mean(dim=1, keepdim=True)
+            if verbose:
+                for b in valid_idx.tolist():
+                    dr_rms = (
+                        torch.sqrt(torch.mean(phi_looks[b] ** 2)).item()
+                        / k * 1000
+                    )
+                    print(
+                        f"  iter {iteration} band {b}: "
+                        f"r=[{r0_full + dr * edges[b]:.1f}, "
+                        f"{r0_full + dr * edges[b + 1]:.1f}] m, "
+                        f"Δr_rms={dr_rms:.2f} mm"
+                    )
+
+        # Position error difference over each lag interval, observed in
+        # slant range per band. The double difference phase is
+        # +k * l . (eps_j - eps_(j-lag)) where eps is the slave position
+        # error; the correction is its negation.
+        dr_diffs = -steps_bands[valid_idx] / k                   # [K, ndiff]
+
+        # Look vector from lag-interval midpoint to broadside band
+        # centroid, same conventions as insar_rme_blocksvd_strata
+        y_mid = 0.5 * (y_looks[lag:] + y_looks[:-lag])           # [ndiff]
+        rc_active = band_rc[valid_idx]
+        if altitude is not None:
+            H = float(altitude)
+            x_ground = torch.sqrt(
+                torch.clamp(rc_active ** 2 - H ** 2, min=1e-6)
+            )
+            dxs = x_ground[None, :].expand(ndiff, -1)            # [ndiff, K]
+            dys = -y_mid[:, None].expand(-1, K)
+            dzs = torch.full_like(dxs, -H)
+        else:
+            dxs = (rc_active[None, :] - float(pos_s[:, 0].mean())).expand(
+                ndiff, -1
+            )
+            dys = -y_mid[:, None].expand(-1, K)
+            dzs = torch.full_like(dxs, -float(pos_s[:, 2].mean()))
+        rg = torch.sqrt(dxs ** 2 + dys ** 2)
+        rs = torch.sqrt(rg ** 2 + dzs ** 2) + 1e-9
+        cos_el_m = rg / rs
+        sin_el_m = dzs / rs
+        cos_az_m = dxs / (rg + 1e-9)
+
+        m_x = (cos_az_m * cos_el_m).t()                          # [K, ndiff]
+        m_z = sin_el_m.t()
+
+        # Global weight normalization keeps the per-difference absolute
+        # SNR information so the ridge term can shrink low-SNR
+        # observations (track edges) toward zero instead of amplifying
+        # noise through the LS inverse.
+        W_ls = w_steps[valid_idx]                                # [K, ndiff]
+        W_ls = W_ls / (W_ls.median() + 1e-30)
+        sqrtW = W_ls.sqrt()
+
+        # Joint LS over all (band, difference) observations: X error
+        # step per adjacent look pair, Z error steps on a coarse linear
+        # basis. Z observability comes only from the band-differential
+        # of the observations, which is much noisier than their common
+        # mode, so Z gets fewer degrees of freedom than X.
+        nobs = K * ndiff
+        if estimate_z:
+            nz = int(max(2, min(n_z_basis, npairs)))
+            knots = torch.linspace(0, npairs - 1, nz, device=device)
+            jj = torch.arange(npairs, device=device, dtype=torch.float32)
+            dk = float(knots[1] - knots[0])
+            B_z = (1.0 - (jj[:, None] - knots[None, :]).abs() / dk).clamp(
+                min=0.0
+            )                                                    # [npairs, nz]
+            SB_z = S_map @ B_z                                   # [ndiff, nz]
+        else:
+            nz = 0
+        nunk = npairs + nz
+
+        A_blocks = []
+        for kb in range(K):
+            wb = sqrtW[kb][:, None]                              # [ndiff, 1]
+            A_x = S_map * (m_x[kb][:, None] * wb)                # [ndiff, npairs]
+            if estimate_z:
+                A_zb = SB_z * (m_z[kb][:, None] * wb)            # [ndiff, nz]
+                A_blocks.append(torch.cat([A_x, A_zb], dim=1))
+            else:
+                A_blocks.append(A_x)
+        A = torch.cat(
+            A_blocks + [ls_reg * torch.eye(nunk, device=device)], dim=0
+        )
+        yv = torch.cat(
+            [
+                (dr_diffs * sqrtW).reshape(-1),
+                torch.zeros(nunk, device=device),
+            ]
+        ).unsqueeze(-1)
+        sol = torch.linalg.lstsq(A, yv).solution.squeeze(-1)
+
+        steps_x = sol[:npairs]
+        steps_z = B_z @ sol[npairs:] if estimate_z else None
+
+        # Integrate the solved steps to the error profile at look centers
+        # and interpolate to sweeps
+        sol_steps = [steps_x]
+        if estimate_z:
+            sol_steps.append(steps_z)
+        sol_steps = torch.stack(sol_steps, dim=-1)               # [npairs, n_axes]
+        prof = torch.cat(
+            [
+                torch.zeros((1, n_axes), device=device),
+                torch.cumsum(sol_steps, dim=0),
+            ],
+            dim=0,
+        )                                                        # [n_looks, n_axes]
+        y_s = pos_s[:, 1].to(torch.float32)
+        delta_swp = _interp1_linear(y_s, y_looks, prof.t())      # [n_axes, nsweeps]
+
+        delta_it = torch.zeros(
+            (nsweeps, 3), dtype=torch.float32, device=device
+        )
+        delta_it[:, 0] = delta_swp[0]
+        if estimate_z:
+            delta_it[:, 2] = delta_swp[1]
+        delta_it = delta_it - delta_it.mean(dim=0, keepdim=True)
+
+        if delta_lowpass and delta_lowpass > 1:
+            L = int(delta_lowpass)
+            w = torch.hamming_window(L, device=device, dtype=torch.float32)
+            w = w / w.sum()
+            for ax in range(3):
+                if delta_it[:, ax].abs().max() == 0:
+                    continue
+                pad_l = L // 2
+                pad_r = L - pad_l - 1
+                vp = torch.nn.functional.pad(
+                    delta_it[:, ax][None, None], (pad_l, pad_r), mode="replicate"
+                )
+                delta_it[:, ax] = torch.nn.functional.conv1d(
+                    vp, w[None, None]
+                )[0, 0]
+
+        rms_it = torch.sqrt(torch.mean(torch.sum(delta_it ** 2, dim=1)))
+        if iteration > 0 and rms_it >= 0.9 * rms_prev:
+            # No further improvement: the remaining correction is at the
+            # per-iteration measurement noise floor and applying it
+            # would only add noise.
+            if verbose:
+                print(
+                    f"  iter {iteration}: correction RMS not decreasing, "
+                    "stopping"
+                )
+            break
+        rms_prev = rms_it
+
+        delta = delta + delta_it
+        pos_s_new = pos_s_new + delta_it
+        if return_phi_bands:
+            phi_bands_swp = _interp1_linear(y_s, y_looks, phi_looks[valid_idx])
+
+        if verbose:
+            rms = [
+                f"X={torch.sqrt(torch.mean(delta_it[:, 0] ** 2)).item() * 1000:.2f}"
+            ]
+            if estimate_z:
+                rms.append(
+                    f"Z={torch.sqrt(torch.mean(delta_it[:, 2] ** 2)).item() * 1000:.2f}"
+                )
+            print(
+                f"  iter {iteration} correction RMS (mm): " + ", ".join(rms)
+            )
+
+        if iteration < max_iters - 1:
+            img_s_cur = backprojection_polar_2d(
+                data_s, grid_polar, fc, r_res, pos_s_new, d0=d0,
+                dealias=dealias, data_fmod=data_fmod, alias_fmod=alias_fmod,
+            )[0]
+
+    if return_phi_bands:
+        return pos_s_new, delta, phi_bands_swp
+    return pos_s_new, delta
+
+
 def _get_kwargs() -> dict:
     frame = inspect.currentframe().f_back
     keys, _, _, values = inspect.getargvalues(frame)
