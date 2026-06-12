@@ -789,12 +789,18 @@ def wiener_normalize(
     Parameters
     ----------
     sar : Tensor
-        Complex or magnitude SAR image, same pseudo-polar shape as ``tx_power``.
+        Complex or magnitude SAR image. 2D ``(nr, ntheta)`` or 3D
+        ``(nbatch, nr, ntheta)``.
     tx_power : Tensor
         Illumination map from
         :func:`torchbp.ops.backprojection_polar_2d_tx_power` (square root of power
-        returned for unit reflectivity). Non-finite entries (un-illuminated
-        pixels) are treated as no-data and mapped to zero.
+        returned for unit reflectivity), real-valued with the same number of
+        dimensions as ``sar``. Its trailing two dimensions may be coarser than
+        ``sar``; if so it is bilinearly interpolated up to ``sar``'s grid on the
+        fly (via :func:`torchbp.ops.mul_2d_interp_linear` /
+        :func:`torchbp.ops.div_2d_interp_linear`) so no full-resolution map is
+        allocated. Non-finite entries (un-illuminated pixels) are treated as
+        no-data and mapped to zero.
     eps : float or None
         Regularization level :math:`\\sigma_n / \\sigma_s` in ``tx_power`` units.
         If None it is estimated from the data using the identity
@@ -812,12 +818,31 @@ def wiener_normalize(
     s_hat : Tensor
         Normalized image, same dtype as ``sar``.
     """
+    # When tx_power is coarser than sar image it is interpolated on the fly with
+    # the fused interp ops so no full-resolution illumination map is ever
+    # materialized.
+    interp = tuple(sar.shape[-2:]) != tuple(tx_power.shape[-2:])
+
     finite = torch.isfinite(tx_power)
     txp = torch.where(finite, tx_power, torch.zeros_like(tx_power))
 
     if eps is None:
-        x = txp[finite].flatten().float()
-        y = (sar.abs()[finite].flatten().float()) ** 2  # |sar|^2
+        if interp:
+            # Area-average the image power onto the (coarse) tx_power grid so each
+            # illumination sample is paired with the mean |sar|^2 it illuminates
+            p = sar.abs().to(torch.float32)
+            p = p * p
+            squeeze = p.dim() == 2
+            if squeeze:
+                p = p[None]
+            p = F.adaptive_avg_pool2d(p, tuple(txp.shape[-2:]))
+            if squeeze:
+                p = p[0]
+            x = txp[finite].flatten().float()
+            y = p[finite].flatten()
+        else:
+            x = txp[finite].flatten().float()
+            y = (sar.abs()[finite].flatten().float()) ** 2  # |sar|^2
         # torch.quantile caps at ~16M elements; subsample large images.
         if x.numel() > 1_000_000:
             sel = torch.randperm(x.numel(), device=x.device)[:1_000_000]
@@ -835,6 +860,19 @@ def wiener_normalize(
         eps = float((sigma_n2 / sigma_s2.clamp_min(1e-30)).sqrt())
 
     eps2 = float(eps) ** 2
+
+    if interp:
+        # Wiener combine with tx_power bilinearly interpolated up to sar's grid,
+        # built from the fused interp ops so no full-resolution illumination map
+        # is allocated:
+        #     s_hat = sar * interp(txp) / interp(txp**2 + eps**2)
+        # The denominator uses interp(txp**2) instead of interp(txp)**2, which
+        # can have slight error, but interpolation itself is already approximate.
+        from .ops import mul_2d_interp_linear, div_2d_interp_linear
+        num = mul_2d_interp_linear(sar, txp)
+        s_hat = div_2d_interp_linear(num, txp * txp + eps2)
+        return s_hat.reshape(sar.shape)
+
     s_hat = sar * txp / (txp * txp + eps2)
     # Un-illuminated (non-finite tx_power) pixels carry no signal -> zero.
     return torch.where(finite, s_hat, torch.zeros_like(s_hat))

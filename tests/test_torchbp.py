@@ -1227,6 +1227,66 @@ class TestDivMul2DInterpLinear(TestCase):
         torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
 
 
+class TestWienerNormalize(TestCase):
+    def _smooth_illumination(self, nb0, nb1):
+        yy, xx = torch.meshgrid(
+            torch.linspace(0, 1, nb0), torch.linspace(0, 1, nb1), indexing="ij"
+        )
+        return (0.3 + 0.7 * torch.sin(xx * 3.14159) * torch.cos(0.4 * yy)).clamp_min(
+            0.05
+        ).float()
+
+    def test_matching_shape_matches_formula(self):
+        """With equal shapes wiener_normalize is the plain elementwise estimate."""
+        from torchbp.util import wiener_normalize
+
+        txp = self._smooth_illumination(48, 32)
+        sar = torch.randn(48, 32, dtype=torch.complex64) * txp
+        eps = 0.05
+        out = wiener_normalize(sar, txp, eps=eps)
+        ref = sar * txp / (txp * txp + eps**2)
+        torch.testing.assert_close(out, ref)
+
+    def test_interp_approximates_full_res_wiener(self):
+        """A coarse tx_power is interpolated up; the result tracks the exact
+        full-resolution Wiener estimate to ~1% over smooth illumination."""
+        from torchbp.util import wiener_normalize
+
+        txp = self._smooth_illumination(17, 13)
+        v = F.interpolate(
+            txp[None, None], size=(128, 96), mode="bilinear", align_corners=True
+        )[0, 0]
+        sar = torch.randn(128, 96, dtype=torch.complex64) * v + 0.01 * torch.randn(
+            128, 96, dtype=torch.complex64
+        )
+        eps = 0.05
+        out = wiener_normalize(sar, txp, eps=eps)
+        ref = sar * v / (v * v + eps**2)
+        self.assertEqual(out.shape, sar.shape)
+        rel = (out - ref).abs().mean() / ref.abs().mean()
+        self.assertLess(float(rel), 0.05)
+
+    def test_interp_batched_matches_per_channel(self):
+        from torchbp.util import wiener_normalize
+
+        txp = self._smooth_illumination(9, 7)
+        sar = torch.randn(64, 48, dtype=torch.complex64)
+        eps = 0.05
+        out2d = wiener_normalize(sar, txp, eps=eps)
+        out3d = wiener_normalize(sar[None], txp[None], eps=eps)
+        torch.testing.assert_close(out3d[0], out2d)
+
+    def test_interp_auto_eps_is_finite(self):
+        from torchbp.util import wiener_normalize
+
+        txp = self._smooth_illumination(9, 7)
+        txp[:, 0] = float("nan")  # un-illuminated no-data edge
+        sar = torch.randn(64, 48, dtype=torch.complex64)
+        out = wiener_normalize(sar, txp)  # eps auto-estimated
+        self.assertEqual(out.shape, sar.shape)
+        self.assertTrue(torch.isfinite(out).all())
+
+
 class TestSubpixelCorrelation(TestCase):
     def sample_inputs(self, device, *, requires_grad=False, dtype=torch.float32):
         def make_tensor(size, dtype=dtype):
