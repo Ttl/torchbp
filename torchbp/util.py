@@ -891,6 +891,47 @@ def next_fast_len(n: int) -> int:
     return n
 
 
+def conv_lowpass_filter(data: Tensor, window_width: int) -> Tensor:
+    """
+    Time-domain lowpass filter: moving average with Hamming window taps
+    along the last axis, with replicate edge padding.
+
+    Time-domain alternative to :func:`fft_lowpass_filter_window`. Note
+    the different parameter meaning: ``window_width`` is the filter
+    length in samples (cutoff at roughly ``1 / window_width`` cycles per
+    sample), while the FFT variant's width is in frequency bins.
+    Replicate padding avoids the edge roll-off that zero padding causes
+    on short signals. Works for real and complex input.
+
+    Parameters
+    ----------
+    data : Tensor
+        Input tensor, filtered along the last axis.
+    window_width : int
+        Filter length in samples. Lengths <= 1 (or longer than the
+        signal) return the input unchanged.
+
+    Returns
+    -------
+    filtered_data : Tensor
+        Filtered tensor with the same shape as the input.
+    """
+    if window_width is None or window_width <= 1:
+        return data
+    L = int(window_width)
+    if L > data.shape[-1]:
+        return data
+    w = torch.hamming_window(L, device=data.device, dtype=torch.float32)
+    w = (w / w.sum()).to(data.dtype)
+    shape = data.shape
+    v = data.reshape(-1, 1, shape[-1])
+    vp = torch.nn.functional.pad(
+        v, (L // 2, L - L // 2 - 1), mode="replicate"
+    )
+    out = torch.nn.functional.conv1d(vp, w[None, None])
+    return out.reshape(shape)
+
+
 def fft_lowpass_filter_precalculate_window(
         data_length: int,
         window_width: int,

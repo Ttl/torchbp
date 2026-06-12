@@ -436,6 +436,93 @@ __global__ void gpga_backprojection_2d_kernel(
     }
 }
 
+// Inner product of one image block against one sweep's backprojection
+// footprint: alpha[b, m] = sum over the block's pixels of
+// conj(img[pix]) * data[m, interp] * exp(j (ref_phase d - data_fmod sx)).
+// Per-pixel math matches gpga_backprojection_2d_kernel (z=0 pixel plane,
+// linear range interpolation); the master image acts as the pixel
+// weighting so the [npix, nsweeps] footprint matrix is never
+// materialized. Mirrors blocksvd_alpha_kernel_cpu in cpu/backproj.cpp.
+__global__ void blocksvd_alpha_kernel(
+          const complex64_t* img,
+          const complex64_t* data,
+          const float* pos,
+          const int32_t* blocks,
+          complex64_t* alpha,
+          int sweep_samples,
+          int nsweeps,
+          int nblocks,
+          int Ntheta,
+          float ref_phase,
+          float delta_r,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          float d0,
+          float data_fmod) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idsweep = idx % nsweeps;
+    const int idblock = idx / nsweeps;
+
+    if (idblock >= nblocks || idsweep >= nsweeps) {
+        return;
+    }
+
+    const int ri0 = blocks[idblock * 6 + 0];
+    const int ri1 = blocks[idblock * 6 + 1];
+    const int ti0 = blocks[idblock * 6 + 2];
+    const int ti1 = blocks[idblock * 6 + 3];
+    const int sweep_lo = blocks[idblock * 6 + 4];
+    const int sweep_hi = blocks[idblock * 6 + 5];
+    // Output is pre-zeroed.
+    if (idsweep < sweep_lo || idsweep >= sweep_hi) {
+        return;
+    }
+
+    const float pos_x = pos[idsweep * 3 + 0];
+    const float pos_y = pos[idsweep * 3 + 1];
+    const float pos_z = pos[idsweep * 3 + 2];
+    const float pz2 = pos_z * pos_z;
+    const complex64_t* data_row = data + (size_t)idsweep * sweep_samples;
+
+    // Theta in the outer loop, range rows inner, mirroring
+    // blocksvd_alpha_kernel_cpu.
+    complex64_t acc = {0.0f, 0.0f};
+    for (int j = ti0; j < ti1; j++) {
+        const float theta = theta0 + j * dtheta;
+        const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
+
+        for (int i = ri0; i < ri1; i++) {
+            const float r = r0 + i * dr;
+            const float px = r * ct - pos_x;
+            const float py = r * theta - pos_y;
+
+            // Calculate distance to the pixel.
+            const float d = sqrtf(px * px + py * py + pz2);
+
+            const float sx = delta_r * (d + d0);
+
+            // Linear interpolation.
+            const int id0 = sx;
+            const int id1 = id0 + 1;
+            if (id0 < 0 || id1 >= sweep_samples) {
+                continue;
+            }
+            const complex64_t s0 = data_row[id0];
+            const complex64_t s1 = data_row[id1];
+            const float interp_idx = sx - id0;
+            const complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+
+            float ref_sin, ref_cos;
+            sincospif(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+            const complex64_t ref = {ref_cos, ref_sin};
+            acc += cuda::std::conj(img[(size_t)i * Ntheta + j]) * (s * ref);
+        }
+    }
+    alpha[(size_t)idblock * nsweeps + idsweep] = acc;
+}
+
 template<typename T>
 __global__ void gpga_backprojection_2d_lanczos_kernel(
           const float* target_pos,
@@ -2154,6 +2241,80 @@ at::Tensor gpga_backprojection_2d_cuda(
 	return data_out;
 }
 
+at::Tensor blocksvd_alpha_cuda(
+          const at::Tensor &img,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &blocks,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          int64_t nblocks,
+          int64_t Ntheta,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          double d0,
+          double data_fmod) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat);
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(blocks.dtype() == at::kInt);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(blocks.device().type() == at::DeviceType::CUDA);
+
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor data_contig = data.contiguous();
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor blocks_contig = blocks.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+	at::Tensor alpha = torch::zeros({nblocks, nsweeps}, options);
+    const c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+    const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const int32_t* blocks_ptr = blocks_contig.data_ptr<int32_t>();
+    c10::complex<float>* alpha_ptr = alpha.data_ptr<c10::complex<float>>();
+
+	const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+
+	dim3 thread_per_block = {256};
+	// Up-rounding division.
+    int threads = nblocks * nsweeps;
+	unsigned int block_x = (threads + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    blocksvd_alpha_kernel
+          <<<block_count, thread_per_block, 0, stream>>>(
+                  (const complex64_t*)img_ptr,
+                  (const complex64_t*)data_ptr,
+                  pos_ptr,
+                  blocks_ptr,
+                  (complex64_t*)alpha_ptr,
+                  sweep_samples,
+                  nsweeps,
+                  nblocks,
+                  Ntheta,
+                  ref_phase,
+                  delta_r,
+                  r0,
+                  dr,
+                  theta0,
+                  dtheta,
+                  d0,
+                  data_fmod/kPI);
+	return alpha;
+}
+
 at::Tensor gpga_backprojection_2d_lanczos_cuda(
           const at::Tensor &target_pos,
           const at::Tensor &data,
@@ -2751,6 +2912,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cuda);
   m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cuda);
   m.impl("gpga_backprojection_2d_lanczos", &gpga_backprojection_2d_lanczos_cuda);
+  m.impl("blocksvd_alpha", &blocksvd_alpha_cuda);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
   m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cuda);
   m.impl("projection_cart_2d", &projection_cart_2d_cuda);

@@ -11,6 +11,7 @@ from .ops import (
     backprojection_polar_2d,
     backprojection_cart_2d,
     gpga_backprojection_2d_core,
+    blocksvd_alpha,
     ffbp,
 )
 from .ops import entropy
@@ -18,6 +19,7 @@ from .util import (
     unwrap,
     unwrap_ref,
     detrend,
+    conv_lowpass_filter,
     fft_lowpass_filter_precalculate_window,
     fft_lowpass_filter_window,
     diff
@@ -966,11 +968,10 @@ def insar_rme_blocksvd(
     aperture_mask: bool = True,
     aperture_pad: float = 1.0,
     phi_lowpass: int = 0,
-    interp_method: str = "linear",
-    pixel_chunk: int = 256,
     spatial_coherence: Tensor | None = None,
     return_alpha: bool = False,
     return_magnitude: bool = False,
+    return_complex: bool = False,
     verbose: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """
@@ -984,15 +985,15 @@ def insar_rme_blocksvd(
     The image is tiled into `n_r_blocks x n_az_blocks` non-overlapping
     blocks. For each block `b`:
 
-    1. The block's pixel positions are passed as targets to
-       `gpga_backprojection_2d_core` on the slave data, producing
-       ``B[k, m] = data_s[m, r_idx(pix_k, m)] * exp(-j k R(pix_k, m))``,
-       i.e. the per-sweep slave backprojection footprint at the block's
-       pixels. Master is never demodulated to targets.
-    2. The per-block per-sweep statistic is the inner product against the
-       existing master image patch:
-       ``alpha^{(b)}_m = Sum_k conj(img_m[pix_k]) * B[k, m]``.
-       This is the closed-form maximizer (over per-sweep phase) of the
+    1. The per-block per-sweep statistic is the inner product of the
+       slave data's backprojection footprint at the block's pixels
+       against the existing master image patch:
+       ``alpha^{(b)}_m = Sum_k conj(img_m[pix_k]) * data_s[m, r_idx(pix_k, m)]
+       * exp(j k R(pix_k, m))``, computed by the fused
+       :func:`torchbp.ops.blocksvd_alpha` kernel (master is never
+       demodulated to targets and the per-pixel footprint matrix is
+       never materialized).
+    2. This is the closed-form maximizer (over per-sweep phase) of the
        block's coherent inner product, with the master image acting as the
        optimal pixel weighting.
 
@@ -1065,11 +1066,14 @@ def insar_rme_blocksvd(
         with a Hamming window of this width (in samples). Use a value
         much smaller than ``nsweeps_s`` and at least a few times smaller
         than the expected RME bandwidth. 0 disables filtering.
-    interp_method : str
-        Interpolation method passed to ``gpga_backprojection_2d_core``.
     return_alpha : bool
         If True, also return the [nblocks, nsweeps_s] alpha matrix for
         diagnostics.
+    return_complex : bool
+        If True, also return the raw per-sweep coherent sum ``v`` before
+        any lowpass filtering or unwrapping. Used by
+        :func:`insar_rme_blocksvd_strata` to do its own phase
+        post-processing.
     verbose : bool
         Print progress.
 
@@ -1079,8 +1083,13 @@ def insar_rme_blocksvd(
         Corrected slave positions (only the range component is modified).
     phi : Tensor [nsweeps_s]
         Estimated per-sweep RME phase, zero-mean.
+    v_mag : Tensor [nsweeps_s], optional
+        Returned only when ``return_magnitude=True``.
     alpha : Tensor [nblocks, nsweeps_s], optional
         Returned only when ``return_alpha=True``.
+    v_complex : Tensor [nsweeps_s], optional
+        Returned only when ``return_complex=True``. The RME phase is
+        ``-angle(v_complex)`` (before mean removal and unwrapping).
     """
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
     c0 = 299792458.0
@@ -1112,7 +1121,6 @@ def insar_rme_blocksvd(
     az_edges = torch.linspace(0, ntheta, n_az_blocks + 1).to(torch.long).tolist()
 
     nblocks = n_r_blocks * n_az_blocks
-    A = torch.zeros((nblocks, nsweeps_s), dtype=torch.complex64, device=device)
     block_power = torch.zeros(nblocks, device=device)
     pos_s_y = pos_s[:, 1]
 
@@ -1121,81 +1129,64 @@ def insar_rme_blocksvd(
     # patch when forming alpha, so each block's alpha automatically excludes
     # contributions from low-coherence pixels.
 
+    # Per-block pixel rectangles and aperture sweep windows for the fused
+    # kernel. The masked sweep set is an index interval when the
+    # along-track positions are monotonic; the kernel gets its hull
+    # [lo, hi) and the exact boolean mask is re-applied to alpha after,
+    # so non-monotonic tracks stay correct. Degenerate or fully masked
+    # blocks keep lo == hi == 0 and produce zero alpha rows.
+    blocks = torch.zeros((nblocks, 6), dtype=torch.int32)
+    if aperture_mask:
+        mask = torch.zeros(
+            (nblocks, nsweeps_s), dtype=torch.bool, device=device
+        )
     for ib in range(n_r_blocks):
         ri0, ri1 = r_edges[ib], r_edges[ib + 1]
-        if ri1 <= ri0:
-            continue
-        rc = r0 + dr * (
-            torch.arange(ri0, ri1, device=device, dtype=torch.float32) + 0.5
-        )
         for jb in range(n_az_blocks):
             ti0, ti1 = az_edges[jb], az_edges[jb + 1]
-            if ti1 <= ti0:
+            if ri1 <= ri0 or ti1 <= ti0:
                 continue
-            tc = theta0 + dtheta * (
-                torch.arange(ti0, ti1, device=device, dtype=torch.float32) + 0.5
-            )
-            R, T = torch.meshgrid(rc, tc, indexing="ij")
-            x = (R * torch.sqrt(torch.clamp(1.0 - T ** 2, min=0.0))).reshape(-1)
-            y = (R * T).reshape(-1)
-            z = torch.zeros_like(x)
-            img_m_patch = img_m_eff[ri0:ri1, ti0:ti1].reshape(-1)
-            kpix = x.shape[0]
-
             bidx = ib * n_az_blocks + jb
-            p_b = torch.sum(torch.abs(img_m_patch) ** 2)
-            block_power[bidx] = p_b
-
-            # Pre-slice sweeps by the block's aperture window so the
-            # CUDA kernel only visits sweeps that would survive the mask
+            block_power[bidx] = torch.sum(
+                torch.abs(img_m_eff[ri0:ri1, ti0:ti1]) ** 2
+            )
             if aperture_mask:
                 rc_mid = float(r0 + dr * 0.5 * (ri0 + ri1))
                 tc_mid = float(theta0 + dtheta * 0.5 * (ti0 + ti1))
                 rel_theta = (rc_mid * tc_mid - pos_s_y) / rc_mid
                 lo = aperture_pad * theta0
                 hi = aperture_pad * theta1
-                mask = (rel_theta >= lo) & (rel_theta <= hi)
-                sweep_idx = mask.nonzero(as_tuple=True)[0]
+                mask_b = (rel_theta >= lo) & (rel_theta <= hi)
+                sweep_idx = mask_b.nonzero(as_tuple=True)[0]
                 if sweep_idx.numel() == 0:
                     continue
-                data_s_b = data_s.index_select(0, sweep_idx)
-                pos_s_b = pos_s.index_select(0, sweep_idx)
+                mask[bidx] = mask_b
+                s_lo = int(sweep_idx[0])
+                s_hi = int(sweep_idx[-1]) + 1
             else:
-                sweep_idx = None
-                data_s_b = data_s
-                pos_s_b = pos_s
-
-            nsweeps_b = data_s_b.shape[0]
-            alpha_b = torch.zeros(
-                nsweeps_b, dtype=torch.complex64, device=device
+                s_lo, s_hi = 0, nsweeps_s
+            blocks[bidx] = torch.tensor(
+                [ri0, ri1, ti0, ti1, s_lo, s_hi], dtype=torch.int32
             )
-            for k0 in range(0, kpix, pixel_chunk):
-                k1 = min(k0 + pixel_chunk, kpix)
-                target_pos = torch.stack(
-                    [x[k0:k1], y[k0:k1], z[k0:k1]], dim=1
-                )
-                B = gpga_backprojection_2d_core(
-                    target_pos, data_s_b, pos_s_b, fc, r_res, d0,
-                    interp_method=interp_method, data_fmod=data_fmod,
-                )
-                alpha_b = alpha_b + torch.conj(img_m_patch[k0:k1]) @ B
-                del B
 
-            # Zero-padded sweeps contribute nothing to num/den, so
-            # coherence on alpha_b matches alpha over the full range.
-            if row_weight == "power":
-                w_b = 1.0 / (torch.sqrt(p_b) + 1e-20)
-            elif row_weight == "coherence":
-                num = torch.abs(alpha_b.sum()) ** 2
-                den = (alpha_b.abs() ** 2).sum() + 1e-30
-                w_b = num / den
-            else:
-                w_b = 1.0
+    A_raw = blocksvd_alpha(
+        img_m_eff.to(torch.complex64), data_s, pos_s, blocks.to(device),
+        fc, r_res, r0, dr, theta0, dtheta, d0=d0, data_fmod=data_fmod,
+    )
+    if aperture_mask:
+        A_raw = A_raw * mask
 
-            if sweep_idx is not None:
-                A[bidx].index_copy_(0, sweep_idx, alpha_b * w_b)
-            else:
-                A[bidx] = alpha_b * w_b
+    # Zero-padded sweeps contribute nothing to num/den, so the row
+    # weights match the values over each block's aperture window only.
+    if row_weight == "power":
+        w_b = 1.0 / (torch.sqrt(block_power) + 1e-20)
+    elif row_weight == "coherence":
+        num = torch.abs(A_raw.sum(dim=1)) ** 2
+        den = (A_raw.abs() ** 2).sum(dim=1) + 1e-30
+        w_b = num / den
+    else:
+        w_b = torch.ones(nblocks, device=device)
+    A = A_raw * w_b[:, None]
 
     if verbose:
         nz = int((block_power > 0).sum().item())
@@ -1215,25 +1206,13 @@ def insar_rme_blocksvd(
     phi = phi_wrapped - phi_wrapped.mean()
 
     if phi_lowpass and phi_lowpass > 1:
-        # Real-valued lowpass via Hamming window centered moving average,
-        # applied to exp(-j*phi) to avoid wrap discontinuities
-        w = torch.hamming_window(int(phi_lowpass), device=device,
-                                 dtype=torch.float32)
-        w = w / w.sum()
-        cphi = torch.exp(1j * phi)
-        cphi_padded = torch.nn.functional.pad(
-            cphi[None, None],
-            (int(phi_lowpass) // 2, int(phi_lowpass) - int(phi_lowpass) // 2 - 1),
-            mode="replicate",
+        # Lowpass applied to exp(j*phi) to avoid wrap discontinuities
+        phi = torch.angle(
+            conv_lowpass_filter(torch.exp(1j * phi), phi_lowpass)
         )
-        wcomplex = w.to(torch.complex64)[None, None]
-        cphi_smooth = torch.nn.functional.conv1d(cphi_padded, wcomplex)[0, 0]
-        phi = torch.angle(cphi_smooth)
 
     # Unwrap along the sweep axis
-    phi_np = phi.detach().cpu().numpy()
-    phi_np = np.unwrap(phi_np)
-    phi = torch.from_numpy(phi_np).to(device=device, dtype=torch.float32)
+    phi = unwrap(phi)
     phi = phi - phi.mean()
 
     d_corr = phi * (c0 / (4.0 * torch.pi * fc))
@@ -1250,6 +1229,8 @@ def insar_rme_blocksvd(
         out = out + (v_mag,)
     if return_alpha:
         out = out + (A_aligned,)
+    if return_complex:
+        out = out + (v_complex,)
     return out
 
 
@@ -1268,9 +1249,10 @@ def insar_rme_blocksvd_strata(
     data_fmod: float = 0.0,
     phi_lowpass: int = 0,
     delta_lowpass: int = 0,
+    z_lowpass: int | None = None,
+    ls_reg: float = 0.3,
+    robust_iters: int = 2,
     spatial_coherence: Tensor | None = None,
-    interp_method: str = "linear",
-    pixel_chunk: int = 256,
     return_phi_strata: bool = False,
     verbose: bool = False,
     altitude: float | None = None,
@@ -1285,6 +1267,16 @@ def insar_rme_blocksvd_strata(
     using the look vector from the slave platform to each strata
     centroid. The result is a per-sweep position correction (XZ or X depending
     on estimate_z).
+
+    The per-sweep system is solved as a ridge-regularized weighted least
+    squares with optional Huber reweighting across strata. The X and Z
+    columns of the system are strongly anti-correlated (both ``cos(el)``
+    and ``sin(el)`` are monotonic in range), so without regularization
+    differential noise between strata is amplified into large
+    anti-correlated X/Z errors. The ridge shrinks the solution toward
+    zero where all strata have low SNR, and the Huber pass rejects
+    strata whose residuals are inconsistent with the rest (layover,
+    decorrelated region).
 
     Same closed-form / no-master-GPGA / no-master-interpolation
     properties as `insar_rme_blocksvd`. Compared to the plain
@@ -1311,11 +1303,35 @@ def insar_rme_blocksvd_strata(
     estimate_z : bool
         If True, also solve for Z position error. Requires ``n_strata >= 2`` and
         meaningful elevation-angle diversity across strata.
-    d0, data_fmod, phi_lowpass, spatial_coherence, interp_method, pixel_chunk
+    d0, data_fmod, spatial_coherence
         Forwarded to per-strata :func:`insar_rme_blocksvd`.
+    phi_lowpass : int
+        If > 1, lowpass the per-strata phase with a Hamming window of
+        this width (sweeps) and use the result as the unwrapping
+        reference only: the full-band phase is kept as
+        ``unwrap(lowpass(phi)) + wrap(phi - lowpass(phi))``. This makes
+        the unwrap robust to per-sweep phase noise without discarding
+        high-frequency RME content. If 0, the raw phase is unwrapped
+        directly, which is fragile at low SNR.
     delta_lowpass : int
         If > 0, Hamming-window lowpass after the LS. Useful to suppress LS noise
         on Z when its conditioning is marginal.
+    z_lowpass : int or None
+        If > 1, additional Hamming-window lowpass applied to the Z
+        correction only. Z is observed through the band-differential of
+        the strata phases, which is much noisier than their common mode,
+        so it tolerates a tighter bandwidth than X. None (default) uses
+        ``phi_lowpass``; 0 disables.
+    ls_reg : float
+        Ridge regularization of the per-sweep least squares, relative to
+        the median per-(strata, sweep) weight. Shrinks the correction
+        toward zero where all strata have low SNR. Set to 0 to disable
+        (weights then revert to per-sweep normalization).
+    robust_iters : int
+        Number of Huber IRLS reweighting passes over the per-sweep LS.
+        Strata whose weighted residuals exceed 1.345 times the global
+        MAD scale are downweighted proportionally, rejecting
+        decorrelated or layover-dominated strata. 0 disables.
     return_phi_strata : bool
         If True, also return the [n_strata, nsweeps] per-strata phase
         matrix for diagnostics.
@@ -1368,11 +1384,10 @@ def insar_rme_blocksvd_strata(
                 f"grid_polar ({nr}, {ntheta})"
             )
 
-    # Strata edges in pixel units. "range" gives uniform Δr (legacy);
+    # Strata edges in pixel units. "range" gives uniform in ground range.
     # "elevation" gives uniform sin(el), spending more strata at near
     # range where the geometry varies fast and fewer at far range where
-    # sin(el) is nearly constant. The latter minimizes within-strata
-    # geometric error.
+    # sin(el) is nearly constant.
     if strata_spacing == "elevation":
         h = float(pos_s[:, 2].mean().item())
         h = max(abs(h), 1e-3)
@@ -1436,33 +1451,53 @@ def insar_rme_blocksvd_strata(
             if spatial_coherence is not None else None
         )
         if coh_s is not None:
-            # Mean coherence squared in this strata; downweights strata dominated by
-            # shadow / decorrelated pixels (e.g. far-range layover).
-            coh_per_strata[s] = (coh_s ** 2).mean()
+            # Power-weighted coherence squared in this strata: bright
+            # coherent scatterers dominate alpha, so weight the
+            # coherence by image power instead of taking a plain mean,
+            # which would underweight strata that are mostly dark
+            # decorrelated pixels but contain strong coherent targets.
+            p_img = img_m[i0:i1, :].abs() ** 2
+            coh_per_strata[s] = (
+                (p_img * coh_s ** 2).sum() / (p_img.sum() + 1e-30)
+            )
 
-        _pos_s_new, phi_s, v_mag_s = insar_rme_blocksvd(
+        _pos_s_new, _phi_unused, v_s = insar_rme_blocksvd(
             data_s, pos_s, img_m[i0:i1, :], fc, r_res, gp_s,
             n_az_blocks=n_az_blocks_per_strata, n_r_blocks=1,
             d0=d0, data_fmod=data_fmod,
             row_weight="coherence", align_blocks=True,
             aperture_mask=True, aperture_pad=1.0,
-            phi_lowpass=phi_lowpass,
-            interp_method=interp_method,
-            pixel_chunk=pixel_chunk,
+            phi_lowpass=0,
             spatial_coherence=coh_s,
-            return_magnitude=True,
+            return_complex=True,
             verbose=False,
         )
+        # Full-band phase with lowpass-referenced unwrap: the lowpassed
+        # phase picks the 2*pi branch, the wrapped residual keeps the
+        # high-frequency content that a plain lowpass would discard.
+        phi_raw = -torch.angle(v_s)
+        phi_raw = phi_raw - phi_raw.mean()
+        if phi_lowpass and phi_lowpass > 1:
+            phi_ref = torch.angle(
+                conv_lowpass_filter(torch.exp(1j * phi_raw), phi_lowpass)
+            )
+            phi_ref = unwrap(phi_ref)
+            phi_s = phi_ref + torch.angle(
+                torch.exp(1j * (phi_raw - phi_ref))
+            )
+        else:
+            phi_s = unwrap(phi_raw)
+        phi_s = phi_s - phi_s.mean()
         phi_per_strata[s] = phi_s
         dr_per_strata[s] = phi_s * (c0 / (4.0 * torch.pi * fc))
-        mag_per_strata[s] = v_mag_s
+        mag_per_strata[s] = v_s.abs()
         strata_rc[s] = rc
         strata_valid[s] = True
 
         if verbose:
             print(f"  strata {s}: r=[{r0_s:.1f}, {r1_s:.1f}] m, "
                   f"Δr_rms={torch.sqrt(torch.mean(dr_per_strata[s] ** 2)).item() * 1000:.2f} mm, "
-                  f"|v|={v_mag_s.mean().item():.2e}, "
+                  f"|v|={mag_per_strata[s].mean().item():.2e}, "
                   f"coh²={coh_per_strata[s].item():.3f}")
 
     valid_idx = torch.where(strata_valid)[0]
@@ -1508,25 +1543,45 @@ def insar_rme_blocksvd_strata(
     # Per-(strata, sweep) SNR weight from per-strata coherent magnitude.
     # Strata at far range have poorer SNR and contribute less to the LS.
     W = mag_per_strata[valid_idx].t()                        # [nsweeps, K]
-    # Multiply by per-strata mean coherence (γ**2): downweights strata
-    # dominated by shadowed / decorrelated regions even when their
+    # Multiply by per-strata power-weighted coherence (γ**2): downweights
+    # strata dominated by shadowed / decorrelated regions even when their
     # coherent magnitude is non-trivial due to bright clutter.
     coh_w = coh_per_strata[valid_idx]                        # [K]
     W = W * coh_w[None, :]
-    # Per-sweep normalization keeps the LS scale consistent
-    W = W / (W.amax(dim=1, keepdim=True) + 1e-30)
-    sqrtW = W.sqrt().unsqueeze(-1)                           # [nsweeps, K, 1]
-    Mw = M * sqrtW
-    yw = y * sqrtW
-
-    if K == n_axes:
-        # Closed-form when square; fall back to lstsq for ill-conditioned
-        try:
-            sol = torch.linalg.solve(Mw, yw)
-        except Exception:
-            sol = torch.linalg.lstsq(Mw, yw).solution
+    if ls_reg > 0:
+        # Global normalization keeps absolute SNR information so the
+        # ridge shrinks genuinely low-SNR sweeps toward zero instead of
+        # amplifying noise through the ill-conditioned X/Z inverse.
+        W = W / (W.median() + 1e-30)
     else:
-        sol = torch.linalg.lstsq(Mw, yw).solution
+        # Per-sweep normalization keeps the LS scale consistent
+        W = W / (W.amax(dim=1, keepdim=True) + 1e-30)
+    sqrtW = W.sqrt().unsqueeze(-1)                           # [nsweeps, K, 1]
+
+    if ls_reg > 0:
+        reg_rows = ls_reg * torch.eye(n_axes, device=device).unsqueeze(
+            0
+        ).expand(nsweeps_s, -1, -1)
+        reg_rhs = torch.zeros((nsweeps_s, n_axes, 1), device=device)
+
+    sqrtW_cur = sqrtW
+    for it in range(max(0, int(robust_iters)) + 1):
+        Mw = M * sqrtW_cur
+        yw = y * sqrtW_cur
+        if ls_reg > 0:
+            Mw = torch.cat([Mw, reg_rows], dim=1)
+            yw = torch.cat([yw, reg_rhs], dim=1)
+        sol = torch.linalg.lstsq(Mw, yw).solution            # [nsweeps, n_axes, 1]
+        if it >= robust_iters:
+            break
+        # Huber IRLS on the weighted residuals: strata inconsistent
+        # with the per-sweep solution (decorrelated regions, layover)
+        # get their weight reduced proportionally to the excess over
+        # 1.345x the global MAD scale.
+        u = ((y - M @ sol) * sqrtW).squeeze(-1).abs()        # [nsweeps, K]
+        scale = 1.4826 * u.median() + 1e-30
+        w_h = torch.clamp(1.345 * scale / (u + 1e-30), max=1.0)
+        sqrtW_cur = sqrtW * w_h.sqrt().unsqueeze(-1)
     sol = sol.squeeze(-1)                                    # [nsweeps, n_axes]
 
     delta = torch.zeros((nsweeps_s, 3), dtype=torch.float32, device=device)
@@ -1536,21 +1591,14 @@ def insar_rme_blocksvd_strata(
     delta = delta - delta.mean(dim=0, keepdim=True)
 
     if delta_lowpass and delta_lowpass > 1:
-        L = int(delta_lowpass)
-        w = torch.hamming_window(L, device=device, dtype=torch.float32)
-        w = w / w.sum()
         for ax in range(3):
             if delta[:, ax].abs().max() == 0:
                 continue
-            v = delta[:, ax]
-            pad_l = L // 2
-            pad_r = L - pad_l - 1
-            vp = torch.nn.functional.pad(
-                v[None, None], (pad_l, pad_r), mode="replicate"
-            )
-            delta[:, ax] = torch.nn.functional.conv1d(
-                vp, w[None, None]
-            )[0, 0]
+            delta[:, ax] = conv_lowpass_filter(delta[:, ax], delta_lowpass)
+
+    z_lp = phi_lowpass if z_lowpass is None else z_lowpass
+    if estimate_z and z_lp and z_lp > 1:
+        delta[:, 2] = conv_lowpass_filter(delta[:, 2], z_lp)
 
     pos_s_new = pos_s + delta
 
@@ -2152,20 +2200,12 @@ def insar_rme_multisquint(
         delta_it = delta_it - delta_it.mean(dim=0, keepdim=True)
 
         if delta_lowpass and delta_lowpass > 1:
-            L = int(delta_lowpass)
-            w = torch.hamming_window(L, device=device, dtype=torch.float32)
-            w = w / w.sum()
             for ax in range(3):
                 if delta_it[:, ax].abs().max() == 0:
                     continue
-                pad_l = L // 2
-                pad_r = L - pad_l - 1
-                vp = torch.nn.functional.pad(
-                    delta_it[:, ax][None, None], (pad_l, pad_r), mode="replicate"
+                delta_it[:, ax] = conv_lowpass_filter(
+                    delta_it[:, ax], delta_lowpass
                 )
-                delta_it[:, ax] = torch.nn.functional.conv1d(
-                    vp, w[None, None]
-                )[0, 0]
 
         rms_it = torch.sqrt(torch.mean(torch.sum(delta_it ** 2, dim=1)))
         if iteration > 0 and rms_it >= 0.9 * rms_prev:

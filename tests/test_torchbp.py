@@ -1552,6 +1552,238 @@ class TestGPGABackprojection2D(TestCase):
             torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
 
 
+class TestBlocksvdAlpha(TestCase):
+    def sample_inputs(self, device):
+        torch.manual_seed(2)
+        nr, ntheta = 12, 10
+        nsweeps, sweep_samples = 7, 200
+        args = {
+            "img": torch.randn(nr, ntheta, device=device, dtype=torch.complex64),
+            "data": torch.randn(
+                nsweeps, sweep_samples, device=device, dtype=torch.complex64
+            ),
+            "pos": 0.1 * torch.randn(nsweeps, 3, device=device),
+            # (ri0, ri1, ti0, ti1, sweep_lo, sweep_hi): full grid, partial
+            # rectangles with partial sweep windows, empty sweep window,
+            # degenerate pixel rectangle
+            "blocks": torch.tensor(
+                [
+                    [0, nr, 0, ntheta, 0, nsweeps],
+                    [0, 6, 0, 5, 2, 6],
+                    [6, nr, 5, ntheta, 0, nsweeps],
+                    [0, 6, 5, ntheta, 0, 0],
+                    [3, 3, 2, 8, 0, nsweeps],
+                ],
+                device=device,
+            ),
+            "fc": 6e9,
+            "r_res": 0.15,
+            "r0": 10.0,
+            "dr": 0.5,
+            "theta0": -0.4,
+            "dtheta": 0.08,
+            "d0": 0.2,
+            "data_fmod": uniform(0, 2 * torch.pi),
+        }
+        return [args]
+
+    def _reference(self, args):
+        """Compose the same result from gpga_backprojection_2d_core + GEMV."""
+        img, data, pos = args["img"], args["data"], args["pos"]
+        blocks = args["blocks"]
+        nsweeps = data.shape[0]
+        ref = torch.zeros(
+            blocks.shape[0], nsweeps, dtype=torch.complex64, device=img.device
+        )
+        for b in range(blocks.shape[0]):
+            ri0, ri1, ti0, ti1, lo, hi = [int(v) for v in blocks[b]]
+            if ri1 <= ri0 or ti1 <= ti0 or hi <= lo:
+                continue
+            r = args["r0"] + args["dr"] * torch.arange(
+                ri0, ri1, device=img.device, dtype=torch.float32
+            )
+            t = args["theta0"] + args["dtheta"] * torch.arange(
+                ti0, ti1, device=img.device, dtype=torch.float32
+            )
+            R, T = torch.meshgrid(r, t, indexing="ij")
+            x = (R * torch.sqrt(torch.clamp(1.0 - T**2, min=0.0))).reshape(-1)
+            y = (R * T).reshape(-1)
+            target_pos = torch.stack([x, y, torch.zeros_like(x)], dim=1)
+            B = torchbp.ops.gpga_backprojection_2d_core(
+                target_pos, data[lo:hi], pos[lo:hi], args["fc"],
+                args["r_res"], d0=args["d0"], data_fmod=args["data_fmod"],
+            )
+            patch = img[ri0:ri1, ti0:ti1].reshape(-1)
+            ref[b, lo:hi] = torch.conj(patch) @ B
+        return ref
+
+    def test_cpu_reference(self):
+        for args in self.sample_inputs("cpu"):
+            out = torchbp.ops.blocksvd_alpha(
+                args["img"], args["data"], args["pos"], args["blocks"],
+                args["fc"], args["r_res"], args["r0"], args["dr"],
+                args["theta0"], args["dtheta"], d0=args["d0"],
+                data_fmod=args["data_fmod"],
+            )
+            ref = self._reference(args)
+            torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+
+    def _opcheck(self, device):
+        for args in self.sample_inputs(device):
+            data = args["data"]
+            blocks = args["blocks"].to(torch.int32)
+            # Only test schema - no gradient support for this op
+            opcheck(
+                torch.ops.torchbp.blocksvd_alpha,
+                (args["img"], data, args["pos"], blocks, data.shape[1],
+                 data.shape[0], blocks.shape[0], args["img"].shape[1],
+                 args["fc"], args["r_res"], args["r0"], args["dr"],
+                 args["theta0"], args["dtheta"], args["d0"],
+                 args["data_fmod"]),
+                test_utils=["test_schema"],
+            )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda(self):
+        for args in self.sample_inputs("cpu"):
+            kw = dict(
+                fc=args["fc"], r_res=args["r_res"], r0=args["r0"],
+                dr=args["dr"], theta0=args["theta0"], dtheta=args["dtheta"],
+                d0=args["d0"], data_fmod=args["data_fmod"],
+            )
+            out_cpu = torchbp.ops.blocksvd_alpha(
+                args["img"], args["data"], args["pos"], args["blocks"], **kw)
+            out_gpu = torchbp.ops.blocksvd_alpha(
+                args["img"].cuda(), args["data"].cuda(), args["pos"].cuda(),
+                args["blocks"].cuda(), **kw).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
+
+
+class TestInsarRmeBlocksvd(TestCase):
+    """End-to-end InSAR RME on synthetic point-scatterer data."""
+
+    fc = 6e9
+    r_res = 0.3
+    grid_polar = {"r": (80.0, 120.0), "theta": (-0.25, 0.25), "nr": 64,
+                  "ntheta": 48}
+    nsweeps = 64
+    sweep_samples = 512
+
+    def _make_data(self, targets, amps, pos):
+        """Point responses consistent with the backprojection phase model."""
+        c0 = 299792458.0
+        data = torch.zeros(
+            pos.shape[0], self.sweep_samples, dtype=torch.complex64
+        )
+        m_idx = torch.arange(pos.shape[0])
+        for t, a in zip(targets, amps):
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = d / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += a * w[valid] * phase[valid]
+        return data
+
+    def _scene(self):
+        torch.manual_seed(3)
+        ntargets = 40
+        r = 85.0 + 30.0 * torch.rand(ntargets)
+        t = -0.2 + 0.4 * torch.rand(ntargets)
+        targets = torch.stack(
+            [r * torch.sqrt(1 - t**2), r * t, torch.zeros_like(r)], dim=1
+        )
+        amps = (1.0 + torch.rand(ntargets)).to(torch.complex64)
+        pos = torch.zeros(self.nsweeps, 3)
+        pos[:, 1] = torch.linspace(-2.0, 2.0, self.nsweeps)
+        pos[:, 2] = 30.0
+        return targets, amps, pos
+
+    def test_recovers_x_error(self):
+        targets, amps, pos = self._scene()
+        data_m = self._make_data(targets, amps, pos)
+        img_m = torchbp.ops.backprojection_polar_2d(
+            data_m, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+
+        # Slave measured at pos + [dx, 0, 0] but backprojected at pos;
+        # blocksvd should recover the zero-mean dx profile. A few cycles
+        # per aperture: a slower error is close to the unobservable
+        # linear trend.
+        dx = 2e-3 * torch.sin(
+            2 * torch.pi * 3 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_err = pos.clone()
+        pos_err[:, 0] += dx
+        data_s = self._make_data(targets, amps, pos_err)
+
+        pos_new, phi = torchbp.autofocus.insar_rme_blocksvd(
+            data_s, pos, img_m, self.fc, self.r_res, self.grid_polar,
+            n_az_blocks=8, n_r_blocks=4,
+        )
+        d_corr = pos_new[:, 0] - pos[:, 0]
+        resid = dx - d_corr
+        self.assertLess(
+            resid.pow(2).mean().sqrt().item(),
+            0.4 * dx.pow(2).mean().sqrt().item(),
+        )
+
+    def test_variants_run(self):
+        targets, amps, pos = self._scene()
+        data_m = self._make_data(targets, amps, pos)
+        img_m = torchbp.ops.backprojection_polar_2d(
+            data_m, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+        coh = torch.rand(
+            self.grid_polar["nr"], self.grid_polar["ntheta"]
+        ) * 0.5 + 0.5
+        for row_weight in ("coherence", "power", "uniform"):
+            for aperture_mask in (True, False):
+                pos_new, phi = torchbp.autofocus.insar_rme_blocksvd(
+                    data_m, pos, img_m, self.fc, self.r_res, self.grid_polar,
+                    n_az_blocks=4, n_r_blocks=2, row_weight=row_weight,
+                    aperture_mask=aperture_mask, spatial_coherence=coh,
+                    phi_lowpass=9,
+                )
+                self.assertTrue(torch.isfinite(phi).all())
+                # Master vs its own data: no motion error (sidelobes of
+                # the point-target scene leave a small residual)
+                self.assertLess(phi.abs().max().item(), 0.3)
+
+    def test_strata_runs(self):
+        targets, amps, pos = self._scene()
+        data_m = self._make_data(targets, amps, pos)
+        img_m = torchbp.ops.backprojection_polar_2d(
+            data_m, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+        dx = 2e-3 * torch.sin(
+            2 * torch.pi * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_err = pos.clone()
+        pos_err[:, 0] += dx
+        data_s = self._make_data(targets, amps, pos_err)
+        pos_new, delta = torchbp.autofocus.insar_rme_blocksvd_strata(
+            data_s, pos, img_m, self.fc, self.r_res, self.grid_polar,
+            n_strata=3, n_az_blocks_per_strata=8, estimate_z=True,
+            phi_lowpass=9,
+        )
+        self.assertTrue(torch.isfinite(delta).all())
+        resid = dx - delta[:, 0]
+        self.assertLess(
+            resid.pow(2).mean().sqrt().item(),
+            0.6 * dx.pow(2).mean().sqrt().item(),
+        )
+
+
 class TestFFBPMerge2Poly(TestCase):
     """Test polynomial approximation version against reference Knab implementation."""
 

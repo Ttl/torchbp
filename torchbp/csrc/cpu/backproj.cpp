@@ -1775,6 +1775,165 @@ at::Tensor gpga_backprojection_2d_cpu(
     return data_out;
 }
 
+// Inner product of one image block against one sweep's backprojection
+// footprint: alpha[b, m] = sum over the block's pixels of
+// conj(img[pix]) * data[m, interp] * exp(j (ref_phase d - data_fmod sx)).
+// Per-pixel math matches gpga_backprojection_2d_kernel_cpu (z=0 pixel
+// plane, linear range interpolation); the master image acts as the pixel
+// weighting so the [npix, nsweeps] footprint matrix is never materialized.
+// Mirrors blocksvd_alpha_kernel in cuda/backproj.cu; structured like
+// backprojection_polar_2d_row_cpu (SIMD geometry + phase pass into chunk
+// buffers, scalar gather + accumulate pass).
+static void blocksvd_alpha_kernel_cpu(
+          const complex64_t* img, const complex64_t* data, const float* pos,
+          const int32_t* blocks, complex64_t* alpha, int sweep_samples,
+          int nsweeps, int Ntheta, float ref_phase, float delta_r,
+          float r0, float dr, float theta0, float dtheta, float d0,
+          float data_fmod, int idblock, int idsweep) {
+    constexpr int CHUNK = 256;
+    float cs_buf[CHUNK], sn_buf[CHUNK], frac_buf[CHUNK];
+    int idx_buf[CHUNK];
+
+    const int ri0 = blocks[idblock * 6 + 0];
+    const int ri1 = blocks[idblock * 6 + 1];
+    const int ti0 = blocks[idblock * 6 + 2];
+    const int ti1 = blocks[idblock * 6 + 3];
+    const int sweep_lo = blocks[idblock * 6 + 4];
+    const int sweep_hi = blocks[idblock * 6 + 5];
+    if (idsweep < sweep_lo || idsweep >= sweep_hi) {
+        return;
+    }
+
+    const float pos_x = pos[idsweep * 3 + 0];
+    const float pos_y = pos[idsweep * 3 + 1];
+    const float pos_z = pos[idsweep * 3 + 2];
+    const float pz2 = pos_z * pos_z;
+    const float* data_row = (const float*)(data + (size_t)idsweep * sweep_samples);
+
+    // Theta in the outer loop, SIMD over range rows: blocksvd blocks are
+    // tall (tens to hundreds of range rows, ~10-20 theta columns), so the
+    // vectorized pass runs at full width along r.
+    float acc_r = 0.0f;
+    float acc_i = 0.0f;
+    for (int j = ti0; j < ti1; j++) {
+        const float theta = theta0 + j * dtheta;
+        const float ct = sqrtf(fmaxf(0.0f, 1.0f - theta * theta));
+
+        for (int rb = ri0; rb < ri1; rb += CHUNK) {
+            const int nchunk = std::min(CHUNK, ri1 - rb);
+
+            // Geometry + phase pass. idx = -1 marks pixels outside the
+            // data range window.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float r = r0 + (rb + q) * dr;
+                const float px = r * ct - pos_x;
+                const float py = r * theta - pos_y;
+
+                const float d = sqrtf(px * px + py * py + pz2);
+
+                const float sx = delta_r * (d + d0);
+                const int id0 = (int)sx;
+                const bool ok = (id0 >= 0) & (id0 + 1 < sweep_samples);
+                idx_buf[q] = ok ? id0 : -1;
+                frac_buf[q] = sx - id0;
+
+                float ref_sin, ref_cos;
+                sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+                cs_buf[q] = ref_cos;
+                sn_buf[q] = ref_sin;
+            }
+
+            // Scalar pass: data gather (linear interpolation), multiply by
+            // reference, accumulate against the conjugated image pixel.
+            // The image patch is small enough to stay cached despite the
+            // Ntheta-strided access.
+            const float* img_col = (const float*)(img + (size_t)rb * Ntheta + j);
+            for (int q = 0; q < nchunk; q++) {
+                const int id0 = idx_buf[q];
+                if (id0 < 0) {
+                    continue;
+                }
+                const float f = frac_buf[q];
+                const float sr = (1.0f - f) * data_row[2*id0]     + f * data_row[2*id0 + 2];
+                const float si = (1.0f - f) * data_row[2*id0 + 1] + f * data_row[2*id0 + 3];
+                const float vr = sr * cs_buf[q] - si * sn_buf[q];
+                const float vi = sr * sn_buf[q] + si * cs_buf[q];
+                const float wr = img_col[2*(size_t)q*Ntheta];
+                const float wi = img_col[2*(size_t)q*Ntheta + 1];
+                // conj(w) * v
+                acc_r += wr * vr + wi * vi;
+                acc_i += wr * vi - wi * vr;
+            }
+        }
+    }
+    alpha[(size_t)idblock * nsweeps + idsweep] = complex64_t(acc_r, acc_i);
+}
+
+at::Tensor blocksvd_alpha_cpu(
+          const at::Tensor &img,
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &blocks,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          int64_t nblocks,
+          int64_t Ntheta,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          double d0,
+          double data_fmod) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat);
+    TORCH_CHECK(data.dtype() == at::kComplexFloat);
+    TORCH_CHECK(pos.dtype() == at::kFloat);
+    TORCH_CHECK(blocks.dtype() == at::kInt);
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+    TORCH_INTERNAL_ASSERT(blocks.device().type() == at::DeviceType::CPU);
+
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor data_contig = data.contiguous();
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor blocks_contig = blocks.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+    at::Tensor alpha = torch::zeros({nblocks, nsweeps}, options);
+
+    const complex64_t* img_ptr = (const complex64_t*)img_contig.data_ptr<c10::complex<float>>();
+    const complex64_t* data_ptr = (const complex64_t*)data_contig.data_ptr<c10::complex<float>>();
+    const float* pos_ptr = pos_contig.data_ptr<float>();
+    const int32_t* blocks_ptr = blocks_contig.data_ptr<int32_t>();
+    complex64_t* alpha_ptr = (complex64_t*)alpha.data_ptr<c10::complex<float>>();
+
+    const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+    // Dynamic schedule: sweeps outside a block's aperture window return
+    // immediately, so per-(block, sweep) work is very uneven.
+#pragma omp parallel for collapse(2) schedule(dynamic, 8)
+    for (int idblock = 0; idblock < nblocks; idblock++) {
+        for (int idsweep = 0; idsweep < nsweeps; idsweep++) {
+            blocksvd_alpha_kernel_cpu(
+                    img_ptr, data_ptr, pos_ptr, blocks_ptr, alpha_ptr,
+                    sweep_samples, nsweeps, Ntheta, ref_phase, delta_r,
+                    r0, dr, theta0, dtheta, d0, data_fmod / kPI,
+                    idblock, idsweep);
+        }
+    }
+    return alpha;
+}
+
 static void backprojection_polar_2d_tx_power_kernel_cpu(
           const float* wa,
           const float* pos,
@@ -2075,6 +2234,7 @@ TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("projection_cart_2d", &projection_cart_2d_cpu);
   m.impl("projection_cart_2d_nufft", &projection_cart_2d_nufft_cpu);
   m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cpu);
+  m.impl("blocksvd_alpha", &blocksvd_alpha_cpu);
 }
 
 }

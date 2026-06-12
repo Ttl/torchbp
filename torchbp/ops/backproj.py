@@ -753,6 +753,82 @@ def gpga_backprojection_2d_core(
         raise ValueError(f"Unknown interp_method f{interp_method}")
 
 
+def blocksvd_alpha(
+    img: Tensor,
+    data: Tensor,
+    pos: Tensor,
+    blocks: Tensor,
+    fc: float,
+    r_res: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    d0: float = 0.0,
+    data_fmod: float = 0.0,
+) -> Tensor:
+    """
+    Per-block inner product of a master image against per-sweep slave
+    backprojection footprints, used by
+    :func:`torchbp.autofocus.insar_rme_blocksvd`.
+
+    For each block ``b`` and sweep ``m``::
+
+        alpha[b, m] = Sum_pix conj(img[pix]) * data[m, r_idx(pix, m)]
+                      * exp(j k R(pix, m))
+
+    where the sum runs over the block's pixel rectangle on the polar
+    grid. Pixels are at ``r = r0 + dr * i``, ``theta = theta0 + dtheta * j``
+    on the z=0 plane, matching :func:`backprojection_polar_2d`. Linear
+    range interpolation; samples outside the data range window
+    contribute zero. Equivalent to ``conj(img_patch) @ B`` with ``B``
+    from :func:`gpga_backprojection_2d_core` over the block's pixels,
+    without materializing ``B``.
+
+    Parameters
+    ----------
+    img : Tensor [nr, ntheta]
+        Complex master image on the polar grid, with any per-pixel
+        weighting (e.g. coherence) already applied.
+    data : Tensor [nsweeps, nsamples]
+        Range-compressed slave data.
+    pos : Tensor [nsweeps, 3]
+        Slave platform positions.
+    blocks : Tensor [nblocks, 6]
+        Integer block definitions ``(r_idx0, r_idx1, theta_idx0,
+        theta_idx1, sweep_lo, sweep_hi)``. Pixel rectangles are
+        half-open index ranges into ``img``; ``alpha[b, m]`` is zero for
+        sweeps outside ``[sweep_lo, sweep_hi)``.
+    fc : float
+        RF center frequency in Hz.
+    r_res : float
+        Range bin resolution in data (meters).
+    r0, dr, theta0, dtheta : float
+        Polar grid definition.
+    d0 : float
+        Zero range correction.
+    data_fmod : float
+        Range modulation frequency applied to input data.
+
+    Returns
+    -------
+    alpha : Tensor [nblocks, nsweeps]
+        Complex per-block per-sweep inner products.
+    """
+    nsweeps = data.shape[0]
+    sweep_samples = data.shape[1]
+    nblocks = blocks.shape[0]
+    ntheta = img.shape[1]
+    assert img.dim() == 2
+    assert pos.shape == (nsweeps, 3)
+    assert blocks.shape == (nblocks, 6)
+    blocks = blocks.to(torch.int32).contiguous()
+    return torch.ops.torchbp.blocksvd_alpha.default(
+        img, data, pos, blocks, sweep_samples, nsweeps, nblocks, ntheta,
+        fc, r_res, r0, dr, theta0, dtheta, d0, data_fmod
+    )
+
+
 def _prepare_backprojection_polar_2d_tx_power_args(
     wa: Tensor,
     g: Tensor,
@@ -1117,6 +1193,32 @@ def _fake_polar_2d(
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
     return torch.empty((nbatch, Nr, Ntheta), dtype=torch.complex64, device=data.device)
+
+
+@torch.library.register_fake("torchbp::blocksvd_alpha")
+def _fake_blocksvd_alpha(
+    img: Tensor,
+    data: Tensor,
+    pos: Tensor,
+    blocks: Tensor,
+    sweep_samples: int,
+    nsweeps: int,
+    nblocks: int,
+    Ntheta: int,
+    fc: float,
+    r_res: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    d0: float,
+    data_fmod: float,
+):
+    torch._check(img.dtype == torch.complex64)
+    torch._check(data.dtype == torch.complex64)
+    torch._check(pos.dtype == torch.float32)
+    torch._check(blocks.dtype == torch.int32)
+    return torch.empty((nblocks, nsweeps), dtype=torch.complex64, device=data.device)
 
 
 @torch.library.register_fake("torchbp::backprojection_polar_2d_grad")
