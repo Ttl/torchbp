@@ -875,6 +875,162 @@ __global__ void backprojection_cart_2d_tx_power_kernel(
     img[idbatch * Nx * Ny + idx_x * Ny + idy] = sqrtf(pixel);
 }
 
+__global__ void backprojection_polar_2d_tx_power_accum_kernel(
+          const float* wa,
+          const float* pos,
+          const float* att,
+          const float* g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          float* img,
+          int nsweeps,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          int Nr,
+          int Ntheta,
+          int normalization,
+          float dr_ref,
+          float h_ref,
+          float altitude,
+          int theta_psi) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta;
+    const int idr = idx / Ntheta;
+
+    if (idr >= Nr || idtheta >= Ntheta) {
+        return;
+    }
+    const size_t np = (size_t)Nr * Ntheta;
+    float* out = &img[idr * Ntheta + idtheta];
+
+    const float r = r0 + idr * dr;
+    // theta_psi: grid is sampled uniformly in psi = asin(theta). This
+    // resolves the antenna pattern features with a constant number of cells
+    // per beamwidth; a uniform theta grid compresses them by cos(psi) near
+    // |theta| = 1. Used for the backprojection_polar_2d_tx_power_ffbp subaperture maps.
+    const float tc = theta0 + idtheta * dtheta;
+    const float theta = theta_psi ? sinf(tc) : tc;
+    const float cos2 = 1.0f - theta * theta;
+
+    // Pixel ground position and effective altitude for angle/distance computation.
+    // altitude > 0: slant-range grid (BP origin at sensor altitude, pos z ≈ 0).
+    // altitude == 0: ground-range grid (pos z = real altitude).
+    float px_base, py_base, z_eff;
+    if (altitude > 0.0f) {
+        float r2cos2 = r * r * cos2;
+        float H2 = altitude * altitude;
+        if (r2cos2 < H2) {
+            // No ground intersection (shadow zone below nadir).
+            for (int c = 0; c < 4; c++) {
+                out[c * np] = 0.0f;
+            }
+            return;
+        }
+        px_base = sqrtf(r2cos2 - H2);
+        py_base = r * theta;
+        z_eff = altitude;
+    } else {
+        px_base = r * sqrtf(cos2);
+        py_base = r * theta;
+        z_eff = 0.0f;  // will use per-sweep pos_z
+    }
+
+    // Angular size of resolution cell at nadir. dr_ref and h_ref refer to the
+    // final output grid so that subaperture grids use the same clamp floor.
+    const float min_look_angle = sqrtf(2.0f * dr_ref / h_ref);
+
+    float pixel = 0.0f;
+    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
+    // used to estimate the azimuth resolution from the aperture.
+    float m_w = 0.0f;     // sum of weights
+    float m_mean = 0.0f;  // weighted mean of psi
+    float m_s = 0.0f;     // weighted sum of squared deviations
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[i * 3 + 0];
+        float pos_y = pos[i * 3 + 1];
+        float pos_z = pos[i * 3 + 2];
+
+        float px = (px_base - pos_x);
+        float py = (py_base - pos_y);
+        float h = (altitude > 0.0f) ? z_eff : pos_z;
+        float pz2 = h * h;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        // Avoid nans due to numerical precision by clamping to valid range.
+        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
+        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
+        const float el_deg = look_angle - att[3 * i + 0];
+        const float az_deg = psi - att[3 * i + 2];
+        // TODO: consider platform pitch
+
+        const float el_idx = (el_deg - g_el0) / g_del;
+        const float az_idx = (az_deg - g_az0) / g_daz;
+
+        const int el_int = el_idx;
+        const int az_int = az_idx;
+        const float el_frac = el_idx - el_int;
+        const float az_frac = az_idx - az_int;
+
+        if (el_int < 0 || el_int+1 >= g_nel) {
+            continue;
+        }
+        if (az_int < 0 || az_int+1 >= g_naz) {
+            continue;
+        }
+        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+        float sinl = 1.0f;
+
+        if (normalization == 1) {
+            // sigma_0
+            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d)));
+        } else if (normalization == 2) {
+            // gamma_0
+            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d))) * d / h;
+        } else if (normalization == 3) {
+            // point
+            // Scale as d^4 instead of d^3 for area target.
+            sinl = d;
+        }
+        // beta_0 otherwise
+
+        float w = wa[i];
+        // Plain illumination weight (no incidence term) for the moments.
+        const float wi = g_i * g_i * w * w / (d*d*d);
+        pixel += wi / sinl;
+
+        // Welford weighted update (numerically stable, handles squint).
+        // Skip zero weights (gain zero or underflow): with m_w still zero
+        // they would give 0/0 which poisons the moments with NaN.
+        if (wi > 0.0f) {
+            const float wsum = m_w + wi;
+            const float delta = psi - m_mean;
+            m_mean += delta * wi / wsum;
+            m_s += wi * delta * (psi - m_mean);
+            m_w = wsum;
+        }
+    }
+
+    // Unfinished accumulators for factorized (ffbp style) processing:
+    // channel 0: S = sum wi/sinl, 1: W = sum wi, 2: P1 = W*mean(psi),
+    // 3: M2 = weighted sum of squared deviations of psi.
+    // P1 is premultiplied by W so that bilinear interpolation of the
+    // channels stays valid where W approaches zero.
+    out[0 * np] = pixel;
+    out[1 * np] = m_w;
+    out[2 * np] = m_w * m_mean;
+    out[3 * np] = m_s;
+}
+
 __global__ void backprojection_cart_2d_kernel(
           const complex64_t* data,
           const float* pos,
@@ -2796,6 +2952,86 @@ at::Tensor backprojection_cart_2d_tx_power_cuda(
 	return img;
 }
 
+at::Tensor backprojection_polar_2d_tx_power_accum_cuda(
+          const at::Tensor &wa,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t nsweeps,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          int64_t normalization,
+          double dr_ref,
+          double h_ref,
+          double altitude,
+          int64_t theta_psi) {
+	TORCH_CHECK(wa.dtype() == at::kFloat);
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(wa.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+
+	at::Tensor wa_contig = wa.contiguous();
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor g_contig = g.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(wa.device());
+	at::Tensor img = torch::zeros({4, Nr, Ntheta}, options);
+	const float* wa_ptr = wa_contig.data_ptr<float>();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
+	float* img_ptr = img.data_ptr<float>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr * Ntheta;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, 1};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    backprojection_polar_2d_tx_power_accum_kernel
+          <<<block_count, thread_per_block, 0, stream>>>(
+                  wa_ptr,
+                  pos_ptr,
+                  att_ptr,
+                  g_ptr,
+                  g_az0,
+                  g_el0,
+                  g_daz,
+                  g_del,
+                  g_naz,
+                  g_nel,
+                  img_ptr,
+                  nsweeps,
+                  r0, dr,
+                  theta0, dtheta,
+                  Nr, Ntheta,
+                  normalization,
+                  static_cast<float>(dr_ref),
+                  static_cast<float>(h_ref),
+                  static_cast<float>(altitude),
+                  static_cast<int>(theta_psi));
+	return img;
+}
+
 at::Tensor backprojection_cart_2d_cuda(
           const at::Tensor &data,
           const at::Tensor &pos,
@@ -3158,6 +3394,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("blocksvd_alpha", &blocksvd_alpha_cuda);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
   m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cuda);
+  m.impl("backprojection_polar_2d_tx_power_accum", &backprojection_polar_2d_tx_power_accum_cuda);
   m.impl("backprojection_cart_2d_tx_power", &backprojection_cart_2d_tx_power_cuda);
   m.impl("projection_cart_2d", &projection_cart_2d_cuda);
   m.impl("projection_cart_2d_nufft", &projection_cart_2d_nufft_cuda);

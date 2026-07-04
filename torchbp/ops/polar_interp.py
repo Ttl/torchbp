@@ -1162,6 +1162,119 @@ def ffbp_merge2(
         raise ValueError(f"Unknown interp_method: {method}")
 
 
+def ffbp_tx_power_merge2(
+    acc0: Tensor,
+    acc1: Tensor | None,
+    dorigin0: Tensor,
+    dorigin1: Tensor | None,
+    grid_polars: list["PolarGrid | dict"],
+    grid_polar_new: "PolarGrid | dict",
+    altitude: float = 0.0,
+    in_psi: bool = False,
+    out_psi: bool = False,
+) -> Tensor:
+    """
+    Merge two tx_power accumulator maps to a new grid with origin shifts.
+
+    Interpolates the 4-channel accumulator maps (S, W, P1, M2, see
+    :func:`torchbp.ops.backproj._backprojection_polar_2d_tx_power_accum`)
+    bilinearly onto the output grid and combines them. The psi moments are
+    combined with Chan's parallel variance formula so the merge is exact up
+    to interpolation. Used internally by :func:`~torchbp.ops.backprojection_polar_2d_tx_power_ffbp`.
+
+    Parameters
+    ----------
+    acc0 : Tensor
+        First accumulator map, shape [4, nr, ntheta] matching grid_polars[0].
+    acc1 : Tensor or None
+        Second accumulator map matching grid_polars[1]. None interpolates
+        only acc0 to the new grid (single input regrid).
+    dorigin0 : Tensor
+        Origin of the output grid relative to acc0 grid origin, shape [3].
+        Only x and y components are used.
+    dorigin1 : Tensor or None
+        Same for acc1.
+    grid_polars : list of PolarGrid or dict
+        Input grid definitions.
+    grid_polar_new : PolarGrid or dict
+        Output grid definition.
+    altitude : float
+        Slant grid altitude. 0 for ground grid.
+    in_psi : bool
+        Input grid theta extents are psi = asin(theta) in radians and the
+        maps are sampled uniformly in psi.
+    out_psi : bool
+        Same for the output grid.
+
+    Returns
+    -------
+    out : Tensor
+        Merged accumulator map, shape [4, nr_new, ntheta_new].
+    """
+    device = acc0.device
+    nimages = 2
+
+    if hasattr(grid_polar_new, "to_dict"):
+        grid_polar_new = grid_polar_new.to_dict()
+    grid_polars = [
+        g.to_dict() if hasattr(g, "to_dict") else g for g in grid_polars
+    ]
+
+    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dr0_t = torch.ones(nimages, dtype=torch.float32, device=device)
+    theta0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
+    dtheta0_t = torch.ones(nimages, dtype=torch.float32, device=device)
+    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    nvalid = 1 if acc1 is None else 2
+    for i in range(nvalid):
+        r1_0, r1_1 = grid_polars[i]["r"]
+        theta1_0, theta1_1 = grid_polars[i]["theta"]
+        ntheta1 = grid_polars[i]["ntheta"]
+        nr1 = grid_polars[i]["nr"]
+        r0[i] = r1_0
+        dr0_t[i] = (r1_1 - r1_0) / nr1
+        theta0_t[i] = theta1_0
+        dtheta0_t[i] = (theta1_1 - theta1_0) / ntheta1
+        Nr0[i] = nr1
+        Ntheta0[i] = ntheta1
+
+    r3_0, r3_1 = grid_polar_new["r"]
+    theta3_0, theta3_1 = grid_polar_new["theta"]
+    ntheta3 = grid_polar_new["ntheta"]
+    nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+
+    assert dorigin0.shape == (3,)
+    if acc1 is None:
+        acc1 = torch.empty(0, dtype=torch.float32, device=device)
+        dorigin1 = torch.zeros(3, dtype=torch.float32, device=device)
+    assert dorigin1.shape == (3,)
+    dorigin = torch.stack((dorigin0, dorigin1), dim=0)
+
+    return torch.ops.torchbp.ffbp_tx_power_merge2.default(
+        acc0,
+        acc1,
+        dorigin,
+        r0,
+        dr0_t,
+        theta0_t,
+        dtheta0_t,
+        Nr0,
+        Ntheta0,
+        r3_0,
+        dr3,
+        theta3_0,
+        dtheta3,
+        nr3,
+        ntheta3,
+        altitude,
+        int(in_psi),
+        int(out_psi),
+    )
+
+
 def polar_to_cart(
     img: Tensor,
     origin: Tensor,

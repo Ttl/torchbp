@@ -1,9 +1,10 @@
+import math
 import torch
 from torch import Tensor
 from typing import Union, TYPE_CHECKING
 from warnings import warn
-from .backproj import backprojection_polar_2d, backprojection_polar_2d_tx_power
-from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, compute_knab_poly_coefs_full, select_knab_poly_degree
+from .backproj import backprojection_polar_2d, backprojection_polar_2d_tx_power, _backprojection_polar_2d_tx_power_accum
+from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, ffbp_tx_power_merge2, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
 from ._utils import AntennaPattern, unpack_polar_grid
@@ -538,5 +539,402 @@ def _ffbp_impl(
     if use_antenna_pattern:
         return imgs[0][2], imgs[0][4], imgs[0][5], imgs[0][6]
     return imgs[0][2], None, None, None
+
+
+def _tx_power_node_grid(
+    boundary: Tensor,
+    pos_local: Tensor,
+    yaw: Tensor,
+    g_extent: list,
+    g_daz: float,
+    sub_dr: float,
+    sub_dpsi: float,
+    margin: int,
+    min_nr: int,
+    min_ntheta: int,
+    altitude: float,
+) -> dict | None:
+    """Polar grid covering the output grid as seen from a subaperture origin.
+
+    boundary contains the output grid boundary in ground coordinates relative
+    to the subaperture origin. The azimuth extent is intersected with the
+    azimuth range visible through the antenna pattern given the subaperture
+    yaw range. Returns None if the subaperture cannot see the output grid.
+
+    The returned grid theta extents are the azimuth angle psi = asin(theta)
+    in radians and the map is sampled uniformly in psi (theta_psi grids).
+    Uniform psi resolves the antenna pattern with a constant number of cells
+    per beamwidth; a grid uniform in theta = sin(psi) compresses the pattern
+    features by cos(psi) towards |theta| = 1 where it would need much finer
+    sampling.
+    """
+    dx = boundary[:, 0]
+    dy = boundary[:, 1]
+    if altitude > 0.0:
+        r = torch.sqrt(dx * dx + dy * dy + altitude * altitude)
+    else:
+        r = torch.sqrt(dx * dx + dy * dy)
+    r_floor = altitude if altitude > 0.0 else 0.0
+    if bool((dx.min() < 0) & (dx.max() > 0) & (dy.min() < 0) & (dy.max() > 0)):
+        # Origin may be inside the scene footprint: the boundary samples do
+        # not bound the interior minimum.
+        r_lo = r_floor
+        r_hi = float(r.max())
+        p_lo = -math.pi / 2
+        p_hi = math.pi / 2
+    else:
+        th = dy / torch.clamp(r, min=1e-9)
+        r_lo = float(r.min())
+        r_hi = float(r.max())
+        p_lo = math.asin(max(-1.0, min(1.0, float(th.min()))))
+        p_hi = math.asin(max(-1.0, min(1.0, float(th.max()))))
+
+    # Azimuth angles visible through the antenna pattern. Pad accounts for
+    # pattern lookup interpolation and for the pulses being offset from the
+    # subaperture origin by up to the subaperture length.
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    max_offset = float(torch.linalg.norm(pos_local[:, :2], dim=-1).max())
+    psi_pad = 2.0 * g_daz + max_offset / max(r_lo, 1e-3)
+    psi_lo = g_az0 + float(yaw.min()) - psi_pad
+    psi_hi = g_az1 + float(yaw.max()) + psi_pad
+    # Polar grid theta cannot represent the rear half plane.
+    if psi_lo > math.pi / 2 or psi_hi < -math.pi / 2:
+        return None
+    p_lo = max(p_lo, psi_lo)
+    p_hi = min(p_hi, psi_hi)
+    if p_hi <= p_lo or r_hi <= r_lo:
+        return None
+
+    r_lo = max(r_floor, r_lo - margin * sub_dr)
+    r_hi = r_hi + margin * sub_dr
+    p_lo = max(-math.pi / 2, p_lo - margin * sub_dpsi)
+    p_hi = min(math.pi / 2, p_hi + margin * sub_dpsi)
+
+    nr = max(min_nr, int(math.ceil((r_hi - r_lo) / sub_dr)))
+    ntheta = max(min_ntheta, int(math.ceil((p_hi - p_lo) / sub_dpsi)))
+    return {"r": (r_lo, r_hi), "theta": (p_lo, p_hi), "nr": nr, "ntheta": ntheta}
+
+
+def _ffbp_tx_power_impl(
+    wa: Tensor,
+    pos: Tensor,
+    att: Tensor,
+    boundary: Tensor,
+    stages: int,
+    divisions: int,
+    g: Tensor,
+    g_extent: list,
+    g_daz: float,
+    normalization: str | None,
+    sub_dr: float,
+    sub_dpsi: float,
+    margin: int,
+    min_nr: int,
+    min_ntheta: int,
+    min_nsweeps: int,
+    dr_ref: float,
+    h_ref: float,
+    altitude: float,
+    grid_out: dict | None = None,
+    is_top_level: bool = True,
+) -> tuple[Tensor, dict, Tensor] | None:
+    """Recursive tx_power accumulator map computation.
+
+    Returns (acc, grid, frame_offset) where frame_offset is the origin of the
+    accumulator map frame relative to this node's frame, or None if no pulse
+    of this node illuminates the output grid.
+    """
+    nsweeps = wa.shape[0]
+    device = wa.device
+
+    # Grid for the intermediate merges of this node.
+    grid_node = _tx_power_node_grid(
+        boundary, pos, att[:, 2], g_extent, g_daz, sub_dr, sub_dpsi,
+        margin, min_nr, min_ntheta, altitude)
+    if grid_node is None:
+        return None
+
+    nodes = []
+    edges = torch.linspace(0, nsweeps, divisions + 1).long()
+    for d_idx in range(divisions):
+        i0 = int(edges[d_idx])
+        i1 = int(edges[d_idx + 1])
+        if i1 - i0 < 1:
+            continue
+        pos_local, origin_local = center_pos(pos[i0:i1])
+        o = origin_local[0]
+        boundary_local = boundary - o[None, :2]
+        wa_local = wa[i0:i1]
+        att_local = att[i0:i1]
+
+        if stages > 1 and i1 - i0 > min_nsweeps:
+            child = _ffbp_tx_power_impl(
+                wa_local, pos_local, att_local, boundary_local,
+                stages - 1, divisions, g, g_extent, g_daz, normalization,
+                sub_dr, sub_dpsi, margin, min_nr, min_ntheta, min_nsweeps,
+                dr_ref, h_ref, altitude, grid_out=None, is_top_level=False)
+            if child is None:
+                continue
+            acc, grid_local, child_offset = child
+            offset = o + child_offset
+        else:
+            grid_local = _tx_power_node_grid(
+                boundary_local, pos_local, att_local[:, 2], g_extent, g_daz,
+                sub_dr, sub_dpsi, margin, min_nr, min_ntheta, altitude)
+            if grid_local is None:
+                continue
+            acc = _backprojection_polar_2d_tx_power_accum(
+                wa_local, g, g_extent, grid_local, pos_local, att_local,
+                normalization, dr_ref, h_ref, altitude, theta_psi=True)
+            offset = o
+        nodes.append((acc, grid_local, offset))
+
+    if len(nodes) == 0:
+        return None
+
+    while len(nodes) > 1:
+        n1 = nodes[0]
+        n2 = nodes[1]
+        is_final_merge = is_top_level and len(nodes) == 2
+        grid_new = grid_out if is_final_merge else grid_node
+        # dorigin = merged frame origin - input frame origin
+        dorigin1 = -n1[2].clone()
+        dorigin2 = -n2[2].clone()
+        dorigin1[2] = 0.0
+        dorigin2[2] = 0.0
+        merged = ffbp_tx_power_merge2(
+            n1[0], n2[0], dorigin1, dorigin2, [n1[1], n2[1]], grid_new,
+            altitude=altitude, in_psi=True, out_psi=not is_final_merge)
+        nodes = nodes[2:] + [(merged, grid_new, torch.zeros(3, device=device))]
+
+    return nodes[0]
+
+
+def backprojection_polar_2d_tx_power_ffbp(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "PolarGrid | dict",
+    r_res: float,
+    pos: Tensor,
+    att: Tensor,
+    stages: int,
+    divisions: int = 2,
+    normalization: str | None = None,
+    azimuth_resolution: bool = True,
+    downsample_r: float = 4.0,
+    downsample_theta: float = 4.0,
+    min_nsweeps: int = 64,
+    min_nr: int = 32,
+    min_ntheta: int = 32,
+    margin: int = 4,
+    altitude: float = 0.0,
+    beam_theta_samples: float = 32.0,
+) -> Tensor:
+    """
+    Fast factorized version of :func:`backprojection_polar_2d_tx_power`.
+
+    Splits the track recursively into subapertures like :func:`ffbp`,
+    computes coarse per-subaperture accumulator maps and merges them
+    pairwise with bilinear interpolation. Unlike the coherent FFBP the
+    accumulated fields are smooth and phase-free, so the subaperture maps
+    can be sampled much more coarsely than the output grid
+    (``downsample_r``, ``downsample_theta``) and the azimuth resolution
+    moments merge exactly (Chan's parallel variance formula).
+
+    Each subaperture gets its own grid extents computed from the output grid
+    geometry as seen from the subaperture center, intersected with the
+    azimuth range visible through the antenna pattern. Subapertures on a
+    long or curved track that see the scene at a different angle than the
+    output grid theta range are handled correctly, and subapertures that
+    cannot see the output grid at all are skipped.
+
+    Implements the same moment-based azimuth resolution model as the direct
+    function. Output matches the direct function up to interpolation errors,
+    except near illumination edges where pixels with very few contributing
+    pulses can differ. With ``altitude > 0`` the region just outside the
+    nadir shadow zone is also approximate because the slant range to ground
+    range mapping is singular at the shadow boundary and the interpolated
+    fields vary too fast there.
+
+    Parameters
+    ----------
+    wa : Tensor
+        Weighting coefficient for amplitude of each pulse, shape: [nsweeps].
+    g : Tensor
+        Square-root of two-way antenna gain in spherical coordinates,
+        shape: [elevation, azimuth]. (0, 0) angle is at the beam center.
+    g_extent : list
+        Antenna pattern extent: [g_el0, g_az0, g_el1, g_az1] in radians.
+    grid : PolarGrid or dict
+        Polar grid definition. Can be:
+
+        - PolarGrid object: ``PolarGrid(r_range=(50, 100), theta_range=(-1, 1), nr=200, ntheta=400)``
+        - dict: ``{"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}``
+
+        where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
+    r_res : float
+        Range bin resolution. Unused, kept for signature parity with
+        :func:`backprojection_polar_2d_tx_power`.
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3].
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be
+        [nsweeps, 3]. [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
+    stages : int
+        Number of recursions.
+    divisions : int
+        Number of subaperture divisions per stage. Default is 2.
+    normalization : str or None
+        Valid choices are:
+            "sigma" to divide each value by sin of incidence angle.
+            "gamma" to divide each value by of tan of incidence angle.
+            "beta" or None for no incidence angle normalization.
+            "point" to normalize to constant reflectivity (no ground patch).
+    azimuth_resolution : bool
+        If True (default), also normalize for the varying azimuth resolution.
+        See :func:`backprojection_polar_2d_tx_power`.
+    downsample_r : float
+        Subaperture map range step relative to the output grid range step.
+        The accumulated fields are smooth, so values well above 1 are
+        usually fine. Default is 4.
+    downsample_theta : float
+        Subaperture map azimuth step relative to the output grid theta step.
+        The subaperture maps are sampled uniformly in azimuth angle
+        psi = asin(theta), so relative to the output theta grid the maps get
+        denser towards |theta| = 1 where the sin mapping compresses the
+        antenna pattern features. Default is 4.
+    min_nsweeps : int
+        Do not recurse into subapertures with fewer pulses than this.
+    min_nr : int
+        Minimum number of range points in a subaperture map. Avoids large
+        interpolation errors near edges of very small maps.
+    min_ntheta : int
+        Minimum number of theta points in a subaperture map.
+    margin : int
+        Extra margin in subaperture map cells around the computed extents.
+    altitude : float
+        If greater than zero, use slant plane grid semantics identical to
+        :func:`backprojection_polar_2d_tx_power_slant` with this reference
+        altitude. Default 0 uses ground plane grid.
+    beam_theta_samples : float
+        Minimum number of subaperture map azimuth samples across the half
+        amplitude azimuth beamwidth of the antenna pattern. The interpolation
+        error scales as the squared ratio of the azimuth step to the azimuth
+        beamwidth, so a beam that is thin compared to the output grid theta
+        step needs subaperture maps finer than ``downsample_theta`` implies.
+        The azimuth step is the smaller of ``downsample_theta`` times the
+        output grid theta step and the beamwidth divided by this value.
+        A quarter of the same sample density is applied to the range step
+        relative to the elevation beamwidth, which matters only when the
+        near edge of the grid approaches nadir.
+
+    Returns
+    -------
+    tx_power : Tensor
+        Pseudo-polar format image of square root of power returned from each
+        pixel assuming constant reflectivity, shape [nr, ntheta].
+    """
+    if hasattr(grid, "to_dict"):
+        grid = grid.to_dict()
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+
+    assert wa.dim() == 1, "backprojection_polar_2d_tx_power_ffbp supports only a single batch"
+    nsweeps = wa.shape[0]
+    assert pos.shape == (nsweeps, 3)
+    assert att.shape == (nsweeps, 3)
+    device = wa.device
+
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_daz = (g_az1 - g_az0) / g.shape[1]
+
+    h_ref = altitude if altitude > 0 else float(pos[nsweeps // 2, 2])
+    sub_dr = dr * downsample_r
+
+    # Subaperture maps are sampled uniformly in azimuth angle psi = asin(theta)
+    # rather than theta, see _tx_power_node_grid. The step is downsample_theta
+    # output grid cells at scene center, additionally capped so that the
+    # azimuth beamwidth stays resolved: the illumination fields vary at the
+    # scale of the beamwidth, not the output grid step, and a beam that is
+    # thin compared to the output theta step degrades the bilinear
+    # interpolation badly (see beam_theta_samples).
+    sub_dpsi = dtheta * downsample_theta
+    p_az = torch.amax(g, dim=0)
+    above = (p_az >= 0.5 * float(p_az.max())).nonzero()
+    if len(above) > 0:
+        half_width = float(above[-1] - above[0] + 1) * g_daz
+        sub_dpsi = min(sub_dpsi, half_width / beam_theta_samples)
+
+    # Same in range: an elevation pattern feature of angular size del maps to
+    # a range interval del * (r^2 + h^2) / h, smallest at near range. Only
+    # binding when the near edge of the grid is close to nadir. The fields
+    # vary more slowly in range than in azimuth (no track-parallel geometry),
+    # so a quarter of the azimuth sample density is enough.
+    g_del = (g_el1 - g_el0) / g.shape[0]
+    p_el = torch.amax(g, dim=1)
+    above = (p_el >= 0.5 * float(p_el.max())).nonzero()
+    if len(above) > 0 and h_ref > 0:
+        el_half_width = float(above[-1] - above[0] + 1) * g_del
+        if altitude > 0.0:
+            # Slant grid: r is slant range, dr/dl = sqrt(r^2 - h^2).
+            rg0 = math.sqrt(max(altitude * 0.1, r0**2 - altitude**2))
+            r_scale = rg0 * r0 / altitude
+        else:
+            r_scale = (r0**2 + h_ref**2) / h_ref
+        r_cap = 4.0 * el_half_width / beam_theta_samples * r_scale
+        sub_dr = min(sub_dr, max(dr, r_cap))
+
+    # Output grid boundary in ground coordinates. Subaperture grid extents
+    # are computed from these points shifted to each subaperture frame.
+    nb = 64
+    rr = torch.linspace(r0, r1, nb, device=device)
+    tt = torch.linspace(theta0, theta1, nb, device=device)
+    r_s = torch.cat((torch.full_like(tt, r0), torch.full_like(tt, r1), rr, rr))
+    t_s = torch.cat((tt, tt, torch.full_like(rr, theta0), torch.full_like(rr, theta1)))
+    if altitude > 0.0:
+        gx = torch.sqrt(torch.clamp(r_s**2 * (1 - t_s**2) - altitude**2, min=0.0))
+    else:
+        gx = r_s * torch.sqrt(torch.clamp(1 - t_s**2, min=0.0))
+    gy = r_s * t_s
+    boundary = torch.stack((gx, gy), dim=1)
+
+    node = _ffbp_tx_power_impl(
+        wa, pos, att, boundary, stages, divisions, g, g_extent, g_daz,
+        normalization, sub_dr, sub_dpsi, margin, min_nr, min_ntheta,
+        min_nsweeps, dr, h_ref, altitude, grid_out=grid, is_top_level=True)
+
+    if node is None:
+        acc = torch.zeros((4, nr, ntheta), dtype=torch.float32, device=device)
+    elif node[1] is not grid or bool(torch.any(node[2] != 0)):
+        # Single surviving subaperture: regrid it to the output grid.
+        dorigin = -node[2].clone()
+        dorigin[2] = 0.0
+        acc = ffbp_tx_power_merge2(
+            node[0], None, dorigin, None, [node[1], node[1]], grid,
+            altitude=altitude, in_psi=True, out_psi=False)
+    else:
+        acc = node[0]
+
+    # Finishing step. Matches the direct kernel epilogue.
+    S, W, P1, M2 = acc[0], acc[1], acc[2], acc[3]
+    r_vec = r0 + dr * torch.arange(nr, dtype=torch.float32, device=device)
+    if azimuth_resolution:
+        var = torch.where(W > 0, M2 / torch.clamp(W, min=1e-30), torch.zeros_like(W))
+        sigma = torch.sqrt(torch.clamp(var, min=0.0))
+        if altitude > 0.0:
+            Rg = torch.sqrt(torch.clamp(r_vec**2 - altitude**2, min=0.0))
+        else:
+            Rg = r_vec
+        denom = sigma * Rg[:, None]
+        pixel = torch.where(denom > 0, S / denom, torch.full_like(S, torch.inf))
+    else:
+        pixel = S
+    out = torch.sqrt(pixel)
+    if altitude > 0.0:
+        # Shadow zone below nadir is zero in the direct kernel.
+        t_vec = theta0 + dtheta * torch.arange(ntheta, dtype=torch.float32, device=device)
+        shadow = r_vec[:, None]**2 * (1 - t_vec[None, :]**2) < altitude**2
+        out = torch.where(shadow, torch.zeros_like(out), out)
+    return out
 
 

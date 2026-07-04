@@ -1822,6 +1822,205 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
 	return ret;
 }
 
+__global__ void ffbp_tx_power_merge2_kernel(
+          const float* acc0,
+          const float* acc1,
+          float* out,
+          const float* dorigin,
+          const float* r0,
+          const float* dr0,
+          const float* theta0,
+          const float* dtheta0,
+          const int* Nr0,
+          const int* Ntheta0,
+          float r1,
+          float dr1,
+          float theta1,
+          float dtheta1,
+          int Nr1,
+          int Ntheta1,
+          float altitude,
+          int in_psi,
+          int out_psi) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = idx % Ntheta1;
+    const int idr = idx / Ntheta1;
+    if (idx >= Nr1 * Ntheta1) {
+        return;
+    }
+
+    const float r = r1 + dr1 * idr;
+    // out_psi: output grid is uniform in psi = asin(theta), see the accum
+    // kernel. The internal subaperture maps use psi grids, the final merge
+    // to the output grid uses a linear theta grid.
+    const float tc = theta1 + dtheta1 * idtheta;
+    const float t = out_psi ? sinf(tc) : tc;
+    if (t < -1.0f || t > 1.0f) {
+        return;
+    }
+    // Output pixel ground offset from the merged origin. Slant grid maps to
+    // ground with the constant altitude; shadow zone stays zero.
+    float gx, gy;
+    const float H2 = altitude * altitude;
+    if (altitude > 0.0f) {
+        const float q = r * r * (1.0f - t * t) - H2;
+        if (q < 0.0f) {
+            return;
+        }
+        gx = sqrtf(q);
+        gy = r * t;
+    } else {
+        gx = r * sqrtf(1.0f - t * t);
+        gy = r * t;
+    }
+
+    const float* accs[2] = {acc0, acc1};
+    float S = 0.0f, W = 0.0f, P1 = 0.0f, M2 = 0.0f;
+    for (int id = 0; id < 2; id++) {
+        const float* acc = accs[id];
+        if (acc == nullptr) {
+            continue;
+        }
+        const float dx = gx + dorigin[id * 3 + 0];
+        const float dy = gy + dorigin[id * 3 + 1];
+        // The polar coordinates are two-to-one in ground position: a pixel
+        // behind the input origin would alias onto its mirror image.
+        if (dx <= 0.0f) {
+            continue;
+        }
+        const float ri = sqrtf(dx * dx + dy * dy + (altitude > 0.0f ? H2 : 0.0f));
+        const float ti = dy / ri;
+        const float tlim = in_psi ? 1.5707964f : 1.0f;
+        const float tq = in_psi ?
+            asinf(fminf(1.0f, fmaxf(-1.0f, ti))) : ti;
+        const float dri = (ri - r0[id]) / dr0[id];
+        float dti = (tq - theta0[id]) / dtheta0[id];
+        const int nri = Nr0[id];
+        const int nti = Ntheta0[id];
+        // Input grids are clamped at the physical |theta| = 1 limit and
+        // cannot have margin cells there. |ti| <= 1 always holds, so clamp
+        // the sample to the grid edge instead of dropping the contribution:
+        // otherwise every merge stage erodes a band at the theta edges.
+        const float t_hi_g = theta0[id] + dtheta0[id] * nti;
+        if (t_hi_g >= tlim - 1e-6f && dti > nti - 1.001f) {
+            dti = nti - 1.001f;
+        }
+        if (theta0[id] <= -tlim + 1e-6f && dti < 1e-3f) {
+            dti = 1e-3f;
+        }
+        if (!(dri >= 0.0f && dri < nri - 1 && dti >= 0.0f && dti < nti - 1)) {
+            continue;
+        }
+        const int ri_int = dri;
+        const int ti_int = dti;
+        const float ri_frac = dri - ri_int;
+        const float ti_frac = dti - ti_int;
+        const size_t np = (size_t)nri * nti;
+        const float s = interp2d<float>(&acc[0 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
+        const float w = interp2d<float>(&acc[1 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
+        const float p1 = interp2d<float>(&acc[2 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
+        const float m2 = interp2d<float>(&acc[3 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
+        if (w <= 0.0f) {
+            continue;
+        }
+        if (W > 0.0f) {
+            // Chan's parallel variance combination of the weighted psi moments.
+            const float delta = P1 / W - p1 / w;
+            M2 += m2 + delta * delta * W * w / (W + w);
+        } else {
+            M2 += m2;
+        }
+        S += s;
+        W += w;
+        P1 += p1;
+    }
+    // Float cancellation could leave a small negative value which would give
+    // NaN in the final sqrt of the variance.
+    M2 = fmaxf(M2, 0.0f);
+
+    const size_t np_out = (size_t)Nr1 * Ntheta1;
+    float* o = &out[idr * Ntheta1 + idtheta];
+    o[0 * np_out] = S;
+    o[1 * np_out] = W;
+    o[2 * np_out] = P1;
+    o[3 * np_out] = M2;
+}
+
+at::Tensor ffbp_tx_power_merge2_cuda(
+          const at::Tensor &acc0,
+          const at::Tensor &acc1,
+          const at::Tensor &dorigin,
+          const at::Tensor &r0,
+          const at::Tensor &dr0,
+          const at::Tensor &theta0,
+          const at::Tensor &dtheta0,
+          const at::Tensor &Nr0,
+          const at::Tensor &Ntheta0,
+          double r1,
+          double dr1,
+          double theta1,
+          double dtheta1,
+          int64_t Nr1,
+          int64_t Ntheta1,
+          double altitude,
+          int64_t in_psi,
+          int64_t out_psi) {
+    TORCH_CHECK(acc0.dtype() == at::kFloat);
+    TORCH_CHECK(dorigin.dtype() == at::kFloat);
+    TORCH_CHECK(r0.dtype() == at::kFloat);
+    TORCH_CHECK(dr0.dtype() == at::kFloat);
+    TORCH_CHECK(theta0.dtype() == at::kFloat);
+    TORCH_CHECK(dtheta0.dtype() == at::kFloat);
+    TORCH_CHECK(Nr0.dtype() == at::kInt);
+    TORCH_CHECK(Ntheta0.dtype() == at::kInt);
+    TORCH_INTERNAL_ASSERT(acc0.device().type() == at::DeviceType::CUDA);
+    TORCH_INTERNAL_ASSERT(dorigin.device().type() == at::DeviceType::CUDA);
+
+    bool has1 = acc1.defined() && acc1.numel() > 0;
+    if (has1) {
+        TORCH_CHECK(acc1.dtype() == at::kFloat);
+    }
+
+    at::Tensor acc0_contig = acc0.contiguous();
+    at::Tensor acc1_contig;
+    at::Tensor dorigin_contig = dorigin.contiguous();
+    at::Tensor r0_contig = r0.contiguous();
+    at::Tensor dr0_contig = dr0.contiguous();
+    at::Tensor theta0_contig = theta0.contiguous();
+    at::Tensor dtheta0_contig = dtheta0.contiguous();
+    at::Tensor Nr0_contig = Nr0.contiguous();
+    at::Tensor Ntheta0_contig = Ntheta0.contiguous();
+    at::Tensor out = torch::zeros({4, Nr1, Ntheta1}, acc0_contig.options());
+    const float* acc0_ptr = acc0_contig.data_ptr<float>();
+    const float* acc1_ptr = nullptr;
+    if (has1) {
+        acc1_contig = acc1.contiguous();
+        acc1_ptr = acc1_contig.data_ptr<float>();
+    }
+    float* out_ptr = out.data_ptr<float>();
+    const float* dorigin_ptr = dorigin_contig.data_ptr<float>();
+    const float* r0_ptr = r0_contig.data_ptr<float>();
+    const float* dr0_ptr = dr0_contig.data_ptr<float>();
+    const float* theta0_ptr = theta0_contig.data_ptr<float>();
+    const float* dtheta0_ptr = dtheta0_contig.data_ptr<float>();
+    const int* Nr0_ptr = Nr0_contig.data_ptr<int>();
+    const int* Ntheta0_ptr = Ntheta0_contig.data_ptr<int>();
+
+    dim3 thread_per_block = {256, 1};
+    unsigned int block_x = (Nr1 * Ntheta1 + thread_per_block.x - 1) / thread_per_block.x;
+    dim3 block_count = {block_x, 1};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    ffbp_tx_power_merge2_kernel
+          <<<block_count, thread_per_block, 0, stream>>>(
+                  acc0_ptr, acc1_ptr, out_ptr, dorigin_ptr,
+                  r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
+                  r1, dr1, theta1, dtheta1, Nr1, Ntheta1,
+                  static_cast<float>(altitude),
+                  static_cast<int>(in_psi), static_cast<int>(out_psi));
+    return out;
+}
+
 // Registers CUDA implementations
 TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("polar_interp_linear", &polar_interp_linear_cuda);
@@ -1831,6 +2030,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("ffbp_merge2_knab", &ffbp_merge2_knab_cuda);
   m.impl("ffbp_merge2_poly", &ffbp_merge2_poly_cuda);
   m.impl("ffbp_merge2_poly_weighted", &ffbp_merge2_poly_weighted_cuda);
+  m.impl("ffbp_tx_power_merge2", &ffbp_tx_power_merge2_cuda);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cuda);
   m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cuda);
   m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cuda);

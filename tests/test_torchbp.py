@@ -2148,6 +2148,327 @@ class TestBackprojectionCart2DTxPower(TestCase):
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
+
+class TestFFBPTxPower(TestCase):
+    """backprojection_polar_2d_tx_power_ffbp must match the direct backprojection_polar_2d_tx_power."""
+
+    @staticmethod
+    def _antenna(device, az_width=0.25, el_width=0.8):
+        nel, naz = 16, 24
+        el = torch.linspace(-1.2, 1.2, nel, device=device)
+        az = torch.linspace(-2.0, 2.0, naz, device=device)
+        gain = torch.exp(-(el[:, None] / el_width) ** 2) * torch.exp(
+            -(az[None, :] / az_width) ** 2
+        )
+        g = gain.to(torch.float32)
+        g_extent = [el[0].item(), az[0].item(), el[-1].item(), az[-1].item()]
+        return g, g_extent
+
+    @staticmethod
+    def _straight_track(device, nsweeps=128, span=32.0, alt=20.0, r_center=60.0):
+        torch.manual_seed(0)
+        pos = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        pos[:, 1] = torch.linspace(-span / 2, span / 2, nsweeps, device=device)
+        pos[:, 2] = alt
+        att = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        d = float(np.sqrt(r_center**2 + alt**2))
+        att[:, 0] = -float(np.arcsin(alt / d))
+        wa = (torch.hann_window(nsweeps, device=device) + 0.1).to(torch.float32)
+        return wa, pos, att
+
+    def _assert_matches(self, out, ref, q95=0.03, emax=0.1, margin=4, min_ratio=None):
+        self.assertEqual(out.shape, ref.shape)
+        out_c = out[margin:-margin, margin:-margin]
+        ref_c = ref[margin:-margin, margin:-margin]
+        # Infinite (unilluminated) pixels should agree except for isolated
+        # interpolation edge cases.
+        inf_agree = (torch.isinf(out_c) == torch.isinf(ref_c)).float().mean()
+        self.assertGreater(float(inf_agree), 0.99)
+        finite = torch.isfinite(ref_c) & torch.isfinite(out_c)
+        self.assertGreater(int(finite.sum()), 0)
+        thresh = 1e-3 * float(ref_c[torch.isfinite(ref_c)].max())
+        mask = finite & (ref_c > thresh)
+        self.assertGreater(int(mask.sum()), 100)
+        ratio = out_c[mask] / ref_c[mask]
+        err = (ratio - 1).abs()
+        self.assertLess(float(torch.quantile(err, 0.95)), q95)
+        self.assertLess(float(err.max()), emax)
+        if min_ratio is not None:
+            self.assertGreater(float(ratio.min()), min_ratio)
+
+    def _run_both(self, wa, g, g_extent, grid, pos, att, device="cpu", altitude=0.0,
+                  **kw):
+        kw.setdefault("stages", 3)
+        kw.setdefault("downsample_r", 1.0)
+        kw.setdefault("downsample_theta", 1.0)
+        kw.setdefault("min_nsweeps", 16)
+        if altitude > 0.0:
+            ref = torchbp.ops.backprojection_polar_2d_tx_power_slant(
+                wa, g, g_extent, grid, 0.15, pos, att, altitude=altitude,
+                normalization=kw.get("normalization"),
+                azimuth_resolution=kw.get("azimuth_resolution", True))[0]
+        else:
+            ref = torchbp.ops.backprojection_polar_2d_tx_power(
+                wa, g, g_extent, grid, 0.15, pos, att,
+                normalization=kw.get("normalization"),
+                azimuth_resolution=kw.get("azimuth_resolution", True))[0]
+        out = torchbp.ops.backprojection_polar_2d_tx_power_ffbp(
+            wa, g, g_extent, grid, 0.15, pos, att, altitude=altitude, **kw)
+        return out, ref
+
+    def test_straight_track(self):
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device)
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
+        out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                  normalization="sigma")
+        self._assert_matches(out, ref, q95=0.03, emax=0.1)
+
+    def test_long_track_narrow_theta(self):
+        """Subapertures at the track ends see the scene at local theta far
+        outside the narrow output theta range. A shared theta grid would lose
+        their contributions entirely."""
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.8)
+        wa, pos, att = self._straight_track(
+            device, nsweeps=256, span=300.0, alt=20.0, r_center=120.0)
+        grid = {"r": (100, 140), "theta": (-0.05, 0.05), "nr": 64, "ntheta": 64}
+        out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                  normalization="sigma", stages=4)
+        # min_ratio catches a systematic deficit from dropped subapertures.
+        self._assert_matches(out, ref, q95=0.03, emax=0.1, min_ratio=0.9)
+
+    def test_curved_track(self):
+        device = "cpu"
+        torch.manual_seed(0)
+        nsweeps = 256
+        g, g_extent = self._antenna(device, az_width=0.5)
+        R = 150.0
+        alpha = torch.linspace(-0.5, 0.5, nsweeps, device=device)
+        pos = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        pos[:, 0] = R - R * torch.cos(alpha)
+        pos[:, 1] = R * torch.sin(alpha)
+        pos[:, 2] = 20.0
+        att = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        # Yaw tracks the scene center so every pulse illuminates the scene.
+        att[:, 2] = torch.atan2(-pos[:, 1], 100.0 - pos[:, 0])
+        att[:, 0] = -float(np.arcsin(20.0 / np.sqrt(100.0**2 + 20.0**2)))
+        wa = (torch.hann_window(nsweeps, device=device) + 0.1).to(torch.float32)
+        grid = {"r": (80, 120), "theta": (-0.3, 0.3), "nr": 64, "ntheta": 128}
+        out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                  normalization="sigma", stages=4)
+        self._assert_matches(out, ref, q95=0.04, emax=0.15)
+
+    def test_thin_beam_deep_stages(self):
+        """A beam that is thin compared to the output grid theta step used to
+        poison the psi moments with NaN (0/0 in the Welford update when the
+        pulse weight underflows to zero) and undersample the illumination
+        rolloff in the subaperture maps. Both showed up as heavy azimuth
+        errors that grew with the number of stages."""
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.05)
+        wa, pos, att = self._straight_track(
+            device, nsweeps=512, span=100.0, alt=40.0, r_center=150.0)
+        grid = {"r": (80, 220), "theta": (-0.6, 0.6), "nr": 128, "ntheta": 256}
+        out, ref = self._run_both(
+            wa, g, g_extent, grid, pos, att, normalization="sigma",
+            stages=100, downsample_r=4.0, downsample_theta=4.0,
+            min_nsweeps=32)
+        self.assertFalse(bool(torch.isnan(out).any()))
+        out_c = out[4:-4, 4:-4]
+        ref_c = ref[4:-4, 4:-4]
+        inf_agree = (torch.isinf(out_c) == torch.isinf(ref_c)).float().mean()
+        self.assertGreater(float(inf_agree), 0.98)
+        finite = torch.isfinite(ref_c) & torch.isfinite(out_c)
+        thresh = 1e-3 * float(ref_c[torch.isfinite(ref_c)].max())
+        mask = finite & (ref_c > thresh)
+        self.assertGreater(int(mask.sum()), 1000)
+        err = (out_c[mask] / ref_c[mask] - 1).abs()
+        self.assertLess(float(err.median()), 0.01)
+        # Isolated illumination edge pixels can still be off, quantile only.
+        self.assertLess(float(torch.quantile(err, 0.95)), 0.05)
+
+    def test_zero_gain_no_nan(self):
+        """Antenna patterns with exact zeros inside the table (measured or
+        rotated patterns) and windows with zero endpoints must not produce
+        NaN moments in either the direct kernel or the accumulator maps."""
+        from torchbp.ops.backproj import _backprojection_polar_2d_tx_power_accum
+
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.1)
+        g = torch.where(g > 1e-3 * g.max(), g, torch.zeros_like(g))
+        wa, pos, att = self._straight_track(device, nsweeps=128)
+        wa = torch.hann_window(128).to(torch.float32)  # exact zero endpoints
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 64, "ntheta": 128}
+        acc = _backprojection_polar_2d_tx_power_accum(
+            wa, g, g_extent, grid, pos, att, "sigma", (80 - 40) / 64, 20.0)
+        self.assertTrue(bool(torch.isfinite(acc).all()))
+        ref = torchbp.ops.backprojection_polar_2d_tx_power(
+            wa, g, g_extent, grid, 0.15, pos, att, normalization="sigma")[0]
+        self.assertFalse(bool(torch.isnan(ref).any()))
+        # Illuminated pixels (W > 0 needs at least two pulses for a nonzero
+        # aperture) must be finite in the direct output too.
+        self.assertGreater(int((torch.isfinite(ref) & (acc[1] > 0)).sum()), 1000)
+
+    def test_slant(self):
+        device = "cpu"
+        alt = 30.0
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device, alt=0.0, r_center=60.0)
+        att[:, 0] = -float(np.arcsin(alt / 60.0))
+        grid = {"r": (25, 90), "theta": (-0.5, 0.5), "nr": 96, "ntheta": 128}
+        out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                  normalization="sigma", altitude=alt)
+        # Shadow zone below nadir must be exactly zero in both.
+        r_vec = 25 + (90 - 25) / 96 * torch.arange(96)
+        t_vec = -0.5 + 1.0 / 128 * torch.arange(128)
+        rg2 = r_vec[:, None] ** 2 * (1 - t_vec[None, :] ** 2) - alt**2
+        shadow = rg2 < 0
+        self.assertGreater(int(shadow.sum()), 0)
+        self.assertTrue((ref[shadow] == 0).all())
+        self.assertTrue((out[shadow] == 0).all())
+        # The slant range to ground range mapping is singular at the shadow
+        # boundary and the accumulator fields cannot be interpolated
+        # accurately there. Exclude the steep fold zone (ground range less
+        # than half the slant range) in addition to the shadow zone itself.
+        steep = rg2 < (r_vec[:, None] / 2) ** 2
+        out = torch.where(steep, torch.inf, out)
+        ref = torch.where(steep, torch.inf, ref)
+        self._assert_matches(out, ref, q95=0.04, emax=0.15)
+
+    def test_normalization_variants(self):
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device, nsweeps=64)
+        grid = {"r": (40, 80), "theta": (-0.4, 0.4), "nr": 48, "ntheta": 64}
+        for normalization in ["beta", "sigma", "gamma", "point"]:
+            out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                      normalization=normalization, stages=2)
+            self._assert_matches(out, ref, q95=0.03, emax=0.1)
+
+    def test_azimuth_resolution_false(self):
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device)
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
+        out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                  normalization="sigma", azimuth_resolution=False)
+        self.assertTrue(torch.isfinite(out).all())
+        self._assert_matches(out, ref, q95=0.02, emax=0.05)
+
+    def test_downsampled_subaperture_maps(self):
+        """Coarse subaperture maps must stay reasonably accurate."""
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device)
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
+        out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                  normalization="sigma",
+                                  downsample_r=4.0, downsample_theta=4.0)
+        self._assert_matches(out, ref, q95=0.05, emax=0.2)
+
+    def _merge_exactness(self, device):
+        """Merging two half track accumulator maps on the same grid must equal
+        the full track accumulator map (Chan's formula is exact)."""
+        from torchbp.ops.backproj import _backprojection_polar_2d_tx_power_accum
+        from torchbp.ops import ffbp_tx_power_merge2
+
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device, nsweeps=64)
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 48, "ntheta": 64}
+        kw = dict(normalization="sigma", dr_ref=(80 - 40) / 48, h_ref=20.0)
+        full = _backprojection_polar_2d_tx_power_accum(
+            wa, g, g_extent, grid, pos, att, **kw)
+        acc0 = _backprojection_polar_2d_tx_power_accum(
+            wa[:32], g, g_extent, grid, pos[:32], att[:32], **kw)
+        acc1 = _backprojection_polar_2d_tx_power_accum(
+            wa[32:], g, g_extent, grid, pos[32:], att[32:], **kw)
+        zero = torch.zeros(3, device=device)
+        merged = ffbp_tx_power_merge2(
+            acc0, acc1, zero, zero.clone(), [grid, grid], grid)
+        # The first and last rows and columns are on the edge of the bilinear
+        # interpolation support of the merge kernel where one ulp of rounding
+        # in the coordinate computation flips the bounds check.
+        torch.testing.assert_close(
+            merged[:, 1:-1, 1:-1], full[:, 1:-1, 1:-1], atol=1e-5, rtol=1e-2)
+
+    def test_merge_exactness_cpu(self):
+        self._merge_exactness("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_merge_exactness_cuda(self):
+        self._merge_exactness("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_accum_cpu_cuda(self):
+        from torchbp.ops.backproj import _backprojection_polar_2d_tx_power_accum
+
+        for altitude in (0.0, 30.0):
+            g, g_extent = self._antenna("cuda", az_width=0.4)
+            wa, pos, att = self._straight_track(
+                "cuda", nsweeps=64, alt=0.0 if altitude > 0 else 20.0)
+            att[:, 0] = -float(np.arcsin(max(altitude, 20.0) / 65.0))
+            grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 48, "ntheta": 64}
+            kw = dict(normalization="sigma", dr_ref=(80 - 40) / 48,
+                      h_ref=altitude if altitude > 0 else 20.0, altitude=altitude)
+            out_gpu = _backprojection_polar_2d_tx_power_accum(
+                wa, g, g_extent, grid, pos, att, **kw)
+            out_cpu = _backprojection_polar_2d_tx_power_accum(
+                wa.cpu(), g.cpu(), g_extent, grid, pos.cpu(), att.cpu(), **kw)
+            torch.testing.assert_close(out_cpu, out_gpu.cpu(), atol=1e-4, rtol=1e-3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_ffbp_tx_power_cpu_cuda(self):
+        g, g_extent = self._antenna("cuda", az_width=0.4)
+        wa, pos, att = self._straight_track("cuda")
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
+        kw = dict(stages=3, downsample_r=1.0, downsample_theta=1.0,
+                  min_nsweeps=16, normalization="sigma")
+        out_gpu = torchbp.ops.backprojection_polar_2d_tx_power_ffbp(
+            wa, g, g_extent, grid, 0.15, pos, att, **kw)
+        out_cpu = torchbp.ops.backprojection_polar_2d_tx_power_ffbp(
+            wa.cpu(), g.cpu(), g_extent, grid, 0.15, pos.cpu(), att.cpu(), **kw)
+        finite = torch.isfinite(out_cpu) & torch.isfinite(out_gpu.cpu())
+        self.assertGreater(float(finite.float().mean()), 0.95)
+        torch.testing.assert_close(
+            out_cpu[finite], out_gpu.cpu()[finite], atol=1e-3, rtol=1e-2)
+
+    def _opcheck(self, device):
+        wa = torch.rand(4, device=device) + 0.5
+        pos = torch.randn(4, 3, device=device)
+        pos[:, 0] -= 5.0
+        att = torch.zeros(4, 3, device=device)
+        g = torch.rand(8, 8, device=device)
+        opcheck(
+            torch.ops.torchbp.backprojection_polar_2d_tx_power_accum,
+            (wa, pos, att, g, -1.0, -0.5, 2.0 / 8, 1.0 / 8, 8, 8, 4,
+             1.0, 0.5, -0.9, 0.2, 8, 8, 1, 0.5, 10.0, 0.0, 0),
+            test_utils=["test_schema"],
+        )
+        acc0 = torch.rand(4, 8, 8, device=device)
+        acc1 = torch.rand(4, 8, 8, device=device)
+        dorigin = torch.zeros(2, 3, device=device)
+        r0 = torch.ones(2, device=device)
+        dr0 = torch.full((2,), 0.5, device=device)
+        theta0 = torch.full((2,), -0.9, device=device)
+        dtheta0 = torch.full((2,), 0.2, device=device)
+        nr0 = torch.full((2,), 8, dtype=torch.int32, device=device)
+        ntheta0 = torch.full((2,), 8, dtype=torch.int32, device=device)
+        opcheck(
+            torch.ops.torchbp.ffbp_tx_power_merge2,
+            (acc0, acc1, dorigin, r0, dr0, theta0, dtheta0, nr0, ntheta0,
+             1.0, 0.5, -0.9, 0.2, 8, 8, 0.0, 0, 0),
+            test_utils=["test_schema"],
+        )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
     def test_matches_polar_at_coincident_ground_points(self):
         """The Cartesian tx_power kernel maps a pixel's ground position
         directly from the grid; the polar kernel maps (r, theta) to the same

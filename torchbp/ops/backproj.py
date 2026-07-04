@@ -831,6 +831,65 @@ def blocksvd_alpha(
     )
 
 
+def _tx_power_norm_int(normalization: str | None) -> int:
+    """Map tx_power normalization string to the C++ enum value."""
+    if normalization == "beta" or normalization is None:
+        return 0
+    elif normalization == "sigma":
+        return 1
+    elif normalization == "gamma":
+        return 2
+    elif normalization == "point":
+        return 3
+    else:
+        raise ValueError(f"Invalid normalization {normalization}.")
+
+
+def _backprojection_polar_2d_tx_power_accum(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "PolarGrid | dict",
+    pos: Tensor,
+    att: Tensor,
+    normalization: str | None,
+    dr_ref: float,
+    h_ref: float,
+    altitude: float = 0.0,
+    theta_psi: bool = False,
+) -> Tensor:
+    """Unfinished tx_power accumulator maps for factorized processing.
+
+    Returns a [4, nr, ntheta] float32 tensor with channels
+    S = sum wi/sinl, W = sum wi, P1 = W*mean(psi) and M2 = weighted sum of
+    squared deviations of psi. Used internally by :func:`~torchbp.ops.backprojection_polar_2d_tx_power_ffbp`.
+
+    dr_ref and h_ref should refer to the final output grid range step and
+    reference altitude so that all subapertures use the same minimum look
+    angle clamp as the direct kernel. With theta_psi the grid theta extents
+    are in psi = asin(theta) radians and the map is sampled uniformly in psi.
+    """
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+
+    assert wa.dim() == 1
+    nsweeps = wa.shape[0]
+    assert pos.shape == (nsweeps, 3)
+    assert att.shape == (nsweeps, 3)
+
+    g_nel = g.shape[0]
+    g_naz = g.shape[1]
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_daz = (g_az1 - g_az0) / g_naz
+    g_del = (g_el1 - g_el0) / g_nel
+
+    norm = _tx_power_norm_int(normalization)
+
+    return torch.ops.torchbp.backprojection_polar_2d_tx_power_accum.default(
+        wa, pos, att, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+        nsweeps, r0, dr, theta0, dtheta, nr, ntheta, norm,
+        dr_ref, h_ref, altitude, int(theta_psi))
+
+
 def _prepare_backprojection_polar_2d_tx_power_args(
     wa: Tensor,
     g: Tensor,
@@ -866,16 +925,7 @@ def _prepare_backprojection_polar_2d_tx_power_args(
     g_daz = (g_az1 - g_az0) / g_naz
     g_del = (g_el1 - g_el0) / g_nel
 
-    if normalization == "beta" or normalization is None:
-        norm = 0
-    elif normalization == "sigma":
-        norm = 1
-    elif normalization == "gamma":
-        norm = 2
-    elif normalization == "point":
-        norm = 3
-    else:
-        raise ValueError(f"Invalid normalization {normalization}.")
+    norm = _tx_power_norm_int(normalization)
 
     return (wa, pos, att, g, nbatch, g_az0, g_el0, g_daz, g_del,
             g_naz, g_nel, nsweeps, r_res, r0, dr, theta0, dtheta,
