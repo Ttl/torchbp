@@ -3575,5 +3575,198 @@ class TestGpgaBpPolarTde(TestGpgaBpPolar):
         self.assertTrue(torch.isfinite(pos_new).all())
 
 
+class TestCFBP(TestCase):
+    """Cartesian factorized backprojection against direct backprojection."""
+
+    fc = 6e9
+    r_res = 0.3
+    grid = {"x": (60.0, 160.0), "y": (-25.0, 25.0), "nx": 256, "ny": 512}
+    sweep_samples = 1024
+
+    def _make_data(self, targets, amps, pos, d0=0.0, data_fmod=0.0):
+        """Point responses consistent with the backprojection phase model."""
+        c0 = 299792458.0
+        data = torch.zeros(
+            pos.shape[0], self.sweep_samples, dtype=torch.complex64
+        )
+        m_idx = torch.arange(pos.shape[0])
+        for t, a in zip(targets, amps):
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = (d + d0) / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += a * w[valid] * phase[valid]
+        if data_fmod != 0.0:
+            mod = torch.exp(1j * data_fmod * torch.arange(self.sweep_samples))
+            data = data * mod[None, :]
+        return data
+
+    def _scene(self, nsweeps=512):
+        torch.manual_seed(5)
+        ntargets = 12
+        x = 70.0 + 80.0 * torch.rand(ntargets)
+        y = -20.0 + 40.0 * torch.rand(ntargets)
+        targets = torch.stack([x, y, torch.zeros_like(x)], dim=1)
+        amps = (1.0 + torch.rand(ntargets)).to(torch.complex64)
+        pos = torch.zeros(nsweeps, 3)
+        pos[:, 1] = torch.linspace(-3.0, 3.0, nsweeps)
+        pos[:, 2] = 20.0
+        return targets, amps, pos
+
+    def _compare(self, device, stages, nsweeps=512, grid=None, d0=0.0,
+                 data_fmod=0.0, divisions=2, tol=0.05):
+        if grid is None:
+            grid = self.grid
+        targets, amps, pos = self._scene(nsweeps)
+        data = self._make_data(targets, amps, pos, d0=d0, data_fmod=data_fmod)
+        data = data.to(device)
+        pos = pos.to(device)
+        ref = torchbp.ops.backprojection_cart_2d(
+            data, grid, self.fc, self.r_res, pos, d0=d0, data_fmod=data_fmod
+        )
+        out = torchbp.ops.cfbp(
+            data, grid, self.fc, self.r_res, pos, stages=stages,
+            divisions=divisions, d0=d0, data_fmod=data_fmod
+        )
+        self.assertEqual(out.shape, ref.shape)
+        rel = ((out - ref).abs().max() / ref.abs().max()).item()
+        self.assertLess(rel, tol, f"cfbp relative error {rel:.2e} exceeds {tol}")
+        return out
+
+    def test_stages1_matches_direct(self):
+        self._compare("cpu", stages=1, tol=0.03)
+
+    def test_stages2_matches_direct(self):
+        self._compare("cpu", stages=2)
+
+    def test_stages3_matches_direct(self):
+        # Enough sweeps that all three stages actually recurse.
+        self._compare("cpu", stages=3, nsweeps=1040)
+
+    def test_odd_nsweeps(self):
+        # divisions does not divide nsweeps: no sweep may be dropped.
+        self._compare("cpu", stages=2, nsweeps=511)
+
+    def test_odd_ny(self):
+        self._compare("cpu", stages=2, grid=dict(self.grid, ny=255))
+        self._compare("cpu", stages=2, grid=dict(self.grid, ny=250))
+
+    def test_divisions3(self):
+        self._compare("cpu", stages=2, nsweeps=1040, divisions=3)
+
+    def test_d0(self):
+        self._compare("cpu", stages=2, d0=-0.5)
+
+    def test_data_fmod(self):
+        self._compare("cpu", stages=2, data_fmod=-torch.pi / 2)
+
+    def test_grid_object(self):
+        from torchbp.grid import CartesianGrid
+        targets, amps, pos = self._scene()
+        data = self._make_data(targets, amps, pos)
+        grid_obj = CartesianGrid(
+            x_range=self.grid["x"], y_range=self.grid["y"],
+            nx=self.grid["nx"], ny=self.grid["ny"],
+        )
+        out_dict = torchbp.ops.cfbp(
+            data, self.grid, self.fc, self.r_res, pos, stages=2
+        )
+        out_obj = torchbp.ops.cfbp(
+            data, grid_obj, self.fc, self.r_res, pos, stages=2
+        )
+        torch.testing.assert_close(out_dict, out_obj)
+
+    def test_data_gradient(self):
+        targets, amps, pos = self._scene(256)
+        data = self._make_data(targets, amps, pos).requires_grad_(True)
+        out = torchbp.ops.cfbp(data, self.grid, self.fc, self.r_res, pos, stages=2)
+        out.abs().mean().backward()
+        self.assertTrue(torch.isfinite(data.grad).all())
+        self.assertGreater(data.grad.abs().sum().item(), 0)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cuda_matches_direct(self):
+        out_cuda = self._compare("cuda", stages=2)
+        out_cpu = self._compare("cpu", stages=2)
+        rel = ((out_cuda.cpu() - out_cpu).abs().max() / out_cpu.abs().max()).item()
+        self.assertLess(rel, 0.05)
+
+
+class TestCFBPAdaptive(TestCase):
+    """Range-adaptive CFBP on a long track with near zero ground range.
+
+    Plain cfbp cannot represent the subaperture images on the subsampled
+    grid at near range in this geometry; cfbp_adaptive must still match
+    direct backprojection.
+    """
+
+    fc = 6e9
+    r_res = 0.375
+    sweep_samples = 512
+    nsweeps = 1024
+    grid = {"x": (2.0, 52.0), "y": (-25.0, 25.0), "nx": 128, "ny": 128}
+
+    def _scene(self):
+        torch.manual_seed(7)
+        c0 = 299792458.0
+        pos = torch.zeros(self.nsweeps, 3)
+        pos[:, 1] = 0.25 * c0 / self.fc * (
+            torch.arange(self.nsweeps) - self.nsweeps / 2
+        )
+        pos[:, 2] = 10.0
+        tx = torch.tensor([3.0, 5.0, 8.0, 14.0, 25.0, 40.0, 50.0])
+        ty = torch.tensor([0.0, 15.0, -10.0, 20.0, -20.0, 5.0, 0.0])
+        data = torch.zeros(self.nsweeps, self.sweep_samples, dtype=torch.complex64)
+        m_idx = torch.arange(self.nsweeps)
+        for x, y in zip(tx, ty):
+            t = torch.tensor([x, y, 0.0])
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = d / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += w[valid] * phase[valid]
+        return data, pos
+
+    def test_matches_direct_near_range(self):
+        data, pos = self._scene()
+        ref = torchbp.ops.backprojection_cart_2d(
+            data, self.grid, self.fc, self.r_res, pos
+        )
+        out = torchbp.ops.cfbp_adaptive(
+            data, self.grid, self.fc, self.r_res, pos, stages=4,
+            data_oversample=1.2
+        )
+        self.assertEqual(out.shape, ref.shape)
+        rel = ((out - ref).abs().max() / ref.abs().max()).item()
+        self.assertLess(rel, 0.02, f"cfbp_adaptive relative error {rel:.2e}")
+        # Plain cfbp must be much worse in this geometry, otherwise the
+        # scene does not actually stress the near range.
+        out_plain = torchbp.ops.cfbp(
+            data, self.grid, self.fc, self.r_res, pos, stages=4
+        )
+        rel_plain = ((out_plain - ref).abs().max() / ref.abs().max()).item()
+        self.assertGreater(rel_plain, 10 * rel)
+
+    def test_blocks(self):
+        _, pos = self._scene()
+        blocks = torchbp.ops.cfbp_adaptive_blocks(
+            self.grid, pos, self.fc, self.r_res, stages=4, data_oversample=1.2
+        )
+        # Blocks cover all rows contiguously and density decreases with range.
+        self.assertEqual(blocks[0][0], 0)
+        self.assertEqual(blocks[-1][1], self.grid["nx"])
+        for b, b_next in zip(blocks, blocks[1:]):
+            self.assertEqual(b[1], b_next[0])
+        ks = [b[2] for b in blocks]
+        self.assertEqual(ks, sorted(ks, reverse=True))
+        self.assertGreater(ks[0], ks[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

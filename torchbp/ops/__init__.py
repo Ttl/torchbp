@@ -1,5 +1,6 @@
 from .backproj import *
 from .cfar import *
+from .cfbp import *
 from .coherence import *
 from .correlation import *
 from .entropy import *
