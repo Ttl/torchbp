@@ -844,18 +844,17 @@ def ffbp_merge2_poly_weighted(
     """
     Interpolate two pseudo-polar radar images to new grid with antenna pattern weighting.
 
-    This is the weighted version of ffbp_merge2_poly that applies antenna pattern
-    weights during the merge. Uses both W1 (sum of gains) and W2 (sum of squared gains)
-    to correctly reconstruct the direct backprojection result.
+    This is the weighted version of ffbp_merge2_poly used with antenna pattern
+    weighting. The input images are unnormalized gain-weighted accumulations
+    (leaves are formed with normalize=False). The merge interpolates and sums
+    the accumulations::
 
-    The merge formula recovers the unnormalized accumulation A from normalized images
-    (img = A * W1/W2) using::
+        merged = A0 + A1
 
-        A = img * W2 / W1
-
-    Then combines::
-
-        merged = (A0 + A1) * (W1_0 + W1_1) / (W2_0 + W2_1)
+    and likewise sums the interpolated illumination moment maps
+    W1 (sum of gains) and W2 (sum of squared gains). The regularized
+    normalization ``img = A * W1 / (W2 + lambda)`` is applied once at the top
+    level in ``ffbp``.
 
     Gradient not supported.
 
