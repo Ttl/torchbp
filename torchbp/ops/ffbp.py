@@ -88,21 +88,61 @@ def _weighted_normalize(
     value of ``lambda`` is not critical. It only sets how far below the signal
     the weakly-illuminated residual sits, so by default it is a small fraction
     ``rel_floor`` of the peak illumination power ``W2_max``.
-    """
-    # Bring decimated weight maps up to the image grid. The top-level
-    # merge already emits them at full resolution, so this is normally skipped.
-    if w1.shape != A.shape:
-        import torch.nn.functional as F
-        size = (A.shape[-2], A.shape[-1])
-        w1 = F.interpolate(w1[None, None].float(), size=size, mode="bilinear", align_corners=False)[0, 0]
-        w2 = F.interpolate(w2[None, None].float(), size=size, mode="bilinear", align_corners=False)[0, 0]
 
+    ``A`` is modified in place and returned. The normalization is applied in
+    row chunks so that decimated weight maps are never materialized at full
+    image resolution (memory saving is the reason to decimate them in the
+    first place). Decimated maps are interpolated at the kernels' sample
+    positions ``dec * i`` (not cell centers).
+    """
+    # Linear interpolation cannot exceed the sample max, so the decimated
+    # max equals the upsampled max.
     w2max = float(w2.max())
     if w2max <= 0.0:
         # nothing illuminated. A = 0
         return A
     lam = max(float(eps) ** 2 if eps is not None else 0.0, rel_floor * w2max)
-    return A * (w1 / (w2 + lam))
+
+    nr, ntheta = A.shape[-2], A.shape[-1]
+    nr_w, ntheta_w = w1.shape[-2], w1.shape[-1]
+    full_res = nr_w == nr and ntheta_w == ntheta
+    dec_r = -(-nr // nr_w)      # ceil, inverse of out = ceil(n / dec)
+    dec_t = -(-ntheta // ntheta_w)
+
+    if not full_res:
+        # Theta-axis sample positions, shared by all chunks.
+        xt = torch.arange(ntheta, device=A.device, dtype=torch.float32) / dec_t
+        t0 = xt.long().clamp(max=ntheta_w - 1)
+        t1 = torch.clamp(t0 + 1, max=ntheta_w - 1)
+        ft = (xt - t0.to(xt.dtype))[None, :]
+        w1 = w1.float()
+        w2 = w2.float()
+
+    # Bound the temporaries to ~chunk * ntheta floats.
+    chunk = max(1, 8_000_000 // ntheta)
+    for rs in range(0, nr, chunk):
+        re = min(rs + chunk, nr)
+        if full_res:
+            # w1c/w2c are views; don't modify them in place.
+            w1c = w1[..., rs:re, :]
+            w2c = w2[..., rs:re, :]
+            A[..., rs:re, :] *= w1c / (w2c + lam)
+        else:
+            xr = torch.arange(rs, re, device=A.device, dtype=torch.float32) / dec_r
+            r0 = xr.long().clamp(max=nr_w - 1)
+            r1 = torch.clamp(r0 + 1, max=nr_w - 1)
+            fr = (xr - r0.to(xr.dtype))[:, None]
+
+            def up(w):
+                rows = w.index_select(-2, r0).lerp_(w.index_select(-2, r1), fr)
+                return rows.index_select(-1, t0).lerp_(rows.index_select(-1, t1), ft)
+
+            w1c = up(w1)
+            w2c = up(w2)
+            w2c += lam
+            w1c /= w2c
+            A[..., rs:re, :] *= w1c
+    return A
 
 
 def ffbp(
@@ -149,7 +189,8 @@ def ffbp(
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
     pos : Tensor
-        Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+        Position of the platform at each data point. Shape should be [nsweeps, 3].
+        Batched input is not supported.
     stages : int
         Number of recursions.
     divisions : int
