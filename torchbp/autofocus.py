@@ -506,6 +506,18 @@ def gpga_bp_polar_tde(
     """
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
 
+    def form_image(p):
+        if use_ffbp:
+            opts = {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}
+            if ffbp_opts is not None:
+                opts.update(ffbp_opts)
+            return ffbp(data, grid_polar, fc, r_res, p, d0=d0,
+                    data_fmod=data_fmod, g=g, g_extent=g_extent, att=att,
+                    **opts)
+        return backprojection_polar_2d(data, grid_polar, fc, r_res, p,
+                d0=d0, data_fmod=data_fmod, g=g, g_extent=g_extent,
+                att=att)[0]
+
     r = r0 + dr * torch.arange(nr, device=data.device, dtype=torch.float32)
     theta = theta0 + dtheta * torch.arange(
         ntheta, device=data.device, dtype=torch.float32
@@ -516,7 +528,7 @@ def gpga_bp_polar_tde(
         window_width = data.shape[0] // azimuth_divisions
 
     if img is None:
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[0]
+        img = form_image(pos_new)
 
     rdiv = img.shape[0] // range_divisions
     azdiv = img.shape[1] // azimuth_divisions
@@ -552,8 +564,8 @@ def gpga_bp_polar_tde(
         )
         for ir in range(range_divisions):
             for jr in range(azimuth_divisions):
-                ir1 = (ir + 1) * rdiv if ir < range_divisions - 1 else -1
-                jr1 = (jr + 1) * azdiv if jr < azimuth_divisions - 1 else -1
+                ir1 = (ir + 1) * rdiv if ir < range_divisions - 1 else None
+                jr1 = (jr + 1) * azdiv if jr < azimuth_divisions - 1 else None
                 local_img = img[ir * rdiv : ir1, jr * azdiv : jr1]
 
                 rpeaks = torch.argmax(torch.abs(local_img), dim=1)
@@ -561,6 +573,19 @@ def gpga_bp_polar_tde(
                 max_a = torch.max(a)
 
                 target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
+                if not torch.any(target_idx):
+                    # No usable targets in this block (e.g. never
+                    # illuminated). Zero weight excludes it from the
+                    # position solve; centers just need to be finite.
+                    local_w[ir * azimuth_divisions + jr] = 0
+                    local_d[ir * azimuth_divisions + jr, :] = 0
+                    local_centers[ir * azimuth_divisions + jr, 0] = (
+                        r0 + dr * (ir * rdiv + local_img.shape[0] / 2)
+                    )
+                    local_centers[ir * azimuth_divisions + jr, 1] = (
+                        theta0 + dtheta * (jr * azdiv + local_img.shape[1] / 2)
+                    )
+                    continue
                 target_theta = (
                     theta0
                     + dtheta * jr * azdiv
@@ -602,12 +627,14 @@ def gpga_bp_polar_tde(
                 d = phi * c0 / (4 * torch.pi * fc)
                 local_d[ir * azimuth_divisions + jr, :] = d
 
-                local_centers[ir * azimuth_divisions + jr, 0] = torch.mean(
-                    w * target_r
-                ) / torch.mean(w)
-                local_centers[ir * azimuth_divisions + jr, 1] = torch.mean(
-                    w * target_theta
-                ) / torch.mean(w)
+                # Normalize to avoid overflow with near-noiseless targets
+                wn = w[:, 0] / torch.max(w)
+                local_centers[ir * azimuth_divisions + jr, 0] = torch.sum(
+                    wn * target_r
+                ) / torch.sum(wn)
+                local_centers[ir * azimuth_divisions + jr, 1] = torch.sum(
+                    wn * target_theta
+                ) / torch.sum(wn)
 
         # Local image centers in Cartesian coordinates
         local_y = local_centers[:, 0] * local_centers[:, 1]
@@ -658,17 +685,7 @@ def gpga_bp_polar_tde(
         if estimate_z:
             pos_new[:, 2] = pos_new[:, 2] + d_solved[2]
 
-        if use_ffbp:
-            opts = {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}
-            if ffbp_opts is not None:
-                opts.update(ffbp_opts)
-            img = ffbp(data, grid_polar, fc, r_res, pos_new, d0=d0,
-                    data_fmod=data_fmod, g=g, g_extent=g_extent, att=att,
-                    **opts)
-        else:
-            img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new,
-                    d0=d0, data_fmod=data_fmod, g=g, g_extent=g_extent,
-                    att=att)[0]
+        img = form_image(pos_new)
         window_width = int(window_width * window_exp)
         if window_width < min_window:
             if verbose:
