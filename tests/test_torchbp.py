@@ -322,8 +322,7 @@ class TestPolarToCartLinear(TestCase):
         }
         return [args]
 
-    # @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
-    @unittest.skip("polar_to_cart_linear_grad has no CPU implementation")
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_cpu_and_gpu_grad(self):
         samples = self.sample_inputs("cuda", requires_grad=True)
         for sample in samples:
@@ -381,10 +380,9 @@ class TestPolarToCartLinear(TestCase):
                 rtol=rtol,  # Also to rtol
             )
 
-    @unittest.skip("polar_to_cart_linear_grad has no CPU implementation")
     def test_gradients_cpu(self):
+        # float64 not tested: CPU forward supports only complex64/float32
         self._test_gradients("cpu")
-        self._test_gradients("cpu", dtype=torch.float64)
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_gradients_cuda(self):
