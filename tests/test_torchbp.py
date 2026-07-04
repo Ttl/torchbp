@@ -3341,6 +3341,54 @@ class TestLowpassFilterWindow(TestCase):
                 torch.testing.assert_close(out_str, out_tensor)
 
 
+class TestPga(TestCase):
+    """Plain phase gradient autofocus on a synthetic point-target image."""
+
+    @staticmethod
+    def _sharpness(img):
+        p = img.abs() ** 2
+        return ((p**2).sum() / (p.sum() ** 2)).item()
+
+    def test_recovers_phase_error(self):
+        torch.manual_seed(3)
+        nr, ntheta = 96, 256
+        # Sparse bright point targets over weak clutter
+        img = 0.01 * torch.randn(nr, ntheta, dtype=torch.complex64)
+        r_idx = torch.randint(0, nr, (16,))
+        t_idx = torch.randint(0, ntheta, (16,))
+        img[r_idx, t_idx] += (1.0 + torch.rand(16)) * torch.exp(
+            2j * torch.pi * torch.rand(16)
+        )
+
+        # Corrupt with a smooth azimuth phase error (the model pga inverts:
+        # img_focused = ifft(fft(img) * exp(-1j*phi)))
+        k = torch.arange(ntheta)
+        phi_true = 2.0 * torch.sin(2 * torch.pi * 2 * k / ntheta) + torch.cos(
+            2 * torch.pi * 5 * k / ntheta
+        )
+        img_bad = torch.fft.ifft(
+            torch.fft.fft(img, axis=-1) * torch.exp(1j * phi_true)[None, :], axis=-1
+        )
+
+        img_focus, phi = torchbp.autofocus.pga(img_bad.clone())
+
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(phi).all())
+        self.assertGreater(
+            self._sharpness(img_focus), 2.0 * self._sharpness(img_bad)
+        )
+        # Recovered phase must match the injected error up to the
+        # unobservable linear trend and constant offset.
+        from torchbp.util import detrend, unwrap
+        resid = detrend(unwrap(phi - phi_true))
+        resid = resid - resid.mean()
+        # Passing runs give ~0.2x; a broken azimuth shift gives ~1x.
+        self.assertLess(
+            resid.pow(2).mean().sqrt().item(),
+            0.4 * phi_true.std().item(),
+        )
+
+
 class TestGpgaBpPolar(TestCase):
     """End-to-end GPGA polar autofocus on synthetic point-scatterer data."""
 

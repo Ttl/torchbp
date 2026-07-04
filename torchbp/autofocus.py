@@ -159,13 +159,15 @@ def pga(
         if window < min_window:
             break
         # Peak for each range bin
-        g = img.clone()
+        rpeaks = torch.argmax(torch.abs(img), axis=1)
+        # Roll theta axis so that peak is at 0 bin. Batched gather instead
+        # of a per-row roll: one kernel instead of nr launches and syncs.
+        idx = (
+            torch.arange(ntheta, device=img.device)[None, :] + rpeaks[:, None]
+        ) % ntheta
+        g = torch.gather(img, 1, idx)
         if offload:
             img = img.to(device="cpu")
-        rpeaks = torch.argmax(torch.abs(g), axis=1)
-        # Roll theta axis so that peak is at 0 bin
-        for j in range(nr):
-            g[j, :] = torch.roll(g[j, :], -rpeaks[j].item())
         # Apply window
         g[:, 1 + window // 2 : 1 - window // 2] = 0
         # IFFT across theta
