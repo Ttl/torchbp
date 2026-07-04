@@ -445,7 +445,8 @@ std::vector<at::Tensor> polar_interp_linear_grad_cpu(
 }
 template<typename T>
 static void polar_to_cart_kernel_linear_cpu(const T *img, T
-        *out, const float *origin, float rotation, float ref_phase, float r0,
+        *out, const float *origin, float rotation, float rs, float rc,
+        float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
         float dx, float y0, float dy, int Nx, int Ny, float alias_fmod,
         int id1, int idbatch) {
@@ -465,8 +466,6 @@ static void polar_to_cart_kernel_linear_cpu(const T *img, T
     const float dz = sqrtf(d*d + orig2*orig2);
     float t = (y - orig1) / d; // Sin of angle
     float tc = (x - orig0) / d; // Cos of angle
-    float rs = sinf(rotation);
-    float rc = cosf(rotation);
     float cosa = t*rs  + tc*rc;
     if (rotation != 0.0f) {
         t = rc * t - rs * tc;
@@ -534,59 +533,37 @@ at::Tensor polar_to_cart_linear_cpu(
     // logical processor count (incl. SMT/hyperthreads).
     omp_set_num_threads(omp_get_num_procs());
 
+    // Hoist the dtype dispatch, data pointers and rotation trig out of the
+    // hot loop: per-pixel data_ptr calls block autovectorization.
+    const float rs = sinf(rotation);
+    const float rc = cosf(rotation);
+
+    if (img.dtype() == at::kComplexFloat) {
+        const complex64_t* img_ptr = (const complex64_t*)img_contig.data_ptr<c10::complex<float>>();
+        complex64_t* out_ptr = (complex64_t*)out.data_ptr<c10::complex<float>>();
 #pragma omp parallel for collapse(2)
-    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
-        for(int id1 = 0; id1 < Nx * Ny; id1++) {
-            if (img.dtype() == at::kComplexFloat) {
-                c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
-                c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+        for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+            for(int id1 = 0; id1 < Nx * Ny; id1++) {
                 polar_to_cart_kernel_linear_cpu<complex64_t>(
-                              (const complex64_t*)img_ptr,
-                              (complex64_t*)out_ptr,
-                              origin_ptr,
-                              rotation,
-                              ref_phase,
-                              r0,
-                              dr,
-                              theta0,
-                              dtheta,
-                              Nr,
-                              Ntheta,
-                              x0,
-                              dx,
-                              y0,
-                              dy,
-                              Nx,
-                              Ny,
-                              alias_fmod/kPI,
-                              id1,
-                              idbatch
-                              );
-            } else {
-                float* img_ptr = img_contig.data_ptr<float>();
-                float* out_ptr = out.data_ptr<float>();
+                              img_ptr, out_ptr, origin_ptr,
+                              rotation, rs, rc, ref_phase,
+                              r0, dr, theta0, dtheta, Nr, Ntheta,
+                              x0, dx, y0, dy, Nx, Ny,
+                              alias_fmod/kPI, id1, idbatch);
+            }
+        }
+    } else {
+        const float* img_ptr = img_contig.data_ptr<float>();
+        float* out_ptr = out.data_ptr<float>();
+#pragma omp parallel for collapse(2)
+        for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+            for(int id1 = 0; id1 < Nx * Ny; id1++) {
                 polar_to_cart_kernel_linear_cpu<float>(
-                              img_ptr,
-                              out_ptr,
-                              origin_ptr,
-                              rotation,
-                              ref_phase,
-                              r0,
-                              dr,
-                              theta0,
-                              dtheta,
-                              Nr,
-                              Ntheta,
-                              x0,
-                              dx,
-                              y0,
-                              dy,
-                              Nx,
-                              Ny,
-                              alias_fmod/kPI,
-                              id1,
-                              idbatch
-                              );
+                              img_ptr, out_ptr, origin_ptr,
+                              rotation, rs, rc, ref_phase,
+                              r0, dr, theta0, dtheta, Nr, Ntheta,
+                              x0, dx, y0, dy, Nx, Ny,
+                              alias_fmod/kPI, id1, idbatch);
             }
         }
     }
@@ -596,7 +573,8 @@ at::Tensor polar_to_cart_linear_cpu(
 // Per-pixel math matches polar_to_cart_kernel_linear_grad in
 // cuda/polar_interp.cu.
 static void polar_to_cart_kernel_linear_grad_cpu(const complex64_t *img,
-        const float *origin, float rotation, float ref_phase, float r0,
+        const float *origin, float rotation, float rs, float rc,
+        float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
         float dx, float y0, float dy, int Nx, int Ny, float alias_fmod,
         const complex64_t *grad, complex64_t *img_grad, float *origin_grad,
@@ -617,8 +595,6 @@ static void polar_to_cart_kernel_linear_grad_cpu(const complex64_t *img,
     const float dz = sqrtf(d*d + orig2*orig2);
     float t = (y - orig1) / d; // Sin of angle
     float tc = (x - orig0) / d; // Cos of angle
-    float rs = sinf(rotation);
-    float rc = cosf(rotation);
     float cosa = t*rs + tc*rc;
     if (rotation != 0.0f) {
         t = rc * t - rs * tc;
@@ -752,6 +728,8 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cpu(
     }
 
     const float ref_phase = 4.0f * fc / kC0;
+    const float rs = sinf(rotation);
+    const float rc = cosf(rotation);
 
     // See polar_interp_linear_cpu for why the thread count is set explicitly.
     omp_set_num_threads(omp_get_num_procs());
@@ -763,6 +741,8 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cpu(
                           (const complex64_t*)img_ptr,
                           origin_ptr,
                           rotation,
+                          rs,
+                          rc,
                           ref_phase,
                           r0,
                           dr,
@@ -1592,7 +1572,8 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cpu(
 
 template<typename T>
 static void polar_to_cart_kernel_lanczos_cpu(const T *img, T
-        *out, const float *origin, float rotation, float ref_phase, float r0,
+        *out, const float *origin, float rotation, float rs, float rc,
+        float ref_phase, float r0,
         float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
         float dx, float y0, float dy, int Nx, int Ny, float alias_fmod, int order,
         int id1, int idbatch) {
@@ -1608,8 +1589,6 @@ static void polar_to_cart_kernel_lanczos_cpu(const T *img, T
     const float dz = sqrtf(d*d + orig2*orig2);
     float t = (y - orig1) / d; // Sin of angle
     float tc = (x - orig0) / d; // Cos of angle
-    float rs = sinf(rotation);
-    float rc = cosf(rotation);
     float cosa = t*rs  + tc*rc;
     if (rotation != 0.0f) {
         t = rc * t - rs * tc;
@@ -1673,21 +1652,31 @@ at::Tensor polar_to_cart_lanczos_cpu(
 
     omp_set_num_threads(omp_get_num_procs());
 
+    // See polar_to_cart_linear_cpu: dispatch and trig hoisted out of the
+    // hot loop.
+    const float rs = sinf(rotation);
+    const float rc = cosf(rotation);
+
+    if (img.dtype() == at::kComplexFloat) {
+        const complex64_t* img_ptr = img_contig.data_ptr<complex64_t>();
+        complex64_t* out_ptr = out.data_ptr<complex64_t>();
 #pragma omp parallel for collapse(2)
-    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
-        for(int id1 = 0; id1 < Nx * Ny; id1++) {
-            if (img.dtype() == at::kComplexFloat) {
-                const complex64_t* img_ptr = img_contig.data_ptr<complex64_t>();
-                complex64_t* out_ptr = out.data_ptr<complex64_t>();
+        for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+            for(int id1 = 0; id1 < Nx * Ny; id1++) {
                 polar_to_cart_kernel_lanczos_cpu<complex64_t>(
-                        img_ptr, out_ptr, origin_ptr, rotation, ref_phase,
+                        img_ptr, out_ptr, origin_ptr, rotation, rs, rc, ref_phase,
                         r0, dr, theta0, dtheta, Nr, Ntheta,
                         x0, dx, y0, dy, Nx, Ny, alias_fmod/kPI, order, id1, idbatch);
-            } else {
-                const float* img_ptr = img_contig.data_ptr<float>();
-                float* out_ptr = out.data_ptr<float>();
+            }
+        }
+    } else {
+        const float* img_ptr = img_contig.data_ptr<float>();
+        float* out_ptr = out.data_ptr<float>();
+#pragma omp parallel for collapse(2)
+        for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+            for(int id1 = 0; id1 < Nx * Ny; id1++) {
                 polar_to_cart_kernel_lanczos_cpu<float>(
-                        img_ptr, out_ptr, origin_ptr, rotation, ref_phase,
+                        img_ptr, out_ptr, origin_ptr, rotation, rs, rc, ref_phase,
                         r0, dr, theta0, dtheta, Nr, Ntheta,
                         x0, dx, y0, dy, Nx, Ny, alias_fmod/kPI, order, id1, idbatch);
             }

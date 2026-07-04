@@ -47,6 +47,7 @@ static void backprojection_polar_2d_row_cpu(
     float cs_buf[CHUNK], sn_buf[CHUNK], frac_buf[CHUNK];
     int idx_buf[CHUNK];
     float wsum_buf[CHUNK], wsum2_buf[CHUNK];
+    float d_buf[CHUNK];
     float ef_buf[CHUNK], af_buf[CHUNK];
     int gi_buf[CHUNK];
 
@@ -86,6 +87,7 @@ static void backprojection_polar_2d_row_cpu(
 
                 // Calculate distance to the pixel.
                 const float d = sqrtf(px * px + py * py + pz2);
+                d_buf[q] = d;
 
                 const float sx = delta_r * (d + d0);
                 const int id0 = (int)sx;
@@ -111,7 +113,7 @@ static void backprojection_polar_2d_row_cpu(
                 for (int q = 0; q < nchunk; q++) {
                     const float px = x_buf[q] - pos_x;
                     const float py = y_buf[q] - pos_y;
-                    const float d = sqrtf(px * px + py * py + pz2);
+                    const float d = d_buf[q];
                     const float sin_l = -pos_z / d;
                     const float look_angle = asinf_fast(sin_l < -1.0f ? -1.0f : sin_l);
                     const float el_deg = look_angle - att0;
@@ -2072,9 +2074,10 @@ static void backprojection_polar_2d_tx_power_kernel_cpu(
         pixel += wi / sinl;
 
         // Welford weighted update (numerically stable, handles squint).
+        // Only needed for the azimuth resolution estimate.
         // Skip zero weights: if the first accepted sweep had wi == 0 the
         // update would be 0/0 = NaN, poisoning the accumulator.
-        if (wi > 0.0f) {
+        if (azimuth_resolution && wi > 0.0f) {
             const float wsum = m_w + wi;
             const float delta = psi - m_mean;
             m_mean += delta * wi / wsum;
