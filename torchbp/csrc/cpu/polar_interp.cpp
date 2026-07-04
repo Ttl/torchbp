@@ -588,6 +588,204 @@ at::Tensor polar_to_cart_linear_cpu(
     }
 	return out;
 }
+
+// Per-pixel math matches polar_to_cart_kernel_linear_grad in
+// cuda/polar_interp.cu.
+static void polar_to_cart_kernel_linear_grad_cpu(const complex64_t *img,
+        const float *origin, float rotation, float ref_phase, float r0,
+        float dr, float theta0, float dtheta, int Nr, int Ntheta, float x0,
+        float dx, float y0, float dy, int Nx, int Ny, float alias_fmod,
+        const complex64_t *grad, complex64_t *img_grad, float *origin_grad,
+        int id1, int idbatch) {
+    const int idy = id1 % Ny;
+    const int idx = id1 / Ny;
+
+    if (id1 >= Nx * Ny) {
+        return;
+    }
+
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
+    const float x = x0 + dx * idx;
+    const float y = y0 + dy * idy;
+    const float d = sqrtf((x-orig0)*(x-orig0) + (y-orig1)*(y-orig1));
+    const float dz = sqrtf(d*d + orig2*orig2);
+    float t = (y - orig1) / d; // Sin of angle
+    float tc = (x - orig0) / d; // Cos of angle
+    float rs = sinf(rotation);
+    float rc = cosf(rotation);
+    float cosa = t*rs + tc*rc;
+    if (rotation != 0.0f) {
+        t = rc * t - rs * tc;
+    }
+
+    const float dri = (d - r0) / dr;
+    const float dti = (t - theta0) / dtheta;
+
+    const int dri_int = dri;
+    const float dri_frac = dri - dri_int;
+    const int dti_int = dti;
+    const float dti_frac = dti - dti_int;
+
+    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+        complex64_t v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
+        float ref_sin, ref_cos;
+        sincospi<float>(ref_phase * dz - alias_fmod * dri, &ref_sin, &ref_cos);
+        complex64_t ref = {ref_cos, ref_sin};
+
+        if (origin_grad != nullptr) {
+            const complex64_t I = {0.0f, 1.0f};
+
+            const complex64_t dref_dz = I * kPI * ref_phase * ref;
+            const complex64_t dref_ddri = -I * kPI * alias_fmod * ref;
+            const complex64_t dv_dd = interp2d_gradx<complex64_t>(
+                    &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                    dti_int, dti_frac) / dr;
+            const complex64_t dv_dt = interp2d_grady<complex64_t>(
+                    &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                    dti_int, dti_frac) / dtheta;
+            const float dt1_dorig0 = rc * ((x - orig0) * (y - orig1) / (d*d*d));
+            const float dt1_dorig1 = rc * ((y - orig1) * (y - orig1) / (d*d*d) - 1.0f / d);
+            const float dt2_dorig0 = -rs * ((x - orig0) * (x - orig0) / (d*d*d) - 1.0f / d);
+            const float dt2_dorig1 = -rs * ((x - orig0) * (y - orig1) / (d*d*d));
+            const float dt_dorig0 = dt1_dorig0 + dt2_dorig0;
+            const float dt_dorig1 = dt1_dorig1 + dt2_dorig1;
+            const float dd_dorig0 = (orig0 - x) / d;
+            const float dd_dorig1 = (orig1 - y) / d;
+            const complex64_t dv_dorig0 = dv_dd * dd_dorig0 + dv_dt * dt_dorig0;
+            const complex64_t dv_dorig1 = dv_dd * dd_dorig1 + dv_dt * dt_dorig1;
+            const float dz_dorig0 = (orig0 - x) / dz;
+            const float dz_dorig1 = (orig1 - y) / dz;
+            const float dz_dorig2 = orig2 / dz;
+            const complex64_t dref_dorig0 = dref_dz * dz_dorig0 + dref_ddri * dd_dorig0 / dr;
+            const complex64_t dref_dorig1 = dref_dz * dz_dorig1 + dref_ddri * dd_dorig1 / dr;
+            const complex64_t dref_dorig2 = dref_dz * dz_dorig2;
+            const complex64_t dout_dorig0 = dv_dorig0 * ref + v * dref_dorig0;
+            const complex64_t dout_dorig1 = dv_dorig1 * ref + v * dref_dorig1;
+            const complex64_t dout_dorig2 = v * dref_dorig2;
+
+            const complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy];
+            const float g_origin0 = std::real(g * std::conj(dout_dorig0));
+            const float g_origin1 = std::real(g * std::conj(dout_dorig1));
+            const float g_origin2 = std::real(g * std::conj(dout_dorig2));
+
+#pragma omp atomic
+            origin_grad[idbatch * 3 + 0] += g_origin0;
+#pragma omp atomic
+            origin_grad[idbatch * 3 + 1] += g_origin1;
+#pragma omp atomic
+            origin_grad[idbatch * 3 + 2] += g_origin2;
+        }
+
+        if (img_grad != nullptr) {
+            complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy] * std::conj(ref);
+
+            complex64_t g11 = g * (1.0f-dri_frac)*(1.0f-dti_frac);
+            complex64_t g12 = g * (1.0f-dri_frac)*dti_frac;
+            complex64_t g21 = g * dri_frac*(1.0f-dti_frac);
+            complex64_t g22 = g * dri_frac*dti_frac;
+            // Slow
+            #pragma omp critical
+            {
+                img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int] += g11;
+                img_grad[idbatch * Nr * Ntheta + dri_int*Ntheta + dti_int + 1] += g12;
+                img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int] += g21;
+                img_grad[idbatch * Nr * Ntheta + (dri_int+1)*Ntheta + dti_int + 1] += g22;
+            }
+        }
+    }
+}
+
+std::vector<at::Tensor> polar_to_cart_linear_grad_cpu(
+          const at::Tensor &grad,
+          const at::Tensor &img,
+          const at::Tensor &origin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double x0,
+          double y0,
+          double dx,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double alias_fmod) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat);
+	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);
+	at::Tensor origin_contig = origin.contiguous();
+	const float* origin_ptr = origin_contig.data_ptr<float>();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor grad_contig = grad.contiguous();
+    c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
+    at::Tensor img_grad;
+    c10::complex<float>* img_grad_ptr = nullptr;
+    if (img.requires_grad()) {
+        img_grad = torch::zeros_like(img);
+        img_grad_ptr = img_grad.data_ptr<c10::complex<float>>();
+    } else {
+        img_grad = torch::Tensor();
+    }
+
+    at::Tensor origin_grad;
+	float* origin_grad_ptr = nullptr;
+    if (origin.requires_grad()) {
+        origin_grad = torch::zeros_like(origin);
+        origin_grad_ptr = origin_grad.data_ptr<float>();
+    } else {
+        origin_grad = torch::Tensor();
+    }
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    // See polar_interp_linear_cpu for why the thread count is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for(int id1 = 0; id1 < Nx * Ny; id1++) {
+            polar_to_cart_kernel_linear_grad_cpu(
+                          (const complex64_t*)img_ptr,
+                          origin_ptr,
+                          rotation,
+                          ref_phase,
+                          r0,
+                          dr,
+                          theta0,
+                          dtheta,
+                          Nr,
+                          Ntheta,
+                          x0,
+                          dx,
+                          y0,
+                          dy,
+                          Nx,
+                          Ny,
+                          alias_fmod/kPI,
+                          (const complex64_t*)grad_ptr,
+                          (complex64_t*)img_grad_ptr,
+                          origin_grad_ptr,
+                          id1,
+                          idbatch);
+        }
+    }
+    std::vector<at::Tensor> ret;
+    ret.push_back(img_grad);
+    ret.push_back(origin_grad);
+	return ret;
+}
+
 // FFBP merge kernels: one theta chunk of one output range row per call.
 //
 // Structured for SIMD like backprojection_polar_2d_row_cpu: for each of the
@@ -1500,6 +1698,7 @@ TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("polar_interp_lanczos", &polar_interp_lanczos_cpu);
   m.impl("polar_interp_linear_grad", &polar_interp_linear_grad_cpu);
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cpu);
+  m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cpu);
   m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cpu);
   m.impl("ffbp_merge2_lanczos", &ffbp_merge2_lanczos_cpu);
   m.impl("ffbp_merge2_knab", &ffbp_merge2_knab_cpu);
