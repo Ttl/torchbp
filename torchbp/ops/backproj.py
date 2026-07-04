@@ -927,9 +927,9 @@ def backprojection_polar_2d_tx_power(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     r_res : float
-        Range bin resolution in data (meters).
-        For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
-        and oversample is FFT oversampling factor.
+        Range bin resolution in data (meters). Currently unused by the
+        computation and kept for API compatibility; the nadir resolution
+        floor uses the image grid range spacing instead.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
     att : Tensor
@@ -949,6 +949,8 @@ def backprojection_polar_2d_tx_power(
         (caused by the resolution cell growing toward the swath edges) in
         addition to the antenna pattern and range falloff.
         See :func:`backprojection_polar_2d_resolution` for the standalone map.
+        Pixels with fewer than two contributing sweeps have no measurable
+        azimuth aperture and are set to inf.
         Set to False to get the pure antenna/range illumination.
 
     Returns
