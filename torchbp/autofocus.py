@@ -203,6 +203,11 @@ def gpga_bp_polar(
     lowpass_window: str = "boxcar",
     eps: float = 1e-6,
     interp_method: str = "linear",
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    use_ffbp: bool = False,
+    ffbp_opts: dict | None = None,
     data_fmod: float = 0
 ) -> tuple[Tensor, Tensor]:
     """
@@ -259,6 +264,24 @@ def gpga_bp_polar(
         Interpolation method
         "linear": linear interpolation.
         ("lanczos", N): Lanczos interpolation with order 2*N+1.
+    att : Tensor
+        Antenna rotation tensor.
+        [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
+        out data outside the antenna beam.
+    g : Tensor or None
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center.
+    g_extent : list or None
+        List of [g_el0, g_az0, g_el1, g_az1].
+        g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
+        in radians. -pi/2 + +pi/2 if including data over the whole sphere.
+        g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
+        radians. -pi to +pi if including data over the whole sphere.
+    use_ffbp : bool
+        Use fast factorized backprojection for image formation.
+    ffbp_opts : dict
+        Dictionary of options for ffbp.
     data_fmod : float
         Range modulation frequency applied to input data.
 
@@ -277,6 +300,18 @@ def gpga_bp_polar(
     """
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
 
+    def form_image(p):
+        if use_ffbp:
+            opts = {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}
+            if ffbp_opts is not None:
+                opts.update(ffbp_opts)
+            return ffbp(data, grid_polar, fc, r_res, p, d0=d0,
+                    data_fmod=data_fmod, g=g, g_extent=g_extent, att=att,
+                    **opts)
+        return backprojection_polar_2d(data, grid_polar, fc, r_res, p,
+                d0=d0, data_fmod=data_fmod, g=g, g_extent=g_extent,
+                att=att)[0]
+
     phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
 
     theta = theta0 + dtheta * torch.arange(
@@ -288,7 +323,7 @@ def gpga_bp_polar(
         window_width = data.shape[0]
 
     if img is None:
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[0]
+        img = form_image(pos_new)
 
     for i in range(max_iters):
         lp_w = fft_lowpass_filter_precalculate_window(
@@ -325,7 +360,7 @@ def gpga_bp_polar(
         d = phi_sum * c0 / (4 * torch.pi * fc)
         pos_new[:, 0] = pos[:, 0] + d
 
-        img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[0]
+        img = form_image(pos_new)
         window_width = int(window_width * window_exp)
         if window_width < min_window:
             break

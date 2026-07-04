@@ -3404,6 +3404,34 @@ class TestGpgaBpPolar(TestCase):
         )
         self.assertLess(resid, 0.4 * dx.pow(2).mean().sqrt().item())
 
+    def test_ffbp_image_formation(self):
+        # use_ffbp swaps the image formation for fast factorized
+        # backprojection but should drive the same autofocus solution.
+        targets, amps, pos = self._scene()
+        dx = 4e-3 * torch.sin(
+            2 * torch.pi * 2 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+
+        common = dict(max_iters=8, target_threshold_db=15)
+        img_bp, phi_bp = torchbp.autofocus.gpga_bp_polar(
+            None, data, pos, self.fc, self.r_res, self.grid_polar, **common
+        )
+        img_ff, phi_ff = torchbp.autofocus.gpga_bp_polar(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            use_ffbp=True, ffbp_opts={"stages": 4}, **common
+        )
+
+        self.assertTrue(torch.isfinite(img_ff).all())
+        self.assertTrue(torch.isfinite(phi_ff).all())
+        self.assertEqual(img_ff.shape, img_bp.shape)
+        # The recovered phase error must agree with the exact-backprojection
+        # path (both estimate the same platform motion error).
+        corr = torch.corrcoef(torch.stack([phi_bp, phi_ff]))[0, 1]
+        self.assertGreater(corr.item(), 0.9)
+
 
 if __name__ == "__main__":
     unittest.main()
