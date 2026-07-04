@@ -1784,6 +1784,36 @@ class TestInsarRmeBlocksvd(TestCase):
         )
 
 
+class TestFFBPRemainderSweeps(TestCase):
+    """ffbp must use every sweep when divisions does not divide nsweeps.
+
+    Regression test: the subaperture split used to truncate to
+    nsweeps // divisions * divisions sweeps at every recursion level,
+    silently dropping the remainder.
+    """
+
+    def _last_sweep_energy(self, nsweeps, stages, divisions=2):
+        grid = {"r": (80.0, 120.0), "theta": (-0.25, 0.25), "nr": 32, "ntheta": 32}
+        pos = torch.zeros(nsweeps, 3)
+        pos[:, 1] = torch.linspace(-3.0, 3.0, nsweeps)
+        pos[:, 2] = 30.0
+        # Only the last sweep carries signal. If it is dropped the image is
+        # exactly zero.
+        data = torch.zeros(nsweeps, 64, dtype=torch.complex64)
+        data[-1, 50] = 1.0
+        img = torchbp.ops.ffbp(
+            data, grid, 6e9, 2.0, pos, stages=stages, divisions=divisions
+        )
+        return img.abs().sum().item()
+
+    def test_odd_nsweeps(self):
+        for stages in (1, 2, 3):
+            self.assertGreater(self._last_sweep_energy(513, stages), 0.0)
+
+    def test_divisions3(self):
+        self.assertGreater(self._last_sweep_energy(1000, 2, divisions=3), 0.0)
+
+
 class TestFFBPMerge2Poly(TestCase):
     """Test polynomial approximation version against reference Knab implementation."""
 

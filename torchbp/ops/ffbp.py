@@ -294,14 +294,18 @@ def _ffbp_impl(
     use_antenna_pattern = g is not None
 
     imgs = []
-    n = nsweeps // divisions
+    # Split at rounded boundaries so that no sweeps are dropped when
+    # divisions does not divide nsweeps. Subaperture sizes differ by at most
+    # one sweep, which the merge handles.
+    bounds = [round(i * nsweeps / divisions) for i in range(divisions + 1)]
     for d_idx in range(divisions):
-        pos_local, origin_local = center_pos(pos[d_idx * n : (d_idx + 1) * n])
+        i0, i1 = bounds[d_idx], bounds[d_idx + 1]
+        pos_local, origin_local = center_pos(pos[i0:i1])
         z0 = torch.mean(pos_local[:, 2])
         grid_local = deepcopy(grid)
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
-        data_local = data[d_idx * n : (d_idx + 1) * n]
-        att_local = att[d_idx * n : (d_idx + 1) * n] if att is not None else None
+        data_local = data[i0:i1]
+        att_local = att[i0:i1] if att is not None else None
 
         # TODO: Better edge handling for interpolation.
         # Interpolation doesn't work too well with too small image due to edges.
