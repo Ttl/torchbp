@@ -3461,5 +3461,71 @@ class TestGpgaBpPolar(TestCase):
         self.assertGreater(corr.item(), 0.9)
 
 
+class TestGpgaBpPolarTde(TestGpgaBpPolar):
+    """End-to-end GPGA TDE (3D position) autofocus on synthetic data.
+
+    Inherits the scene/data helpers from TestGpgaBpPolar; the parent's test
+    methods are disabled by overriding them.
+    """
+
+    # Don't re-run the parent's tests in this class.
+    def test_focuses_range_motion_error(self):
+        pass
+
+    def test_ffbp_image_formation(self):
+        pass
+
+    def test_focuses_and_recovers_position(self):
+        targets, amps, pos = self._scene()
+        dx = 4e-3 * torch.sin(
+            2 * torch.pi * 2 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+
+        img_blur = torchbp.ops.backprojection_polar_2d(
+            data, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+        img_focus, pos_new = torchbp.autofocus.gpga_bp_polar_tde(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            azimuth_divisions=2, range_divisions=2, estimate_z=False,
+            max_iters=8, target_threshold_db=15,
+        )
+
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(pos_new).all())
+        self.assertGreater(
+            self._sharpness(img_focus).item(),
+            1.3 * self._sharpness(img_blur).item(),
+        )
+
+        # The solved X correction should track the injected error
+        # (linear trend is unobservable).
+        from torchbp.util import detrend
+        d = pos_new[:, 0] - pos[:, 0]
+        resid = detrend(dx - d).pow(2).mean().sqrt().item()
+        self.assertLess(resid, 0.5 * dx.pow(2).mean().sqrt().item())
+
+    def test_dead_blocks_and_ffbp_initial_image(self):
+        # Regression: blocks with no targets (grid extends past the data's
+        # max range) used to crash on an empty reduction, and the initial
+        # image ignored use_ffbp. Also exercises the weighted block-center
+        # computation.
+        targets, amps, pos = self._scene()
+        data = self._make_data(targets, amps, pos)
+        grid_dead = dict(self.grid_polar)
+        grid_dead["r"] = (80.0, 400.0)
+        grid_dead["nr"] = 128
+
+        img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(
+            None, data, pos, self.fc, self.r_res, grid_dead,
+            azimuth_divisions=2, range_divisions=4, estimate_z=False,
+            max_iters=2, use_ffbp=True, ffbp_opts={"stages": 3},
+        )
+        self.assertTrue(torch.isfinite(img).all())
+        self.assertTrue(torch.isfinite(pos_new).all())
+
+
 if __name__ == "__main__":
     unittest.main()
