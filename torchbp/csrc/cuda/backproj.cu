@@ -254,18 +254,20 @@ __global__ void backprojection_polar_2d_grad_kernel(
     const int idr = idx / Ntheta;
     const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
 
-    unsigned mask = __ballot_sync(FULL_MASK, idx < Nr * Ntheta);
-
-    if (idx >= Nr * Ntheta) {
-        return;
-    }
+    // Out-of-range threads can't return early because every lane in the warp
+    // must participate in the shuffle reduction below. They stay alive with
+    // zero contributions instead.
+    const bool active = idx < Nr * Ntheta;
 
     const float r = r0 + idr * dr;
     const float theta = theta0 + idtheta * dtheta;
     const float x = r * sqrtf(1.0f - theta*theta);
     const float y = r * theta;
 
-    complex64_t g = grad[idbatch * Nr * Ntheta + idr * Ntheta + idtheta];
+    complex64_t g = {0.0f, 0.0f};
+    if (active) {
+        g = grad[idbatch * Nr * Ntheta + idr * Ntheta + idtheta];
+    }
 
     float arg_dealias = 0.0f;
     if (dealias) {
@@ -300,7 +302,7 @@ __global__ void backprojection_polar_2d_grad_kernel(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (id0 >= 0 && id1 < sweep_samples) {
+        if (active && id0 >= 0 && id1 < sweep_samples) {
             complex64_t s0, s1;
             if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
                 s0 = ((complex64_t*)data)[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
@@ -347,9 +349,9 @@ __global__ void backprojection_polar_2d_grad_kernel(
 
         if (have_pos_grad) {
             for (int offset = 16; offset > 0; offset /= 2) {
-                dx += __shfl_down_sync(mask, dx, offset);
-                dy += __shfl_down_sync(mask, dy, offset);
-                dz += __shfl_down_sync(mask, dz, offset);
+                dx += __shfl_down_sync(FULL_MASK, dx, offset);
+                dy += __shfl_down_sync(FULL_MASK, dy, offset);
+                dz += __shfl_down_sync(FULL_MASK, dz, offset);
             }
 
             if (threadIdx.x % 32 == 0) {
@@ -360,7 +362,7 @@ __global__ void backprojection_polar_2d_grad_kernel(
         }
 
         if (have_data_grad) {
-            if (id0 >= 0 && id1 < sweep_samples) {
+            if (active && id0 >= 0 && id1 < sweep_samples) {
                 float2 *x0 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
                 float2 *x1 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
                 atomicAdd(&x0->x, ds0.real());
@@ -706,11 +708,15 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         pixel += wi / sinl;
 
         // Welford weighted update (numerically stable, handles squint).
-        const float wsum = m_w + wi;
-        const float delta = psi - m_mean;
-        m_mean += delta * wi / wsum;
-        m_s += wi * delta * (psi - m_mean);
-        m_w = wsum;
+        // Skip zero weights: if the first accepted sweep had wi == 0 the
+        // update would be 0/0 = NaN, poisoning the accumulator.
+        if (wi > 0.0f) {
+            const float wsum = m_w + wi;
+            const float delta = psi - m_mean;
+            m_mean += delta * wi / wsum;
+            m_s += wi * delta * (psi - m_mean);
+            m_w = wsum;
+        }
     }
 
     if (azimuth_resolution) {
@@ -822,16 +828,18 @@ __global__ void backprojection_cart_2d_grad_kernel(
     const int idx = idt / Ny;
     const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
 
-    unsigned mask = __ballot_sync(FULL_MASK, idx < Nx && idy < Ny);
-
-    if (idx >= Nx || idy >= Ny) {
-        return;
-    }
+    // Out-of-range threads can't return early because every lane in the warp
+    // must participate in the shuffle reduction below. They stay alive with
+    // zero contributions instead.
+    const bool active = idx < Nx && idy < Ny;
 
     const float x = x0 + idx * dx;
     const float y = y0 + idy * dy;
 
-    complex64_t g = grad[idbatch * Nx * Ny + idx * Ny + idy];
+    complex64_t g = {0.0f, 0.0f};
+    if (active) {
+        g = grad[idbatch * Nx * Ny + idx * Ny + idy];
+    }
 
     const complex64_t I = {0.0f, 1.0f};
 
@@ -864,7 +872,7 @@ __global__ void backprojection_cart_2d_grad_kernel(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (id0 >= 0 && id1 < sweep_samples) {
+        if (active && id0 >= 0 && id1 < sweep_samples) {
             complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
             complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
 
@@ -902,9 +910,9 @@ __global__ void backprojection_cart_2d_grad_kernel(
 
         if (have_pos_grad) {
             for (int offset = 16; offset > 0; offset /= 2) {
-                dx += __shfl_down_sync(mask, dx, offset);
-                dy += __shfl_down_sync(mask, dy, offset);
-                dz += __shfl_down_sync(mask, dz, offset);
+                dx += __shfl_down_sync(FULL_MASK, dx, offset);
+                dy += __shfl_down_sync(FULL_MASK, dy, offset);
+                dz += __shfl_down_sync(FULL_MASK, dz, offset);
             }
 
             if (threadIdx.x % 32 == 0) {
@@ -915,7 +923,7 @@ __global__ void backprojection_cart_2d_grad_kernel(
         }
 
         if (have_data_grad) {
-            if (id0 >= 0 && id1 < sweep_samples) {
+            if (active && id0 >= 0 && id1 < sweep_samples) {
                 float2 *x0 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
                 float2 *x1 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
                 atomicAdd(&x0->x, ds0.real());
@@ -1529,21 +1537,26 @@ at::Tensor projection_cart_2d_cuda(
         .device(img.device());
 	at::Tensor data = torch::zeros({nbatch, nsweeps, sweep_samples}, options);
 	const float* pos_ptr = pos_contig.data_ptr<float>();
+    // Keep contiguous copies alive until the kernel has run.
+    at::Tensor dem_contig;
+    at::Tensor vel_contig;
+    at::Tensor att_contig;
+    at::Tensor g_contig;
 	const float* dem_ptr = nullptr;
     if (dem.defined()) {
-        at::Tensor dem_contig = dem.contiguous();
+        dem_contig = dem.contiguous();
         dem_ptr = dem_contig.data_ptr<float>();
     }
 	const float* vel_ptr = nullptr;
     if (vel.defined()) {
-        at::Tensor vel_contig = vel.contiguous();
+        vel_contig = vel.contiguous();
         vel_ptr = vel_contig.data_ptr<float>();
     }
     float* att_ptr = nullptr;
     float* g_ptr = nullptr;
     if (antenna_pattern) {
-        at::Tensor att_contig = att.contiguous();
-        at::Tensor g_contig = g.contiguous();
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
         att_ptr = att_contig.data_ptr<float>();
         g_ptr = g_contig.data_ptr<float>();
     }
@@ -1643,11 +1656,14 @@ at::Tensor backprojection_polar_2d_cuda(
 	const float* pos_ptr = pos_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
+    // Keep contiguous copies alive until the kernel has run.
+    at::Tensor att_contig;
+    at::Tensor g_contig;
     float* att_ptr = nullptr;
     float* g_ptr = nullptr;
     if (antenna_pattern) {
-        at::Tensor att_contig = att.contiguous();
-        at::Tensor g_contig = g.contiguous();
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
         att_ptr = att_contig.data_ptr<float>();
         g_ptr = g_contig.data_ptr<float>();
     }
@@ -1969,8 +1985,6 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
     }
 
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor att_contig = att.contiguous();
-	at::Tensor g_contig = g.contiguous();
 	at::Tensor data_contig = data.contiguous();
     auto options =
       torch::TensorOptions()
@@ -1981,11 +1995,14 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 	const float* pos_ptr = pos_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
+    // Keep contiguous copies alive until the kernel has run.
+    at::Tensor att_contig;
+    at::Tensor g_contig;
     float* att_ptr = nullptr;
     float* g_ptr = nullptr;
     if (antenna_pattern) {
-        at::Tensor att_contig = att.contiguous();
-        at::Tensor g_contig = g.contiguous();
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
         att_ptr = att_contig.data_ptr<float>();
         g_ptr = g_contig.data_ptr<float>();
     }
@@ -2089,8 +2106,6 @@ at::Tensor backprojection_polar_2d_knab_cuda(
     }
 
 	at::Tensor pos_contig = pos.contiguous();
-	at::Tensor att_contig = att.contiguous();
-	at::Tensor g_contig = g.contiguous();
 	at::Tensor data_contig = data.contiguous();
     auto options =
       torch::TensorOptions()
@@ -2101,11 +2116,14 @@ at::Tensor backprojection_polar_2d_knab_cuda(
 	const float* pos_ptr = pos_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
+    // Keep contiguous copies alive until the kernel has run.
+    at::Tensor att_contig;
+    at::Tensor g_contig;
     float* att_ptr = nullptr;
     float* g_ptr = nullptr;
     if (antenna_pattern) {
-        at::Tensor att_contig = att.contiguous();
-        at::Tensor g_contig = g.contiguous();
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
         att_ptr = att_contig.data_ptr<float>();
         g_ptr = g_contig.data_ptr<float>();
     }

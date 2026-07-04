@@ -252,11 +252,14 @@ at::Tensor backprojection_polar_2d_cpu(
 	const float* pos_ptr = pos_contig.data_ptr<float>();
     c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
 
+    // Keep contiguous copies alive until the kernel has run.
+    at::Tensor att_contig;
+    at::Tensor g_contig;
     float* att_ptr = nullptr;
     float* g_ptr = nullptr;
     if (antenna_pattern) {
-        at::Tensor att_contig = att.contiguous();
-        at::Tensor g_contig = g.contiguous();
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
         att_ptr = att_contig.data_ptr<float>();
         g_ptr = g_contig.data_ptr<float>();
     }
@@ -2059,11 +2062,15 @@ static void backprojection_polar_2d_tx_power_kernel_cpu(
         pixel += wi / sinl;
 
         // Welford weighted update (numerically stable, handles squint).
-        const float wsum = m_w + wi;
-        const float delta = psi - m_mean;
-        m_mean += delta * wi / wsum;
-        m_s += wi * delta * (psi - m_mean);
-        m_w = wsum;
+        // Skip zero weights: if the first accepted sweep had wi == 0 the
+        // update would be 0/0 = NaN, poisoning the accumulator.
+        if (wi > 0.0f) {
+            const float wsum = m_w + wi;
+            const float delta = psi - m_mean;
+            m_mean += delta * wi / wsum;
+            m_s += wi * delta * (psi - m_mean);
+            m_w = wsum;
+        }
     }
 
     if (azimuth_resolution) {

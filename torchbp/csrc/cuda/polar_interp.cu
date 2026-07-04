@@ -75,14 +75,11 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
         t = sinf(asinf(t) - rotation);
     }
 
-    unsigned mask = __ballot_sync(FULL_MASK, idx < Nr1 * Ntheta1 && t >= -1.0f && t <= 1.0f);
+    // Out-of-range threads can't return early because every lane in the warp
+    // must participate in the shuffle reduction below. They stay alive with
+    // zero contributions instead.
+    const bool active = idx < Nr1 * Ntheta1 && t >= -1.0f && t <= 1.0f;
 
-    if (idx >= Nr1 * Ntheta1) {
-        return;
-    }
-    if (t < -1.0f || t > 1.0f) {
-        return;
-    }
     const float dorig0 = dorigin[idbatch * 3 + 0];
     const float dorig1 = dorigin[idbatch * 3 + 1];
     const float dorig2 = dorigin[idbatch * 3 + 2];
@@ -107,7 +104,9 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
 
     const float z0 = z1 + dorig2;
     const float rpz = sqrtf(z0*z0 + rp*rp);
-    if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    const bool in_grid = active && dri_int >= 0 && dri_int < Nr-1 &&
+                         dti_int >= 0 && dti_int < Ntheta-1;
+    if (in_grid) {
         v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
         const float dz = sqrtf(z1*z1 + d*d);
@@ -116,35 +115,41 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
     }
 
     if (dorigin_grad != nullptr) {
-        const complex64_t dref_drpz = I * kPI * ref_phase * ref;
-        const complex64_t dref_ddri = -I * kPI * alias_fmod * ref;
-        const complex64_t dv_drp = interp2d_gradx<complex64_t>(
-                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
-                dti_int, dti_frac) / dr;
-        const complex64_t dv_dt = interp2d_grady<complex64_t>(
-                &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
-                dti_int, dti_frac) / dtheta;
-        const float drp_dorig0 = (cost*d + dorig0) / rp;
-        const float drp_dorig1 = (sint*d + dorig1) / rp;
-        const float drpz_dorig0 = (cost*d + dorig0) / rpz;
-        const float drpz_dorig1 = (sint*d + dorig1) / rpz;
-        const float drpz_dorig2 = (dorig2 + z1) / rpz;
-        const float dt_darg = -arg*arg/(cosarg*cosarg*cosarg) + 1.0f / cosarg;
-        const float darg_dorig0 = -(d*sint + dorig1) / ((dorig0 + d*cost)*(dorig0 + d*cost));
-        const float darg_dorig1 = 1.0f / (cost*d + dorig0);
+        float g_dorig0 = 0.0f;
+        float g_dorig1 = 0.0f;
+        float g_dorig2 = 0.0f;
 
-        const complex64_t g = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta];
-        const complex64_t dout_dorig0 = ref * (dv_drp * drp_dorig0 + dv_dt * dt_darg * darg_dorig0) + v * dref_drpz * drpz_dorig0 + v * dref_ddri * drp_dorig0 / dr;
-        const complex64_t dout_dorig1 = ref * (dv_drp * drp_dorig1 + dv_dt * dt_darg * darg_dorig1) + v * dref_drpz * drpz_dorig1 + v * dref_ddri * drp_dorig1 / dr;
-        const complex64_t dout_dorig2 = v * dref_drpz * drpz_dorig2;
-        float g_dorig0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
-        float g_dorig1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
-        float g_dorig2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
+        if (in_grid) {
+            const complex64_t dref_drpz = I * kPI * ref_phase * ref;
+            const complex64_t dref_ddri = -I * kPI * alias_fmod * ref;
+            const complex64_t dv_drp = interp2d_gradx<complex64_t>(
+                    &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                    dti_int, dti_frac) / dr;
+            const complex64_t dv_dt = interp2d_grady<complex64_t>(
+                    &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac,
+                    dti_int, dti_frac) / dtheta;
+            const float drp_dorig0 = (cost*d + dorig0) / rp;
+            const float drp_dorig1 = (sint*d + dorig1) / rp;
+            const float drpz_dorig0 = (cost*d + dorig0) / rpz;
+            const float drpz_dorig1 = (sint*d + dorig1) / rpz;
+            const float drpz_dorig2 = (dorig2 + z1) / rpz;
+            const float dt_darg = -arg*arg/(cosarg*cosarg*cosarg) + 1.0f / cosarg;
+            const float darg_dorig0 = -(d*sint + dorig1) / ((dorig0 + d*cost)*(dorig0 + d*cost));
+            const float darg_dorig1 = 1.0f / (cost*d + dorig0);
+
+            const complex64_t g = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta];
+            const complex64_t dout_dorig0 = ref * (dv_drp * drp_dorig0 + dv_dt * dt_darg * darg_dorig0) + v * dref_drpz * drpz_dorig0 + v * dref_ddri * drp_dorig0 / dr;
+            const complex64_t dout_dorig1 = ref * (dv_drp * drp_dorig1 + dv_dt * dt_darg * darg_dorig1) + v * dref_drpz * drpz_dorig1 + v * dref_ddri * drp_dorig1 / dr;
+            const complex64_t dout_dorig2 = v * dref_drpz * drpz_dorig2;
+            g_dorig0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
+            g_dorig1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
+            g_dorig2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
+        }
 
         for (int offset = 16; offset > 0; offset /= 2) {
-            g_dorig0 += __shfl_down_sync(mask, g_dorig0, offset);
-            g_dorig1 += __shfl_down_sync(mask, g_dorig1, offset);
-            g_dorig2 += __shfl_down_sync(mask, g_dorig2, offset);
+            g_dorig0 += __shfl_down_sync(FULL_MASK, g_dorig0, offset);
+            g_dorig1 += __shfl_down_sync(FULL_MASK, g_dorig1, offset);
+            g_dorig2 += __shfl_down_sync(FULL_MASK, g_dorig2, offset);
         }
 
         if (threadIdx.x % 32 == 0) {
@@ -155,7 +160,7 @@ __global__ void polar_interp_kernel_linear_grad(const complex64_t *img, const
     }
 
     if (img_grad != nullptr) {
-        if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+        if (in_grid) {
             complex64_t g = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] * cuda::std::conj(ref);
 
             complex64_t g11 = g * (1.0f-dri_frac)*(1.0f-dti_frac);
@@ -308,11 +313,10 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
         t = rc * t - rs * tc;
     }
 
-    unsigned mask = __ballot_sync(FULL_MASK, cosa >= 0 && id1 < Nr * Ntheta && t >= theta0 && t <= theta0 + dtheta * Ntheta);
-
-    if (id1 >= Nx * Ny) {
-        return;
-    }
+    // Out-of-range threads can't return early because every lane in the warp
+    // must participate in the shuffle reduction below. They stay alive with
+    // zero contributions instead.
+    const bool active = id1 < Nx * Ny;
 
     const float dri = (d - r0) / dr;
     const float dti = (t - theta0) / dtheta;
@@ -322,7 +326,11 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
     const int dti_int = dti;
     const float dti_frac = dti - dti_int;
 
-    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    float g_origin0 = 0.0f;
+    float g_origin1 = 0.0f;
+    float g_origin2 = 0.0f;
+
+    if (active && cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
         complex64_t v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
         sincospif(ref_phase * dz - alias_fmod * dri, &ref_sin, &ref_cos);
@@ -360,21 +368,9 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
             const complex64_t dout_dorig2 = v * dref_dorig2;
 
             const complex64_t g = grad[idbatch * Nx * Ny + idx*Ny + idy];
-            float g_origin0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
-            float g_origin1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
-            float g_origin2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
-
-            for (int offset = 16; offset > 0; offset /= 2) {
-                g_origin0 += __shfl_down_sync(mask, g_origin0, offset);
-                g_origin1 += __shfl_down_sync(mask, g_origin1, offset);
-                g_origin2 += __shfl_down_sync(mask, g_origin2, offset);
-            }
-
-            if (threadIdx.x % 32 == 0) {
-                atomicAdd(&(origin_grad[idbatch * 3 + 0]), g_origin0);
-                atomicAdd(&(origin_grad[idbatch * 3 + 1]), g_origin1);
-                atomicAdd(&(origin_grad[idbatch * 3 + 2]), g_origin2);
-            }
+            g_origin0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
+            g_origin1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
+            g_origin2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
         }
 
         if (img_grad != nullptr) {
@@ -398,6 +394,20 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
                 atomicAdd(&x22->x, g22.real());
                 atomicAdd(&x22->y, g22.imag());
             }
+        }
+    }
+
+    if (origin_grad != nullptr) {
+        for (int offset = 16; offset > 0; offset /= 2) {
+            g_origin0 += __shfl_down_sync(FULL_MASK, g_origin0, offset);
+            g_origin1 += __shfl_down_sync(FULL_MASK, g_origin1, offset);
+            g_origin2 += __shfl_down_sync(FULL_MASK, g_origin2, offset);
+        }
+
+        if (threadIdx.x % 32 == 0) {
+            atomicAdd(&(origin_grad[idbatch * 3 + 0]), g_origin0);
+            atomicAdd(&(origin_grad[idbatch * 3 + 1]), g_origin1);
+            atomicAdd(&(origin_grad[idbatch * 3 + 2]), g_origin2);
         }
     }
 }
