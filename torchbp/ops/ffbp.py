@@ -249,6 +249,15 @@ def ffbp(
         if att.shape[0] != nsweeps:
             raise ValueError(f"att must have {nsweeps} sweeps, got {att.shape[0]}")
 
+    if nsweeps < divisions:
+        # Too few sweeps to split into subapertures
+        return backprojection_polar_2d(
+            data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
+            data_fmod=data_fmod,
+            alias_fmod=alias_fmod if (output_alias and dealias) else 0.0,
+            att=att, g=g, g_extent=g_extent,
+        )[0]
+
     result = _ffbp_impl(
         data, grid, fc, r_res, pos, stages, divisions, d0, interp_method,
         oversample_r, oversample_theta, dealias, data_fmod, alias_fmod,
@@ -304,6 +313,12 @@ def _ffbp_impl(
         z0 = torch.mean(pos_local[:, 2])
         grid_local = deepcopy(grid)
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
+        # Oversample the subaperture grid to leave interpolation margin for
+        # the merges. Applies to both the recursive and the base
+        # backprojection branch; deeper levels receive oversample=1 since
+        # the grid is already increased.
+        grid_local["nr"] = int(oversample_r * grid_local["nr"])
+        grid_local["ntheta"] = int(oversample_theta * grid_local["ntheta"])
         data_local = data[i0:i1]
         att_local = att[i0:i1] if att is not None else None
 
@@ -311,8 +326,6 @@ def _ffbp_impl(
         # Interpolation doesn't work too well with too small image due to edges.
         # Limit the minimum image size to avoid large interpolation errors.
         if stages > 1 and len(data_local) > 128:
-            grid_local["nr"] = int(oversample_r * grid_local["nr"])
-            grid_local["ntheta"] = int(oversample_theta * grid_local["ntheta"])
             img, w1_map, w2_map, weight_grid = _ffbp_impl(
                 data_local,
                 grid_local,
