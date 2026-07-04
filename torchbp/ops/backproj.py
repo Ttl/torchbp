@@ -1411,6 +1411,8 @@ def _backward_polar_2d(ctx, grad):
     pos = ctx.saved_tensors[1]
     if ctx.saved[13]:
         raise ValueError("dealias gradient not supported")
+    if ctx.saved[15] is not None:
+        raise ValueError("gradient with antenna pattern g not supported")
     ret = torch.ops.torchbp.backprojection_polar_2d_grad.default(
         grad, data, pos, *ctx.saved
     )
