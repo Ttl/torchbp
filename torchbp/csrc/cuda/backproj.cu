@@ -207,9 +207,12 @@ __global__ void backprojection_polar_2d_kernel(
             // Unweighted: Σs = scene * Σg (signal has g)
             // Weighted: Σ(s * g) = scene * Σg²
             // To match: normalize by Σg / Σg²
+            // A denormal w_sum2 would blow up the scale, so require at
+            // least the smallest normal float (with FTZ it flushes to zero
+            // anyway; this keeps CPU and CUDA consistent).
             // When Normalize=false, skip this normalization (used in FFBP)
             if constexpr (HasAntennaPattern && Normalize) {
-                if (w_sum2[k] > 0.0f) {
+                if (w_sum2[k] >= 1.17549435e-38f) {
                     pixel *= w_sum1[k] / w_sum2[k];
                 }
             }
@@ -639,10 +642,11 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         z_eff = 0.0f;  // will use per-sweep pos_z
     }
 
-    // Angular size of resolution cell at nadir.
+    // Squared sine of the angle subtended by one range cell at nadir, used
+    // as a floor on sin^2 of the look angle.
     float h_ref = (altitude > 0.0f) ? altitude
                   : pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2];
-    const float min_look_angle = sqrtf(2.0f * dr / h_ref);
+    const float min_sin2_look = 2.0f * dr / h_ref;
 
     float pixel = 0.0f;
     // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
@@ -691,10 +695,10 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
 
         if (normalization == 1) {
             // sigma_0
-            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d)));
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d)));
         } else if (normalization == 2) {
             // gamma_0
-            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d))) * d / h;
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d))) * d / h;
         } else if (normalization == 3) {
             // point
             // Scale as d^4 instead of d^3 for area target.
@@ -1718,6 +1722,7 @@ at::Tensor backprojection_polar_2d_cuda(
     }
 
     #undef LAUNCH_KERNEL
+
 	return img;
 }
 

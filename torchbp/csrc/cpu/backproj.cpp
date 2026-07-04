@@ -1995,10 +1995,11 @@ static void backprojection_polar_2d_tx_power_kernel_cpu(
         z_eff = 0.0f;  // will use per-sweep pos_z
     }
 
-    // Angular size of resolution cell at nadir.
+    // Squared sine of the angle subtended by one range cell at nadir, used
+    // as a floor on sin^2 of the look angle.
     float h_ref = (altitude > 0.0f) ? altitude
                   : pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2];
-    const float min_look_angle = sqrtf(2.0f * dr / h_ref);
+    const float min_sin2_look = 2.0f * dr / h_ref;
 
     float pixel = 0.0f;
     // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
@@ -2047,10 +2048,10 @@ static void backprojection_polar_2d_tx_power_kernel_cpu(
 
         if (normalization == 1) {
             // sigma_0
-            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d)));
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d)));
         } else if (normalization == 2) {
             // gamma_0
-            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d))) * d / h;
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d))) * d / h;
         } else if (normalization == 3) {
             // point
             // Scale as d^4 instead of d^3 for area target.
