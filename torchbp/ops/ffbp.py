@@ -338,10 +338,18 @@ def _ffbp_impl(
     g_extent: list | None = None,
     weight_map_downsample: int = 1,
     is_top_level: bool = True,
+    pos_z: list | None = None,
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients."""
     nsweeps = data.shape[0]
     use_antenna_pattern = g is not None
+
+    if pos_z is None:
+        # Sweep z coordinates as Python floats: the z0/new_z scalars then
+        # never touch the device (one sync here instead of one per tree
+        # node on GPU). center_pos doesn't modify z, so plain slices of
+        # this list stay valid down the recursion.
+        pos_z = pos[:, 2].tolist()
 
     imgs = []
     # Split at rounded boundaries so that no sweeps are dropped when
@@ -351,7 +359,8 @@ def _ffbp_impl(
     for d_idx in range(divisions):
         i0, i1 = bounds[d_idx], bounds[d_idx + 1]
         pos_local, origin_local = center_pos(pos[i0:i1])
-        z0 = torch.mean(pos_local[:, 2])
+        pos_z_local = pos_z[i0:i1]
+        z0 = sum(pos_z_local) / len(pos_z_local)
         grid_local = deepcopy(grid)
         grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
         # Oversample the subaperture grid to leave interpolation margin for
@@ -390,6 +399,7 @@ def _ffbp_impl(
                 g_extent=g_extent,
                 weight_map_downsample=weight_map_downsample,
                 is_top_level=False,
+                pos_z=pos_z_local,
             )
         else:
             # When using antenna pattern, request unnormalized output

@@ -715,9 +715,10 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         pixel += wi / sinl;
 
         // Welford weighted update (numerically stable, handles squint).
+        // Only needed for the azimuth resolution estimate.
         // Skip zero weights: if the first accepted sweep had wi == 0 the
         // update would be 0/0 = NaN, poisoning the accumulator.
-        if (wi > 0.0f) {
+        if (azimuth_resolution && wi > 0.0f) {
             const float wsum = m_w + wi;
             const float delta = psi - m_mean;
             m_mean += delta * wi / wsum;
