@@ -170,11 +170,13 @@ static void backprojection_polar_2d_row_cpu(
         // Unweighted: Σs = scene * Σg (signal has g)
         // Weighted: Σ(s * g) = scene * Σg²
         // To match: normalize by Σg / Σg²
+        // A denormal wsum2 would blow up the scale (and CUDA flushes it to
+        // zero), so require at least the smallest normal float.
         // When normalize=false, skip this normalization (used in FFBP).
         if (g != nullptr && normalize) {
 #pragma omp simd
             for (int q = 0; q < nchunk; q++) {
-                const float scale = wsum2_buf[q] > 0.0f ?
+                const float scale = wsum2_buf[q] >= 1.17549435e-38f ?
                     wsum_buf[q] / wsum2_buf[q] : 1.0f;
                 accr[q] *= scale;
                 acci[q] *= scale;
