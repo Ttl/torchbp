@@ -150,18 +150,31 @@ static inline float lanczos_kernel_cpu(float x, float a) {
     return sinpi_f(x) / (kPI * x) * sinpi_f(x/a) / (kPI * x / a);
 }
 
+// Max cached 1D interpolation window (taps <= order + 1) for the lanczos and
+// knab interpolators. Taps past the cap (order > 32) are dropped.
+#define INTERP_MAX_TAPS 33
+
+// Weighted sum of one contiguous row of samples. For complex input
+// accumulates the real and imaginary parts in plain floats: gcc optimizes
+// this much better than the c10::complex operator chain, especially with the
+// hardening flags (-fstack-protector-strong) most Python builds add.
 template<class T>
-static T lanczos_interp_1d_cpu(const T *img, int n, float pos, int order) {
-    float a = 0.5f * order;
-    int start = std::max(0, (int)ceilf(pos - a));
-    int end = std::min(n-1, (int)floorf(pos + a));
-    T sum{};
-    for (int i = start; i <= end; i++) {
-        float dx = pos - i;
-        float w = lanczos_kernel_cpu(dx, a);
-        sum += img[i] * w;
+static inline T interp_row_cpu(const T *row, const float *w, int count) {
+    if constexpr (std::is_same_v<T, complex64_t>) {
+        const float *rowf = (const float*)row;
+        float sr = 0.0f, si = 0.0f;
+        for (int j = 0; j < count; j++) {
+            sr += rowf[2*j] * w[j];
+            si += rowf[2*j+1] * w[j];
+        }
+        return {sr, si};
+    } else {
+        T sum{};
+        for (int j = 0; j < count; j++) {
+            sum += row[j] * w[j];
+        }
+        return sum;
     }
-    return sum;
 }
 
 template<class T>
@@ -169,11 +182,19 @@ static T lanczos_interp_2d_cpu(const T *img, int nx, int ny, float x, float y, i
     float a = 0.5f * order;
     int start_x = std::max(0, (int)ceilf(x - a));
     int end_x = std::min(nx-1, (int)floorf(x + a));
+    int start_y = std::max(0, (int)ceilf(y - a));
+    int end_y = std::min(ny-1, (int)floorf(y + a));
+    // Cache the y weights, they are reused for every x row.
+    int ny_count = std::min(end_y - start_y + 1, INTERP_MAX_TAPS);
+    float wy[INTERP_MAX_TAPS];
+    for (int j = 0; j < ny_count; j++) {
+        wy[j] = lanczos_kernel_cpu(y - (start_y + j), a);
+    }
     T sum{};
     for (int i = start_x; i <= end_x; i++) {
         float dx = x - i;
         float wx = lanczos_kernel_cpu(dx, a);
-        T row_val = lanczos_interp_1d_cpu<T>(img + i * ny, ny, y, order);
+        T row_val = interp_row_cpu<T>(img + i * ny + start_y, wy, ny_count);
         sum += row_val * wx;
     }
     return sum;
@@ -197,72 +218,47 @@ static inline float knab_kernel_cpu(float x, float a, float v, float norm) {
 }
 
 template<class T>
-static T knab_interp_1d_cpu(const T *img, int n, float pos, int order, float v, float norm) {
-    float a = 0.5f * order;
-    int start = std::max(0, (int)ceilf(pos - a));
-    int end = std::min(n-1, (int)floorf(pos + a));
-    T sum{};
-    for (int i = start; i <= end; i++) {
-        float dx = pos - i;
-        float w = knab_kernel_cpu(dx, a, v, norm);
-        sum += img[i] * w;
-    }
-    return sum;
-}
-
-template<class T>
 static T knab_interp_2d_cpu(const T *img, int nx, int ny, float x, float y, int order, float v, float norm) {
     float a = 0.5f * order;
     int start_x = std::max(0, (int)ceilf(x - a));
     int end_x = std::min(nx-1, (int)floorf(x + a));
+    int start_y = std::max(0, (int)ceilf(y - a));
+    int end_y = std::min(ny-1, (int)floorf(y + a));
+    // Cache the y weights, they are reused for every x row.
+    int ny_count = std::min(end_y - start_y + 1, INTERP_MAX_TAPS);
+    float wy[INTERP_MAX_TAPS];
+    for (int j = 0; j < ny_count; j++) {
+        wy[j] = knab_kernel_cpu(y - (start_y + j), a, v, norm);
+    }
     T sum{};
     for (int i = start_x; i <= end_x; i++) {
         float dx = x - i;
         float wx = knab_kernel_cpu(dx, a, v, norm);
-        T row_val = knab_interp_1d_cpu<T>(img + i * ny, ny, y, order, v, norm);
+        T row_val = interp_row_cpu<T>(img + i * ny + start_y, wy, ny_count);
         sum += row_val * wx;
     }
     return sum;
 }
 
+// Template-specialized polynomial evaluation for full compile-time unrolling.
 // Evaluates 1 + c1*x + c2*x^2 + ... + cn*x^n using Horner's method.
-static inline float polyval_c0_one_cpu(const float *coefs, int n_coefs, float x) {
-    float inner = coefs[n_coefs - 1];
-    for (int i = n_coefs - 2; i >= 0; i--) {
+// Mirrors polyval_c0_one in cuda/util.h with the coefficients passed as an
+// argument instead of constant memory.
+template<int N_COEFS>
+static inline float polyval_c0_one_cpu(const float *coefs, float x) {
+    float inner = coefs[N_COEFS - 1];
+    for (int i = N_COEFS - 2; i >= 0; i--) {
         inner = inner * x + coefs[i];
     }
     return x * inner + 1.0f;
 }
 
-static inline float poly_interp_kernel_cpu(const float *coefs, int n_coefs, float x, float inv_a2) {
+template<int N_COEFS>
+static inline float poly_interp_kernel_cpu(const float *coefs, float x, float inv_a2) {
     float x2 = x * x;
+    // Polynomial was fitted for (x/a)²
     float t = x2 * inv_a2;
-    return polyval_c0_one_cpu(coefs, n_coefs, t);
-}
-
-template<class T>
-static T interp_2d_poly_cpu(const T *img, int nx, int ny, float x, float y,
-        int order, const float *coefs, int n_coefs) {
-    float a = 0.5f * order;
-    float inv_a2 = 1.0f / (a * a);
-
-    int start_x = std::max(0, (int)ceilf(x - a));
-    int end_x = std::min(nx-1, (int)floorf(x + a));
-    int start_y = std::max(0, (int)ceilf(y - a));
-    int end_y = std::min(ny-1, (int)floorf(y + a));
-
-    T sum{};
-    for (int i = start_x; i <= end_x; i++) {
-        float dx = x - (float)i;
-        float wx = poly_interp_kernel_cpu(coefs, n_coefs, dx, inv_a2);
-        const T *row = img + i * ny;
-        for (int j = start_y; j <= end_y; j++) {
-            float dy = y - (float)j;
-            float wy = poly_interp_kernel_cpu(coefs, n_coefs, dy, inv_a2);
-            sum += row[j] * (wx * wy);
-        }
-    }
-    return sum;
+    return polyval_c0_one_cpu<N_COEFS>(coefs, t);
 }
 
 }

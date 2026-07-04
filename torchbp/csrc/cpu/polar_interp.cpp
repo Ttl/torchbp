@@ -588,8 +588,111 @@ at::Tensor polar_to_cart_linear_cpu(
     }
 	return out;
 }
-// Applies the optional output-alias phase common to all merge kernels.
-static inline void apply_merge_alias(complex64_t &pixel, int alias,
+// FFBP merge kernels: one theta chunk of one output range row per call.
+//
+// Structured for SIMD like backprojection_polar_2d_row_cpu: for each of the
+// two input images a vectorizable geometry + phase pass writes per-pixel
+// input-grid coordinates and the reference phasor to small buffers, then a
+// scalar pass does the data-dependent interpolation gather and accumulates.
+// Per-pixel math matches the ffbp_merge2 kernels in cuda/polar_interp.cu.
+constexpr int MERGE_CHUNK = 256;
+
+// Geometry + phase pass for one input image. dri_buf < 0 marks pixels that
+// fall outside the input grid (or outside |theta| <= 1).
+static void ffbp_merge2_geom_pass_cpu(float d, float dz, float theta1,
+        float dtheta1, int tb, float dorig0, float dorig1, float dorig2,
+        float z1, float ref_phase, float r0, float dr, float theta0,
+        float dtheta, int Nr, int Ntheta, float alias_fmod, int idr,
+        int nchunk, float *dri_buf, float *dti_buf, float *rp_buf,
+        float *tp_buf, float *cs_buf, float *sn_buf) {
+    const float z0 = z1 + dorig2;
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        const float t = theta1 + dtheta1 * (tb + q);
+        const bool tok = (t >= -1.0f) & (t <= 1.0f);
+        // Zero theta on the out-of-range lanes so sqrtf sees a non-negative
+        // argument and no NaNs enter the pipeline.
+        const float sint = tok ? t : 0.0f;
+        const float cost = sqrtf(1.0f - sint*sint);
+        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
+        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
+        const float tp = arg / sqrtf(1.0f + arg*arg);
+
+        const float dri = (rp - r0) / dr;
+        const float dti = (tp - theta0) / dtheta;
+
+        const bool ok = tok & (dri >= 0.0f) & (dri < Nr-1) &
+                        (dti >= 0.0f) & (dti < Ntheta-1);
+
+        const float rpz = sqrtf(z0*z0 + rp*rp);
+        float ref_sin, ref_cos;
+        sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
+        cs_buf[q] = ref_cos;
+        sn_buf[q] = ref_sin;
+        rp_buf[q] = rp;
+        tp_buf[q] = tp;
+        dri_buf[q] = ok ? dri : -1.0f;
+        dti_buf[q] = dti;
+    }
+}
+
+// Interpolation window and weight pass for the polynomial merge kernels:
+// computes the same clamped window and weights as interp_2d_poly in
+// cuda/util.h, but for a whole chunk of pixels at once so that the Horner
+// recurrences vectorize. Weights are stored [tap][pixel]. Lanes with
+// dri_buf < 0 hold garbage; the scalar pass skips them.
+template<int N_COEFS, int MAX_ORDER>
+static void ffbp_merge2_poly_weights_pass_cpu(const float *coefs, int order,
+        int Nr, int Ntheta, int nchunk,
+        const float *dri_buf, const float *dti_buf,
+        int *ir_buf, int *it_buf, int *nrc_buf, int *ntc_buf,
+        float wr_buf[][MERGE_CHUNK], float wt_buf[][MERGE_CHUNK]) {
+    const float a = 0.5f * order;
+    const float inv_a2 = 1.0f / (a * a);
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        const float x = dri_buf[q];
+        const float y = dti_buf[q];
+        const int start_x = std::max(0, (int)ceilf(x - a));
+        const int end_x = std::min(Nr-1, (int)floorf(x + a));
+        const int start_y = std::max(0, (int)ceilf(y - a));
+        const int end_y = std::min(Ntheta-1, (int)floorf(y + a));
+        ir_buf[q] = start_x;
+        it_buf[q] = start_y;
+        nrc_buf[q] = std::min(end_x - start_x + 1, MAX_ORDER);
+        ntc_buf[q] = std::min(end_y - start_y + 1, MAX_ORDER);
+        for (int j = 0; j < MAX_ORDER; j++) {
+            wr_buf[j][q] = poly_interp_kernel_cpu<N_COEFS>(coefs, x - (float)(start_x + j), inv_a2);
+            wt_buf[j][q] = poly_interp_kernel_cpu<N_COEFS>(coefs, y - (float)(start_y + j), inv_a2);
+        }
+    }
+}
+
+// Scalar per-pixel interpolation tap loop of the polynomial merge kernels:
+// same taps and accumulation order as interp_2d_poly in cuda/util.h with the
+// window and weights read from the buffers filled by the weight pass.
+static inline complex64_t ffbp_merge2_poly_taps_cpu(const complex64_t *img,
+        int Ntheta, int q,
+        const int *ir_buf, const int *it_buf, const int *nrc_buf, const int *ntc_buf,
+        const float wr_buf[][MERGE_CHUNK], const float wt_buf[][MERGE_CHUNK]) {
+    // Accumulate the real and imaginary parts in plain floats: gcc optimizes
+    // this much better than the c10::complex operator chain.
+    float sr = 0.0f, si = 0.0f;
+    for (int i = 0; i < nrc_buf[q]; i++) {
+        const float *row = (const float*)(img + (size_t)(ir_buf[q] + i) * Ntheta + it_buf[q]);
+        const float wxi = wr_buf[i][q];
+        for (int j = 0; j < ntc_buf[q]; j++) {
+            const float w = wxi * wt_buf[j][q];
+            sr += row[2*j] * w;
+            si += row[2*j+1] * w;
+        }
+    }
+    return {sr, si};
+}
+
+// Applies the optional output-alias phase common to all merge kernels. The
+// phasor depends only on the range row, so one chunk shares a single phasor.
+static void apply_merge_alias(float *accr, float *acci, int nchunk, int alias,
         float ref_phase, float alias_fmod, float dz, int idr) {
     if (!alias) {
         return;
@@ -604,8 +707,13 @@ static inline void apply_merge_alias(complex64_t &pixel, int alias,
     }
     float ref_sin, ref_cos;
     sincospi<float>(rp * dz - af * idr, &ref_sin, &ref_cos);
-    complex64_t ref = {ref_cos, ref_sin};
-    pixel *= ref;
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        const float pr = accr[q] * ref_cos - acci[q] * ref_sin;
+        const float pi = accr[q] * ref_sin + acci[q] * ref_cos;
+        accr[q] = pr;
+        acci[q] = pi;
+    }
 }
 
 static void ffbp_merge2_kernel_lanczos_cpu(const complex64_t *img0, const complex64_t *img1,
@@ -613,48 +721,47 @@ static void ffbp_merge2_kernel_lanczos_cpu(const complex64_t *img0, const comple
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
         float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod,
-        int idx) {
-    const int idtheta = idx % Ntheta1;
-    const int idr = idx / Ntheta1;
+        int idr, int tb) {
+    float dri_buf[MERGE_CHUNK], dti_buf[MERGE_CHUNK];
+    float rp_buf[MERGE_CHUNK], tp_buf[MERGE_CHUNK];
+    float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
+    float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
 
+    const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
     const float d = r1 + dr1 * idr;
-    const float t = theta1 + dtheta1 * idtheta;
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        return;
-    }
-
-    const float sint = t;
-    const float cost = sqrtf(1.0f - t*t);
     const float dz = sqrtf(z1*z1 + d*d);
 
-    complex64_t pixel{};
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        accr[q] = 0.0f;
+        acci[q] = 0.0f;
+    }
 
     for (int id=0; id < 2; id++) {
         const complex64_t *img = id == 0 ? img0 : img1;
-        const float dorig0 = dorigin[id * 3 + 0];
-        const float dorig1 = dorigin[id * 3 + 1];
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
-
-        const float dri = (rp - r0[id]) / dr[id];
-        const float dti = (tp - theta0[id]) / dtheta[id];
-
-        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+        ffbp_merge2_geom_pass_cpu(d, dz, theta1, dtheta1, tb,
+                dorigin[id * 3 + 0], dorigin[id * 3 + 1], dorigin[id * 3 + 2],
+                z1, ref_phase, r0[id], dr[id], theta0[id], dtheta[id],
+                Nr[id], Ntheta[id], alias_fmod, idr, nchunk,
+                dri_buf, dti_buf, rp_buf, tp_buf, cs_buf, sn_buf);
+        // Scalar pass: data-dependent interpolation gather.
+        for (int q = 0; q < nchunk; q++) {
+            const float dri = dri_buf[q];
+            if (dri < 0.0f) {
+                continue;
+            }
             complex64_t v = lanczos_interp_2d_cpu<complex64_t>(
-                    img, Nr[id], Ntheta[id], dri, dti, order);
-
-            float ref_sin, ref_cos;
-            const float z0 = z1 + dorigin[id * 3 + 2];
-            const float rpz = sqrtf(z0*z0 + rp*rp);
-            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
-            complex64_t ref = {ref_cos, ref_sin};
-            pixel += v * ref;
+                    img, Nr[id], Ntheta[id], dri, dti_buf[q], order);
+            accr[q] += v.real() * cs_buf[q] - v.imag() * sn_buf[q];
+            acci[q] += v.real() * sn_buf[q] + v.imag() * cs_buf[q];
         }
     }
-    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
-    out[idr*Ntheta1 + idtheta] = pixel;
+    apply_merge_alias(accr, acci, nchunk, alias, ref_phase, alias_fmod, dz, idr);
+    complex64_t *out_row = out + (size_t)idr * Ntheta1 + tb;
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        out_row[q] = complex64_t(accr[q], acci[q]);
+    }
 }
 
 static void ffbp_merge2_kernel_knab_cpu(const complex64_t *img0, const complex64_t *img1,
@@ -662,98 +769,103 @@ static void ffbp_merge2_kernel_knab_cpu(const complex64_t *img0, const complex64
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
         float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v, int alias,
-        float alias_fmod, int idx) {
-    const int idtheta = idx % Ntheta1;
-    const int idr = idx / Ntheta1;
+        float alias_fmod, int idr, int tb) {
+    float dri_buf[MERGE_CHUNK], dti_buf[MERGE_CHUNK];
+    float rp_buf[MERGE_CHUNK], tp_buf[MERGE_CHUNK];
+    float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
+    float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
 
+    const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
     const float d = r1 + dr1 * idr;
-    const float t = theta1 + dtheta1 * idtheta;
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        return;
-    }
-
-    const float sint = t;
-    const float cost = sqrtf(1.0f - t*t);
     const float dz = sqrtf(z1*z1 + d*d);
-
-    complex64_t pixel{};
     const float knab_norm = knab_kernel_norm_cpu(order, knab_v);
+
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        accr[q] = 0.0f;
+        acci[q] = 0.0f;
+    }
 
     for (int id=0; id < 2; id++) {
         const complex64_t *img = id == 0 ? img0 : img1;
-        const float dorig0 = dorigin[id * 3 + 0];
-        const float dorig1 = dorigin[id * 3 + 1];
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
-
-        const float dri = (rp - r0[id]) / dr[id];
-        const float dti = (tp - theta0[id]) / dtheta[id];
-
-        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
+        ffbp_merge2_geom_pass_cpu(d, dz, theta1, dtheta1, tb,
+                dorigin[id * 3 + 0], dorigin[id * 3 + 1], dorigin[id * 3 + 2],
+                z1, ref_phase, r0[id], dr[id], theta0[id], dtheta[id],
+                Nr[id], Ntheta[id], alias_fmod, idr, nchunk,
+                dri_buf, dti_buf, rp_buf, tp_buf, cs_buf, sn_buf);
+        // Scalar pass: data-dependent interpolation gather.
+        for (int q = 0; q < nchunk; q++) {
+            const float dri = dri_buf[q];
+            if (dri < 0.0f) {
+                continue;
+            }
             complex64_t v = knab_interp_2d_cpu<complex64_t>(
-                    img, Nr[id], Ntheta[id], dri, dti, order, knab_v, knab_norm);
-
-            float ref_sin, ref_cos;
-            const float z0 = z1 + dorigin[id * 3 + 2];
-            const float rpz = sqrtf(z0*z0 + rp*rp);
-            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
-            complex64_t ref = {ref_cos, ref_sin};
-            pixel += v * ref;
+                    img, Nr[id], Ntheta[id], dri, dti_buf[q], order, knab_v, knab_norm);
+            accr[q] += v.real() * cs_buf[q] - v.imag() * sn_buf[q];
+            acci[q] += v.real() * sn_buf[q] + v.imag() * cs_buf[q];
         }
     }
-    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
-    out[idr*Ntheta1 + idtheta] = pixel;
+    apply_merge_alias(accr, acci, nchunk, alias, ref_phase, alias_fmod, dz, idr);
+    complex64_t *out_row = out + (size_t)idr * Ntheta1 + tb;
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        out_row[q] = complex64_t(accr[q], acci[q]);
+    }
 }
 
+template<int N_COEFS>
 static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64_t *img1,
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, const float *coefs, int n_coefs,
-        int alias, float alias_fmod, int idx) {
-    const int idtheta = idx % Ntheta1;
-    const int idr = idx / Ntheta1;
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, const float *coefs,
+        int alias, float alias_fmod, int idr, int tb) {
+    constexpr int MAX_ORDER = 8;
+    float dri_buf[MERGE_CHUNK], dti_buf[MERGE_CHUNK];
+    float rp_buf[MERGE_CHUNK], tp_buf[MERGE_CHUNK];
+    float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
+    float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
+    float wr_buf[MAX_ORDER][MERGE_CHUNK], wt_buf[MAX_ORDER][MERGE_CHUNK];
+    int ir_buf[MERGE_CHUNK], it_buf[MERGE_CHUNK];
+    int nrc_buf[MERGE_CHUNK], ntc_buf[MERGE_CHUNK];
 
+    const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
     const float d = r1 + dr1 * idr;
-    const float t = theta1 + dtheta1 * idtheta;
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        return;
-    }
-
-    const float sint = t;
-    const float cost = sqrtf(1.0f - t*t);
     const float dz = sqrtf(z1*z1 + d*d);
 
-    complex64_t pixel{};
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        accr[q] = 0.0f;
+        acci[q] = 0.0f;
+    }
 
     for (int id=0; id < 2; id++) {
         const complex64_t *img = id == 0 ? img0 : img1;
-        const float dorig0 = dorigin[id * 3 + 0];
-        const float dorig1 = dorigin[id * 3 + 1];
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
-
-        const float dri = (rp - r0[id]) / dr[id];
-        const float dti = (tp - theta0[id]) / dtheta[id];
-
-        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
-            complex64_t v = interp_2d_poly_cpu<complex64_t>(
-                    img, Nr[id], Ntheta[id], dri, dti, order, coefs, n_coefs);
-
-            float ref_sin, ref_cos;
-            const float z0 = z1 + dorigin[id * 3 + 2];
-            const float rpz = sqrtf(z0*z0 + rp*rp);
-            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
-            complex64_t ref = {ref_cos, ref_sin};
-            pixel += v * ref;
+        ffbp_merge2_geom_pass_cpu(d, dz, theta1, dtheta1, tb,
+                dorigin[id * 3 + 0], dorigin[id * 3 + 1], dorigin[id * 3 + 2],
+                z1, ref_phase, r0[id], dr[id], theta0[id], dtheta[id],
+                Nr[id], Ntheta[id], alias_fmod, idr, nchunk,
+                dri_buf, dti_buf, rp_buf, tp_buf, cs_buf, sn_buf);
+        ffbp_merge2_poly_weights_pass_cpu<N_COEFS, MAX_ORDER>(coefs, order,
+                Nr[id], Ntheta[id], nchunk, dri_buf, dti_buf,
+                ir_buf, it_buf, nrc_buf, ntc_buf, wr_buf, wt_buf);
+        // Scalar pass: data-dependent interpolation gather.
+        for (int q = 0; q < nchunk; q++) {
+            if (dri_buf[q] < 0.0f) {
+                continue;
+            }
+            complex64_t v = ffbp_merge2_poly_taps_cpu(img, Ntheta[id], q,
+                    ir_buf, it_buf, nrc_buf, ntc_buf, wr_buf, wt_buf);
+            accr[q] += v.real() * cs_buf[q] - v.imag() * sn_buf[q];
+            acci[q] += v.real() * sn_buf[q] + v.imag() * cs_buf[q];
         }
     }
-    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
-    out[idr*Ntheta1 + idtheta] = pixel;
+    apply_merge_alias(accr, acci, nchunk, alias, ref_phase, alias_fmod, dz, idr);
+    complex64_t *out_row = out + (size_t)idr * Ntheta1 + tb;
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        out_row[q] = complex64_t(accr[q], acci[q]);
+    }
 }
 
 at::Tensor ffbp_merge2_lanczos_cpu(
@@ -810,11 +922,15 @@ at::Tensor ffbp_merge2_lanczos_cpu(
 
     omp_set_num_threads(omp_get_num_procs());
 
-#pragma omp parallel for
-    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
-        ffbp_merge2_kernel_lanczos_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
-                ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
-                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI, idx);
+    const int ntchunks = (Ntheta1 + MERGE_CHUNK - 1) / MERGE_CHUNK;
+#pragma omp parallel for collapse(2)
+    for (int idr = 0; idr < Nr1; idr++) {
+        for (int tc = 0; tc < ntchunks; tc++) {
+            ffbp_merge2_kernel_lanczos_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
+                    ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
+                    r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI,
+                    idr, tc * MERGE_CHUNK);
+        }
     }
     return out;
 }
@@ -875,11 +991,15 @@ at::Tensor ffbp_merge2_knab_cpu(
 
     omp_set_num_threads(omp_get_num_procs());
 
-#pragma omp parallel for
-    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
-        ffbp_merge2_kernel_knab_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
-                ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
-                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, v, alias, alias_fmod/kPI, idx);
+    const int ntchunks = (Ntheta1 + MERGE_CHUNK - 1) / MERGE_CHUNK;
+#pragma omp parallel for collapse(2)
+    for (int idr = 0; idr < Nr1; idr++) {
+        for (int tc = 0; tc < ntchunks; tc++) {
+            ffbp_merge2_kernel_knab_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
+                    ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
+                    r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, v, alias, alias_fmod/kPI,
+                    idr, tc * MERGE_CHUNK);
+        }
     }
     return out;
 }
@@ -945,16 +1065,42 @@ at::Tensor ffbp_merge2_poly_cpu(
 
     omp_set_num_threads(omp_get_num_procs());
 
-#pragma omp parallel for
-    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
-        ffbp_merge2_kernel_poly_cpu(img0_ptr, img1_ptr, out_ptr, dorigin_ptr,
-                ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
-                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, n_coefs,
-                alias, alias_fmod/kPI, idx);
+    const int ntchunks = (Ntheta1 + MERGE_CHUNK - 1) / MERGE_CHUNK;
+
+    // Dispatch to template-specialized kernel based on n_coefs. This enables
+    // full compile-time unrolling of the polynomial evaluation. Mirrors the
+    // dispatch in ffbp_merge2_poly_cuda.
+    #define LAUNCH_KERNEL(N) \
+        _Pragma("omp parallel for collapse(2)") \
+        for (int idr = 0; idr < Nr1; idr++) { \
+            for (int tc = 0; tc < ntchunks; tc++) { \
+                ffbp_merge2_kernel_poly_cpu<N>(img0_ptr, img1_ptr, out_ptr, dorigin_ptr, \
+                        ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
+                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, \
+                        alias, alias_fmod/kPI, idr, tc * MERGE_CHUNK); \
+            } \
+        }
+
+    switch (n_coefs) {
+        case 4: LAUNCH_KERNEL(4); break;
+        case 5: LAUNCH_KERNEL(5); break;
+        case 6: LAUNCH_KERNEL(6); break;
+        case 7: LAUNCH_KERNEL(7); break;
+        case 8: LAUNCH_KERNEL(8); break;
+        case 9: LAUNCH_KERNEL(9); break;
+        case 10: LAUNCH_KERNEL(10); break;
+        case 11: LAUNCH_KERNEL(11); break;
+        case 12: LAUNCH_KERNEL(12); break;
+        case 13: LAUNCH_KERNEL(13); break;
+        case 14: LAUNCH_KERNEL(14); break;
+        default:
+            TORCH_CHECK(false, "ffbp_merge2_poly: n_coefs must be 4-14, got ", n_coefs);
     }
+    #undef LAUNCH_KERNEL
     return out;
 }
 
+template<int N_COEFS>
 static void ffbp_merge2_kernel_poly_weighted_cpu(
         const complex64_t *img0, const complex64_t *img1,
         complex64_t *out,
@@ -965,44 +1111,27 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
         const float *r0, const float *dr, const float *theta0, const float *dtheta,
         const int *Nr, const int *Ntheta,
         float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
-        float z1, int order, const float *coefs, int n_coefs, int alias, float alias_fmod,
+        float z1, int order, const float *coefs, int alias, float alias_fmod,
         const float *w1_map0, const float *w2_map0,
         float w_r0_0, float w_dr0, float w_theta0_0, float w_dtheta0,
         int w_nr0, int w_ntheta0,
         const float *w1_map1, const float *w2_map1,
         float w_r0_1, float w_dr1, float w_theta0_1, float w_dtheta1,
         int w_nr1, int w_ntheta1,
-        int output_weight_decimation, int idx) {
+        int output_weight_decimation, int idr, int tb) {
+    constexpr int MAX_ORDER = 8;
+    float dri_buf[MERGE_CHUNK], dti_buf[MERGE_CHUNK];
+    float rp_buf[MERGE_CHUNK], tp_buf[MERGE_CHUNK];
+    float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
+    float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
+    float accw1[MERGE_CHUNK], accw2[MERGE_CHUNK];
+    float wr_buf[MAX_ORDER][MERGE_CHUNK], wt_buf[MAX_ORDER][MERGE_CHUNK];
+    int ir_buf[MERGE_CHUNK], it_buf[MERGE_CHUNK];
+    int nrc_buf[MERGE_CHUNK], ntc_buf[MERGE_CHUNK];
 
-    const int idtheta = idx % Ntheta1;
-    const int idr = idx / Ntheta1;
-
+    const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
     const float d = r1 + dr1 * idr;
-    const float t = theta1 + dtheta1 * idtheta;
-
-    const int dec = output_weight_decimation;
-    const int out_ntheta_dec = (Ntheta1 + dec - 1) / dec;
-    const bool should_write_weight = (w1_out != nullptr) &&
-                                     (idr % dec == 0) && (idtheta % dec == 0);
-    const int w_out_idx = should_write_weight ?
-                          (idr / dec) * out_ntheta_dec + (idtheta / dec) : 0;
-
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        if (should_write_weight) {
-            w1_out[w_out_idx] = 0.0f;
-            w2_out[w_out_idx] = 0.0f;
-        }
-        return;
-    }
-
-    const float sint = t;
-    const float cost = sqrtf(1.0f - t*t);
     const float dz = sqrtf(z1*z1 + d*d);
-
-    complex64_t A_total{};
-    float W1_total = 0.0f;
-    float W2_total = 0.0f;
 
     const float *w1_maps[2] = {w1_map0, w1_map1};
     const float *w2_maps[2] = {w2_map0, w2_map1};
@@ -1013,34 +1142,40 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
     const int w_nr[2] = {w_nr0, w_nr1};
     const int w_ntheta[2] = {w_ntheta0, w_ntheta1};
 
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        accr[q] = 0.0f;
+        acci[q] = 0.0f;
+        accw1[q] = 0.0f;
+        accw2[q] = 0.0f;
+    }
+
     for (int id=0; id < 2; id++) {
         const complex64_t *img = id == 0 ? img0 : img1;
-        const float dorig0 = dorigin[id * 3 + 0];
-        const float dorig1 = dorigin[id * 3 + 1];
-        const float dorig2 = dorigin[id * 3 + 2];
+        ffbp_merge2_geom_pass_cpu(d, dz, theta1, dtheta1, tb,
+                dorigin[id * 3 + 0], dorigin[id * 3 + 1], dorigin[id * 3 + 2],
+                z1, ref_phase, r0[id], dr[id], theta0[id], dtheta[id],
+                Nr[id], Ntheta[id], alias_fmod, idr, nchunk,
+                dri_buf, dti_buf, rp_buf, tp_buf, cs_buf, sn_buf);
+        ffbp_merge2_poly_weights_pass_cpu<N_COEFS, MAX_ORDER>(coefs, order,
+                Nr[id], Ntheta[id], nchunk, dri_buf, dti_buf,
+                ir_buf, it_buf, nrc_buf, ntc_buf, wr_buf, wt_buf);
+        // Scalar pass: data-dependent interpolation and weight map gathers.
+        for (int q = 0; q < nchunk; q++) {
+            if (dri_buf[q] < 0.0f) {
+                continue;
+            }
+            complex64_t v = ffbp_merge2_poly_taps_cpu(img, Ntheta[id], q,
+                    ir_buf, it_buf, nrc_buf, ntc_buf, wr_buf, wt_buf);
 
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
-
-        const float dri = (rp - r0[id]) / dr[id];
-        const float dti = (tp - theta0[id]) / dtheta[id];
-
-        if (dri >= 0 && dri < Nr[id]-1 && dti >= 0 && dti < Ntheta[id]-1) {
-            complex64_t v = interp_2d_poly_cpu<complex64_t>(
-                    img, Nr[id], Ntheta[id], dri, dti, order, coefs, n_coefs);
-
-            float ref_sin, ref_cos;
-            const float z0 = z1 + dorig2;
-            const float rpz = sqrtf(z0*z0 + rp*rp);
-            sincospi<float>(ref_phase * (rpz - dz) - alias_fmod * (dri - idr), &ref_sin, &ref_cos);
-            complex64_t ref = {ref_cos, ref_sin};
+            const float vr = v.real() * cs_buf[q] - v.imag() * sn_buf[q];
+            const float vi = v.real() * sn_buf[q] + v.imag() * cs_buf[q];
 
             float w1 = 0.0f;
             float w2 = 0.0f;
             if (w1_maps[id] != nullptr && w2_maps[id] != nullptr) {
-                const float w_ri = (rp - w_r0[id]) / w_dr[id];
-                const float w_ti = (tp - w_theta0[id]) / w_dtheta[id];
+                const float w_ri = (rp_buf[q] - w_r0[id]) / w_dr[id];
+                const float w_ti = (tp_buf[q] - w_theta0[id]) / w_dtheta[id];
 
                 const int w_ri_int = std::max(0, std::min((int)w_ri, w_nr[id] - 2));
                 const int w_ti_int = std::max(0, std::min((int)w_ti, w_ntheta[id] - 2));
@@ -1054,26 +1189,46 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
             }
 
             if (w1 > 0.0f && w2 > 0.0f) {
-                A_total += v * ref;
-                W1_total += w1;
-                W2_total += w2;
+                accr[q] += vr;
+                acci[q] += vi;
+                accw1[q] += w1;
+                accw2[q] += w2;
             } else if (w1_maps[id] == nullptr) {
-                A_total += v * ref;
+                accr[q] += vr;
+                acci[q] += vi;
             }
         }
     }
 
-    complex64_t pixel = A_total;
-    if (w1_out == nullptr && W2_total > 0.0f) {
-        pixel = A_total * (W1_total / W2_total);
+    // Normalize only at final output (when no weight maps are emitted).
+    if (w1_out == nullptr) {
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            const float scale = accw2[q] > 0.0f ? accw1[q] / accw2[q] : 1.0f;
+            accr[q] *= scale;
+            acci[q] *= scale;
+        }
     }
 
-    apply_merge_alias(pixel, alias, ref_phase, alias_fmod, dz, idr);
-    out[idr*Ntheta1 + idtheta] = pixel;
+    apply_merge_alias(accr, acci, nchunk, alias, ref_phase, alias_fmod, dz, idr);
+    complex64_t *out_row = out + (size_t)idr * Ntheta1 + tb;
+#pragma omp simd
+    for (int q = 0; q < nchunk; q++) {
+        out_row[q] = complex64_t(accr[q], acci[q]);
+    }
 
-    if (should_write_weight) {
-        w1_out[w_out_idx] = W1_total;
-        w2_out[w_out_idx] = W2_total;
+    const int dec = output_weight_decimation;
+    if (w1_out != nullptr && idr % dec == 0) {
+        const int out_ntheta_dec = (Ntheta1 + dec - 1) / dec;
+        float *w1_row = w1_out + (size_t)(idr / dec) * out_ntheta_dec;
+        float *w2_row = w2_out + (size_t)(idr / dec) * out_ntheta_dec;
+        for (int q = 0; q < nchunk; q++) {
+            const int idtheta = tb + q;
+            if (idtheta % dec == 0) {
+                w1_row[idtheta / dec] = accw1[q];
+                w2_row[idtheta / dec] = accw2[q];
+            }
+        }
     }
 }
 
@@ -1189,17 +1344,42 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cpu(
 
     omp_set_num_threads(omp_get_num_procs());
 
-#pragma omp parallel for
-    for (int idx = 0; idx < Nr1 * Ntheta1; idx++) {
-        ffbp_merge2_kernel_poly_weighted_cpu(
-                img0_ptr, img1_ptr, out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase,
-                r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr,
-                r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, n_coefs,
-                alias, alias_fmod/kPI,
-                w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0,
-                w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1,
-                dec, idx);
+    const int ntchunks = (Ntheta1 + MERGE_CHUNK - 1) / MERGE_CHUNK;
+
+    // Dispatch to template-specialized kernel based on n_coefs. This enables
+    // full compile-time unrolling of the polynomial evaluation. Mirrors the
+    // dispatch in ffbp_merge2_poly_weighted_cuda.
+    #define LAUNCH_KERNEL(N) \
+        _Pragma("omp parallel for collapse(2)") \
+        for (int idr = 0; idr < Nr1; idr++) { \
+            for (int tc = 0; tc < ntchunks; tc++) { \
+                ffbp_merge2_kernel_poly_weighted_cpu<N>( \
+                        img0_ptr, img1_ptr, out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase, \
+                        r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
+                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, \
+                        alias, alias_fmod/kPI, \
+                        w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0, \
+                        w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1, \
+                        dec, idr, tc * MERGE_CHUNK); \
+            } \
+        }
+
+    switch (n_coefs) {
+        case 4: LAUNCH_KERNEL(4); break;
+        case 5: LAUNCH_KERNEL(5); break;
+        case 6: LAUNCH_KERNEL(6); break;
+        case 7: LAUNCH_KERNEL(7); break;
+        case 8: LAUNCH_KERNEL(8); break;
+        case 9: LAUNCH_KERNEL(9); break;
+        case 10: LAUNCH_KERNEL(10); break;
+        case 11: LAUNCH_KERNEL(11); break;
+        case 12: LAUNCH_KERNEL(12); break;
+        case 13: LAUNCH_KERNEL(13); break;
+        case 14: LAUNCH_KERNEL(14); break;
+        default:
+            TORCH_CHECK(false, "ffbp_merge2_poly_weighted: n_coefs must be 4-14, got ", n_coefs);
     }
+    #undef LAUNCH_KERNEL
 
     std::vector<at::Tensor> ret;
     ret.push_back(out);
