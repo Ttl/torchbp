@@ -3278,5 +3278,132 @@ class TestOrientationAngle(TestCase):
         self.assertLess(abs(math.degrees(m.mean().item()) - 15.0), 3.0)
 
 
+class TestLowpassFilterWindow(TestCase):
+    """Regression tests for FFT lowpass filtering."""
+
+    def test_string_window_matches_precalculated(self):
+        """String-window path must match the precalculated-Tensor path.
+
+        Regression: `fft_lowpass_filter_window` used to try to unpack
+        `w, pad_size = fft_lowpass_filter_precalculate_window(...)`, but
+        that helper only returns the window Tensor, so any call passing a
+        string window (e.g. the "boxcar" default of `gpga_bp_polar`)
+        raised `ValueError: too many values to unpack`.
+        """
+        from torchbp.util import (
+            fft_lowpass_filter_window,
+            fft_lowpass_filter_precalculate_window,
+        )
+
+        torch.manual_seed(0)
+        data = torch.randn(4, 64, dtype=torch.complex64)
+        for window in ("boxcar", "hamming", "hann"):
+            for width in (11, 20, 33):
+                out_str = fft_lowpass_filter_window(
+                    data, window=window, window_width=width
+                )
+                w = fft_lowpass_filter_precalculate_window(
+                    data.shape[-1], width, data.device, window, fast_len=True
+                )
+                out_tensor = fft_lowpass_filter_window(
+                    data, window=w, window_width=width
+                )
+                self.assertTrue(torch.isfinite(out_str).all())
+                self.assertEqual(out_str.shape, data.shape)
+                torch.testing.assert_close(out_str, out_tensor)
+
+
+class TestGpgaBpPolar(TestCase):
+    """End-to-end GPGA polar autofocus on synthetic point-scatterer data."""
+
+    fc = 6e9
+    r_res = 0.3
+    grid_polar = {"r": (80.0, 120.0), "theta": (-0.25, 0.25), "nr": 64,
+                  "ntheta": 64}
+    nsweeps = 128
+    sweep_samples = 512
+
+    def _make_data(self, targets, amps, pos):
+        """Point responses consistent with the backprojection phase model."""
+        c0 = 299792458.0
+        data = torch.zeros(
+            pos.shape[0], self.sweep_samples, dtype=torch.complex64
+        )
+        m_idx = torch.arange(pos.shape[0])
+        for t, a in zip(targets, amps):
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = d / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += a * w[valid] * phase[valid]
+        return data
+
+    def _scene(self):
+        torch.manual_seed(5)
+        ntargets = 12
+        r = 90.0 + 20.0 * torch.rand(ntargets)
+        t = -0.15 + 0.3 * torch.rand(ntargets)
+        targets = torch.stack(
+            [r * torch.sqrt(1 - t**2), r * t, torch.zeros_like(r)], dim=1
+        )
+        amps = (1.0 + torch.rand(ntargets)).to(torch.complex64)
+        pos = torch.zeros(self.nsweeps, 3)
+        pos[:, 1] = torch.linspace(-3.0, 3.0, self.nsweeps)
+        pos[:, 2] = 30.0
+        return targets, amps, pos
+
+    @staticmethod
+    def _sharpness(img):
+        # Inverse participation ratio of the intensity: higher for a
+        # well-focused (peaky) image, lower for a blurred one.
+        p = img.abs() ** 2
+        return (p**2).sum() / (p.sum() ** 2)
+
+    def test_focuses_range_motion_error(self):
+        targets, amps, pos = self._scene()
+        # True platform has a smooth zero-mean range (X) motion error;
+        # the data are formed with it but backprojected at the nominal
+        # positions, defocusing the image. GPGA must recover it.
+        dx = 4e-3 * torch.sin(
+            2 * torch.pi * 2 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+
+        img_blur = torchbp.ops.backprojection_polar_2d(
+            data, self.grid_polar, self.fc, self.r_res, pos
+        )[0]
+        img_focus, phi = torchbp.autofocus.gpga_bp_polar(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            max_iters=8, target_threshold_db=15,
+        )
+
+        # Autofocus must run to completion (the lowpass path is exercised
+        # once window_width drops below the number of sweeps) and produce
+        # a finite, sharper image.
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(phi).all())
+        self.assertGreater(
+            self._sharpness(img_focus).item(),
+            1.3 * self._sharpness(img_blur).item(),
+        )
+
+        # The recovered range correction should track the injected error.
+        from torchbp.util import detrend
+        c0 = 299792458.0
+        d = phi * c0 / (4 * torch.pi * self.fc)
+        # Sign/linear-trend are unobservable, so compare detrended and
+        # take the better-matching sign.
+        resid = min(
+            detrend(dx - d).pow(2).mean().sqrt().item(),
+            detrend(dx + d).pow(2).mean().sqrt().item(),
+        )
+        self.assertLess(resid, 0.4 * dx.pow(2).mean().sqrt().item())
+
+
 if __name__ == "__main__":
     unittest.main()

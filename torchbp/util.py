@@ -946,8 +946,6 @@ def fft_lowpass_filter_precalculate_window(
     -------
     w : Tensor
         Windowing Tensor.
-    pad_size : int
-        Amount of padding added to signal (needed for extraction).
     """
     half_width = (window_width + 1) // 2
 
@@ -999,7 +997,7 @@ def fft_lowpass_filter_window(
     if isinstance(window, Tensor):
         w = window
     else:
-        w, pad_size = fft_lowpass_filter_precalculate_window(
+        w = fft_lowpass_filter_precalculate_window(
             N, window_width, target_data.device, window,
             circular_conv=circular_conv, fast_len=fast_len
         )

@@ -291,6 +291,9 @@ def gpga_bp_polar(
         img = backprojection_polar_2d(data, grid_polar, fc, r_res, pos_new, d0=d0, data_fmod=data_fmod)[0]
 
     for i in range(max_iters):
+        lp_w = fft_lowpass_filter_precalculate_window(
+            pos_new.shape[0], window_width, img.device, lowpass_window, fast_len=True
+        )
         rpeaks = torch.argmax(torch.abs(img), dim=1)
         a = torch.abs(img[torch.arange(img.size(0)), rpeaks])
         max_a = torch.max(a)
@@ -311,7 +314,7 @@ def gpga_bp_polar(
         # Filter samples
         if window_width is not None and window_width < target_data.shape[1]:
             target_data = fft_lowpass_filter_window(
-                target_data, window=lowpass_window, window_width=window_width
+                target_data, window=lp_w, window_width=window_width
             )
         phi = pga_estimator(target_data, estimator, eps)
         phi_sum = unwrap(phi_sum + phi)
