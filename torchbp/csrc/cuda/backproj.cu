@@ -121,7 +121,10 @@ __global__ void backprojection_polar_2d_kernel(
 
             if constexpr (Method == InterpMethod::LINEAR) {
                 int id0 = (int)sx;
-                valid_sample = (id0 >= 0 && id0 <= max_id0);
+                // Float-domain check: (int)sx truncates toward zero, so
+                // sx in (-1, 0) would pass an id0 >= 0 check and
+                // extrapolate with a negative weight.
+                valid_sample = (sx >= 0.0f && id0 <= max_id0);
 
                 if (valid_sample) {
                     int data_idx = sweep_offset + id0;
@@ -178,7 +181,7 @@ __global__ void backprojection_polar_2d_kernel(
                     const int el_int = (int)el_idx;
                     const int az_int = (int)az_idx;
 
-                    if (el_int >= 0 && el_int + 1 < g_nel && az_int >= 0 && az_int + 1 < g_naz) {
+                    if (el_idx >= 0.0f && el_int + 1 < g_nel && az_idx >= 0.0f && az_int + 1 < g_naz) {
                         const float el_frac = el_idx - el_int;
                         const float az_frac = az_idx - az_int;
                         const float w = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
@@ -305,7 +308,7 @@ __global__ void backprojection_polar_2d_grad_kernel(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (active && id0 >= 0 && id1 < sweep_samples) {
+        if (active && sx >= 0.0f && id1 < sweep_samples) {
             complex64_t s0, s1;
             if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
                 s0 = ((complex64_t*)data)[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
@@ -365,7 +368,7 @@ __global__ void backprojection_polar_2d_grad_kernel(
         }
 
         if (have_data_grad) {
-            if (active && id0 >= 0 && id1 < sweep_samples) {
+            if (active && sx >= 0.0f && id1 < sweep_samples) {
                 float2 *x0 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
                 float2 *x1 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
                 atomicAdd(&x0->x, ds0.real());
@@ -418,7 +421,7 @@ __global__ void gpga_backprojection_2d_kernel(
     // Linear interpolation.
     int id0 = sx;
     int id1 = id0 + 1;
-    if (id0 < 0 || id1 >= sweep_samples) {
+    if (sx < 0.0f || id1 >= sweep_samples) {
         data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
     } else {
         complex64_t s0, s1;
@@ -511,7 +514,7 @@ __global__ void blocksvd_alpha_kernel(
             // Linear interpolation.
             const int id0 = sx;
             const int id1 = id0 + 1;
-            if (id0 < 0 || id1 >= sweep_samples) {
+            if (sx < 0.0f || id1 >= sweep_samples) {
                 continue;
             }
             const complex64_t s0 = data_row[id0];
@@ -570,7 +573,7 @@ __global__ void gpga_backprojection_2d_lanczos_kernel(
     // Linear interpolation.
     int id0 = sx;
     int id1 = id0 + 1;
-    if (id0 < 0 || id1 >= sweep_samples) {
+    if (sx < 0.0f || id1 >= sweep_samples) {
         data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
     } else {
         complex64_t s = lanczos_interp_1d<complex64_t, T>(
@@ -684,10 +687,10 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         const float el_frac = el_idx - el_int;
         const float az_frac = az_idx - az_int;
 
-        if (el_int < 0 || el_int+1 >= g_nel) {
+        if (el_idx < 0.0f || el_int+1 >= g_nel) {
             continue;
         }
-        if (az_int < 0 || az_int+1 >= g_naz) {
+        if (az_idx < 0.0f || az_int+1 >= g_naz) {
             continue;
         }
         float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
@@ -791,7 +794,7 @@ __global__ void backprojection_cart_2d_kernel(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (id0 >= 0 && id1 < sweep_samples) {
+        if (sx >= 0.0f && id1 < sweep_samples) {
             complex64_t s0 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id0];
             complex64_t s1 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id1];
 
@@ -876,7 +879,7 @@ __global__ void backprojection_cart_2d_grad_kernel(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (active && id0 >= 0 && id1 < sweep_samples) {
+        if (active && sx >= 0.0f && id1 < sweep_samples) {
             complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
             complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
 
@@ -927,7 +930,7 @@ __global__ void backprojection_cart_2d_grad_kernel(
         }
 
         if (have_data_grad) {
-            if (active && id0 >= 0 && id1 < sweep_samples) {
+            if (active && sx >= 0.0f && id1 < sweep_samples) {
                 float2 *x0 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
                 float2 *x1 = (float2*)&data_grad[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
                 atomicAdd(&x0->x, ds0.real());
@@ -1049,7 +1052,7 @@ __global__ void projection_cart_2d_kernel(
                 const float el_idx = (el_deg - g_el0) / g_del;
                 const float az_idx = (az_deg - g_az0) / g_daz;
                 const int el_int = (int)el_idx, az_int = (int)az_idx;
-                if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+                if (el_idx < 0.0f || el_int+1 >= g_nel || az_idx < 0.0f || az_int+1 >= g_naz)
                     norm = 0.0f;
                 else
                     norm *= interp2d<float>(g, g_nel, g_naz,
@@ -1264,7 +1267,7 @@ __global__ void projection_nufft_geometry_kernel(
         const float el_idx = (el_deg - g_el0) / g_del;
         const float az_idx = (az_deg - g_az0) / g_daz;
         const int el_int = (int)el_idx, az_int = (int)az_idx;
-        if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+        if (el_idx < 0.0f || el_int+1 >= g_nel || az_idx < 0.0f || az_int+1 >= g_naz)
             norm = 0.0f;
         else
             norm *= interp2d<float>(g, g_nel, g_naz,
@@ -1400,13 +1403,17 @@ at::Tensor projection_cart_2d_nufft_cuda(
     at::Tensor grid  = at::zeros({nbatch, nsweeps, M_ext}, cplx_opts);
     at::Tensor data  = at::empty({nbatch, nsweeps, M},     cplx_opts);
 
-    // Raw pointers (contiguous guaranteed by callers)
+    // Keep contiguous copies alive until the kernels have run.
+    at::Tensor pos_contig = pos.contiguous();
+    at::Tensor dem_contig = dem.defined() ? dem.contiguous() : at::Tensor();
+    at::Tensor att_contig = (g.defined() && att.defined()) ? att.contiguous() : at::Tensor();
+    at::Tensor g_contig   = g.defined() ? g.contiguous() : at::Tensor();
+
     const complex64_t* img_raw  = (const complex64_t*)img.data_ptr<c10::complex<float>>();
-    const float*       dem_raw  = dem.defined()  ? dem.contiguous().data_ptr<float>() : nullptr;
-    const float*       pos_raw  = pos.contiguous().data_ptr<float>();
-    const float*       att_raw  = (g.defined() && att.defined())
-                                   ? att.contiguous().data_ptr<float>() : nullptr;
-    const float*       g_raw    = g.defined() ? g.contiguous().data_ptr<float>() : nullptr;
+    const float*       dem_raw  = dem_contig.defined() ? dem_contig.data_ptr<float>() : nullptr;
+    const float*       pos_raw  = pos_contig.data_ptr<float>();
+    const float*       att_raw  = att_contig.defined() ? att_contig.data_ptr<float>() : nullptr;
+    const float*       g_raw    = g_contig.defined() ? g_contig.data_ptr<float>() : nullptr;
     const float*       lut_raw  = kb_lut.data_ptr<float>();
     float2*            grid_raw = (float2*)grid.data_ptr<c10::complex<float>>();
     float*             ar       = A_re.data_ptr<float>();

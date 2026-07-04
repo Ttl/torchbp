@@ -89,7 +89,10 @@ static void backprojection_polar_2d_row_cpu(
 
                 const float sx = delta_r * (d + d0);
                 const int id0 = (int)sx;
-                const bool ok = (id0 >= 0) & (id0 + 1 < sweep_samples);
+                // Float-domain check: (int)sx truncates toward zero, so
+                // sx in (-1, 0) would pass an id0 >= 0 check and
+                // extrapolate with a negative weight.
+                const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
                 idx_buf[q] = ok ? id0 : -1;
                 frac_buf[q] = sx - id0;
 
@@ -119,8 +122,8 @@ static void backprojection_polar_2d_row_cpu(
 
                     const int el_int = (int)el_idx;
                     const int az_int = (int)az_idx;
-                    const bool ok = (el_int >= 0) & (el_int + 1 < g_nel) &
-                                    (az_int >= 0) & (az_int + 1 < g_naz);
+                    const bool ok = (el_idx >= 0.0f) & (el_int + 1 < g_nel) &
+                                    (az_idx >= 0.0f) & (az_int + 1 < g_naz);
                     ef_buf[q] = el_idx - el_int;
                     af_buf[q] = az_idx - az_int;
                     gi_buf[q] = ok ? el_int * g_naz + az_int : -1;
@@ -235,7 +238,8 @@ at::Tensor backprojection_polar_2d_cpu(
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
 
-    bool antenna_pattern = g.defined() || att.defined();
+    // Match CUDA: att alone (without a gain pattern) is ignored.
+    bool antenna_pattern = g.defined();
     if (antenna_pattern) {
         TORCH_CHECK(g.dtype() == at::kFloat);
         TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
@@ -381,7 +385,7 @@ static void backprojection_polar_2d_grad_kernel_cpu(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (id0 >= 0 && id1 < sweep_samples) {
+        if (sx >= 0.0f && id1 < sweep_samples) {
             complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
             complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
 
@@ -428,7 +432,7 @@ static void backprojection_polar_2d_grad_kernel_cpu(
         }
 
         if (have_data_grad) {
-            if (id0 >= 0 && id1 < sweep_samples) {
+            if (sx >= 0.0f && id1 < sweep_samples) {
                 size_t data_idx = idbatch * sweep_samples * nsweeps + i * sweep_samples;
                 #pragma omp atomic
                 reinterpret_cast<float*>(&data_grad[data_idx + id0])[0] += std::real(ds0);
@@ -592,7 +596,7 @@ static void backprojection_cart_2d_kernel_cpu(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (id0 >= 0 && id1 < sweep_samples) {
+        if (sx >= 0.0f && id1 < sweep_samples) {
             complex64_t s0 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id0];
             complex64_t s1 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id1];
 
@@ -730,7 +734,7 @@ static void backprojection_cart_2d_grad_kernel_cpu(
         // Linear interpolation.
         int id0 = sx;
         int id1 = id0 + 1;
-        if (id0 >= 0 && id1 < sweep_samples) {
+        if (sx >= 0.0f && id1 < sweep_samples) {
             complex64_t s0 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id0];
             complex64_t s1 = data[idbatch * sweep_samples * nsweeps + i * sweep_samples + id1];
 
@@ -777,7 +781,7 @@ static void backprojection_cart_2d_grad_kernel_cpu(
         }
 
         if (have_data_grad) {
-            if (id0 >= 0 && id1 < sweep_samples) {
+            if (sx >= 0.0f && id1 < sweep_samples) {
                 size_t data_idx = idbatch * sweep_samples * nsweeps + i * sweep_samples;
                 #pragma omp atomic
                 reinterpret_cast<float*>(&data_grad[data_idx + id0])[0] += std::real(ds0);
@@ -1192,8 +1196,8 @@ static void projection_nufft_spread_row_cpu(
                     const float el_idx = (el_deg - g_el0) / g_del;
                     const float az_idx = (az_deg - g_az0) / g_daz;
                     const int el_int = (int)el_idx, az_int = (int)az_idx;
-                    const bool ok = (el_int >= 0) & (el_int + 1 < g_nel) &
-                                    (az_int >= 0) & (az_int + 1 < g_naz);
+                    const bool ok = (el_idx >= 0.0f) & (el_int + 1 < g_nel) &
+                                    (az_idx >= 0.0f) & (az_int + 1 < g_naz);
                     ef_q[q] = el_idx - el_int;
                     af_q[q] = az_idx - az_int;
                     gi_q[q] = ok ? el_int * g_naz + az_int : -1;
@@ -1493,7 +1497,7 @@ static void projection_cart_2d_kernel_cpu(
             const float el_idx = (el_deg - g_el0) / g_del;
             const float az_idx = (az_deg - g_az0) / g_daz;
             const int el_int = (int)el_idx, az_int = (int)az_idx;
-            if (el_int < 0 || el_int+1 >= g_nel || az_int < 0 || az_int+1 >= g_naz)
+            if (el_idx < 0.0f || el_int+1 >= g_nel || az_idx < 0.0f || az_int+1 >= g_naz)
                 norm = 0.0f;
             else
                 norm *= interp2d<float>(g, g_nel, g_naz,
@@ -1714,7 +1718,7 @@ static void gpga_backprojection_2d_kernel_cpu(
 
     int id0 = sx;
     int id1 = id0 + 1;
-    if (id0 < 0 || id1 >= sweep_samples) {
+    if (sx < 0.0f || id1 >= sweep_samples) {
         data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
     } else {
         complex64_t s0 = data[idsweep * sweep_samples + id0];
@@ -1839,7 +1843,10 @@ static void blocksvd_alpha_kernel_cpu(
 
                 const float sx = delta_r * (d + d0);
                 const int id0 = (int)sx;
-                const bool ok = (id0 >= 0) & (id0 + 1 < sweep_samples);
+                // Float-domain check: (int)sx truncates toward zero, so
+                // sx in (-1, 0) would pass an id0 >= 0 check and
+                // extrapolate with a negative weight.
+                const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
                 idx_buf[q] = ok ? id0 : -1;
                 frac_buf[q] = sx - id0;
 
@@ -2037,10 +2044,10 @@ static void backprojection_polar_2d_tx_power_kernel_cpu(
         const float el_frac = el_idx - el_int;
         const float az_frac = az_idx - az_int;
 
-        if (el_int < 0 || el_int+1 >= g_nel) {
+        if (el_idx < 0.0f || el_int+1 >= g_nel) {
             continue;
         }
-        if (az_int < 0 || az_int+1 >= g_naz) {
+        if (az_idx < 0.0f || az_int+1 >= g_naz) {
             continue;
         }
         float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);

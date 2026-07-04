@@ -268,7 +268,7 @@ __global__ void polar_to_cart_kernel_linear(const T *img, T
     const int dti_int = dti;
     const float dti_frac = dti - dti_int;
 
-    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    if (cosa >= 0 && dri >= 0.0f && dri_int < Nr-1 && dti >= 0.0f && dti_int < Ntheta-1) {
         T v = interp2d<T>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
             float ref_sin, ref_cos;
@@ -330,7 +330,7 @@ __global__ void polar_to_cart_kernel_linear_grad(const complex64_t *img,
     float g_origin1 = 0.0f;
     float g_origin2 = 0.0f;
 
-    if (active && cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    if (active && cosa >= 0 && dri >= 0.0f && dri_int < Nr-1 && dti >= 0.0f && dti_int < Ntheta-1) {
         complex64_t v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
         sincospif(ref_phase * dz - alias_fmod * dri, &ref_sin, &ref_cos);
@@ -624,7 +624,7 @@ __global__ void polar_to_cart_kernel_lanczos(const T *img, T
     const int dri_int = dri;
     const int dti_int = dti;
 
-    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    if (cosa >= 0 && dri >= 0.0f && dri_int < Nr-1 && dti >= 0.0f && dti_int < Ntheta-1) {
         T v = lanczos_interp_2d<T, T>(
                 &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
         if constexpr (::cuda::std::is_same_v<T, complex64_t>) {

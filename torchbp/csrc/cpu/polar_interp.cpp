@@ -147,7 +147,9 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
 
     const T z0 = z1 + dorig2;
     const T rpz = sqrt(z0*z0 + rp*rp);
-    if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    const bool in_grid = dri_int >= 0 && dri_int < Nr-1 &&
+                         dti_int >= 0 && dti_int < Ntheta-1;
+    if (in_grid) {
         v = interp2d<c10::complex<T>>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         T ref_sin, ref_cos;
         const T dz = sqrt(z1*z1 + d*d);
@@ -155,7 +157,9 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
         ref = {ref_cos, ref_sin};
     }
 
-    if (dorigin_grad != nullptr) {
+    // Out-of-grid pixels contribute zero (v = ref = 0), but the interp2d
+    // gradient gathers below would read out of bounds, so skip them.
+    if (dorigin_grad != nullptr && in_grid) {
         const c10::complex<T> dref_drpz = I * kPI * ref_phase * ref;
         const c10::complex<T> dref_ddri = -I * kPI * alias_fmod * ref;
         const c10::complex<T> dv_drp = interp2d_gradx<c10::complex<T>>(
@@ -190,7 +194,7 @@ static void polar_interp_kernel_linear_grad_cpu(const c10::complex<T> *img, cons
     }
 
     if (img_grad != nullptr) {
-        if (dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+        if (in_grid) {
             c10::complex<T> g = grad[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] * std::conj(ref);
 
             c10::complex<T> g11 = g * (1.0f-dri_frac)*(1.0f-dti_frac);
@@ -475,7 +479,7 @@ static void polar_to_cart_kernel_linear_cpu(const T *img, T
     const int dti_int = dti;
     const float dti_frac = dti - dti_int;
 
-    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    if (cosa >= 0 && dri >= 0.0f && dri_int < Nr-1 && dti >= 0.0f && dti_int < Ntheta-1) {
         T v = interp2d<T>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         if constexpr (std::is_same_v<T, complex64_t>) {
             float ref_sin, ref_cos;
@@ -628,7 +632,7 @@ static void polar_to_cart_kernel_linear_grad_cpu(const complex64_t *img,
     const int dti_int = dti;
     const float dti_frac = dti - dti_int;
 
-    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    if (cosa >= 0 && dri >= 0.0f && dri_int < Nr-1 && dti >= 0.0f && dti_int < Ntheta-1) {
         complex64_t v = interp2d<complex64_t>(&img[idbatch * Nr * Ntheta], Nr, Ntheta, dri_int, dri_frac, dti_int, dti_frac);
         float ref_sin, ref_cos;
         sincospi<float>(ref_phase * dz - alias_fmod * dri, &ref_sin, &ref_cos);
@@ -1616,7 +1620,7 @@ static void polar_to_cart_kernel_lanczos_cpu(const T *img, T
     const int dri_int = dri;
     const int dti_int = dti;
 
-    if (cosa >= 0 && dri_int >= 0 && dri_int < Nr-1 && dti_int >= 0 && dti_int < Ntheta-1) {
+    if (cosa >= 0 && dri >= 0.0f && dri_int < Nr-1 && dti >= 0.0f && dti_int < Ntheta-1) {
         T v = lanczos_interp_2d_cpu<T>(
                 &img[idbatch * Nr * Ntheta], Nr, Ntheta, dri, dti, order);
         if constexpr (std::is_same_v<T, complex64_t>) {
