@@ -183,6 +183,8 @@ def backprojection_polar_2d(
         Range modulation frequency applied to SAR image.
     normalize : bool
         If True (default), apply W1/W2 normalization when antenna pattern is used.
+        The antenna pattern should be nonzero everywhere to avoid noise
+        amplification at pixels illuminated only near pattern nulls.
         Set to False for FFBP to output unnormalized accumulation.
 
     Returns
@@ -1413,6 +1415,8 @@ def _backward_polar_2d(ctx, grad):
         raise ValueError("dealias gradient not supported")
     if ctx.saved[15] is not None:
         raise ValueError("gradient with antenna pattern g not supported")
+    if data.dtype == torch.complex32:
+        raise NotImplementedError("complex32 gradient not supported, use complex64 data")
     ret = torch.ops.torchbp.backprojection_polar_2d_grad.default(
         grad, data, pos, *ctx.saved
     )
