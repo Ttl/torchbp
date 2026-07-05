@@ -1915,24 +1915,8 @@ __global__ void ffbp_tx_power_merge2_kernel(
         const int ti_int = dti;
         const float ri_frac = dri - ri_int;
         const float ti_frac = dti - ti_int;
-        const size_t np = (size_t)nri * nti;
-        const float s = interp2d<float>(&acc[0 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
-        const float w = interp2d<float>(&acc[1 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
-        const float p1 = interp2d<float>(&acc[2 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
-        const float m2 = interp2d<float>(&acc[3 * np], nri, nti, ri_int, ri_frac, ti_int, ti_frac);
-        if (w <= 0.0f) {
-            continue;
-        }
-        if (W > 0.0f) {
-            // Chan's parallel variance combination of the weighted psi moments.
-            const float delta = P1 / W - p1 / w;
-            M2 += m2 + delta * delta * W * w / (W + w);
-        } else {
-            M2 += m2;
-        }
-        S += s;
-        W += w;
-        P1 += p1;
+        tx_power_merge_sample(acc, nri, nti, ri_int, ri_frac, ti_int, ti_frac,
+                              &S, &W, &P1, &M2);
     }
     // Float cancellation could leave a small negative value which would give
     // NaN in the final sqrt of the variance.

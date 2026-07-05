@@ -6,7 +6,7 @@ from torch import Tensor
 from typing import TYPE_CHECKING
 from copy import deepcopy
 
-from .backproj import backprojection_cart_2d, _backprojection_cart_2d_tx_power_accum
+from .backproj import backprojection_cart_2d, _backprojection_cart_2d_tx_power_accum, _tx_power_finish
 from ..util import center_pos
 from ._utils import unpack_cartesian_grid
 
@@ -1048,15 +1048,7 @@ def backprojection_cart_2d_tx_power_cfbp(
         acc = node[0]
 
     # Finishing step. Matches the direct kernel epilogue (ground plane).
-    S, W, P1, M2 = acc[0], acc[1], acc[2], acc[3]
     x_vec = x0 + dx * torch.arange(nx, dtype=torch.float32, device=device)
     y_vec = y0 + dy * torch.arange(ny, dtype=torch.float32, device=device)
-    if azimuth_resolution:
-        var = torch.where(W > 0, M2 / torch.clamp(W, min=1e-30), torch.zeros_like(W))
-        sigma = torch.sqrt(torch.clamp(var, min=0.0))
-        Rg = torch.sqrt(x_vec[:, None] ** 2 + y_vec[None, :] ** 2)
-        denom = sigma * Rg
-        pixel = torch.where(denom > 0, S / denom, torch.full_like(S, torch.inf))
-    else:
-        pixel = S
-    return torch.sqrt(pixel)
+    Rg = torch.sqrt(x_vec[:, None] ** 2 + y_vec[None, :] ** 2)
+    return _tx_power_finish(acc, Rg, azimuth_resolution)

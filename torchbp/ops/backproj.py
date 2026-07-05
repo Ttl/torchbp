@@ -845,6 +845,28 @@ def _tx_power_norm_int(normalization: str | None) -> int:
         raise ValueError(f"Invalid normalization {normalization}.")
 
 
+def _tx_power_finish(acc: Tensor, Rg: Tensor, azimuth_resolution: bool) -> Tensor:
+    """Finish a factorized tx_power accumulator map.
+
+    ``acc`` is a ``[4, N0, N1]`` tensor with channels (S, W, P1, M2) from the
+    accumulate/merge ops. ``Rg`` is the per-pixel ground range, broadcastable to
+    ``[N0, N1]``. When ``azimuth_resolution`` divides the accumulated power by
+    the azimuth resolution ``sigma * Rg`` (``sigma = sqrt(M2 / W)``); pixels with
+    no measurable azimuth aperture become inf. Returns ``sqrt`` of the result.
+    Shared finishing step of :func:`backprojection_polar_2d_tx_power_ffbp` and
+    :func:`backprojection_cart_2d_tx_power_cfbp`, matching the direct kernels.
+    """
+    S, W, M2 = acc[0], acc[1], acc[3]
+    if azimuth_resolution:
+        var = torch.where(W > 0, M2 / torch.clamp(W, min=1e-30), torch.zeros_like(W))
+        sigma = torch.sqrt(torch.clamp(var, min=0.0))
+        denom = sigma * Rg
+        pixel = torch.where(denom > 0, S / denom, torch.full_like(S, torch.inf))
+    else:
+        pixel = S
+    return torch.sqrt(pixel)
+
+
 def _backprojection_polar_2d_tx_power_accum(
     wa: Tensor,
     g: Tensor,

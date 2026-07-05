@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 from typing import Union, TYPE_CHECKING
 from warnings import warn
-from .backproj import backprojection_polar_2d, backprojection_polar_2d_tx_power, _backprojection_polar_2d_tx_power_accum
+from .backproj import backprojection_polar_2d, backprojection_polar_2d_tx_power, _backprojection_polar_2d_tx_power_accum, _tx_power_finish
 from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, ffbp_tx_power_merge2, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
@@ -916,20 +916,12 @@ def backprojection_polar_2d_tx_power_ffbp(
         acc = node[0]
 
     # Finishing step. Matches the direct kernel epilogue.
-    S, W, P1, M2 = acc[0], acc[1], acc[2], acc[3]
     r_vec = r0 + dr * torch.arange(nr, dtype=torch.float32, device=device)
-    if azimuth_resolution:
-        var = torch.where(W > 0, M2 / torch.clamp(W, min=1e-30), torch.zeros_like(W))
-        sigma = torch.sqrt(torch.clamp(var, min=0.0))
-        if altitude > 0.0:
-            Rg = torch.sqrt(torch.clamp(r_vec**2 - altitude**2, min=0.0))
-        else:
-            Rg = r_vec
-        denom = sigma * Rg[:, None]
-        pixel = torch.where(denom > 0, S / denom, torch.full_like(S, torch.inf))
+    if altitude > 0.0:
+        Rg = torch.sqrt(torch.clamp(r_vec**2 - altitude**2, min=0.0))
     else:
-        pixel = S
-    out = torch.sqrt(pixel)
+        Rg = r_vec
+    out = _tx_power_finish(acc, Rg[:, None], azimuth_resolution)
     if altitude > 0.0:
         # Shadow zone below nadir is zero in the direct kernel.
         t_vec = theta0 + dtheta * torch.arange(ntheta, dtype=torch.float32, device=device)

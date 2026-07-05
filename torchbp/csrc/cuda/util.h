@@ -98,6 +98,72 @@ __device__ T interp2d_grady(const T *img, int nx, int ny,
            img[(x_int+1)*ny + y_int+1]*x_frac;
 }
 
+// Shared tx_power helpers (CUDA). Mirror of cpu/util.h; see there for docs.
+__device__ static inline void tx_power_pixel_moments(
+        float px_base, float py_base, bool use_h_fixed, float h_fixed,
+        const float* pos, const float* att, int nsweeps,
+        const float* g, float g_az0, float g_el0, float g_daz, float g_del,
+        int g_naz, int g_nel, const float* wa, int normalization,
+        float min_sin2, bool strict_edge,
+        float* pixel, float* m_w, float* m_mean, float* m_s) {
+    float acc = 0.0f, mw = 0.0f, mmean = 0.0f, ms = 0.0f;
+    for (int i = 0; i < nsweeps; i++) {
+        const float px = px_base - pos[i*3 + 0];
+        const float py = py_base - pos[i*3 + 1];
+        const float h = use_h_fixed ? h_fixed : pos[i*3 + 2];
+        const float d = sqrtf(px*px + py*py + h*h);
+        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
+        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
+        const float el_idx = (look_angle - att[3*i + 0] - g_el0) / g_del;
+        const float az_idx = (psi - att[3*i + 2] - g_az0) / g_daz;
+        const int el_int = el_idx;
+        const int az_int = az_idx;
+        const bool el_bad = strict_edge ? (el_idx < 0.0f) : (el_int < 0);
+        const bool az_bad = strict_edge ? (az_idx < 0.0f) : (az_int < 0);
+        if (el_bad || el_int + 1 >= g_nel) continue;
+        if (az_bad || az_int + 1 >= g_naz) continue;
+        const float g_i = interp2d<float>(g, g_nel, g_naz,
+                el_int, el_idx - el_int, az_int, az_idx - az_int);
+        float sinl = 1.0f;
+        if (normalization == 1) {           // sigma_0
+            sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d)));
+        } else if (normalization == 2) {    // gamma_0
+            sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d))) * d / h;
+        } else if (normalization == 3) {    // point (d^4)
+            sinl = d;
+        }
+        const float w = wa[i];
+        const float wi = g_i * g_i * w * w / (d*d*d);
+        acc += wi / sinl;
+        if (wi > 0.0f) {
+            const float wsum = mw + wi;
+            const float delta = psi - mmean;
+            mmean += delta * wi / wsum;
+            ms += wi * delta * (psi - mmean);
+            mw = wsum;
+        }
+    }
+    *pixel = acc; *m_w = mw; *m_mean = mmean; *m_s = ms;
+}
+
+__device__ static inline void tx_power_merge_sample(const float* acc, int nx, int ny,
+        int xi, float xf, int yi, float yf,
+        float* S, float* W, float* P1, float* M2) {
+    const size_t np = (size_t)nx * ny;
+    const float w = interp2d<float>(&acc[1*np], nx, ny, xi, xf, yi, yf);
+    if (w <= 0.0f) return;
+    const float s  = interp2d<float>(&acc[0*np], nx, ny, xi, xf, yi, yf);
+    const float p1 = interp2d<float>(&acc[2*np], nx, ny, xi, xf, yi, yf);
+    const float m2 = interp2d<float>(&acc[3*np], nx, ny, xi, xf, yi, yf);
+    if (*W > 0.0f) {
+        const float delta = *P1 / *W - p1 / w;
+        *M2 += m2 + delta * delta * (*W) * w / (*W + w);
+    } else {
+        *M2 += m2;
+    }
+    *S += s; *W += w; *P1 += p1;
+}
+
 template<class T>
 __device__ float interp2d_abs(const T *img, int nx, int ny,
         int x_int, float x_frac, int y_int, float y_frac) {

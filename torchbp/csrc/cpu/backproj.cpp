@@ -2569,80 +2569,14 @@ static void backprojection_polar_2d_tx_power_accum_kernel_cpu(
     // final output grid so that subaperture grids use the same clamp floor.
     const float min_look_angle = sqrtf(2.0f * dr_ref / h_ref);
 
-    float pixel = 0.0f;
-    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
-    // used to estimate the azimuth resolution from the aperture.
-    float m_w = 0.0f;     // sum of weights
-    float m_mean = 0.0f;  // weighted mean of psi
-    float m_s = 0.0f;     // weighted sum of squared deviations
-
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[i * 3 + 0];
-        float pos_y = pos[i * 3 + 1];
-        float pos_z = pos[i * 3 + 2];
-
-        float px = (px_base - pos_x);
-        float py = (py_base - pos_y);
-        float h = (altitude > 0.0f) ? z_eff : pos_z;
-        float pz2 = h * h;
-
-        // Calculate distance to the pixel.
-        float d = sqrtf(px * px + py * py + pz2);
-
-        // Avoid nans due to numerical precision by clamping to valid range.
-        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
-        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
-        const float el_deg = look_angle - att[3 * i + 0];
-        const float az_deg = psi - att[3 * i + 2];
-        // TODO: consider platform pitch
-
-        const float el_idx = (el_deg - g_el0) / g_del;
-        const float az_idx = (az_deg - g_az0) / g_daz;
-
-        const int el_int = el_idx;
-        const int az_int = az_idx;
-        const float el_frac = el_idx - el_int;
-        const float az_frac = az_idx - az_int;
-
-        if (el_int < 0 || el_int+1 >= g_nel) {
-            continue;
-        }
-        if (az_int < 0 || az_int+1 >= g_naz) {
-            continue;
-        }
-        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
-        float sinl = 1.0f;
-
-        if (normalization == 1) {
-            // sigma_0
-            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d)));
-        } else if (normalization == 2) {
-            // gamma_0
-            sinl = sqrtf(fmaxf(min_look_angle, 1.0f - (h * h) / (d * d))) * d / h;
-        } else if (normalization == 3) {
-            // point
-            // Scale as d^4 instead of d^3 for area target.
-            sinl = d;
-        }
-        // beta_0 otherwise
-
-        float w = wa[i];
-        // Plain illumination weight (no incidence term) for the moments.
-        const float wi = g_i * g_i * w * w / (d*d*d);
-        pixel += wi / sinl;
-
-        // Welford weighted update (numerically stable, handles squint).
-        // Skip zero weights (gain zero or underflow): with m_w still zero
-        // they would give 0/0 which poisons the moments with NaN.
-        if (wi > 0.0f) {
-            const float wsum = m_w + wi;
-            const float delta = psi - m_mean;
-            m_mean += delta * wi / wsum;
-            m_s += wi * delta * (psi - m_mean);
-            m_w = wsum;
-        }
-    }
+    // Polar grid: slant grids use a fixed reference height (z_eff = altitude),
+    // ground grids the per-sweep platform z. Non-strict pattern edge (matches
+    // the direct polar kernel: reject only a negative integer index).
+    float pixel, m_w, m_mean, m_s;
+    tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/altitude > 0.0f, z_eff,
+            pos, att, nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            wa, normalization, min_look_angle, /*strict_edge=*/false,
+            &pixel, &m_w, &m_mean, &m_s);
 
     // Unfinished accumulators for factorized (ffbp style) processing:
     // channel 0: S = sum wi/sinl, 1: W = sum wi, 2: P1 = W*mean(psi),
@@ -2777,80 +2711,13 @@ static void backprojection_cart_2d_tx_power_accum_kernel_cpu(
     // final output grid so that all subaperture maps use the same clamp floor.
     const float min_sin2_look = 2.0f * dx_ref / h_ref;
 
-    float pixel = 0.0f;
-    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
-    // used to estimate the azimuth resolution from the aperture.
-    float m_w = 0.0f;     // sum of weights
-    float m_mean = 0.0f;  // weighted mean of psi
-    float m_s = 0.0f;     // weighted sum of squared deviations
-
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[i * 3 + 0];
-        float pos_y = pos[i * 3 + 1];
-        float pos_z = pos[i * 3 + 2];
-
-        float px = (px_base - pos_x);
-        float py = (py_base - pos_y);
-        float h = pos_z;
-        float pz2 = h * h;
-
-        // Calculate distance to the pixel.
-        float d = sqrtf(px * px + py * py + pz2);
-
-        // Avoid nans due to numerical precision by clamping to valid range.
-        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
-        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
-        const float el_deg = look_angle - att[3 * i + 0];
-        const float az_deg = psi - att[3 * i + 2];
-        // TODO: consider platform pitch
-
-        const float el_idx = (el_deg - g_el0) / g_del;
-        const float az_idx = (az_deg - g_az0) / g_daz;
-
-        const int el_int = el_idx;
-        const int az_int = az_idx;
-        const float el_frac = el_idx - el_int;
-        const float az_frac = az_idx - az_int;
-
-        if (el_idx < 0.0f || el_int+1 >= g_nel) {
-            continue;
-        }
-        if (az_idx < 0.0f || az_int+1 >= g_naz) {
-            continue;
-        }
-        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
-        float sinl = 1.0f;
-
-        if (normalization == 1) {
-            // sigma_0
-            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d)));
-        } else if (normalization == 2) {
-            // gamma_0
-            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d))) * d / h;
-        } else if (normalization == 3) {
-            // point
-            // Scale as d^4 instead of d^3 for area target.
-            sinl = d;
-        }
-        // beta_0 otherwise
-
-        float w = wa[i];
-        // Plain illumination weight (no incidence term) for the moments.
-        const float wi = g_i * g_i * w * w / (d*d*d);
-        pixel += wi / sinl;
-
-        // Welford weighted update (numerically stable, handles squint).
-        // Skip zero weights (gain zero or underflow): with m_w still zero
-        // they would give 0/0 which poisons the moments with NaN.
-        if (wi > 0.0f) {
-            const float wsum = m_w + wi;
-            const float delta = psi - m_mean;
-            m_mean += delta * wi / wsum;
-            m_s += wi * delta * (psi - m_mean);
-            m_w = wsum;
-        }
-    }
+    // Cartesian ground grid: per-sweep height is the platform z; strict pattern
+    // edge (reject negative fractional index, no extrapolation below the edge).
+    float pixel, m_w, m_mean, m_s;
+    tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/false, 0.0f,
+            pos, att, nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            wa, normalization, min_sin2_look, /*strict_edge=*/true,
+            &pixel, &m_w, &m_mean, &m_s);
 
     // Unfinished accumulators for factorized (cfbp style) processing:
     // channel 0: S = sum wi/sinl, 1: W = sum wi, 2: P1 = W*mean(psi),
@@ -2983,24 +2850,8 @@ static void cart_tx_power_merge2_kernel_cpu(
         const int yi_int = dyi;
         const float xi_frac = dxi - xi_int;
         const float yi_frac = dyi - yi_int;
-        const size_t np = (size_t)nxi * nyi;
-        const float s = interp2d<float>(&acc[0 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
-        const float w = interp2d<float>(&acc[1 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
-        const float p1 = interp2d<float>(&acc[2 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
-        const float m2 = interp2d<float>(&acc[3 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
-        if (w <= 0.0f) {
-            continue;
-        }
-        if (W > 0.0f) {
-            // Chan's parallel variance combination of the weighted psi moments.
-            const float delta = P1 / W - p1 / w;
-            M2 += m2 + delta * delta * W * w / (W + w);
-        } else {
-            M2 += m2;
-        }
-        S += s;
-        W += w;
-        P1 += p1;
+        tx_power_merge_sample(acc, nxi, nyi, xi_int, xi_frac, yi_int, yi_frac,
+                              &S, &W, &P1, &M2);
     }
     // Float cancellation could leave a small negative value which would give
     // NaN in the final sqrt of the variance.
