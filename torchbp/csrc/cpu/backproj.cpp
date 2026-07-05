@@ -550,7 +550,15 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
 	return ret;
 }
 
-static void backprojection_cart_2d_kernel_cpu(
+// One x-column of the image (fixed idx), the y pixels processed in chunks.
+//
+// Structured for SIMD like backprojection_polar_2d_row_cpu: per sweep, a
+// vectorizable geometry + phase pass writes per-pixel sample index, fraction
+// and reference phasor to small buffers, then a scalar pass does the
+// data-dependent sample gather and accumulates. For a fixed x column, the y
+// pixels are contiguous in the output image, so the final store is a plain
+// vectorized write.
+static void backprojection_cart_2d_row_cpu(
           const complex64_t* data,
           const float* pos,
           complex64_t* img,
@@ -564,54 +572,88 @@ static void backprojection_cart_2d_kernel_cpu(
           float dy,
           int Nx,
           int Ny,
-          float beamwidth,
           float d0,
           float data_fmod,
-          int idt,
+          int idx,
           int idbatch) {
-    const int idy = idt % Ny;
-    const int idx = idt / Ny;
-
-    if (idx >= Nx || idy >= Ny) {
-        return;
-    }
+    constexpr int CHUNK = 256;
+    float y_buf[CHUNK];
+    float accr[CHUNK], acci[CHUNK];
+    float cs_buf[CHUNK], sn_buf[CHUNK], frac_buf[CHUNK];
+    int idx_buf[CHUNK];
 
     const float x = x0 + idx * dx;
-    const float y = y0 + idy * dy;
+    const complex64_t* data_b = data + (size_t)idbatch * nsweeps * sweep_samples;
+    const float* pos_b = pos + (size_t)idbatch * nsweeps * 3;
+    complex64_t* img_row = img + ((size_t)idbatch * Nx + idx) * Ny;
 
-    complex64_t pixel{};
+    for (int yb = 0; yb < Ny; yb += CHUNK) {
+        const int nchunk = std::min(CHUNK, Ny - yb);
 
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
-        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
-        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
-        float px = (x - pos_x);
-        float py = (y - pos_y);
-        float pz2 = pos_z * pos_z;
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            y_buf[q] = y0 + (yb + q) * dy;
+            accr[q] = 0.0f;
+            acci[q] = 0.0f;
+        }
 
-        // Calculate distance to the pixel.
-        float d = sqrtf(px * px + py * py + pz2);
+        for(int i = 0; i < nsweeps; i++) {
+            // Sweep reference position.
+            const float pos_x = pos_b[i * 3 + 0];
+            const float pos_y = pos_b[i * 3 + 1];
+            const float pos_z = pos_b[i * 3 + 2];
+            const float pz2 = pos_z * pos_z;
+            // x is constant across the column, so px and px*px are too.
+            const float px = x - pos_x;
+            const float px2 = px * px;
+            const float* data_row = (const float*)(data_b + (size_t)i * sweep_samples);
 
-        float sx = delta_r * (d + d0);
+            // Geometry + phase pass. idx = -1 marks pixels outside the data
+            // range window.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float py = y_buf[q] - pos_y;
 
-        // Linear interpolation.
-        int id0 = sx;
-        int id1 = id0 + 1;
-        if (sx >= 0.0f && id1 < sweep_samples) {
-            complex64_t s0 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id0];
-            complex64_t s1 = data[idbatch * nsweeps * sweep_samples + i * sweep_samples + id1];
+                // Calculate distance to the pixel.
+                const float d = sqrtf(px2 + py * py + pz2);
 
-            float interp_idx = sx - id0;
-            complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+                const float sx = delta_r * (d + d0);
+                const int id0 = (int)sx;
+                // Float-domain check: (int)sx truncates toward zero, so
+                // sx in (-1, 0) would pass an id0 >= 0 check and
+                // extrapolate with a negative weight.
+                const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
+                idx_buf[q] = ok ? id0 : -1;
+                frac_buf[q] = sx - id0;
 
-            float ref_sin, ref_cos;
-            sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
-            complex64_t ref = {ref_cos, ref_sin};
-            pixel += s * ref;
+                float ref_sin, ref_cos;
+                sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+                cs_buf[q] = ref_cos;
+                sn_buf[q] = ref_sin;
+            }
+
+            // Scalar pass: data gather (linear interpolation), multiply by
+            // reference and accumulate. Forcing this to vectorize with clamped
+            // indices + mask is slower: the vectorizer emulates the strided
+            // complex gather.
+            for (int q = 0; q < nchunk; q++) {
+                const int id0 = idx_buf[q];
+                if (id0 < 0) {
+                    continue;
+                }
+                const float f = frac_buf[q];
+                const float sr = (1.0f - f) * data_row[2*id0]     + f * data_row[2*id0 + 2];
+                const float si = (1.0f - f) * data_row[2*id0 + 1] + f * data_row[2*id0 + 3];
+                accr[q] += sr * cs_buf[q] - si * sn_buf[q];
+                acci[q] += sr * sn_buf[q] + si * cs_buf[q];
+            }
+        }
+
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            img_row[yb + q] = complex64_t(accr[q], acci[q]);
         }
     }
-    img[idbatch * Nx * Ny + idx * Ny + idy] = pixel;
 }
 
 at::Tensor backprojection_cart_2d_cpu(
@@ -653,10 +695,12 @@ at::Tensor backprojection_cart_2d_cpu(
     // logical processor count (incl. SMT/hyperthreads).
     omp_set_num_threads(omp_get_num_procs());
 
+    (void)beamwidth_f;
+
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
-        for(int idt = 0; idt < Nx * Ny; idt++) {
-            backprojection_cart_2d_kernel_cpu(
+        for(int idx = 0; idx < Nx; idx++) {
+            backprojection_cart_2d_row_cpu(
                           data_ptr,
                           pos_ptr,
                           img_ptr,
@@ -667,9 +711,9 @@ at::Tensor backprojection_cart_2d_cpu(
                           x0, dx,
                           y0, dy,
                           Nx, Ny,
-                          beamwidth_f, d0,
+                          d0,
                           data_fmod/kPI,
-                          idt, idbatch);
+                          idx, idbatch);
         }
     }
     return img;
