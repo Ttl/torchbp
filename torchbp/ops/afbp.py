@@ -10,6 +10,7 @@ from .backproj import (
     _prepare_backprojection_polar_2d_args,
 )
 from ._utils import unpack_polar_grid
+from ..util import next_fast_len
 
 if TYPE_CHECKING:
     from ..grid import PolarGrid
@@ -235,8 +236,9 @@ def afbp(
 
     # Internal decimated grid with the theta guard band. The fine grid the
     # fusion assembles has n_c * nsub cells starting guard_theta * nsub
-    # cells below theta0.
-    n_c = n_c_full
+    # cells below theta0. Rounding n_c up to a fast FFT length only adds
+    # guard cells; the decimation alignment holds for any n_c.
+    n_c = next_fast_len(n_c_full)
     n_fine = n_c * nsub
     theta0_i = theta0 - guard_theta * nsub * dtheta
     grid_c = {
@@ -254,7 +256,11 @@ def afbp(
     data_b = data.new_zeros((nsub, m, nsamples))
     pos_b = pos.new_zeros((nsub, m, 3))
     att_b = att.new_zeros((nsub, m, 3)) if att is not None else None
-    x_u = torch.zeros(nsub, dtype=torch.float64)
+    # Single transfer for the chunk means instead of one device sync per
+    # chunk.
+    pos_y = pos[:, 1].double().cpu()
+    x_u = torch.tensor([float(pos_y[bounds[u] : bounds[u + 1]].mean())
+                        for u in range(nsub)], dtype=torch.float64)
     for u in range(nsub):
         i0, i1 = bounds[u], bounds[u + 1]
         data_b[u, : i1 - i0] = data[i0:i1]
@@ -263,7 +269,6 @@ def afbp(
         if att is not None:
             att_b[u, : i1 - i0] = att[i0:i1]
             att_b[u, i1 - i0 :] = att[i1 - 1]
-        x_u[u] = float(pos[i0:i1, 1].double().mean())
 
     z0 = float(pos[:, 2].double().mean())
     # Ground-to-slant factor: with nonzero altitude the azimuth carrier of
@@ -335,7 +340,10 @@ def afbp(
 
     # Wavenumber-domain fusion. Azimuth FFT of every subaperture image; a
     # component exp(-1j*k*x_u*rd*alpha) of a dealiased image lands at
-    # azimuth frequency -k*x_u*rd/(2*pi) cycles per unit theta.
+    # azimuth frequency -k*x_u*rd/(2*pi) cycles per unit theta. The
+    # subapertures are processed in ascending x_u order so that the
+    # per-bin contributors form a contiguous index run.
+    imgs = imgs[order.to(device)]
     Sa = torch.fft.fft(imgs, dim=-1)
 
     # Range blocks: rd(r) varies over the swath and after the range FFT
@@ -366,32 +374,45 @@ def afbp(
         row_bounds = [0, nr]
 
     nua = torch.fft.fftfreq(n_fine, d=dtheta, dtype=torch.float64, device=device)
-    cols = torch.arange(n_fine, device=device) % n_c
+    cols = (torch.arange(n_fine, device=device) % n_c)[None, :]
+    xs_dev = x_s.to(device)
+    spacing_min = max(float(spacing.min()), 1e-9)
     fine = Sa.new_zeros((nr, n_fine))
     for b0, b1 in zip(row_bounds[:-1], row_bounds[1:]):
         nrb = b1 - b0
+        # Pad the block range FFT to a fast length; the analysis is linear
+        # per row so cropping after the inverse FFT is exact.
+        nrf = next_fast_len(nrb)
         fac_b = float(0.5 * (rd_rows[b0] + rd_rows[b1 - 1]))
-        Sb = torch.fft.fft(Sa[:, b0:b1, :], dim=-2)
-        fr = torch.fft.fftfreq(nrb, d=dr, dtype=torch.float64, device=device)
+        Sb = torch.fft.fft(Sa[:, b0:b1, :], n=nrf, dim=-2)
+        fr = torch.fft.fftfreq(nrf, d=dr, dtype=torch.float64, device=device)
         half = 1.0 / (2.0 * dr)
         # Physical range frequency offset of each row, unwrapped around
         # the modulation-shifted spectrum center.
         fr_phys = torch.remainder(fr - nu_c + half, 2.0 * half) - half
-        kr = krc + 2.0 * math.pi * fr_phys  # [nrb]
+        kr = krc + 2.0 * math.pi * fr_phys  # [nrf]
         # Along-track position owning each (range wavenumber row, azimuth
         # bin).
-        x_eq = -2.0 * math.pi * nua[None, :] / (kr[:, None] * fac_b)  # [nrb, n_fine]
+        x_eq = -2.0 * math.pi * nua[None, :] / (kr[:, None] * fac_b)  # [nrf, n_fine]
         # Each subaperture patch is reconstructed over a full decimated
         # band centered on the patch: the overlapping regions of adjacent
         # subapertures are summed, which keeps the patch edge transitions
         # that a disjoint tiling would truncate. Content outside every
         # region (past the aperture edges) is zero.
-        x_half = math.pi * n_c / (n_fine * dtheta) / (kr * fac_b)  # [nrb]
-        fine_b = Sb.new_zeros((nrb, n_fine))
-        for u in range(nsub):
-            masku = (x_eq - float(x_u[u])).abs() <= x_half[:, None].abs()
-            fine_b += Sb[u, :, cols] * masku
-        fine[b0:b1] = torch.fft.ifft(fine_b, dim=-2)
+        x_half = (math.pi * n_c / (n_fine * dtheta) / (kr * fac_b)).abs()  # [nrf]
+        # Only the subapertures whose region covers a bin contribute: a
+        # contiguous run of at most ~(region width / subaperture spacing)
+        # + 1 indices independent of nsub.
+        kmax = min(nsub, int(math.ceil(2.0 * float(x_half.max()) / spacing_min)) + 1)
+        u0 = torch.bucketize(x_eq - x_half[:, None], xs_dev)
+        rows = torch.arange(nrf, device=device)[:, None]
+        fine_b = Sb.new_zeros((nrf, n_fine))
+        for k in range(kmax):
+            uk = u0 + k
+            u = uk.clamp(max=nsub - 1)
+            masku = (uk < nsub) & ((x_eq - xs_dev[u]).abs() <= x_half[:, None])
+            fine_b += Sb[u, rows, cols] * masku
+        fine[b0:b1] = torch.fft.ifft(fine_b, dim=-2)[:nrb]
     fine *= nsub
 
     out = torch.fft.ifft(fine, dim=-1)
