@@ -82,6 +82,9 @@ def afbp(
     g: Tensor | None = None,
     g_extent: list | None = None,
     normalize: bool = True,
+    weight_map_downsample: int = 4,
+    weight_eps: float | None = None,
+    _batched_fusion: bool | None = None,
 ) -> Tensor:
     """
     Accelerated factorized backprojection. [1]_
@@ -147,10 +150,15 @@ def afbp(
         roughly ``nsub`` times below direct backprojection. Larger values
         need a theta-oversampled grid (see ``grid``) and increase the
         relative cost of the guard band and the fusion. Falls back to
-        direct backprojection when the split cannot pay off (fewer than
-        two pulses per subaperture, or ``ntheta / nsub + 2 * guard_theta
-        >= ntheta`` so that the decimated grid would not be smaller than
-        the output).
+        direct backprojection (with a warning where informative) when the
+        split cannot work: fewer than two pulses per subaperture, a
+        decimated grid that would not be smaller than the output, or an
+        internal grid alpha extent exceeding the grating-free extent of
+        the pulse sampling ``lambda_min / (2 * max pulse spacing)`` — a
+        subaperture of few pulses has azimuth grating replicas at that
+        period which would alias through the fusion. The last condition
+        is what bounds nsub for a given pulse count; accuracy degrades
+        gradually as it is approached.
     d0 : float
         Zero range correction.
     dealias : bool
@@ -174,17 +182,28 @@ def afbp(
         Only used with an antenna pattern.
     g : Tensor or None
         Square-root of two-way antenna gain in spherical coordinates,
-        shape: [elevation, azimuth]. Requires ``normalize=False``: the
-        direct kernel normalization is a per-pixel scale over the full
-        aperture which cannot be reproduced from per-subaperture images.
-        The unnormalized output matches ``backprojection_polar_2d(...,
-        normalize=False)`` and can be normalized afterwards with
-        illumination maps (see :func:`ffbp`).
+        shape: [elevation, azimuth]. With ``normalize=False`` the output is
+        the unnormalized gain-weighted accumulation, matching
+        ``backprojection_polar_2d(..., normalize=False)`` (used by
+        :func:`ffbp` as its base image). With ``normalize=True`` the
+        accumulation is normalized with regularized illumination moment
+        maps, matching the antenna-weighted :func:`ffbp` output; the
+        direct kernel's exact per-pixel normalization is an aperture-wide
+        quantity that cannot be reassembled from subaperture images, so
+        ``backprojection_polar_2d(..., normalize=True)`` is only matched
+        where the illumination is not weak.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1]. See
         :func:`backprojection_polar_2d`.
     normalize : bool
         See ``g``. Ignored when no antenna pattern is given.
+    weight_map_downsample : int
+        Decimation of the illumination weight maps used by the
+        ``normalize=True`` antenna path, as in :func:`ffbp`. The maps are
+        smooth, so the default 4 is usually accurate; computing them at
+        full resolution can cost more than the backprojection itself.
+    weight_eps : float or None
+        Regularization of the antenna normalization, see :func:`ffbp`.
 
     Returns
     -------
@@ -204,12 +223,25 @@ def afbp(
         raise ValueError("data shape should be [nsweeps, samples]")
     if pos.dim() != 2 or pos.shape[0] != data.shape[0]:
         raise ValueError("pos shape should be [nsweeps, 3]")
-    if g is not None and normalize:
-        raise NotImplementedError(
-            "afbp with an antenna pattern requires normalize=False; the "
-            "aperture-wide kernel normalization is not factorizable")
     if guard_theta < 0:
         raise ValueError("guard_theta should be >= 0")
+    if g is not None and normalize:
+        # The direct kernel's per-pixel sum(g)/sum(g^2) normalization is an
+        # aperture-wide quantity that cannot be reassembled from
+        # subaperture images. Instead the unnormalized gain-weighted
+        # accumulation is normalized with decimated illumination moment
+        # maps exactly like the antenna-weighted ffbp, whose output this
+        # matches (not backprojection_polar_2d(..., normalize=True), which
+        # differs at weakly illuminated pixels).
+        img = afbp(
+            data, grid, fc, r_res, pos, nsub, d0=d0, dealias=dealias,
+            data_fmod=data_fmod, alias_fmod=alias_fmod,
+            guard_theta=guard_theta, att=att, g=g, g_extent=g_extent,
+            normalize=False, _batched_fusion=_batched_fusion)
+        from .ffbp import compute_subaperture_illumination, _weighted_normalize
+        w1, w2 = compute_subaperture_illumination(
+            pos, att, g, g_extent, grid, decimation=weight_map_downsample)
+        return _weighted_normalize(img, w1, w2, eps=weight_eps)
 
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
     nsweeps, nsamples = data.shape
@@ -234,41 +266,14 @@ def afbp(
     # Range spectrum center of the dealiased image in cycles/m.
     nu_c = alias_fmod / (2.0 * dr) - data_fmod / (2.0 * r_res)
 
-    # Internal decimated grid with the theta guard band. The fine grid the
-    # fusion assembles has n_c * nsub cells starting guard_theta * nsub
-    # cells below theta0. Rounding n_c up to a fast FFT length only adds
-    # guard cells; the decimation alignment holds for any n_c.
-    n_c = next_fast_len(n_c_full)
-    n_fine = n_c * nsub
-    theta0_i = theta0 - guard_theta * nsub * dtheta
-    grid_c = {
-        "r": (r0, r1),
-        "theta": (theta0_i, theta0_i + n_c * nsub * dtheta),
-        "nr": nr,
-        "ntheta": n_c,
-    }
-
-    # Split the track into nsub contiguous chunks, padded to equal length
-    # for one batched backprojection call. Zero data rows contribute
-    # nothing, so padding with repeated positions is exact.
+    # Split the track into nsub contiguous chunks.
     bounds = [round(i * nsweeps / nsub) for i in range(nsub + 1)]
     m = max(bounds[i + 1] - bounds[i] for i in range(nsub))
-    data_b = data.new_zeros((nsub, m, nsamples))
-    pos_b = pos.new_zeros((nsub, m, 3))
-    att_b = att.new_zeros((nsub, m, 3)) if att is not None else None
     # Single transfer for the chunk means instead of one device sync per
     # chunk.
     pos_y = pos[:, 1].double().cpu()
     x_u = torch.tensor([float(pos_y[bounds[u] : bounds[u + 1]].mean())
                         for u in range(nsub)], dtype=torch.float64)
-    for u in range(nsub):
-        i0, i1 = bounds[u], bounds[u + 1]
-        data_b[u, : i1 - i0] = data[i0:i1]
-        pos_b[u, : i1 - i0] = pos[i0:i1]
-        pos_b[u, i1 - i0 :] = pos[i1 - 1]
-        if att is not None:
-            att_b[u, : i1 - i0] = att[i0:i1]
-            att_b[u, i1 - i0 :] = att[i1 - 1]
 
     z0 = float(pos[:, 2].double().mean())
     # Ground-to-slant factor: with nonzero altitude the azimuth carrier of
@@ -310,6 +315,60 @@ def afbp(
         warn(f"afbp: quadratic phase error bound alpha*l <= r/4 violated "
              f"for r < {r_qpe:.1f}; image degraded at near range; increase "
              f"nsub or use ffbp")
+
+    # Internal decimated grid. Rounding n_c up to a fast FFT length only
+    # adds guard cells; the decimation alignment holds for any n_c. The
+    # extra cells are split evenly between the two guard bands.
+    #
+    # The internal grid alpha extent n_c * nsub * dtheta must stay within
+    # the grating-free extent of the pulse sampling, 2*pi / (kr * dp *
+    # fac) with dp the pulse spacing: a subaperture of few pulses has
+    # azimuth grating replicas at that alpha period, and once the internal
+    # extent (output plus guard cells, which scale with nsub) reaches
+    # them, they alias through the fusion into the image. This is what
+    # limits nsub for a given pulse count.
+    dp = float((pos_y[1:] - pos_y[:-1]).abs().max())
+    n_c_max = int(2.0 * math.pi / (kr_max * max(dp, 1e-12) * fac * nsub * dtheta))
+    n_c = next_fast_len(n_c_full)
+    if n_c > n_c_max:
+        n_c = n_c_full
+    if n_c > n_c_max:
+        warn(f"afbp: the pulse spacing cannot support the internal grid "
+             f"extent (azimuth grating replicas of the {m}-pulse "
+             f"subapertures would alias into the image); decrease nsub. "
+             f"Falling back to direct backprojection")
+        return backprojection_polar_2d(
+            data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
+            data_fmod=data_fmod, alias_fmod=alias_fmod,
+            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+    if n_c >= ntheta:
+        # The guard and padding ate the decimation gain.
+        return backprojection_polar_2d(
+            data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
+            data_fmod=data_fmod, alias_fmod=alias_fmod,
+            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+    n_fine = n_c * nsub
+    guard_lo = (n_c - (-(-ntheta // nsub))) // 2
+    theta0_i = theta0 - guard_lo * nsub * dtheta
+    grid_c = {
+        "r": (r0, r1),
+        "theta": (theta0_i, theta0_i + n_c * nsub * dtheta),
+        "nr": nr,
+        "ntheta": n_c,
+    }
+
+    # Padded chunks for one batched backprojection call, built with single
+    # gathers instead of per-chunk copies. Rows past a chunk end repeat
+    # its last pulse; the repeated data rows are zeroed, which makes the
+    # padding exact.
+    idx = (torch.tensor(bounds[:-1], device=device)[:, None]
+           + torch.arange(m, device=device)[None, :])
+    ends = torch.tensor(bounds[1:], device=device)[:, None]
+    valid = idx < ends
+    idx = torch.minimum(idx, ends - 1).reshape(-1)
+    data_b = data[idx].view(nsub, m, nsamples) * valid[:, :, None]
+    pos_b = pos[idx].view(nsub, m, 3)
+    att_b = att[idx].view(nsub, m, 3) if att is not None else None
 
     # The kernel dealias path does not support gradients; with gradients
     # the carrier is instead removed with a differentiable multiply, which
@@ -373,50 +432,195 @@ def afbp(
     else:
         row_bounds = [0, nr]
 
-    nua = torch.fft.fftfreq(n_fine, d=dtheta, dtype=torch.float64, device=device)
-    cols = (torch.arange(n_fine, device=device) % n_c)[None, :]
     xs_dev = x_s.to(device)
+    x_c = float(0.5 * (x_s[0] + x_s[-1]))
     spacing_min = max(float(spacing.min()), 1e-9)
-    fine = Sa.new_zeros((nr, n_fine))
-    for b0, b1 in zip(row_bounds[:-1], row_bounds[1:]):
-        nrb = b1 - b0
-        # Pad the block range FFT to a fast length; the analysis is linear
-        # per row so cropping after the inverse FFT is exact.
-        nrf = next_fast_len(nrb)
-        fac_b = float(0.5 * (rd_rows[b0] + rd_rows[b1 - 1]))
-        Sb = torch.fft.fft(Sa[:, b0:b1, :], n=nrf, dim=-2)
-        fr = torch.fft.fftfreq(nrf, d=dr, dtype=torch.float64, device=device)
-        half = 1.0 / (2.0 * dr)
-        # Physical range frequency offset of each row, unwrapped around
-        # the modulation-shifted spectrum center.
-        fr_phys = torch.remainder(fr - nu_c + half, 2.0 * half) - half
-        kr = krc + 2.0 * math.pi * fr_phys  # [nrf]
-        # Along-track position owning each (range wavenumber row, azimuth
-        # bin).
-        x_eq = -2.0 * math.pi * nua[None, :] / (kr[:, None] * fac_b)  # [nrf, n_fine]
-        # Each subaperture patch is reconstructed over a full decimated
-        # band centered on the patch: the overlapping regions of adjacent
-        # subapertures are summed, which keeps the patch edge transitions
-        # that a disjoint tiling would truncate. Content outside every
-        # region (past the aperture edges) is zero.
-        x_half = (math.pi * n_c / (n_fine * dtheta) / (kr * fac_b)).abs()  # [nrf]
-        # Only the subapertures whose region covers a bin contribute: a
-        # contiguous run of at most ~(region width / subaperture spacing)
-        # + 1 indices independent of nsub.
-        kmax = min(nsub, int(math.ceil(2.0 * float(x_half.max()) / spacing_min)) + 1)
-        u0 = torch.bucketize(x_eq - x_half[:, None], xs_dev)
-        rows = torch.arange(nrf, device=device)[:, None]
-        fine_b = Sb.new_zeros((nrf, n_fine))
-        for k in range(kmax):
-            uk = u0 + k
-            u = uk.clamp(max=nsub - 1)
-            masku = (uk < nsub) & ((x_eq - xs_dev[u]).abs() <= x_half[:, None])
-            fine_b += Sb[u, rows, cols] * masku
-        fine[b0:b1] = torch.fft.ifft(fine_b, dim=-2)[:nrb]
-    fine *= nsub
+    cols = (torch.arange(n_fine, device=device) % n_c)[None, :]
+    # Roll the region weight off smoothly between the physical patch
+    # half-extent and the region edge instead of a hard cut. The hard
+    # truncation of the patch leakage tails is a spectral discontinuity
+    # whose image-domain ripple reaches theta regions with no true
+    # content, where the antenna Wiener normalization then amplifies it
+    # into visible artifacts; the taper keeps the residual localized near
+    # the content that caused it. Contributions at less than 0.55 *
+    # subaperture spacing keep unit weight, so the seam-sum region between
+    # adjacent subapertures is unaffected.
+    x_taper = 0.55 * float(spacing.max())
 
+    # The fusion runs either as a loop over the range blocks or as batched
+    # tensor ops over a zero-padded block stack. The batched form exists
+    # for the GPU, where the loop is a kernel launch storm; on CPU it
+    # moves several times more memory and loses. _batched_fusion is a
+    # testing override.
+    use_batched = (_batched_fusion if _batched_fusion is not None
+                   else device.type == "cuda")
+    if not use_batched:
+        # Per-block loop: on CPU the padded batched path below moves several
+        # times more memory (small near-range blocks pad to the shared FFT
+        # length and the gathers broadcast large index tensors), while the
+        # per-op overhead the batching avoids is negligible.
+        nua = torch.fft.fftfreq(n_fine, d=dtheta, dtype=torch.float64, device=device)
+        fine = Sa.new_zeros((nr, n_fine))
+        for b0, b1 in zip(row_bounds[:-1], row_bounds[1:]):
+            nrb = b1 - b0
+            # Pad the block range FFT to a fast length; the analysis is
+            # linear per row so cropping after the inverse FFT is exact.
+            nrf = next_fast_len(nrb)
+            fac_b = float(0.5 * (rd_rows[b0] + rd_rows[b1 - 1]))
+            Sb = torch.fft.fft(Sa[:, b0:b1, :], n=nrf, dim=-2)
+            fr = torch.fft.fftfreq(nrf, d=dr, dtype=torch.float64, device=device)
+            half = 1.0 / (2.0 * dr)
+            # Physical range frequency offset of each row, unwrapped
+            # around the modulation-shifted spectrum center.
+            fr_phys = torch.remainder(fr - nu_c + half, 2.0 * half) - half
+            kr = krc + 2.0 * math.pi * fr_phys  # [nrf]
+            # A row with kr ~ 0 (range grid step below ~lambda/4) would
+            # give an infinite band and NaN from the wrap below; such rows
+            # carry no signal, park them on a harmless value.
+            kr = torch.where(kr.abs() < 1e-6, torch.full_like(kr, 1e-6), kr)
+            # Along-track position owning each (range wavenumber row,
+            # azimuth bin).
+            x_eq = -2.0 * math.pi * nua[None, :] / (kr[:, None] * fac_b)
+            # Each subaperture patch is reconstructed over a full
+            # decimated band centered on the patch: the overlapping
+            # regions of adjacent subapertures are summed, which keeps the
+            # patch edge transitions that a disjoint tiling would
+            # truncate. Content outside every region (past the aperture
+            # edges) is zero. Only the subapertures whose region covers a
+            # bin contribute: a contiguous run of at most ~(region width /
+            # subaperture spacing) + 1 indices independent of nsub.
+            x_half = (math.pi * n_c / (n_fine * dtheta) / (kr * fac_b)).abs()
+            kmax = min(nsub, int(math.ceil(2.0 * float(x_half.max()) / spacing_min)) + 1)
+            # x_eq spans one alias band of the fine grid; recentering the
+            # span on the subaperture positions makes the placement
+            # consistent with the aliased carrier a direct backprojection
+            # of an off-center track produces (no-op for a centered one).
+            band = (2.0 * math.pi / (kr * fac_b * dtheta)).abs()[:, None]
+            x_eq = torch.remainder(x_eq - x_c + band / 2, band) + (x_c - band / 2)
+            u0 = torch.bucketize(x_eq - x_half[:, None], xs_dev)
+            rows = torch.arange(nrf, device=device)[:, None]
+            fine_b = Sb.new_zeros((nrf, n_fine))
+            for k in range(kmax):
+                uk = u0 + k
+                u = uk.clamp(max=nsub - 1)
+                w = _region_weight(
+                    (x_eq - xs_dev[u]).abs(), x_half[:, None], x_taper)
+                w = w * (uk < nsub)
+                fine_b += Sb[u, rows, cols] * w
+            fine[b0:b1] = torch.fft.ifft(fine_b, dim=-2)[:nrb]
+        fine *= nsub
+        return _afbp_finish(fine, grid, fc, alias_fmod, z0, dealias,
+                            guard_lo * nsub, ntheta, device)
+
+    # Cap the block size so that every block can be padded to one shared
+    # FFT length: the whole per-block fusion then runs as a handful of
+    # batched tensor ops instead of a kernel launch storm proportional to
+    # the block count (float64 is also very slow on most GPUs, so the
+    # placement tables are float32 here). Splitting a block only refines
+    # the range localization of its factor, so it is always valid.
+    if len(row_bounds) > 2:
+        b_cap = 128
+        rb = [0]
+        for b0, b1 in zip(row_bounds[:-1], row_bounds[1:]):
+            pieces = -(-(b1 - b0) // b_cap)
+            for p in range(1, pieces + 1):
+                rb.append(b0 + round(p * (b1 - b0) / pieces))
+        row_bounds = rb
+    sizes = [b1 - b0 for b0, b1 in zip(row_bounds[:-1], row_bounds[1:])]
+    nb = len(sizes)
+    nrf = next_fast_len(max(sizes))
+
+    # Row scatter/gather map between the image rows and the zero-padded
+    # block stack.
+    dest_idx = torch.cat([
+        torch.arange(b * nrf, b * nrf + s) for b, s in enumerate(sizes)
+    ]).to(device)
+    Sblk = Sa.new_zeros((nsub, nb * nrf, n_c))
+    Sblk.index_copy_(1, dest_idx, Sa)
+    S = torch.fft.fft(Sblk.view(nsub, nb, nrf, n_c), dim=-2)
+
+    # Placement tables, shared by all blocks up to the per-block factor.
+    # Computed in float64 and used in float32: the placement only needs to
+    # be accurate to a small fraction of a subaperture spacing, and
+    # float64 arithmetic is very slow on most GPUs.
+    fr = torch.fft.fftfreq(nrf, d=dr, dtype=torch.float64)
+    half = 1.0 / (2.0 * dr)
+    # Physical range frequency offset of each row, unwrapped around the
+    # modulation-shifted spectrum center.
+    fr_phys = torch.remainder(fr - nu_c + half, 2.0 * half) - half
+    kr = krc + 2.0 * math.pi * fr_phys  # [nrf]
+    # See the kr ~ 0 note in the loop path.
+    kr = torch.where(kr.abs() < 1e-6, torch.full_like(kr, 1e-6), kr)
+    nua = torch.fft.fftfreq(n_fine, d=dtheta, dtype=torch.float64)
+    # Along-track position owning each (range wavenumber row, azimuth bin)
+    # at rd = 1, and the half width of one decimated band in the same
+    # units. Scaled per block by 1 / fac_b.
+    base_xeq = (-2.0 * math.pi * nua[None, :] / kr[:, None]).float().to(device)
+    base_xh = (math.pi * n_c / (n_fine * dtheta) / kr).abs().float().to(device)
+    inv_fac = torch.tensor(
+        [1.0 / float(0.5 * (rd_rows[b0] + rd_rows[b1 - 1]))
+         for b0, b1 in zip(row_bounds[:-1], row_bounds[1:])],
+        dtype=torch.float32, device=device)
+    xs_f32 = x_s.float().to(device)
+
+    x_eq = base_xeq[None] * inv_fac[:, None, None]  # [nb, nrf, n_fine]
+    x_half = (base_xh[None] * inv_fac[:, None])[:, :, None]  # [nb, nrf, 1]
+    # Recenter the alias band on the subaperture positions (see the loop
+    # path).
+    base_band = (2.0 * math.pi / (kr * dtheta)).abs().float().to(device)
+    band = (base_band[None] * inv_fac[:, None])[:, :, None]
+    x_eq = torch.remainder(x_eq - x_c + band / 2, band) + (x_c - band / 2)
+    # Each subaperture patch is reconstructed over a full decimated band
+    # centered on the patch: the overlapping regions of adjacent
+    # subapertures are summed, which keeps the patch edge transitions that
+    # a disjoint tiling would truncate. Content outside every region (past
+    # the aperture edges) is zero. Only the subapertures whose region
+    # covers a bin contribute: a contiguous run of at most ~(region width
+    # / subaperture spacing) + 1 indices independent of nsub.
+    kmax = min(nsub, int(math.ceil(
+        2.0 * float(base_xh.max()) * float(inv_fac.max()) / spacing_min)) + 1)
+    u0 = torch.bucketize(x_eq - x_half, xs_f32)
+    bidx = torch.arange(nb, device=device)[:, None, None]
+    ridx = torch.arange(nrf, device=device)[None, :, None]
+    cidx = (torch.arange(n_fine, device=device) % n_c)[None, None, :]
+    fine_b = S.new_zeros((nb, nrf, n_fine))
+    for k in range(kmax):
+        uk = u0 + k
+        u = uk.clamp(max=nsub - 1)
+        w = _region_weight((x_eq - xs_f32[u]).abs(), x_half, x_taper)
+        w = w * (uk < nsub)
+        fine_b += S[u, bidx, ridx, cidx] * w
+    fine = torch.fft.ifft(fine_b, dim=-2).reshape(nb * nrf, n_fine)
+    fine = fine.index_select(0, dest_idx)
+    fine *= nsub
+    return _afbp_finish(fine, grid, fc, alias_fmod, z0, dealias,
+                        guard_lo * nsub, ntheta, device)
+
+
+def _region_weight(dist: Tensor, x_half: Tensor, x_taper: float) -> Tensor:
+    """Subaperture region weight: 1 inside ``x_taper``, raised cosine roll
+    to 0 at the region edge ``x_half``, 0 beyond. Falls back to a hard cut
+    when the region is not wider than the taper start."""
+    span = (x_half - x_taper).clamp(min=1e-9)
+    t = ((dist - x_taper) / span).clamp(min=0.0, max=1.0)
+    w = 0.5 * (1.0 + torch.cos(math.pi * t))
+    return torch.where(x_half > x_taper, w, (dist <= x_half).to(w.dtype))
+
+
+def _afbp_finish(
+    fine: Tensor,
+    grid: dict,
+    fc: float,
+    alias_fmod: float,
+    z0: float,
+    dealias: bool,
+    gt: int,
+    ntheta: int,
+    device,
+) -> Tensor:
+    """Inverse azimuth FFT of the assembled fine spectrum, guard crop and
+    optional carrier restore."""
     out = torch.fft.ifft(fine, dim=-1)
-    gt = guard_theta * nsub
     out = out[:, gt : gt + ntheta]
     if not dealias:
         out = out * _dealias_carrier(grid, fc, alias_fmod, z0, device)

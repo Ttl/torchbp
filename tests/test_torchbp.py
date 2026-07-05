@@ -4568,9 +4568,18 @@ class TestAFBP(TestCase):
             att=att, g=g, g_extent=g_extent, normalize=False)
         rel = ((out - ref).abs().max() / ref.abs().max()).item()
         self.assertLess(rel, 2e-2)
-        with self.assertRaises(NotImplementedError):
-            torchbp.ops.afbp(data, self.grid, self.fc, self.r_res, pos,
-                             nsub=4, att=att, g=g, g_extent=g_extent)
+        # normalize=True matches the same accumulation normalized with the
+        # illumination moment maps (the antenna-weighted ffbp convention).
+        from torchbp.ops.ffbp import (
+            compute_subaperture_illumination, _weighted_normalize)
+        w1, w2 = compute_subaperture_illumination(
+            pos, att, g, g_extent, self.grid, decimation=1)
+        ref_n = _weighted_normalize(ref.clone(), w1, w2)
+        out_n = torchbp.ops.afbp(
+            data, self.grid, self.fc, self.r_res, pos, nsub=4, dealias=True,
+            att=att, g=g, g_extent=g_extent, weight_map_downsample=1)
+        rel = ((out_n - ref_n).abs().max() / ref_n.abs().max()).item()
+        self.assertLess(rel, 2e-2)
 
     def test_gradient_matches_direct(self):
         data, pos = self._scene()
@@ -4600,6 +4609,16 @@ class TestAFBP(TestCase):
         self.assertEqual(int(torch.isnan(out).sum()), 0)
         rel = ((out - ref).abs().max() / ref.abs().max()).item()
         self.assertLess(rel, 5e-2)
+
+    def test_batched_fusion_parity(self):
+        # The batched (GPU) fusion path must match the per-block loop path.
+        data, pos = self._scene(z0=40.0)
+        out1 = torchbp.ops.afbp(data, self.grid, self.fc, self.r_res, pos,
+                                nsub=8, dealias=True)
+        out2 = torchbp.ops.afbp(data, self.grid, self.fc, self.r_res, pos,
+                                nsub=8, dealias=True, _batched_fusion=True)
+        rel = ((out1 - out2).abs().max() / out1.abs().max()).item()
+        self.assertLess(rel, 1e-4)
 
     def test_patch_alias_warns(self):
         # Theta step too coarse for the subaperture spectrum patch.
