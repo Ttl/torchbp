@@ -741,6 +741,140 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
     img[idbatch * Nr * Ntheta + idr * Ntheta + idtheta] = sqrtf(pixel);
 }
 
+// Cartesian analog of backprojection_polar_2d_tx_power_kernel. The pixel
+// ground position comes straight from the Cartesian image grid (z = 0 ground
+// plane) instead of a polar (r, theta) cell; the platform altitude is always
+// the per-sweep pos_z.
+__global__ void backprojection_cart_2d_tx_power_kernel(
+          const float* wa,
+          const float* pos,
+          const float* att,
+          const float* g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          float* img,
+          int nsweeps,
+          float delta_r,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          int normalization,
+          int azimuth_resolution) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idy = idx % Ny;
+    const int idx_x = idx / Ny;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx_x >= Nx || idy >= Ny) {
+        return;
+    }
+
+    // Pixel ground position (z = 0 ground plane).
+    const float px_base = x0 + idx_x * dx;
+    const float py_base = y0 + idy * dy;
+
+    // Squared sine of the angle subtended by one ground-range cell at nadir,
+    // used as a floor on sin^2 of the look angle. Uses the mid-sweep altitude.
+    const float h_ref = pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2];
+    const float min_sin2_look = 2.0f * dx / h_ref;
+
+    float pixel = 0.0f;
+    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
+    // used to estimate the azimuth resolution from the aperture.
+    float m_w = 0.0f;     // sum of weights
+    float m_mean = 0.0f;  // weighted mean of psi
+    float m_s = 0.0f;     // weighted sum of squared deviations
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
+        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
+        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
+
+        float px = (px_base - pos_x);
+        float py = (py_base - pos_y);
+        float h = pos_z;
+        float pz2 = h * h;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        // Avoid nans due to numerical precision by clamping to valid range.
+        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
+        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
+        const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
+        const float az_deg = psi - att[idbatch * nsweeps * 3 + 3 * i + 2];
+        // TODO: consider platform pitch
+
+        const float el_idx = (el_deg - g_el0) / g_del;
+        const float az_idx = (az_deg - g_az0) / g_daz;
+
+        const int el_int = el_idx;
+        const int az_int = az_idx;
+        const float el_frac = el_idx - el_int;
+        const float az_frac = az_idx - az_int;
+
+        if (el_idx < 0.0f || el_int+1 >= g_nel) {
+            continue;
+        }
+        if (az_idx < 0.0f || az_int+1 >= g_naz) {
+            continue;
+        }
+        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+        float sinl = 1.0f;
+
+        if (normalization == 1) {
+            // sigma_0
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d)));
+        } else if (normalization == 2) {
+            // gamma_0
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d))) * d / h;
+        } else if (normalization == 3) {
+            // point
+            // Scale as d^4 instead of d^3 for area target.
+            sinl = d;
+        }
+        // beta_0 otherwise
+
+        float w = wa[idbatch * nsweeps + i];
+        // Plain illumination weight (no incidence term) for the moments.
+        const float wi = g_i * g_i * w * w / (d*d*d);
+        pixel += wi / sinl;
+
+        // Welford weighted update (numerically stable, handles squint).
+        // Only needed for the azimuth resolution estimate.
+        // Skip zero weights: if the first accepted sweep had wi == 0 the
+        // update would be 0/0 = NaN, poisoning the accumulator.
+        if (azimuth_resolution && wi > 0.0f) {
+            const float wsum = m_w + wi;
+            const float delta = psi - m_mean;
+            m_mean += delta * wi / wsum;
+            m_s += wi * delta * (psi - m_mean);
+            m_w = wsum;
+        }
+    }
+
+    if (azimuth_resolution) {
+        const float Rg = sqrtf(px_base * px_base + py_base * py_base);
+        const float var = (m_w > 0.0f) ? m_s / m_w : 0.0f;
+        const float sigma = sqrtf(fmaxf(var, 0.0f));
+        if (sigma > 0.0f && Rg > 0.0f) {
+            pixel = pixel / (sigma * Rg);
+        } else {
+            // No measurable azimuth aperture (<=1 contributing sweep)
+            pixel = INFINITY;
+        }
+    }
+    img[idbatch * Nx * Ny + idx_x * Ny + idy] = sqrtf(pixel);
+}
+
 __global__ void backprojection_cart_2d_kernel(
           const complex64_t* data,
           const float* pos,
@@ -2584,6 +2718,84 @@ at::Tensor backprojection_polar_2d_tx_power_slant_cuda(
 	return img;
 }
 
+at::Tensor backprojection_cart_2d_tx_power_cuda(
+          const at::Tensor &wa,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          int64_t nbatch,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t nsweeps,
+          double r_res,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          int64_t normalization,
+          int64_t azimuth_resolution) {
+	TORCH_CHECK(wa.dtype() == at::kFloat);
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(wa.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+
+	at::Tensor wa_contig = wa.contiguous();
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor g_contig = g.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(wa.device());
+	at::Tensor img = torch::zeros({nbatch, Nx, Ny}, options);
+	const float* wa_ptr = wa_contig.data_ptr<float>();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
+	float* img_ptr = img.data_ptr<float>();
+
+	const float delta_r = 1.0f / r_res;
+
+	dim3 thread_per_block = {256, 1};
+    int blocks = Nx * Ny;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    backprojection_cart_2d_tx_power_kernel
+          <<<block_count, thread_per_block, 0, stream>>>(
+                  wa_ptr,
+                  pos_ptr,
+                  att_ptr,
+                  g_ptr,
+                  g_az0,
+                  g_el0,
+                  g_daz,
+                  g_del,
+                  g_naz,
+                  g_nel,
+                  img_ptr,
+                  nsweeps,
+                  delta_r,
+                  x0, dx,
+                  y0, dy,
+                  Nx, Ny,
+                  normalization,
+                  azimuth_resolution);
+	return img;
+}
+
 at::Tensor backprojection_cart_2d_cuda(
           const at::Tensor &data,
           const at::Tensor &pos,
@@ -2946,6 +3158,7 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("blocksvd_alpha", &blocksvd_alpha_cuda);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cuda);
   m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cuda);
+  m.impl("backprojection_cart_2d_tx_power", &backprojection_cart_2d_tx_power_cuda);
   m.impl("projection_cart_2d", &projection_cart_2d_cuda);
   m.impl("projection_cart_2d_nufft", &projection_cart_2d_nufft_cuda);
   m.impl("compute_illumination", &compute_illumination_cuda);

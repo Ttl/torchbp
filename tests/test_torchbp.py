@@ -2095,6 +2095,118 @@ class TestBackprojectionPolar2DTxPower(TestCase):
         self._opcheck("cuda")
 
 
+class TestBackprojectionCart2DTxPower(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False):
+        def make_tensor(size):
+            return torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=torch.float32
+            )
+
+        def make_pos_tensor(size):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=torch.float32
+            )
+            # Push the platform below and behind the scene so the ground pixels
+            # fall inside a reasonable look/azimuth cone.
+            x = x.clone()
+            with torch.no_grad():
+                x[..., 2] = 100.0
+            return x
+
+        nbatch = 2
+        nsweeps = 4
+        grid = {"x": (30.0, 200.0), "y": (-100.0, 100.0), "nx": 8, "ny": 8}
+        g_extent = [-1.4, -1.2, 1.4, 1.2]  # [g_el0, g_az0, g_el1, g_az1]
+        args = {
+            "wa": make_tensor((nbatch, nsweeps)).abs(),
+            "g": make_tensor((16, 16)).abs(),
+            "g_extent": g_extent,
+            "grid": grid,
+            "r_res": 0.15,
+            "pos": make_pos_tensor((nbatch, nsweeps, 3)),
+            "att": make_tensor((nbatch, nsweeps, 3)),
+            "normalization": "sigma",
+        }
+        return [args]
+
+    def _opcheck(self, device):
+        from torchbp.ops.backproj import _prepare_backprojection_cart_2d_tx_power_args
+
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = _prepare_backprojection_cart_2d_tx_power_args(**args)
+            opcheck(
+                torch.ops.torchbp.backprojection_cart_2d_tx_power,
+                cpp_args,
+                test_utils=["test_schema"]
+            )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+    def test_matches_polar_at_coincident_ground_points(self):
+        """The Cartesian tx_power kernel maps a pixel's ground position
+        directly from the grid; the polar kernel maps (r, theta) to the same
+        ground point. Evaluated at coincident ground positions with the
+        azimuth-resolution normalization off, they must agree."""
+        import math
+        from torchbp.ops.backproj import (
+            backprojection_cart_2d_tx_power,
+            backprojection_polar_2d_tx_power,
+        )
+
+        torch.manual_seed(1)
+        nsweeps = 32
+        wa = torch.rand(nsweeps)
+        g = torch.rand(16, 16)
+        g_extent = [-1.4, -1.2, 1.4, 1.2]
+        pos = torch.zeros(nsweeps, 3)
+        pos[:, 1] = torch.linspace(-20, 20, nsweeps)
+        pos[:, 2] = 100.0
+        att = torch.zeros(nsweeps, 3)
+
+        r0, r1, nr = 150.0, 260.0, 40
+        t0, t1, nt = -0.3, 0.3, 40
+        pgrid = {"r": (r0, r1), "theta": (t0, t1), "nr": nr, "ntheta": nt}
+        dr = (r1 - r0) / nr
+        dt = (t1 - t0) / nt
+        ir, it = 20, 25
+        r = r0 + ir * dr
+        t = t0 + it * dt
+        x = r * math.sqrt(1 - t * t)
+        y = r * t
+        cgrid = {"x": (x, x + 1.0), "y": (y, y + 1.0), "nx": 1, "ny": 1}
+
+        for norm in ["beta", "sigma", "gamma", "point"]:
+            pol = backprojection_polar_2d_tx_power(
+                wa, g, g_extent, pgrid, 0.15, pos, att,
+                normalization=norm, azimuth_resolution=False)[0]
+            cart = backprojection_cart_2d_tx_power(
+                wa, g, g_extent, cgrid, 0.15, pos, att,
+                normalization=norm, azimuth_resolution=False)[0, 0, 0]
+            torch.testing.assert_close(
+                cart, pol[ir, it], atol=1e-6, rtol=1e-5)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_match(self):
+        from torchbp.ops.backproj import backprojection_cart_2d_tx_power
+
+        args = self.sample_inputs("cpu")[0]
+        out_cpu = backprojection_cart_2d_tx_power(**args)
+        gargs = {k: (v.cuda() if torch.is_tensor(v) else v)
+                 for k, v in args.items()}
+        out_cuda = backprojection_cart_2d_tx_power(**gargs).cpu()
+        fin = torch.isfinite(out_cpu) & torch.isfinite(out_cuda)
+        torch.testing.assert_close(out_cpu[fin], out_cuda[fin],
+                                   atol=1e-5, rtol=1e-4)
+        self.assertTrue(
+            (torch.isinf(out_cpu) == torch.isinf(out_cuda)).all())
+
+
 class TestProjectionCart2D(TestCase):
     """Tests for projection_cart_2d (direct scatter kernel) and
     projection_cart_2d_nufft (NUFFT-based O(N log M) kernel)."""

@@ -1006,6 +1006,133 @@ def backprojection_polar_2d_tx_power_slant(
     )
 
 
+def _prepare_backprojection_cart_2d_tx_power_args(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "CartesianGrid | dict",
+    r_res: float,
+    pos: Tensor,
+    att: Tensor,
+    normalization: str | None = None,
+    azimuth_resolution: bool = True,
+) -> tuple:
+    """Prepare arguments for C++ backprojection_cart_2d_tx_power operator.
+
+    Returns tuple of arguments matching C++ operator signature.
+    Used internally by backprojection_cart_2d_tx_power and for testing.
+    """
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+
+    if wa.dim() == 1:
+        nbatch = 1
+        nsweeps = wa.shape[0]
+        assert pos.shape == (nsweeps, 3)
+        assert att.shape == (nsweeps, 3)
+    else:
+        nbatch = wa.shape[0]
+        nsweeps = wa.shape[1]
+        assert pos.shape == (nbatch, nsweeps, 3)
+        assert att.shape == (nbatch, nsweeps, 3)
+
+    g_nel = g.shape[0]
+    g_naz = g.shape[1]
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_daz = (g_az1 - g_az0) / g_naz
+    g_del = (g_el1 - g_el0) / g_nel
+
+    if normalization == "beta" or normalization is None:
+        norm = 0
+    elif normalization == "sigma":
+        norm = 1
+    elif normalization == "gamma":
+        norm = 2
+    elif normalization == "point":
+        norm = 3
+    else:
+        raise ValueError(f"Invalid normalization {normalization}.")
+
+    return (wa, pos, att, g, nbatch, g_az0, g_el0, g_daz, g_del,
+            g_naz, g_nel, nsweeps, r_res, x0, dx, y0, dy,
+            nx, ny, norm, int(azimuth_resolution))
+
+
+def backprojection_cart_2d_tx_power(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "CartesianGrid | dict",
+    r_res: float,
+    pos: Tensor,
+    att: Tensor,
+    normalization: str | None = None,
+    azimuth_resolution: bool = True,
+) -> Tensor:
+    """
+    Cartesian-grid variant of :func:`backprojection_polar_2d_tx_power`.
+
+    Calculates square root of transmitted power to each pixel of a Cartesian
+    image grid. Can be used to correct for antenna pattern and distance effect
+    on a Cartesian radar image (e.g. from :func:`backprojection_cart_2d`).
+
+    Each pixel takes its ground position ``(x, y, 0)`` directly from the
+    Cartesian grid (z = 0 ground plane); the platform altitude used for the
+    elevation, distance and incidence-angle calculations is the per-sweep
+    ``pos`` z coordinate.
+
+    Parameters
+    ----------
+    wa : Tensor
+        Weighting coefficient for amplitude of each pulse. Should include window
+        function and transmit power variation if known, shape: [nsweeps] or
+        [nbatch, nsweeps].
+    g : Tensor
+        Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
+        If TX antenna equals RX antenna, then this should be just antenna gain.
+        (0, 0) angle is at the beam center.
+    g_extent : list
+        ``[g_el0, g_az0, g_el1, g_az1]`` giving the elevation/azimuth axis
+        limits of ``g`` in radians.
+    grid : CartesianGrid or dict
+        Cartesian grid definition. Can be:
+
+        - CartesianGrid object: ``CartesianGrid(x_range=(-50, 50), y_range=(-50, 50), nx=200, ny=200)``
+        - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
+
+    r_res : float
+        Range bin resolution in data (meters). Currently unused by the
+        computation and kept for API compatibility; the nadir resolution
+        floor uses the image grid x spacing instead.
+    pos : Tensor
+        Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+    att : Tensor
+        Euler angles of the radar antenna at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
+        [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
+    normalization : str or None
+        Valid choices are:
+            "sigma" to divide each value by sin of incidence angle.
+            "gamma" to divide each value by of tan of incidence angle.
+            "beta" or None for no incidence angle normalization.
+            "point" to normalize to constant reflectivity (no ground patch).
+    azimuth_resolution : bool
+        If True (default), also normalize for the varying azimuth resolution.
+        See :func:`backprojection_polar_2d_tx_power` for details. Pixels with
+        fewer than two contributing sweeps have no measurable azimuth aperture
+        and are set to inf. Set to False to get the pure antenna/range
+        illumination.
+
+    Returns
+    -------
+    tx_power : Tensor
+        Cartesian format image of square root of power returned from each
+        pixel assuming constant reflectivity.
+    """
+    cpp_args = _prepare_backprojection_cart_2d_tx_power_args(
+        wa, g, g_extent, grid, r_res, pos, att, normalization, azimuth_resolution
+    )
+    return torch.ops.torchbp.backprojection_cart_2d_tx_power.default(*cpp_args)
+
+
 def backprojection_polar_2d_resolution(
     wa: Tensor,
     g: Tensor,
