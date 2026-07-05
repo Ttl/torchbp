@@ -6,7 +6,7 @@ from torch import Tensor
 from typing import TYPE_CHECKING
 from copy import deepcopy
 
-from .backproj import backprojection_cart_2d
+from .backproj import backprojection_cart_2d, _backprojection_cart_2d_tx_power_accum
 from ..util import center_pos
 from ._utils import unpack_cartesian_grid
 
@@ -669,3 +669,394 @@ def _cfbp_impl(
         imgs = imgs[2:] + [(new_origin, grid_new, img_sum, new_z)]
 
     return imgs[0][2], imgs[0][0], imgs[0][3]
+
+
+def cart_tx_power_merge2(
+    acc0: Tensor,
+    acc1: Tensor | None,
+    grid0: "CartesianGrid | dict",
+    grid1: "CartesianGrid | dict | None",
+    grid_new: "CartesianGrid | dict",
+) -> Tensor:
+    """
+    Merge two Cartesian tx_power accumulator maps onto a new Cartesian grid.
+
+    Bilinearly interpolates the 4-channel accumulator maps (S, W, P1, M2, see
+    :func:`torchbp.ops.backproj._backprojection_cart_2d_tx_power_accum`) from
+    each input grid onto the output grid and combines them. All grids are in
+    absolute world coordinates, so an output pixel maps straight into each
+    input's local index; no origin shift is needed. The psi moments are
+    combined with Chan's parallel variance formula so the merge is exact up to
+    interpolation. ``acc1 = None`` interpolates only ``acc0`` (single-input
+    regrid). Used internally by
+    :func:`~torchbp.ops.backprojection_cart_2d_tx_power_cfbp`.
+    """
+    device = acc0.device
+    if hasattr(grid_new, "to_dict"):
+        grid_new = grid_new.to_dict()
+    if hasattr(grid0, "to_dict"):
+        grid0 = grid0.to_dict()
+    gx0_0, _, gy0_0, _, nx0, ny0, gdx0, gdy0 = unpack_cartesian_grid(grid0)
+    if acc1 is None:
+        acc1 = torch.empty(0, dtype=torch.float32, device=device)
+        gx0_1 = gdx1 = gy0_1 = gdy1 = 0.0
+        nx1 = ny1 = 0
+    else:
+        if hasattr(grid1, "to_dict"):
+            grid1 = grid1.to_dict()
+        gx0_1, _, gy0_1, _, nx1, ny1, gdx1, gdy1 = unpack_cartesian_grid(grid1)
+    ox0, _, oy0, _, onx, ony, odx, ody = unpack_cartesian_grid(grid_new)
+    return torch.ops.torchbp.cart_tx_power_merge2.default(
+        acc0, acc1,
+        gx0_0, gdx0, gy0_0, gdy0, nx0, ny0,
+        gx0_1, gdx1, gy0_1, gdy1, nx1, ny1,
+        ox0, odx, oy0, ody, onx, ony,
+    )
+
+
+@torch.library.register_fake("torchbp::cart_tx_power_merge2")
+def _fake_cart_tx_power_merge2(
+    acc0: Tensor,
+    acc1: Tensor,
+    x0_0: float, dx_0: float, y0_0: float, dy_0: float, Nx_0: int, Ny_0: int,
+    x0_1: float, dx_1: float, y0_1: float, dy_1: float, Nx_1: int, Ny_1: int,
+    x1: float, dx1: float, y1: float, dy1: float, Nx1: int, Ny1: int,
+):
+    torch._check(acc0.dtype == torch.float32)
+    return torch.empty((4, Nx1, Ny1), dtype=torch.float32, device=acc0.device)
+
+
+def _tx_power_cart_node_grid(
+    boundary: Tensor,
+    pos: Tensor,
+    yaw: Tensor,
+    g_extent: list,
+    g_daz: float,
+    sub_dx: float,
+    sub_dy: float,
+    margin: int,
+    min_nx: int,
+    min_ny: int,
+) -> dict | None:
+    """Absolute Cartesian grid covering the region a subaperture illuminates.
+
+    ``boundary`` is the output-grid perimeter in absolute ground coordinates.
+    The azimuth extent visible through the antenna pattern (given the yaw
+    range) selects the boundary points the subaperture can see; their bounding
+    box, expanded by ``margin`` cells, is the node grid. The margin extends
+    slightly *beyond* the output boundary (not clipped to it) so the pairwise
+    bilinear merge has valid interior samples for the output edge pixels;
+    clipping to the output extent would leave the outermost output rows/columns
+    with no interpolation neighbours and drop them. Range/elevation is not
+    windowed (kept to the full output extent) since unilluminated pixels merge
+    as zero; the azimuth window is what shrinks the maps on long tracks.
+    Returns None if the subaperture cannot see the output grid. Cannot
+    represent scenes in the rear half plane (|azimuth| > pi/2), like the polar
+    :func:`_tx_power_node_grid`.
+    """
+    bx = boundary[:, 0]
+    by = boundary[:, 1]
+    cen = pos[:, :2].mean(dim=0)
+    dxb = bx - cen[0]
+    dyb = by - cen[1]
+    r = torch.sqrt(dxb * dxb + dyb * dyb)
+    psi = torch.atan2(dyb, dxb)
+    r_lo = float(torch.clamp(r.min(), min=1e-3))
+
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    # Pad for pattern lookup interpolation and for the pulses being offset from
+    # the aperture centroid by up to the subaperture length (as ffbp).
+    max_offset = float(torch.linalg.norm(pos[:, :2] - cen[None, :], dim=-1).max())
+    psi_pad = 2.0 * g_daz + max_offset / r_lo
+    psi_lo = g_az0 + float(yaw.min()) - psi_pad
+    psi_hi = g_az1 + float(yaw.max()) + psi_pad
+    visible = (psi >= psi_lo) & (psi <= psi_hi)
+    if not bool(visible.any()):
+        return None
+    vbx = bx[visible]
+    vby = by[visible]
+    # Expand by margin cells beyond the visible boundary (not clipped to the
+    # output extent) so output edge pixels have interior merge neighbours.
+    x_lo = float(vbx.min()) - margin * sub_dx
+    x_hi = float(vbx.max()) + margin * sub_dx
+    y_lo = float(vby.min()) - margin * sub_dy
+    y_hi = float(vby.max()) + margin * sub_dy
+    if x_hi <= x_lo or y_hi <= y_lo:
+        return None
+    nx = max(min_nx, int(math.ceil((x_hi - x_lo) / sub_dx)))
+    ny = max(min_ny, int(math.ceil((y_hi - y_lo) / sub_dy)))
+    return {"x": (x_lo, x_hi), "y": (y_lo, y_hi), "nx": nx, "ny": ny}
+
+
+def _cfbp_tx_power_impl(
+    wa: Tensor,
+    pos: Tensor,
+    att: Tensor,
+    boundary: Tensor,
+    stages: int,
+    divisions: int,
+    g: Tensor,
+    g_extent: list,
+    g_daz: float,
+    normalization: str | None,
+    sub_dx: float,
+    sub_dy: float,
+    margin: int,
+    min_nx: int,
+    min_ny: int,
+    min_nsweeps: int,
+    dx_ref: float,
+    h_ref: float,
+    grid_out: dict | None = None,
+    is_top_level: bool = True,
+) -> tuple[Tensor, dict] | None:
+    """Recursive Cartesian tx_power accumulator map computation.
+
+    Returns (acc, grid) with the 4-channel accumulator on grid, or None if no
+    pulse of this node illuminates the output grid. All grids are absolute; no
+    frame offset is tracked (tx_power is phase free).
+    """
+    nsweeps = wa.shape[0]
+
+    grid_node = _tx_power_cart_node_grid(
+        boundary, pos, att[:, 2], g_extent, g_daz, sub_dx, sub_dy,
+        margin, min_nx, min_ny)
+    if grid_node is None:
+        return None
+
+    nodes = []
+    edges = torch.linspace(0, nsweeps, divisions + 1).long()
+    for d_idx in range(divisions):
+        i0 = int(edges[d_idx])
+        i1 = int(edges[d_idx + 1])
+        if i1 - i0 < 1:
+            continue
+        wa_local = wa[i0:i1]
+        pos_local = pos[i0:i1]
+        att_local = att[i0:i1]
+
+        if stages > 1 and i1 - i0 > min_nsweeps:
+            child = _cfbp_tx_power_impl(
+                wa_local, pos_local, att_local, boundary, stages - 1, divisions,
+                g, g_extent, g_daz, normalization, sub_dx, sub_dy, margin,
+                min_nx, min_ny, min_nsweeps, dx_ref, h_ref,
+                grid_out=None, is_top_level=False)
+            if child is None:
+                continue
+            acc, grid_local = child
+        else:
+            grid_local = _tx_power_cart_node_grid(
+                boundary, pos_local, att_local[:, 2], g_extent, g_daz,
+                sub_dx, sub_dy, margin, min_nx, min_ny)
+            if grid_local is None:
+                continue
+            acc = _backprojection_cart_2d_tx_power_accum(
+                wa_local, g, g_extent, grid_local, pos_local, att_local,
+                normalization, dx_ref, h_ref)
+        nodes.append((acc, grid_local))
+
+    if len(nodes) == 0:
+        return None
+
+    while len(nodes) > 1:
+        n1 = nodes[0]
+        n2 = nodes[1]
+        is_final_merge = is_top_level and len(nodes) == 2
+        grid_new = grid_out if is_final_merge else grid_node
+        merged = cart_tx_power_merge2(n1[0], n2[0], n1[1], n2[1], grid_new)
+        nodes = nodes[2:] + [(merged, grid_new)]
+
+    return nodes[0]
+
+
+def backprojection_cart_2d_tx_power_cfbp(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "CartesianGrid | dict",
+    r_res: float,
+    pos: Tensor,
+    att: Tensor,
+    stages: int,
+    divisions: int = 2,
+    normalization: str | None = None,
+    azimuth_resolution: bool = True,
+    downsample_x: float = 4.0,
+    downsample_y: float = 4.0,
+    min_nsweeps: int = 64,
+    min_nx: int = 32,
+    min_ny: int = 32,
+    margin: int = 4,
+    beam_theta_samples: float = 32.0,
+) -> Tensor:
+    """
+    Fast factorized (CFBP style) version of
+    :func:`backprojection_cart_2d_tx_power`.
+
+    Splits the track recursively into subapertures like :func:`cfbp`, computes
+    coarse per-subaperture accumulator maps over the ground region each
+    illuminates, and merges them pairwise with bilinear interpolation. Like the
+    polar :func:`backprojection_polar_2d_tx_power_ffbp` the accumulated fields
+    are smooth and phase-free, so the subaperture maps can be sampled much more
+    coarsely than the output grid (``downsample_x``, ``downsample_y``) and the
+    azimuth resolution moments merge exactly (Chan's parallel variance
+    formula). Unlike the polar version everything is in absolute Cartesian
+    coordinates: no origin shift and no carrier phase.
+
+    Output matches :func:`backprojection_cart_2d_tx_power` up to interpolation
+    error, except near illumination edges where pixels with very few
+    contributing pulses can differ. Ground-plane grid only (z = 0, per-sweep
+    ``pos`` z altitude).
+
+    Parameters
+    ----------
+    wa : Tensor
+        Amplitude weighting of each pulse, shape [nsweeps].
+    g : Tensor
+        Square-root of two-way antenna gain, shape [elevation, azimuth].
+    g_extent : list
+        Antenna pattern extent [g_el0, g_az0, g_el1, g_az1] in radians.
+    grid : CartesianGrid or dict
+        Cartesian grid ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``.
+        x is range, y is along-track / azimuth.
+    r_res : float
+        Range bin resolution. Unused, kept for signature parity with
+        :func:`backprojection_cart_2d_tx_power`.
+    pos : Tensor
+        Platform position at each pulse, shape [nsweeps, 3].
+    att : Tensor
+        Euler angles [roll, pitch, yaw] at each pulse, shape [nsweeps, 3].
+        Only roll and yaw are used.
+    stages : int
+        Number of recursions.
+    divisions : int
+        Subaperture divisions per stage. Default 2.
+    normalization : str or None
+        "sigma", "gamma", "beta"/None or "point"; see
+        :func:`backprojection_cart_2d_tx_power`.
+    azimuth_resolution : bool
+        If True (default), also normalize for the varying azimuth resolution.
+    downsample_x, downsample_y : float
+        Subaperture map step relative to the output grid step in x (range) and
+        y (azimuth). The fields are smooth, so values well above 1 are usually
+        fine. Default 4.
+    min_nsweeps : int
+        Do not recurse into subapertures with fewer pulses than this.
+    min_nx, min_ny : int
+        Minimum subaperture map size. Avoids large edge interpolation errors.
+    margin : int
+        Extra margin in subaperture map cells around the computed extents.
+    beam_theta_samples : float
+        Minimum number of subaperture map samples across the antenna half
+        amplitude azimuth beamwidth (and a quarter of that across the elevation
+        beamwidth in range). Caps ``downsample_y``/``downsample_x`` so a beam
+        thin compared to the output grid step stays resolved.
+
+    Returns
+    -------
+    tx_power : Tensor
+        Cartesian image of square root of power returned from each pixel
+        assuming constant reflectivity, shape [nx, ny].
+    """
+    if hasattr(grid, "to_dict"):
+        grid = grid.to_dict()
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+
+    assert wa.dim() == 1, "backprojection_cart_2d_tx_power_cfbp supports only a single batch"
+    nsweeps = wa.shape[0]
+    assert pos.shape == (nsweeps, 3)
+    assert att.shape == (nsweeps, 3)
+    device = wa.device
+
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_daz = (g_az1 - g_az0) / g.shape[1]
+    g_del = (g_el1 - g_el0) / g.shape[0]
+
+    h_ref = float(pos[nsweeps // 2, 2])
+    dx_ref = dx
+
+    sub_dx = dx * downsample_x
+    sub_dy = dy * downsample_y
+
+    # Cap the subaperture map steps so the antenna illumination features stay
+    # resolved. The illumination varies at the antenna beam scale, not the
+    # output grid scale, and a beam edge undersampled by the coarse maps shows
+    # up as a bilinear reconstruction lattice ("staircase") in the merged
+    # result. Two ground features matter: the azimuth beamwidth ACROSS the line
+    # of sight (cross-range) and the elevation beamwidth ALONG it (range). For
+    # a SQUINTED beam the line of sight is at an angle psi_c to the grid axes,
+    # so each feature projects onto BOTH x and y and both steps must resolve
+    # it; a broadside (psi_c = 0) beam recovers the plain azimuth->y,
+    # elevation->x split. Near range is used because the same angular beamwidth
+    # maps to the smallest, sharpest ground feature there.
+    px_mid = float(pos[nsweeps // 2, 0])
+    py_mid = float(pos[nsweeps // 2, 1])
+    horiz_near = min(math.hypot(xx - px_mid, yy - py_mid)
+                     for xx in (x0, x1) for yy in (y0, y1))
+    r_near = min(math.hypot(xx, yy) for xx in (x0, x1) for yy in (y0, y1))
+    # Beam centre ground azimuth = antenna azimuth peak + mean yaw. The cross
+    # line-of-sight direction is (-sin psi_c, cos psi_c), the along direction
+    # (cos psi_c, sin psi_c); a step resolves a feature when its projection on
+    # the feature normal is below the ground feature width / beam_theta_samples.
+    mean_yaw = float(att[:, 2].mean())
+    az_peak = g_az0 + (int(torch.argmax(torch.amax(g, dim=0))) + 0.5) * g_daz
+    psi_c = az_peak + mean_yaw
+    cpsi = abs(math.cos(psi_c))
+    spsi = abs(math.sin(psi_c))
+    eps = 1e-3
+
+    p_az = torch.amax(g, dim=0)
+    above = (p_az >= 0.5 * float(p_az.max())).nonzero()
+    if len(above) > 0 and horiz_near > 0:
+        half_width_az = float(above[-1] - above[0] + 1) * g_daz
+        L_az = half_width_az * horiz_near
+        sub_dy = min(sub_dy, max(dy, L_az / (beam_theta_samples * (cpsi + eps))))
+        sub_dx = min(sub_dx, max(dx, L_az / (beam_theta_samples * (spsi + eps))))
+
+    # Elevation beamwidth mapped to ground range. Only binding when the near
+    # edge of the grid approaches nadir. The fields vary more slowly in range,
+    # so a quarter of the azimuth sample density.
+    p_el = torch.amax(g, dim=1)
+    above = (p_el >= 0.5 * float(p_el.max())).nonzero()
+    if len(above) > 0 and h_ref > 0:
+        el_half_width = float(above[-1] - above[0] + 1) * g_del
+        L_el = el_half_width * (r_near ** 2 + h_ref ** 2) / h_ref
+        bts_el = beam_theta_samples / 4.0
+        sub_dx = min(sub_dx, max(dx, L_el / (bts_el * (cpsi + eps))))
+        sub_dy = min(sub_dy, max(dy, L_el / (bts_el * (spsi + eps))))
+
+    # Output grid perimeter in absolute ground coordinates. Subaperture grid
+    # extents are the visible subset of these points.
+    nb = 64
+    xs = torch.linspace(x0, x1, nb, device=device)
+    ys = torch.linspace(y0, y1, nb, device=device)
+    bx = torch.cat((torch.full_like(ys, x0), torch.full_like(ys, x1), xs, xs))
+    by = torch.cat((ys, ys, torch.full_like(xs, y0), torch.full_like(xs, y1)))
+    boundary = torch.stack((bx, by), dim=1)
+
+    node = _cfbp_tx_power_impl(
+        wa, pos, att, boundary, stages, divisions, g, g_extent, g_daz,
+        normalization, sub_dx, sub_dy, margin, min_nx, min_ny, min_nsweeps,
+        dx_ref, h_ref, grid_out=grid, is_top_level=True)
+
+    if node is None:
+        acc = torch.zeros((4, nx, ny), dtype=torch.float32, device=device)
+    elif node[1] is not grid:
+        # Single surviving subaperture: regrid it to the output grid.
+        acc = cart_tx_power_merge2(node[0], None, node[1], None, grid)
+    else:
+        acc = node[0]
+
+    # Finishing step. Matches the direct kernel epilogue (ground plane).
+    S, W, P1, M2 = acc[0], acc[1], acc[2], acc[3]
+    x_vec = x0 + dx * torch.arange(nx, dtype=torch.float32, device=device)
+    y_vec = y0 + dy * torch.arange(ny, dtype=torch.float32, device=device)
+    if azimuth_resolution:
+        var = torch.where(W > 0, M2 / torch.clamp(W, min=1e-30), torch.zeros_like(W))
+        sigma = torch.sqrt(torch.clamp(var, min=0.0))
+        Rg = torch.sqrt(x_vec[:, None] ** 2 + y_vec[None, :] ** 2)
+        denom = sigma * Rg
+        pixel = torch.where(denom > 0, S / denom, torch.full_like(S, torch.inf))
+    else:
+        pixel = S
+    return torch.sqrt(pixel)

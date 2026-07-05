@@ -2737,6 +2737,322 @@ at::Tensor backprojection_polar_2d_tx_power_accum_cpu(
 	return img;
 }
 
+static void backprojection_cart_2d_tx_power_accum_kernel_cpu(
+          const float* wa,
+          const float* pos,
+          const float* att,
+          const float* g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          float* img,
+          int nsweeps,
+          float x0,
+          float dx,
+          float y0,
+          float dy,
+          int Nx,
+          int Ny,
+          int normalization,
+          float dx_ref,
+          float h_ref,
+          int idx) {
+    const int idy = idx % Ny;
+    const int idx_x = idx / Ny;
+    if (idx_x >= Nx || idy >= Ny) {
+        return;
+    }
+    const size_t np = (size_t)Nx * Ny;
+    float* out = &img[idx_x * Ny + idy];
+
+    // Pixel ground position (z = 0 ground plane).
+    const float px_base = x0 + idx_x * dx;
+    const float py_base = y0 + idy * dy;
+
+    // Squared sine of the angle subtended by one ground-range cell at nadir,
+    // used as a floor on sin^2 of the look angle. dx_ref and h_ref refer to the
+    // final output grid so that all subaperture maps use the same clamp floor.
+    const float min_sin2_look = 2.0f * dx_ref / h_ref;
+
+    float pixel = 0.0f;
+    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
+    // used to estimate the azimuth resolution from the aperture.
+    float m_w = 0.0f;     // sum of weights
+    float m_mean = 0.0f;  // weighted mean of psi
+    float m_s = 0.0f;     // weighted sum of squared deviations
+
+    for(int i = 0; i < nsweeps; i++) {
+        // Sweep reference position.
+        float pos_x = pos[i * 3 + 0];
+        float pos_y = pos[i * 3 + 1];
+        float pos_z = pos[i * 3 + 2];
+
+        float px = (px_base - pos_x);
+        float py = (py_base - pos_y);
+        float h = pos_z;
+        float pz2 = h * h;
+
+        // Calculate distance to the pixel.
+        float d = sqrtf(px * px + py * py + pz2);
+
+        // Avoid nans due to numerical precision by clamping to valid range.
+        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
+        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
+        const float el_deg = look_angle - att[3 * i + 0];
+        const float az_deg = psi - att[3 * i + 2];
+        // TODO: consider platform pitch
+
+        const float el_idx = (el_deg - g_el0) / g_del;
+        const float az_idx = (az_deg - g_az0) / g_daz;
+
+        const int el_int = el_idx;
+        const int az_int = az_idx;
+        const float el_frac = el_idx - el_int;
+        const float az_frac = az_idx - az_int;
+
+        if (el_idx < 0.0f || el_int+1 >= g_nel) {
+            continue;
+        }
+        if (az_idx < 0.0f || az_int+1 >= g_naz) {
+            continue;
+        }
+        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
+        float sinl = 1.0f;
+
+        if (normalization == 1) {
+            // sigma_0
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d)));
+        } else if (normalization == 2) {
+            // gamma_0
+            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d))) * d / h;
+        } else if (normalization == 3) {
+            // point
+            // Scale as d^4 instead of d^3 for area target.
+            sinl = d;
+        }
+        // beta_0 otherwise
+
+        float w = wa[i];
+        // Plain illumination weight (no incidence term) for the moments.
+        const float wi = g_i * g_i * w * w / (d*d*d);
+        pixel += wi / sinl;
+
+        // Welford weighted update (numerically stable, handles squint).
+        // Skip zero weights (gain zero or underflow): with m_w still zero
+        // they would give 0/0 which poisons the moments with NaN.
+        if (wi > 0.0f) {
+            const float wsum = m_w + wi;
+            const float delta = psi - m_mean;
+            m_mean += delta * wi / wsum;
+            m_s += wi * delta * (psi - m_mean);
+            m_w = wsum;
+        }
+    }
+
+    // Unfinished accumulators for factorized (cfbp style) processing:
+    // channel 0: S = sum wi/sinl, 1: W = sum wi, 2: P1 = W*mean(psi),
+    // 3: M2 = weighted sum of squared deviations of psi.
+    // P1 is premultiplied by W so that bilinear interpolation of the
+    // channels stays valid where W approaches zero.
+    out[0 * np] = pixel;
+    out[1 * np] = m_w;
+    out[2 * np] = m_w * m_mean;
+    out[3 * np] = m_s;
+}
+
+at::Tensor backprojection_cart_2d_tx_power_accum_cpu(
+          const at::Tensor &wa,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          int64_t nsweeps,
+          double x0,
+          double dx,
+          double y0,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          int64_t normalization,
+          double dx_ref,
+          double h_ref) {
+	TORCH_CHECK(wa.dtype() == at::kFloat);
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(att.dtype() == at::kFloat);
+	TORCH_CHECK(g.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(wa.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+
+	at::Tensor wa_contig = wa.contiguous();
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor att_contig = att.contiguous();
+	at::Tensor g_contig = g.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kFloat)
+        .layout(torch::kStrided)
+        .device(wa.device());
+	at::Tensor img = torch::zeros({4, Nx, Ny}, options);
+	const float* wa_ptr = wa_contig.data_ptr<float>();
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+	const float* att_ptr = att_contig.data_ptr<float>();
+	const float* g_ptr = g_contig.data_ptr<float>();
+	float* img_ptr = img.data_ptr<float>();
+
+    // See backprojection_polar_2d_tx_power_accum_cpu for why the team size is
+    // set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for(int idx = 0; idx < Nx * Ny; idx++) {
+        backprojection_cart_2d_tx_power_accum_kernel_cpu(
+                      wa_ptr,
+                      pos_ptr,
+                      att_ptr,
+                      g_ptr,
+                      g_az0,
+                      g_el0,
+                      g_daz,
+                      g_del,
+                      g_naz,
+                      g_nel,
+                      img_ptr,
+                      nsweeps,
+                      x0, dx,
+                      y0, dy,
+                      Nx, Ny,
+                      normalization,
+                      static_cast<float>(dx_ref),
+                      static_cast<float>(h_ref),
+                      idx);
+    }
+	return img;
+}
+
+static void cart_tx_power_merge2_kernel_cpu(
+          const float* acc0,
+          const float* acc1,
+          float* out,
+          float x0_0, float dx_0, float y0_0, float dy_0, int Nx_0, int Ny_0,
+          float x0_1, float dx_1, float y0_1, float dy_1, int Nx_1, int Ny_1,
+          float x1, float dx1, float y1, float dy1, int Nx1, int Ny1,
+          int idx) {
+    const int idy = idx % Ny1;
+    const int idx_x = idx / Ny1;
+    if (idx >= Nx1 * Ny1) {
+        return;
+    }
+
+    // Output pixel absolute ground position.
+    const float X = x1 + dx1 * idx_x;
+    const float Y = y1 + dy1 * idy;
+
+    const float* accs[2] = {acc0, acc1};
+    const float ix0[2] = {x0_0, x0_1};
+    const float idxs[2] = {dx_0, dx_1};
+    const float iy0[2] = {y0_0, y0_1};
+    const float idys[2] = {dy_0, dy_1};
+    const int inx[2] = {Nx_0, Nx_1};
+    const int iny[2] = {Ny_0, Ny_1};
+
+    float S = 0.0f, W = 0.0f, P1 = 0.0f, M2 = 0.0f;
+    for (int id = 0; id < 2; id++) {
+        const float* acc = accs[id];
+        if (acc == nullptr) {
+            continue;
+        }
+        const int nxi = inx[id];
+        const int nyi = iny[id];
+        // Map the absolute output position into this input's local index.
+        const float dxi = (X - ix0[id]) / idxs[id];
+        const float dyi = (Y - iy0[id]) / idys[id];
+        if (!(dxi >= 0.0f && dxi < nxi - 1 && dyi >= 0.0f && dyi < nyi - 1)) {
+            continue;
+        }
+        const int xi_int = dxi;
+        const int yi_int = dyi;
+        const float xi_frac = dxi - xi_int;
+        const float yi_frac = dyi - yi_int;
+        const size_t np = (size_t)nxi * nyi;
+        const float s = interp2d<float>(&acc[0 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
+        const float w = interp2d<float>(&acc[1 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
+        const float p1 = interp2d<float>(&acc[2 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
+        const float m2 = interp2d<float>(&acc[3 * np], nxi, nyi, xi_int, xi_frac, yi_int, yi_frac);
+        if (w <= 0.0f) {
+            continue;
+        }
+        if (W > 0.0f) {
+            // Chan's parallel variance combination of the weighted psi moments.
+            const float delta = P1 / W - p1 / w;
+            M2 += m2 + delta * delta * W * w / (W + w);
+        } else {
+            M2 += m2;
+        }
+        S += s;
+        W += w;
+        P1 += p1;
+    }
+    // Float cancellation could leave a small negative value which would give
+    // NaN in the final sqrt of the variance.
+    M2 = fmaxf(M2, 0.0f);
+
+    const size_t np_out = (size_t)Nx1 * Ny1;
+    float* o = &out[idx_x * Ny1 + idy];
+    o[0 * np_out] = S;
+    o[1 * np_out] = W;
+    o[2 * np_out] = P1;
+    o[3 * np_out] = M2;
+}
+
+at::Tensor cart_tx_power_merge2_cpu(
+          const at::Tensor &acc0,
+          const at::Tensor &acc1,
+          double x0_0, double dx_0, double y0_0, double dy_0, int64_t Nx_0, int64_t Ny_0,
+          double x0_1, double dx_1, double y0_1, double dy_1, int64_t Nx_1, int64_t Ny_1,
+          double x1, double dx1, double y1, double dy1, int64_t Nx1, int64_t Ny1) {
+    TORCH_CHECK(acc0.dtype() == at::kFloat);
+    TORCH_INTERNAL_ASSERT(acc0.device().type() == at::DeviceType::CPU);
+
+    bool has1 = acc1.defined() && acc1.numel() > 0;
+    if (has1) {
+        TORCH_CHECK(acc1.dtype() == at::kFloat);
+    }
+
+    at::Tensor acc0_contig = acc0.contiguous();
+    at::Tensor acc1_contig;
+    at::Tensor out = torch::zeros({4, Nx1, Ny1}, acc0_contig.options());
+    const float* acc0_ptr = acc0_contig.data_ptr<float>();
+    const float* acc1_ptr = nullptr;
+    if (has1) {
+        acc1_contig = acc1.contiguous();
+        acc1_ptr = acc1_contig.data_ptr<float>();
+    }
+    float* out_ptr = out.data_ptr<float>();
+
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for
+    for(int idx = 0; idx < Nx1 * Ny1; idx++) {
+        cart_tx_power_merge2_kernel_cpu(
+                acc0_ptr, acc1_ptr, out_ptr,
+                x0_0, dx_0, y0_0, dy_0, Nx_0, Ny_0,
+                x0_1, dx_1, y0_1, dy_1, Nx_1, Ny_1,
+                x1, dx1, y1, dy1, Nx1, Ny1,
+                idx);
+    }
+    return out;
+}
+
 
 // Registers CPU implementations
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
@@ -2746,6 +3062,8 @@ TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cpu);
   m.impl("backprojection_polar_2d_tx_power_accum", &backprojection_polar_2d_tx_power_accum_cpu);
   m.impl("backprojection_cart_2d_tx_power", &backprojection_cart_2d_tx_power_cpu);
+  m.impl("backprojection_cart_2d_tx_power_accum", &backprojection_cart_2d_tx_power_accum_cpu);
+  m.impl("cart_tx_power_merge2", &cart_tx_power_merge2_cpu);
   m.impl("backprojection_cart_2d", &backprojection_cart_2d_cpu);
   m.impl("backprojection_cart_2d_grad", &backprojection_cart_2d_grad_cpu);
   m.impl("compute_illumination", &compute_illumination_cpu);

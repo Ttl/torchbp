@@ -2528,6 +2528,160 @@ class TestFFBPTxPower(TestCase):
             (torch.isinf(out_cpu) == torch.isinf(out_cuda)).all())
 
 
+class TestCartTxPowerCFBP(TestCase):
+    """backprojection_cart_2d_tx_power_cfbp must match the direct
+    backprojection_cart_2d_tx_power."""
+
+    @staticmethod
+    def _antenna(device, az_width=0.4, el_width=0.8):
+        nel, naz = 16, 24
+        el = torch.linspace(-1.2, 1.2, nel, device=device)
+        az = torch.linspace(-2.0, 2.0, naz, device=device)
+        gain = torch.exp(-(el[:, None] / el_width) ** 2) * torch.exp(
+            -(az[None, :] / az_width) ** 2
+        )
+        g = gain.to(torch.float32)
+        g_extent = [el[0].item(), az[0].item(), el[-1].item(), az[-1].item()]
+        return g, g_extent
+
+    @staticmethod
+    def _straight_track(device, nsweeps=128, span=32.0, alt=20.0, r_center=60.0):
+        pos = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        pos[:, 1] = torch.linspace(-span / 2, span / 2, nsweeps, device=device)
+        pos[:, 2] = alt
+        att = torch.zeros([nsweeps, 3], dtype=torch.float32, device=device)
+        d = float(np.sqrt(r_center**2 + alt**2))
+        att[:, 0] = -float(np.arcsin(alt / d))
+        wa = (torch.hann_window(nsweeps, device=device) + 0.1).to(torch.float32)
+        return wa, pos, att
+
+    def _assert_matches(self, out, ref, q95=0.03, emax=0.1, margin=4):
+        self.assertEqual(out.shape, ref.shape)
+        # No illuminated pixel of the direct result may be dropped (turned to
+        # inf) by the factorization, including the image border. Guards against
+        # the merge losing edge rows/columns for want of interpolation margin.
+        missing = torch.isfinite(ref) & ~torch.isfinite(out)
+        self.assertEqual(int(missing.sum()), 0)
+        out_c = out[margin:-margin, margin:-margin]
+        ref_c = ref[margin:-margin, margin:-margin]
+        inf_agree = (torch.isinf(out_c) == torch.isinf(ref_c)).float().mean()
+        self.assertGreater(float(inf_agree), 0.99)
+        finite = torch.isfinite(ref_c) & torch.isfinite(out_c)
+        self.assertGreater(int(finite.sum()), 0)
+        thresh = 1e-3 * float(ref_c[torch.isfinite(ref_c)].max())
+        mask = finite & (ref_c > thresh)
+        self.assertGreater(int(mask.sum()), 100)
+        ratio = out_c[mask] / ref_c[mask]
+        err = (ratio - 1).abs()
+        self.assertLess(float(torch.quantile(err, 0.95)), q95)
+        self.assertLess(float(err.max()), emax)
+
+    def _run_both(self, wa, g, g_extent, grid, pos, att, **kw):
+        kw.setdefault("stages", 3)
+        kw.setdefault("downsample_x", 1.0)
+        kw.setdefault("downsample_y", 1.0)
+        kw.setdefault("min_nsweeps", 16)
+        ref = torchbp.ops.backprojection_cart_2d_tx_power(
+            wa, g, g_extent, grid, 0.15, pos, att,
+            normalization=kw.get("normalization"),
+            azimuth_resolution=kw.get("azimuth_resolution", True))[0]
+        out = torchbp.ops.backprojection_cart_2d_tx_power_cfbp(
+            wa, g, g_extent, grid, 0.15, pos, att, **kw)
+        return out, ref
+
+    def test_straight_track(self):
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device)
+        grid = {"x": (45, 75), "y": (-25, 25), "nx": 128, "ny": 256}
+        for norm in [None, "sigma", "gamma", "point"]:
+            out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                      normalization=norm)
+            self._assert_matches(out, ref, q95=0.03, emax=0.1)
+
+    def test_no_azimuth_resolution(self):
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(device)
+        grid = {"x": (45, 75), "y": (-25, 25), "nx": 128, "ny": 256}
+        out, ref = self._run_both(wa, g, g_extent, grid, pos, att,
+                                  normalization="sigma", azimuth_resolution=False)
+        self._assert_matches(out, ref, q95=0.03, emax=0.1)
+
+    def test_downsampled_deep_stages(self):
+        """Coarse subaperture maps (downsample 4) merged over many stages must
+        stay accurate and free of NaN."""
+        device = "cpu"
+        g, g_extent = self._antenna(device, az_width=0.4)
+        wa, pos, att = self._straight_track(
+            device, nsweeps=512, span=60.0, alt=20.0, r_center=60.0)
+        grid = {"x": (45, 75), "y": (-25, 25), "nx": 256, "ny": 512}
+        out, ref = self._run_both(
+            wa, g, g_extent, grid, pos, att, normalization="sigma",
+            stages=100, downsample_x=4.0, downsample_y=4.0, min_nsweeps=32)
+        self.assertFalse(bool(torch.isnan(out).any()))
+        # No illuminated direct pixel dropped, even at the image border.
+        self.assertEqual(int((torch.isfinite(ref) & ~torch.isfinite(out)).sum()), 0)
+        out_c = out[4:-4, 4:-4]
+        ref_c = ref[4:-4, 4:-4]
+        inf_agree = (torch.isinf(out_c) == torch.isinf(ref_c)).float().mean()
+        self.assertGreater(float(inf_agree), 0.98)
+        finite = torch.isfinite(ref_c) & torch.isfinite(out_c)
+        thresh = 1e-3 * float(ref_c[torch.isfinite(ref_c)].max())
+        mask = finite & (ref_c > thresh)
+        self.assertGreater(int(mask.sum()), 1000)
+        err = (out_c[mask] / ref_c[mask] - 1).abs()
+        self.assertLess(float(err.median()), 0.01)
+        # Isolated illumination edge pixels can still be off, quantile only.
+        self.assertLess(float(torch.quantile(err, 0.95)), 0.05)
+
+    def _opcheck(self, device):
+        wa = torch.rand(4, device=device) + 0.5
+        pos = torch.randn(4, 3, device=device)
+        pos[:, 2] = 20.0
+        att = torch.zeros(4, 3, device=device)
+        g = torch.rand(8, 8, device=device)
+        opcheck(
+            torch.ops.torchbp.backprojection_cart_2d_tx_power_accum,
+            (wa, pos, att, g, -1.0, -0.5, 2.0 / 8, 1.0 / 8, 8, 8, 4,
+             45.0, 0.25, -25.0, 0.2, 8, 8, 1, 0.25, 20.0),
+            test_utils=["test_schema"],
+        )
+        acc0 = torch.rand(4, 8, 8, device=device)
+        acc1 = torch.rand(4, 8, 8, device=device)
+        opcheck(
+            torch.ops.torchbp.cart_tx_power_merge2,
+            (acc0, acc1,
+             45.0, 0.25, -25.0, 0.2, 8, 8,
+             45.0, 0.25, -25.0, 0.2, 8, 8,
+             45.0, 0.25, -25.0, 0.2, 8, 8),
+            test_utils=["test_schema"],
+        )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_match(self):
+        g, g_extent = self._antenna("cuda", az_width=0.4)
+        wa, pos, att = self._straight_track("cuda")
+        grid = {"x": (45, 75), "y": (-25, 25), "nx": 128, "ny": 256}
+        kw = dict(stages=3, downsample_x=1.0, downsample_y=1.0,
+                  min_nsweeps=16, normalization="sigma")
+        out_gpu = torchbp.ops.backprojection_cart_2d_tx_power_cfbp(
+            wa, g, g_extent, grid, 0.15, pos, att, **kw)
+        out_cpu = torchbp.ops.backprojection_cart_2d_tx_power_cfbp(
+            wa.cpu(), g.cpu(), g_extent, grid, 0.15, pos.cpu(), att.cpu(), **kw)
+        finite = torch.isfinite(out_cpu) & torch.isfinite(out_gpu.cpu())
+        self.assertGreater(float(finite.float().mean()), 0.95)
+        torch.testing.assert_close(
+            out_cpu[finite], out_gpu.cpu()[finite], atol=1e-3, rtol=1e-2)
+
+
 class TestProjectionCart2D(TestCase):
     """Tests for projection_cart_2d (direct scatter kernel) and
     projection_cart_2d_nufft (NUFFT-based O(N log M) kernel)."""

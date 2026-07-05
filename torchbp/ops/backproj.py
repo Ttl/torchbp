@@ -1183,6 +1183,77 @@ def backprojection_cart_2d_tx_power(
     return torch.ops.torchbp.backprojection_cart_2d_tx_power.default(*cpp_args)
 
 
+def _backprojection_cart_2d_tx_power_accum(
+    wa: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: "CartesianGrid | dict",
+    pos: Tensor,
+    att: Tensor,
+    normalization: str | None,
+    dx_ref: float,
+    h_ref: float,
+) -> Tensor:
+    """Unfinished Cartesian tx_power accumulator maps for factorized processing.
+
+    Returns a [4, Nx, Ny] float32 tensor with channels
+    S = sum wi/sinl, W = sum wi, P1 = W*mean(psi) and M2 = weighted sum of
+    squared deviations of psi. Cartesian analog of
+    :func:`_backprojection_polar_2d_tx_power_accum`; used internally by
+    :func:`~torchbp.ops.backprojection_cart_2d_tx_power_cfbp`.
+
+    dx_ref and h_ref should refer to the final output grid x step and reference
+    altitude so that all subapertures use the same minimum look angle clamp as
+    the direct kernel.
+    """
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+
+    assert wa.dim() == 1
+    nsweeps = wa.shape[0]
+    assert pos.shape == (nsweeps, 3)
+    assert att.shape == (nsweeps, 3)
+
+    g_nel = g.shape[0]
+    g_naz = g.shape[1]
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_daz = (g_az1 - g_az0) / g_naz
+    g_del = (g_el1 - g_el0) / g_nel
+
+    norm = _tx_power_norm_int(normalization)
+
+    return torch.ops.torchbp.backprojection_cart_2d_tx_power_accum.default(
+        wa, pos, att, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+        nsweeps, x0, dx, y0, dy, nx, ny, norm, dx_ref, h_ref)
+
+
+@torch.library.register_fake("torchbp::backprojection_cart_2d_tx_power_accum")
+def _fake_cart_2d_tx_power_accum(
+    wa: Tensor,
+    pos: Tensor,
+    att: Tensor,
+    g: Tensor,
+    g_az0: float,
+    g_el0: float,
+    g_daz: float,
+    g_del: float,
+    g_naz: int,
+    g_nel: int,
+    nsweeps: int,
+    x0: float,
+    dx: float,
+    y0: float,
+    dy: float,
+    Nx: int,
+    Ny: int,
+    normalization: int,
+    dx_ref: float,
+    h_ref: float,
+):
+    torch._check(wa.dtype == torch.float32)
+    torch._check(pos.dtype == torch.float32)
+    return torch.empty((4, Nx, Ny), dtype=torch.float32, device=wa.device)
+
+
 def backprojection_polar_2d_resolution(
     wa: Tensor,
     g: Tensor,
