@@ -3617,7 +3617,8 @@ class TestCFBP(TestCase):
         return targets, amps, pos
 
     def _compare(self, device, stages, nsweeps=512, grid=None, d0=0.0,
-                 data_fmod=0.0, divisions=2, tol=0.05):
+                 data_fmod=0.0, divisions=2, tol=0.05,
+                 interp_method=("knab", 8, 1.4)):
         if grid is None:
             grid = self.grid
         targets, amps, pos = self._scene(nsweeps)
@@ -3629,7 +3630,8 @@ class TestCFBP(TestCase):
         )
         out = torchbp.ops.cfbp(
             data, grid, self.fc, self.r_res, pos, stages=stages,
-            divisions=divisions, d0=d0, data_fmod=data_fmod
+            divisions=divisions, d0=d0, data_fmod=data_fmod,
+            interp_method=interp_method
         )
         self.assertEqual(out.shape, ref.shape)
         rel = ((out - ref).abs().max() / ref.abs().max()).item()
@@ -3686,6 +3688,105 @@ class TestCFBP(TestCase):
         out.abs().mean().backward()
         self.assertTrue(torch.isfinite(data.grad).all())
         self.assertGreater(data.grad.abs().sum().item(), 0)
+
+    def test_interp_method_fft(self):
+        self._compare("cpu", stages=2, interp_method="fft")
+
+    def test_knab_matches_fft(self):
+        # The merge kernel should differ from the exact FFT merge only by
+        # interpolation error.
+        targets, amps, pos = self._scene()
+        data = self._make_data(targets, amps, pos)
+        out_fft = torchbp.ops.cfbp(
+            data, self.grid, self.fc, self.r_res, pos, stages=2,
+            interp_method="fft"
+        )
+        out_knab = torchbp.ops.cfbp(
+            data, self.grid, self.fc, self.r_res, pos, stages=2,
+            interp_method=("knab", 8, 1.4)
+        )
+        rel = ((out_knab - out_fft).abs().max() / out_fft.abs().max()).item()
+        self.assertLess(rel, 1e-2)
+
+    def test_guard_y0(self):
+        # Without a guard band the y edges differ (FFT wrap-around vs window
+        # truncation); the interior should still match direct backprojection.
+        grid = self.grid
+        targets, amps, pos = self._scene()
+        data = self._make_data(targets, amps, pos)
+        ref = torchbp.ops.backprojection_cart_2d(
+            data, grid, self.fc, self.r_res, pos
+        )
+        out = torchbp.ops.cfbp(
+            data, grid, self.fc, self.r_res, pos, stages=2, guard_y=0.0
+        )
+        m = int(0.05 * grid["ny"])
+        rel = ((out - ref)[..., m:-m].abs().max() / ref.abs().max()).item()
+        self.assertLess(rel, 0.05)
+
+    def _merge2_args(self, device):
+        from torchbp.ops.cfbp import _merge_weight_table
+
+        torch.manual_seed(2)
+        nb, nx, ny0, ny1, nyout = 2, 16, 100, 130, 260
+        img0 = torch.randn(nb, nx, ny0, dtype=torch.complex64, device=device)
+        img1 = torch.randn(nb, nx, ny1, dtype=torch.complex64, device=device)
+        order, v = 8, round(1 - 1 / 1.4, 6)
+        w0, i0 = _merge_weight_table(ny0, nyout, order, v)
+        w1, i1 = _merge_weight_table(ny1, nyout, order, v)
+        w0, i0, w1, i1 = (t.to(device) for t in (w0, i0, w1, i1))
+        return (img0, img1, w0, i0, w1, i1, nb, nx, ny0, ny1, nyout,
+                w0.shape[1], w1.shape[1], 0.5, 0.25,
+                300.0, -30.2, 50.0, 300.4, -29.8, 50.5, 300.2, -30.0, 50.25,
+                80.05)
+
+    def test_merge2_matches_torch_reference(self):
+        args = self._merge2_args("cpu")
+        (img0, img1, w0, i0, w1, i1, nb, nx, ny0, ny1, nyout, order0, order1,
+         dx, dy, ox0, oy0, z0, ox1, oy1, z1, oxp, oyp, zp, ref_phase) = args
+        out = torch.ops.torchbp.cfbp_merge2.default(*args)
+
+        x = torch.arange(nx, dtype=torch.float64)[:, None] * dx
+        y = torch.arange(nyout, dtype=torch.float64)[None, :] * dy
+
+        def dist(ox, oy, z):
+            return torch.sqrt((ox + x).float() ** 2 + (oy + y).float() ** 2 + z**2)
+
+        dp = dist(oxp, oyp, zp)
+        ref = 0
+        for img, w, idx, (ox, oy, z) in [
+            (img0, w0, i0, (ox0, oy0, z0)),
+            (img1, w1, i1, (ox1, oy1, z1)),
+        ]:
+            order = w.shape[1]
+            gidx = idx[:, None].long() + torch.arange(order)[None, :]
+            g = img[..., gidx.reshape(-1)].reshape(nb, nx, nyout, order)
+            interp = (g * w.to(img.dtype)).sum(-1)
+            ph = torch.pi * ref_phase * (dist(ox, oy, z) - dp)
+            ref = ref + interp * torch.polar(torch.ones_like(ph), ph)
+        rel = ((out - ref).abs().max() / ref.abs().max()).item()
+        self.assertLess(rel, 1e-4)
+
+    def _merge2_opcheck(self, device):
+        opcheck(
+            torch.ops.torchbp.cfbp_merge2,
+            self._merge2_args(device),
+            test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+        )
+
+    def test_merge2_opcheck_cpu(self):
+        self._merge2_opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_merge2_opcheck_cuda(self):
+        self._merge2_opcheck("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_merge2_cuda_matches_cpu(self):
+        out_cuda = torch.ops.torchbp.cfbp_merge2.default(*self._merge2_args("cuda"))
+        out_cpu = torch.ops.torchbp.cfbp_merge2.default(*self._merge2_args("cpu"))
+        rel = ((out_cuda.cpu() - out_cpu).abs().max() / out_cpu.abs().max()).item()
+        self.assertLess(rel, 1e-4)
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_cuda_matches_direct(self):

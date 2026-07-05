@@ -1,3 +1,6 @@
+import math
+import functools
+
 import torch
 from torch import Tensor
 from typing import TYPE_CHECKING
@@ -59,6 +62,121 @@ def _fft_resample_dim(img: Tensor, n_new: int, dim: int) -> Tensor:
     return torch.fft.ifft(Y, dim=dim) * (n_new / n_old)
 
 
+@functools.lru_cache(maxsize=64)
+def _merge_weight_table(ny_c: int, ny_new: int, order: int, v: float) -> tuple[Tensor, Tensor]:
+    """
+    Knab windowed-sinc weights for resampling ny_c -> ny_new samples over a
+    shared extent with the ``v0 + i*L/n`` sample convention.
+
+    Output index j interpolates the child at fractional index
+    ``u = j*ny_c/ny_new``. The start index is clamped to keep all taps in
+    bounds; out-of-window taps get zero weight, so clamping is exactly window
+    truncation at the edges. Returns (w [ny_new, order_eff] float32,
+    idx [ny_new] int32) on CPU.
+    """
+    if ny_c == ny_new:
+        w = torch.ones((ny_new, 1), dtype=torch.float32)
+        idx = torch.arange(ny_new, dtype=torch.int32)
+        return w, idx
+    order_eff = min(order, ny_c)
+    a = order_eff / 2
+    j = torch.arange(ny_new, dtype=torch.float64)
+    u = j * ny_c / ny_new
+    idx = torch.clamp(torch.floor(u).long() - order_eff // 2 + 1, 0, ny_c - order_eff)
+    t = torch.arange(order_eff, dtype=torch.float64)
+    x = u[:, None] - (idx[:, None].double() + t[None, :])
+    arg = torch.clamp(1.0 - (x / a) ** 2, min=0.0)
+    w = torch.sinc(x) * torch.cosh(math.pi * v * a * torch.sqrt(arg)) / math.cosh(math.pi * v * a)
+    w = torch.where(x.abs() < a, w, torch.zeros_like(w))
+    return w.float(), idx.to(torch.int32)
+
+
+@functools.lru_cache(maxsize=64)
+def _merge_weight_table_dev(ny_c: int, ny_new: int, order: int, v: float, device: str) -> tuple[Tensor, Tensor]:
+    w, idx = _merge_weight_table(ny_c, ny_new, order, v)
+    return w.to(device), idx.to(device)
+
+
+def cfbp_merge2(
+    img0: Tensor,
+    img1: Tensor,
+    w0: Tensor,
+    idx0: Tensor,
+    w1: Tensor,
+    idx1: Tensor,
+    dx: float,
+    dy: float,
+    ox0: float,
+    oy0: float,
+    z0: float,
+    ox1: float,
+    oy1: float,
+    z1: float,
+    oxp: float,
+    oyp: float,
+    zp: float,
+    ref_phase: float,
+) -> Tensor:
+    """
+    Merge two demodulated cfbp subaperture images into their parent image.
+
+    Both children and the output share the same x and y extents; the y
+    interpolation from child sampling to output sampling uses the
+    precomputed per-output-row weight tables (see
+    :func:`_merge_weight_table`). ``ox*, oy*`` are the output grid start
+    coordinates relative to each subaperture center (child 0, child 1,
+    parent) and ``z*`` the corresponding center heights. Each interpolated
+    child is re-referenced from its own demodulation carrier to the parent
+    carrier with phase ``pi * ref_phase * (d_child - d_parent)`` and the two
+    are summed.
+    """
+    nbatch, nx, ny0 = img0.shape
+    ny1 = img1.shape[-1]
+    nyout = idx0.shape[0]
+    return torch.ops.torchbp.cfbp_merge2.default(
+        img0, img1, w0, idx0, w1, idx1,
+        nbatch, nx, ny0, ny1, nyout, w0.shape[-1], w1.shape[-1],
+        dx, dy, ox0, oy0, z0, ox1, oy1, z1, oxp, oyp, zp, ref_phase,
+    )
+
+
+@torch.library.register_fake("torchbp::cfbp_merge2")
+def _fake_cfbp_merge2(
+    img0: Tensor,
+    img1: Tensor,
+    w0: Tensor,
+    idx0: Tensor,
+    w1: Tensor,
+    idx1: Tensor,
+    nbatch: int,
+    Nx: int,
+    Ny0: int,
+    Ny1: int,
+    Nyout: int,
+    order0: int,
+    order1: int,
+    dx: float,
+    dy: float,
+    ox0: float,
+    oy0: float,
+    z0: float,
+    ox1: float,
+    oy1: float,
+    z1: float,
+    oxp: float,
+    oyp: float,
+    zp: float,
+    ref_phase: float,
+):
+    torch._check(img0.dtype == torch.complex64)
+    torch._check(img1.dtype == torch.complex64)
+    torch._check(w0.dtype == torch.float32)
+    torch._check(w1.dtype == torch.float32)
+    torch._check(idx0.dtype == torch.int32)
+    torch._check(idx1.dtype == torch.int32)
+    return torch.empty((nbatch, Nx, Nyout), dtype=torch.complex64, device=img0.device)
+
+
 def _grid_axes(grid: dict, origin: Tensor, device) -> tuple[Tensor, Tensor]:
     """Pixel coordinate axes centered on origin, in float64."""
     x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
@@ -101,6 +219,7 @@ def cfbp(
     guard_y: float = 0.05,
     beamwidth: float = torch.pi,
     data_fmod: float = 0,
+    interp_method: "tuple | str" = ("knab", 8, 1.4),
 ) -> Tensor:
     """
     Cartesian factorized backprojection.
@@ -110,9 +229,10 @@ def cfbp(
     :func:`backprojection_cart_2d` onto the full output grid extent, coarsely
     sampled in the cross-range (y) dimension. Subaperture images are
     demodulated with the carrier referenced to the subaperture center, which
-    makes them bandlimited so that merging only needs exact FFT upsampling
-    along y and a phase re-reference. The output matches
-    ``backprojection_cart_2d(data, grid, ...)`` up to interpolation error.
+    makes them bandlimited so that merging only needs upsampling along y and
+    a phase re-reference, done in a single fused kernel (see
+    ``interp_method``). The output matches ``backprojection_cart_2d(data,
+    grid, ...)`` up to interpolation error.
 
     Antenna pattern normalization is not implemented.
 
@@ -151,13 +271,23 @@ def cfbp(
         images are never resampled in x.
     guard_y : float
         Internal guard band on each side of the y extent as a fraction of ny,
-        cropped from the output. Absorbs the periodic wrap-around of the FFT
-        interpolation at the y edges of the image.
+        cropped from the output. Absorbs the y edge effects of the merge
+        interpolation (periodic wrap-around for the fft method, window
+        truncation for knab).
     beamwidth : float
         Beamwidth of the antenna in radians. Passed to
         :func:`backprojection_cart_2d`.
     data_fmod : float
         Range modulation frequency applied to input data.
+    interp_method : tuple or str
+        Merge interpolation method. ``("knab", order, oversample)`` uses the
+        compiled merge kernel with an exactly evaluated Knab windowed-sinc
+        interpolator of ``order`` taps designed for signals occupying
+        ``1/oversample`` of the sampling rate; ``oversample`` should not
+        exceed ``oversample_y``. ``"fft"`` uses exact FFT resampling in
+        pure torch, which is slower but has no interpolation error and
+        supports gradient calculation through the merge. The knab method
+        falls back to the fft path when the merged images require gradient.
 
     Returns
     -------
@@ -185,6 +315,15 @@ def cfbp(
         raise ValueError("data shape should be [nsweeps, samples]")
     if pos.dim() != 2 or pos.shape[0] != data.shape[0]:
         raise ValueError("pos shape should be [nsweeps, 3]")
+    if isinstance(interp_method, str):
+        interp_method = (interp_method,)
+    if interp_method[0] == "knab":
+        if len(interp_method) != 3:
+            raise ValueError("interp_method should be ('knab', order, oversample) or 'fft'")
+        if interp_method[2] <= 1:
+            raise ValueError("interp_method oversample should be > 1")
+    elif interp_method[0] != "fft":
+        raise ValueError("interp_method should be ('knab', order, oversample) or 'fft'")
 
     # Carrier spatial frequency of the image in units of pi. Includes the
     # data_fmod contribution to the range phase applied by the kernel.
@@ -203,7 +342,7 @@ def cfbp(
 
     img, origin, z0 = _cfbp_impl(
         data, grid_impl, fc, r_res, pos, stages, divisions, d0,
-        oversample_y, beamwidth, data_fmod, keff
+        oversample_y, beamwidth, data_fmod, keff, interp_method
     )
     if n_guard > 0:
         img = img[..., n_guard : n_guard + grid["ny"]]
@@ -344,6 +483,7 @@ def cfbp_adaptive(
     data_fmod: float = 0,
     data_oversample: float = 2.0,
     merge_cost: float = 8.0,
+    interp_method: "tuple | str" = ("knab", 8, 1.4),
 ) -> Tensor:
     """
     Cartesian factorized backprojection with range-adaptive y-density.
@@ -407,7 +547,7 @@ def cfbp_adaptive(
         }
         img_b = cfbp(
             data, grid_b, fc, r_res, pos, s, divisions, d0,
-            oversample_y, guard_y, beamwidth, data_fmod
+            oversample_y, guard_y, beamwidth, data_fmod, interp_method
         )
         # Internal samples lie at y0 + i*Ly/(k*ny); every k-th one is exactly
         # an output grid position, so decimation is pure subsampling.
@@ -428,6 +568,7 @@ def _cfbp_impl(
     beamwidth: float,
     data_fmod: float,
     keff: float,
+    interp_method: tuple,
 ) -> tuple[Tensor, Tensor, float]:
     """Recursive cfbp. Returns (demodulated image [1, nx, ny], origin [3], z0)."""
     device = data.device
@@ -452,6 +593,7 @@ def _cfbp_impl(
                 beamwidth=beamwidth,
                 data_fmod=data_fmod,
                 keff=keff,
+                interp_method=interp_method,
             )
         else:
             pos_local, origin_row = center_pos(pos_chunk)
@@ -482,20 +624,44 @@ def _cfbp_impl(
             grid_new["ny"] = grid1["ny"] + grid2["ny"]
             grid_new["nx"] = max(grid1["nx"], grid2["nx"])
 
-        d_parent = _grid_distance(grid_new, new_origin, new_z, device)
+        use_kernel = (
+            interp_method[0] == "knab"
+            and grid1["nx"] == grid_new["nx"]
+            and grid2["nx"] == grid_new["nx"]
+            and grid1["ny"] <= grid_new["ny"]
+            and grid2["ny"] <= grid_new["ny"]
+            and not (torch.is_grad_enabled() and (img1.requires_grad or img2.requires_grad))
+        )
+        if use_kernel:
+            order, oversample = interp_method[1], interp_method[2]
+            v = round(1.0 - 1.0 / oversample, 6)
+            ny_new = grid_new["ny"]
+            dev = str(device)
+            w1, i1 = _merge_weight_table_dev(grid1["ny"], ny_new, order, v, dev)
+            w2, i2 = _merge_weight_table_dev(grid2["ny"], ny_new, order, v, dev)
+            x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid_new)
+            img_sum = cfbp_merge2(
+                img1, img2, w1, i1, w2, i2, dx, dy,
+                x0 - float(origin1[0]), y0 - float(origin1[1]), z1,
+                x0 - float(origin2[0]), y0 - float(origin2[1]), z2,
+                x0 - float(new_origin[0]), y0 - float(new_origin[1]), new_z,
+                keff,
+            )
+        else:
+            d_parent = _grid_distance(grid_new, new_origin, new_z, device)
 
-        img_sum = None
-        for origin_c, grid_c, img_c, z_c in ((origin1, grid1, img1, z1), (origin2, grid2, img2, z2)):
-            if grid_c["ny"] != grid_new["ny"]:
-                img_c = _fft_resample_dim(img_c, grid_new["ny"], dim=-1)
-            if grid_c["nx"] != grid_new["nx"]:
-                img_c = _fft_resample_dim(img_c, grid_new["nx"], dim=-2)
-            # Re-reference the demodulation carrier to the merged
-            # subaperture center. The phase difference is small so float32
-            # is accurate enough here.
-            ph = (torch.pi * keff) * (_grid_distance(grid_new, origin_c, z_c, device) - d_parent)
-            img_c = img_c * torch.polar(torch.ones_like(ph), ph)
-            img_sum = img_c if img_sum is None else img_sum + img_c
+            img_sum = None
+            for origin_c, grid_c, img_c, z_c in ((origin1, grid1, img1, z1), (origin2, grid2, img2, z2)):
+                if grid_c["ny"] != grid_new["ny"]:
+                    img_c = _fft_resample_dim(img_c, grid_new["ny"], dim=-1)
+                if grid_c["nx"] != grid_new["nx"]:
+                    img_c = _fft_resample_dim(img_c, grid_new["nx"], dim=-2)
+                # Re-reference the demodulation carrier to the merged
+                # subaperture center. The phase difference is small so float32
+                # is accurate enough here.
+                ph = (torch.pi * keff) * (_grid_distance(grid_new, origin_c, z_c, device) - d_parent)
+                img_c = img_c * torch.polar(torch.ones_like(ph), ph)
+                img_sum = img_c if img_sum is None else img_sum + img_c
 
         imgs[0] = None
         imgs[1] = None
