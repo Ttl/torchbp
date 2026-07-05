@@ -104,7 +104,7 @@ __device__ static inline void tx_power_pixel_moments(
         const float* pos, const float* att, int nsweeps,
         const float* g, float g_az0, float g_el0, float g_daz, float g_del,
         int g_naz, int g_nel, const float* wa, int normalization,
-        float min_sin2, bool strict_edge,
+        float min_sin2,
         float* pixel, float* m_w, float* m_mean, float* m_s) {
     float acc = 0.0f, mw = 0.0f, mmean = 0.0f, ms = 0.0f;
     for (int i = 0; i < nsweeps; i++) {
@@ -118,10 +118,10 @@ __device__ static inline void tx_power_pixel_moments(
         const float az_idx = (psi - att[3*i + 2] - g_az0) / g_daz;
         const int el_int = el_idx;
         const int az_int = az_idx;
-        const bool el_bad = strict_edge ? (el_idx < 0.0f) : (el_int < 0);
-        const bool az_bad = strict_edge ? (az_idx < 0.0f) : (az_int < 0);
-        if (el_bad || el_int + 1 >= g_nel) continue;
-        if (az_bad || az_int + 1 >= g_naz) continue;
+        // Reject samples below the pattern's first row/column (negative
+        // fractional index) rather than extrapolating gain below the edge.
+        if (el_idx < 0.0f || el_int + 1 >= g_nel) continue;
+        if (az_idx < 0.0f || az_int + 1 >= g_naz) continue;
         const float g_i = interp2d<float>(g, g_nel, g_naz,
                 el_int, el_idx - el_int, az_int, az_idx - az_int);
         float sinl = 1.0f;

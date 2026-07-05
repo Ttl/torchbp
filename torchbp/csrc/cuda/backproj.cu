@@ -651,81 +651,15 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
                   : pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2];
     const float min_sin2_look = 2.0f * dr / h_ref;
 
-    float pixel = 0.0f;
-    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
-    // used to estimate the azimuth resolution from the aperture.
-    float m_w = 0.0f;     // sum of weights
-    float m_mean = 0.0f;  // weighted mean of psi
-    float m_s = 0.0f;     // weighted sum of squared deviations
-
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
-        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
-        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
-
-        float px = (px_base - pos_x);
-        float py = (py_base - pos_y);
-        float h = (altitude > 0.0f) ? z_eff : pos_z;
-        float pz2 = h * h;
-
-        // Calculate distance to the pixel.
-        float d = sqrtf(px * px + py * py + pz2);
-
-        // Avoid nans due to numerical precision by clamping to valid range.
-        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
-        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
-        const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
-        const float az_deg = psi - att[idbatch * nsweeps * 3 + 3 * i + 2];
-        // TODO: consider platform pitch
-
-        const float el_idx = (el_deg - g_el0) / g_del;
-        const float az_idx = (az_deg - g_az0) / g_daz;
-
-        const int el_int = el_idx;
-        const int az_int = az_idx;
-        const float el_frac = el_idx - el_int;
-        const float az_frac = az_idx - az_int;
-
-        if (el_idx < 0.0f || el_int+1 >= g_nel) {
-            continue;
-        }
-        if (az_idx < 0.0f || az_int+1 >= g_naz) {
-            continue;
-        }
-        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
-        float sinl = 1.0f;
-
-        if (normalization == 1) {
-            // sigma_0
-            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d)));
-        } else if (normalization == 2) {
-            // gamma_0
-            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d))) * d / h;
-        } else if (normalization == 3) {
-            // point
-            // Scale as d^4 instead of d^3 for area target.
-            sinl = d;
-        }
-        // beta_0 otherwise
-
-        float w = wa[idbatch * nsweeps + i];
-        // Plain illumination weight (no incidence term) for the moments.
-        const float wi = g_i * g_i * w * w / (d*d*d);
-        pixel += wi / sinl;
-
-        // Welford weighted update (numerically stable, handles squint).
-        // Only needed for the azimuth resolution estimate.
-        // Skip zero weights: if the first accepted sweep had wi == 0 the
-        // update would be 0/0 = NaN, poisoning the accumulator.
-        if (azimuth_resolution && wi > 0.0f) {
-            const float wsum = m_w + wi;
-            const float delta = psi - m_mean;
-            m_mean += delta * wi / wsum;
-            m_s += wi * delta * (psi - m_mean);
-            m_w = wsum;
-        }
-    }
+    // Per-sweep accumulation (shared helper). nbatch is handled by offsetting
+    // the pointers. Slant grids use a fixed reference height (z_eff = altitude),
+    // ground grids the per-sweep platform z.
+    float pixel, m_w, m_mean, m_s;
+    tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/altitude > 0.0f, z_eff,
+            pos + (size_t)idbatch * nsweeps * 3, att + (size_t)idbatch * nsweeps * 3,
+            nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            wa + (size_t)idbatch * nsweeps, normalization, min_sin2_look,
+            &pixel, &m_w, &m_mean, &m_s);
 
     if (azimuth_resolution) {
         const float Rg = sqrtf(px_base * px_base + py_base * py_base);
@@ -785,81 +719,14 @@ __global__ void backprojection_cart_2d_tx_power_kernel(
     const float h_ref = pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2];
     const float min_sin2_look = 2.0f * dx / h_ref;
 
-    float pixel = 0.0f;
-    // Welford weighted moments of the ground-frame line-of-sight azimuth angle,
-    // used to estimate the azimuth resolution from the aperture.
-    float m_w = 0.0f;     // sum of weights
-    float m_mean = 0.0f;  // weighted mean of psi
-    float m_s = 0.0f;     // weighted sum of squared deviations
-
-    for(int i = 0; i < nsweeps; i++) {
-        // Sweep reference position.
-        float pos_x = pos[idbatch * nsweeps * 3 + i * 3 + 0];
-        float pos_y = pos[idbatch * nsweeps * 3 + i * 3 + 1];
-        float pos_z = pos[idbatch * nsweeps * 3 + i * 3 + 2];
-
-        float px = (px_base - pos_x);
-        float py = (py_base - pos_y);
-        float h = pos_z;
-        float pz2 = h * h;
-
-        // Calculate distance to the pixel.
-        float d = sqrtf(px * px + py * py + pz2);
-
-        // Avoid nans due to numerical precision by clamping to valid range.
-        const float look_angle = asinf(fmaxf(-h / d, -1.0f));
-        const float psi = atan2f(py, px);  // ground-frame LOS azimuth
-        const float el_deg = look_angle - att[idbatch * nsweeps * 3 + 3 * i + 0];
-        const float az_deg = psi - att[idbatch * nsweeps * 3 + 3 * i + 2];
-        // TODO: consider platform pitch
-
-        const float el_idx = (el_deg - g_el0) / g_del;
-        const float az_idx = (az_deg - g_az0) / g_daz;
-
-        const int el_int = el_idx;
-        const int az_int = az_idx;
-        const float el_frac = el_idx - el_int;
-        const float az_frac = az_idx - az_int;
-
-        if (el_idx < 0.0f || el_int+1 >= g_nel) {
-            continue;
-        }
-        if (az_idx < 0.0f || az_int+1 >= g_naz) {
-            continue;
-        }
-        float g_i = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
-        float sinl = 1.0f;
-
-        if (normalization == 1) {
-            // sigma_0
-            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d)));
-        } else if (normalization == 2) {
-            // gamma_0
-            sinl = sqrtf(fmaxf(min_sin2_look, 1.0f - (h * h) / (d * d))) * d / h;
-        } else if (normalization == 3) {
-            // point
-            // Scale as d^4 instead of d^3 for area target.
-            sinl = d;
-        }
-        // beta_0 otherwise
-
-        float w = wa[idbatch * nsweeps + i];
-        // Plain illumination weight (no incidence term) for the moments.
-        const float wi = g_i * g_i * w * w / (d*d*d);
-        pixel += wi / sinl;
-
-        // Welford weighted update (numerically stable, handles squint).
-        // Only needed for the azimuth resolution estimate.
-        // Skip zero weights: if the first accepted sweep had wi == 0 the
-        // update would be 0/0 = NaN, poisoning the accumulator.
-        if (azimuth_resolution && wi > 0.0f) {
-            const float wsum = m_w + wi;
-            const float delta = psi - m_mean;
-            m_mean += delta * wi / wsum;
-            m_s += wi * delta * (psi - m_mean);
-            m_w = wsum;
-        }
-    }
+    // Per-sweep accumulation (shared helper). nbatch is handled by offsetting
+    // the pointers. Cartesian ground grid: per-sweep height is the platform z.
+    float pixel, m_w, m_mean, m_s;
+    tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/false, 0.0f,
+            pos + (size_t)idbatch * nsweeps * 3, att + (size_t)idbatch * nsweeps * 3,
+            nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+            wa + (size_t)idbatch * nsweeps, normalization, min_sin2_look,
+            &pixel, &m_w, &m_mean, &m_s);
 
     if (azimuth_resolution) {
         const float Rg = sqrtf(px_base * px_base + py_base * py_base);
@@ -946,12 +813,11 @@ __global__ void backprojection_polar_2d_tx_power_accum_kernel(
     const float min_look_angle = sqrtf(2.0f * dr_ref / h_ref);
 
     // Polar grid: slant grids use a fixed reference height (z_eff = altitude),
-    // ground grids the per-sweep platform z. Non-strict pattern edge (matches
-    // the direct polar kernel: reject only a negative integer index).
+    // ground grids the per-sweep platform z.
     float pixel, m_w, m_mean, m_s;
     tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/altitude > 0.0f, z_eff,
             pos, att, nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
-            wa, normalization, min_look_angle, /*strict_edge=*/false,
+            wa, normalization, min_look_angle,
             &pixel, &m_w, &m_mean, &m_s);
 
     // Unfinished accumulators for factorized (ffbp style) processing:
@@ -1005,12 +871,11 @@ __global__ void backprojection_cart_2d_tx_power_accum_kernel(
     // final output grid so that all subaperture maps use the same clamp floor.
     const float min_sin2_look = 2.0f * dx_ref / h_ref;
 
-    // Cartesian ground grid: per-sweep height is the platform z; strict pattern
-    // edge (reject negative fractional index, no extrapolation below the edge).
+    // Cartesian ground grid: per-sweep height is the platform z.
     float pixel, m_w, m_mean, m_s;
     tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/false, 0.0f,
             pos, att, nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
-            wa, normalization, min_sin2_look, /*strict_edge=*/true,
+            wa, normalization, min_sin2_look,
             &pixel, &m_w, &m_mean, &m_s);
 
     // Unfinished accumulators for factorized (cfbp style) processing:
