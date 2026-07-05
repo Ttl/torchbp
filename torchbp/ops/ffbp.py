@@ -3,6 +3,7 @@ import torch
 from torch import Tensor
 from typing import Union, TYPE_CHECKING
 from warnings import warn
+from .afbp import afbp
 from .backproj import backprojection_polar_2d, backprojection_polar_2d_tx_power, _backprojection_polar_2d_tx_power_accum, _tx_power_finish
 from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, ffbp_tx_power_merge2, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
@@ -168,6 +169,7 @@ def ffbp(
     g_extent: list | None = None,
     weight_map_downsample: int = 1,
     weight_eps: float | None = None,
+    afbp_nsub: int = 1,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -248,6 +250,15 @@ def ffbp(
         pixels at the matched-filter value and only suppresses weakly illuminated
         ones. Exact value should not be critical.
         Ignored when no antenna pattern is given.
+    afbp_nsub : int
+        If greater than 1, compute the base level subaperture images with
+        :func:`afbp` using this many sub-subapertures instead of direct
+        backprojection, which reduces the base level cost roughly
+        ``afbp_nsub`` times. This does not change the output accuracy,
+        which stays dominated by the merge interpolation error; the gain
+        is that ``stages`` can be reduced by about ``log2(afbp_nsub)``
+        merge levels at constant total cost, which does reduce the error.
+        Default is 1 (direct backprojection).
 
     Returns
     -------
@@ -305,7 +316,8 @@ def ffbp(
         oversample_r, oversample_theta, dealias, data_fmod, alias_fmod,
         output_alias, use_poly, poly_coefs,
         att, g, g_extent, weight_map_downsample,
-        is_top_level=True
+        is_top_level=True,
+        afbp_nsub=afbp_nsub,
     )
     # _ffbp_impl returns (img, w1_map, w2_map, weight_grid)
     # Without an antenna pattern the image is already normalized
@@ -340,6 +352,7 @@ def _ffbp_impl(
     weight_map_downsample: int = 1,
     is_top_level: bool = True,
     pos_z: list | None = None,
+    afbp_nsub: int = 1,
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients."""
     nsweeps = data.shape[0]
@@ -401,15 +414,25 @@ def _ffbp_impl(
                 weight_map_downsample=weight_map_downsample,
                 is_top_level=False,
                 pos_z=pos_z_local,
+                afbp_nsub=afbp_nsub,
             )
         else:
             # When using antenna pattern, request unnormalized output
             normalize = not use_antenna_pattern
-            img = backprojection_polar_2d(
-                data_local, grid_local, fc, r_res, pos_local, d0=d0, dealias=True,
-                data_fmod=data_fmod, alias_fmod=alias_fmod,
-                att=att_local, g=g, g_extent=g_extent, normalize=normalize
-            )
+            if afbp_nsub > 1:
+                img = afbp(
+                    data_local, grid_local, fc, r_res, pos_local,
+                    nsub=afbp_nsub, d0=d0, dealias=True,
+                    data_fmod=data_fmod, alias_fmod=alias_fmod,
+                    att=att_local, g=g, g_extent=g_extent,
+                    normalize=normalize
+                )[None]
+            else:
+                img = backprojection_polar_2d(
+                    data_local, grid_local, fc, r_res, pos_local, d0=d0, dealias=True,
+                    data_fmod=data_fmod, alias_fmod=alias_fmod,
+                    att=att_local, g=g, g_extent=g_extent, normalize=normalize
+                )
 
             # Compute weight maps at base level for antenna pattern weighting
             w1_map = None

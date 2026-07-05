@@ -1,3 +1,4 @@
+from .afbp import *
 from .backproj import *
 from .cfar import *
 from .cfbp import *
