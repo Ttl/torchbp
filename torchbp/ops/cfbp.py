@@ -222,7 +222,7 @@ def cfbp(
     interp_method: "tuple | str" = ("knab", 8, 1.4),
 ) -> Tensor:
     """
-    Cartesian factorized backprojection.
+    Cartesian factorized backprojection. [1]_
 
     Factorized backprojection directly on a Cartesian grid. The aperture is
     recursively split into subapertures which are backprojected with
@@ -308,6 +308,13 @@ def cfbp(
     ``stages`` to avoid aliasing in the base images. Polar :func:`ffbp` does
     not have this limitation and is a better choice for very wide-angle
     imaging.
+
+    References
+    ----------
+    .. [1] Q. Dong, G. -C. Sun, Z. Yang, L. Guo and M. Xing, "Cartesian
+    Factorized Backprojection Algorithm for High-Resolution Spotlight SAR
+    Imaging," in IEEE Sensors Journal, vol. 18, no. 3, pp. 1160-1168, 1 Feb.1,
+    2018.
     """
     if hasattr(grid, "to_dict"):
         grid = grid.to_dict()
