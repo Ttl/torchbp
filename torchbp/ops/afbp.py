@@ -146,19 +146,23 @@ def afbp(
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
     nsub : int
-        Number of subapertures. The subaperture backprojection cost drops
-        roughly ``nsub`` times below direct backprojection. Larger values
-        need a theta-oversampled grid (see ``grid``) and increase the
-        relative cost of the guard band and the fusion. Falls back to
-        direct backprojection (with a warning where informative) when the
-        split cannot work: fewer than two pulses per subaperture, a
-        decimated grid that would not be smaller than the output, or an
-        internal grid alpha extent exceeding the grating-free extent of
-        the pulse sampling ``lambda_min / (2 * max pulse spacing)`` — a
-        subaperture of few pulses has azimuth grating replicas at that
-        period which would alias through the fusion. The last condition
-        is what bounds nsub for a given pulse count; accuracy degrades
-        gradually as it is approached.
+        Number of subapertures, treated as an upper bound. The subaperture
+        backprojection cost drops roughly ``nsub`` times below direct
+        backprojection. Larger values need a theta-oversampled grid (see
+        ``grid``) and increase the relative cost of the guard band and the
+        fusion. The value is lowered silently when the requested split
+        cannot work: to keep at least two pulses per subaperture, and to
+        keep the internal grid alpha extent within the grating-free
+        extent of the pulse sampling ``lambda_min / (2 * max pulse
+        spacing)`` — a subaperture of few pulses has azimuth
+        grating replicas at that period which would alias through the
+        fusion, and the internal extent grows with nsub through the guard
+        band. A lowered value sits at the constraint boundary, where
+        accuracy degrades gradually. Falls back to direct backprojection
+        when no split works: the output theta extent alone reaches the
+        grating replicas (a direct image of such a grid carries grating
+        lobes anyway), or the decimated grid would not be smaller than
+        the output.
     d0 : float
         Zero range correction.
     dealias : bool
@@ -247,14 +251,9 @@ def afbp(
     nsweeps, nsamples = data.shape
     device = data.device
 
-    # Fall back to direct backprojection when the split cannot pay off:
-    # too few pulses, or a decimated grid that would not be smaller than
-    # the output grid once the guard band and ceil padding are added (the
-    # subaperture backprojection work scales with the decimated grid
-    # size). The latter happens when afbp is applied to tiny grids, e.g.
-    # a deep ffbp recursion base level.
-    n_c_full = -(-ntheta // nsub) + 2 * guard_theta
-    if nsub <= 1 or nsweeps < 2 * nsub or n_c_full >= ntheta:
+    # Direct backprojection when no split is possible at all: a split
+    # needs at least two subapertures of at least two pulses.
+    if nsub <= 1 or nsweeps < 4:
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
@@ -266,15 +265,8 @@ def afbp(
     # Range spectrum center of the dealiased image in cycles/m.
     nu_c = alias_fmod / (2.0 * dr) - data_fmod / (2.0 * r_res)
 
-    # Split the track into nsub contiguous chunks.
-    bounds = [round(i * nsweeps / nsub) for i in range(nsub + 1)]
-    m = max(bounds[i + 1] - bounds[i] for i in range(nsub))
-    # Single transfer for the chunk means instead of one device sync per
-    # chunk.
+    # Single transfer instead of one device sync per use.
     pos_y = pos[:, 1].double().cpu()
-    x_u = torch.tensor([float(pos_y[bounds[u] : bounds[u + 1]].mean())
-                        for u in range(nsub)], dtype=torch.float64)
-
     z0 = float(pos[:, 2].double().mean())
     # Ground-to-slant factor: with nonzero altitude the azimuth carrier of
     # a pixel at ground range r is kr * x * rd(r) with rd(r) = r / sqrt(r^2
@@ -282,9 +274,59 @@ def afbp(
     # runs in the range wavenumber domain where the rows mix all ranges;
     # rd is handled by fusing the swath in range blocks, each with the
     # factor at its center (see below). fac here is the swath center value
-    # used by the validity checks.
+    # used by the split sizing and validity checks.
     r_mid = 0.5 * (r0 + r1)
     fac = r_mid / math.sqrt(r_mid**2 + z0**2)
+    kr_max = abs(krc) + min(math.pi / dr, math.pi / r_res)
+
+    # nsub is an upper bound. The internal grid alpha extent n_c * nsub *
+    # dtheta must stay within the grating-free extent of the pulse
+    # sampling, 2*pi / (kr * dp * fac) with dp the pulse spacing: a
+    # subaperture of few pulses has azimuth grating replicas at that alpha
+    # period, and once the internal extent (output plus guard and ceil
+    # padding cells, whose width scales with nsub) reaches them, they
+    # alias through the fusion into the image. The output extent is
+    # fixed, so the constraint only bounds the guard and padding
+    # contribution and with it nsub: lower nsub until the extent fits,
+    # keeping at least two pulses per subaperture.
+    dp = float((pos_y[1:] - pos_y[:-1]).abs().max())
+    # Grating-free extent in units of dtheta.
+    e_cells = 2.0 * math.pi / (kr_max * max(dp, 1e-12) * fac * dtheta)
+    nsub_max = min(nsub, nsweeps // 2)
+    nsub_eff = nsub_max
+    while nsub_eff > 1 and (
+            (-(-ntheta // nsub_eff) + 2 * guard_theta) * nsub_eff > e_cells):
+        nsub_eff -= 1
+    if nsub_eff <= 1:
+        warn("afbp: the pulse spacing cannot support the internal grid "
+             "extent for any subaperture split (the output theta extent "
+             "reaches the azimuth grating replicas of the pulse sampling "
+             "within the guard band); falling back to direct "
+             "backprojection")
+        return backprojection_polar_2d(
+            data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
+            data_fmod=data_fmod, alias_fmod=alias_fmod,
+            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+    nsub = nsub_eff
+
+    # Fall back to direct backprojection when the split cannot pay off: a
+    # decimated grid that would not be smaller than the output grid once
+    # the guard band and ceil padding are added (the subaperture
+    # backprojection work scales with the decimated grid size). Happens
+    # when afbp is applied to tiny grids, e.g. a deep ffbp recursion base
+    # level.
+    n_c_full = -(-ntheta // nsub) + 2 * guard_theta
+    if n_c_full >= ntheta:
+        return backprojection_polar_2d(
+            data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
+            data_fmod=data_fmod, alias_fmod=alias_fmod,
+            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+
+    # Split the track into nsub contiguous chunks.
+    bounds = [round(i * nsweeps / nsub) for i in range(nsub + 1)]
+    m = max(bounds[i + 1] - bounds[i] for i in range(nsub))
+    x_u = torch.tensor([float(pos_y[bounds[u] : bounds[u + 1]].mean())
+                        for u in range(nsub)], dtype=torch.float64)
 
     # Validity checks. Patch width at the largest occupied range wavenumber
     # must fit the decimated grid band, and the linear phase approximation
@@ -300,7 +342,6 @@ def afbp(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
-    kr_max = abs(krc) + min(math.pi / dr, math.pi / r_res)
     if kr_max * l_sub * fac * nsub * dtheta > 2.0 * math.pi:
         warn(f"afbp: subaperture spectrum patch does not fit the decimated "
              f"theta grid band; decrease nsub or the grid theta step "
@@ -318,29 +359,12 @@ def afbp(
 
     # Internal decimated grid. Rounding n_c up to a fast FFT length only
     # adds guard cells; the decimation alignment holds for any n_c. The
-    # extra cells are split evenly between the two guard bands.
-    #
-    # The internal grid alpha extent n_c * nsub * dtheta must stay within
-    # the grating-free extent of the pulse sampling, 2*pi / (kr * dp *
-    # fac) with dp the pulse spacing: a subaperture of few pulses has
-    # azimuth grating replicas at that alpha period, and once the internal
-    # extent (output plus guard cells, which scale with nsub) reaches
-    # them, they alias through the fusion into the image. This is what
-    # limits nsub for a given pulse count.
-    dp = float((pos_y[1:] - pos_y[:-1]).abs().max())
-    n_c_max = int(2.0 * math.pi / (kr_max * max(dp, 1e-12) * fac * nsub * dtheta))
+    # extra cells are split evenly between the two guard bands. The fast
+    # length is only used when it keeps the internal extent within the
+    # grating-free extent (n_c_full itself fits by the nsub cap above).
     n_c = next_fast_len(n_c_full)
-    if n_c > n_c_max:
+    if n_c * nsub > e_cells:
         n_c = n_c_full
-    if n_c > n_c_max:
-        warn(f"afbp: the pulse spacing cannot support the internal grid "
-             f"extent (azimuth grating replicas of the {m}-pulse "
-             f"subapertures would alias into the image); decrease nsub. "
-             f"Falling back to direct backprojection")
-        return backprojection_polar_2d(
-            data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
-            data_fmod=data_fmod, alias_fmod=alias_fmod,
-            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
     if n_c >= ntheta:
         # The guard and padding ate the decimation gain.
         return backprojection_polar_2d(
