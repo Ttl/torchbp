@@ -387,15 +387,13 @@ def afbp(
             att_b, g, g_extent, normalize)
 
     # The guard band and the ceil padding can push internal grid columns
-    # past the polar domain |theta| <= 1, where the backprojection kernel
-    # returns NaN. Zero them: they carry no scene content and zeros act as
-    # a clean guard buffer. nan_to_num catches the domain-boundary columns
-    # where the kernel's float32 theta rounding may still cross 1.
-    th_c = theta0_i + (nsub * dtheta) * torch.arange(n_c, dtype=torch.float64)
-    outside = th_c.abs() > 1.0
-    if bool(outside.any()):
-        imgs = imgs * (~outside).to(device=device, dtype=imgs.real.dtype)
-        imgs = torch.nan_to_num(imgs)
+    # past the polar domain |theta| <= 1. The backprojection kernel
+    # computes the smooth continuation of the azimuth signal there (its
+    # phase stays linear in theta for a straight track), which the linear
+    # spectrum placement below handles like any interior column, so the
+    # columns can be kept: they carry valid guard content for output grids
+    # that themselves extend past |theta| = 1 (ffbp guard band base
+    # images).
 
     # Wavenumber-domain fusion. Azimuth FFT of every subaperture image; a
     # component exp(-1j*k*x_u*rd*alpha) of a dealiased image lands at

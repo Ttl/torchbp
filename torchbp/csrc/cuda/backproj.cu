@@ -55,12 +55,16 @@ __global__ void backprojection_polar_2d_kernel(
 
     if (idr_base >= Nr || idtheta >= Ntheta) return;
 
-    // Precompute theta sin/cos once (shared by all pixels in this thread)
+    // Precompute theta sin/cos once (shared by all pixels in this thread).
+    // The cosine is clamped: guard band grids extend past |theta| = 1 where
+    // the pixel is the smooth continuation of the azimuth signal past the
+    // fold (see the polar-form distance note below).
     const float sin_theta = theta0 + idtheta * dtheta;  // theta IS sin(angle) in this coord system
-    const float cos_theta = sqrtf(1.0f - sin_theta * sin_theta);
+    const float cos_theta = sqrtf(fmaxf(0.0f, 1.0f - sin_theta * sin_theta));
 
     // Coordinate storage for the pixels
     float r[PIXELS_PER_THREAD];
+    float r2[PIXELS_PER_THREAD];
     float x[PIXELS_PER_THREAD];
     float y[PIXELS_PER_THREAD];
     float pixel_re[PIXELS_PER_THREAD] = {0};
@@ -72,6 +76,7 @@ __global__ void backprojection_polar_2d_kernel(
     for(int k=0; k<PIXELS_PER_THREAD; ++k) {
         if(idr_base + k < Nr) {
             r[k] = r0 + (idr_base + k) * dr;
+            r2[k] = r[k] * r[k];
             x[k] = r[k] * cos_theta;
             y[k] = r[k] * sin_theta;
         }
@@ -94,6 +99,7 @@ __global__ void backprojection_polar_2d_kernel(
         float pos_z = __ldg(&pos[pos_idx + 2]);
 
         float pz2 = pos_z * pos_z;
+        float pn2 = fmaf(pos_x, pos_x, fmaf(pos_y, pos_y, pz2));
         int sweep_offset = data_batch_stride + i * sweep_samples;
 
         float att_el, att_az;
@@ -108,8 +114,17 @@ __global__ void backprojection_polar_2d_kernel(
 
             float px = x[k] - pos_x;
             float py = y[k] - pos_y;
-            float d_sq = fmaf(px, px, fmaf(py, py, pz2));
-            float d = sqrtf(d_sq);
+            // Distance in the polar form d^2 = r^2 + |p|^2
+            // - 2*r*(cos(theta)*p_x + sin(theta)*p_y). Inside |theta| <= 1 it
+            // equals the Cartesian distance to (x, y, 0); with the clamped
+            // cosine it stays affine in theta past |theta| = 1, which
+            // continues the azimuth chirp smoothly (exactly, for a straight
+            // track on the y axis) so that guard band samples give the FFBP
+            // merge interpolation valid support at the grid edge. Distance
+            // from a virtual Cartesian point would instead jump the phase
+            // rate to ~2k*r at the fold.
+            float d_sq = fmaf(-2.0f * x[k], pos_x, fmaf(-2.0f * y[k], pos_y, r2[k] + pn2));
+            float d = sqrtf(fmaxf(d_sq, 0.0f));
 
             // Compute d_eff once, use for both sx and phase
             float d_eff = d + d0;
@@ -221,7 +236,9 @@ __global__ void backprojection_polar_2d_kernel(
             }
 
             if (dealias) {
-                const float dd = sqrtf(x[k]*x[k] + y[k]*y[k] + z0*z0);
+                // Range-row-only carrier (also for guard band pixels
+                // |theta| > 1 where x^2 + y^2 != r^2).
+                const float dd = sqrtf(r2[k] + z0*z0);
                 float ref_sin, ref_cos;
                 __sincosf(fmaf(dealias_coef, dd, dealias_fmod * (idr_base + k)), &ref_sin, &ref_cos);
                 complex64_t ref = {ref_cos, ref_sin};
@@ -267,7 +284,9 @@ __global__ void backprojection_polar_2d_grad_kernel(
 
     const float r = r0 + idr * dr;
     const float theta = theta0 + idtheta * dtheta;
-    const float x = r * sqrtf(1.0f - theta*theta);
+    // Clamped cosine + polar-form distance below: same guard band
+    // continuation past |theta| = 1 as the forward kernel.
+    const float x = r * sqrtf(fmaxf(0.0f, 1.0f - theta*theta));
     const float y = r * theta;
 
     complex64_t g = {0.0f, 0.0f};
@@ -277,7 +296,7 @@ __global__ void backprojection_polar_2d_grad_kernel(
 
     float arg_dealias = 0.0f;
     if (dealias) {
-        const float d = sqrtf(x*x + y*y + z0*z0);
+        const float d = sqrtf(r*r + z0*z0);
         arg_dealias = -ref_phase * d + alias_fmod * idr;
         // TODO: Missing z0 gradient.
     }
@@ -294,8 +313,12 @@ __global__ void backprojection_polar_2d_grad_kernel(
         // Image plane is assumed to be at z=0
         float pz2 = pos_z * pos_z;
 
-        // Calculate distance to the pixel.
-        const float d = sqrtf(px * px + py * py + pz2);
+        // Distance in polar form, matches the forward kernel (also past
+        // |theta| = 1). d(pos) derivatives are unchanged: d(d^2)/d(pos_x)
+        // = 2*(pos_x - x) with x held constant.
+        const float d_sq = r*r + pos_x*pos_x + pos_y*pos_y + pz2
+                         - 2.0f * (x * pos_x + y * pos_y);
+        const float d = sqrtf(fmaxf(d_sq, 0.0f));
 
         float sx = delta_r * (d + d0);
 
@@ -3282,10 +3305,12 @@ __global__ void compute_illumination_kernel(
     const int full_idr = out_idr * decimation;
     const int full_idtheta = out_idtheta * decimation;
 
-    // Compute pixel coordinates
+    // Compute pixel coordinates. Clamped cosine + polar-form distance:
+    // guard band grids extend past |theta| = 1 (see the backprojection
+    // kernel note).
     const float r = r0 + dr * full_idr;
     const float t = theta0 + dtheta * full_idtheta;  // t is sin(theta)
-    const float cost = sqrtf(1.0f - t*t);
+    const float cost = sqrtf(fmaxf(0.0f, 1.0f - t*t));
     const float x = r * cost;
     const float y = r * t;
 
@@ -3299,8 +3324,9 @@ __global__ void compute_illumination_kernel(
 
         const float px = x - pos_x;
         const float py = y - pos_y;
-        const float pz = -pos_z;
-        const float d = sqrtf(px*px + py*py + pz*pz);
+        const float d_sq = r*r + pos_x*pos_x + pos_y*pos_y + pos_z*pos_z
+                         - 2.0f * (x * pos_x + y * pos_y);
+        const float d = sqrtf(fmaxf(d_sq, 0.0f));
 
         const float look_angle = asinf(fmaxf(-1.0f, fminf(1.0f, -pos_z / d)));
 

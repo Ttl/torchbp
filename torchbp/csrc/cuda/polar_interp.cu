@@ -22,6 +22,8 @@ __global__ void polar_interp_kernel_linear(const complex64_t *img, complex64_t
         t = sinf(asinf(t) - rotation);
     }
     if (t < -1.0f || t > 1.0f) {
+        // The output tensor is uninitialized; write zeros, don't skip.
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
         return;
     }
     const float dorig0 = dorigin[idbatch * 3 + 0];
@@ -203,6 +205,8 @@ __global__ void polar_interp_kernel_lanczos(const complex64_t *img,
         t = sinf(asinf(t) - rotation);
     }
     if (t < -1.0f || t > 1.0f) {
+        // The output tensor is uninitialized; write zeros, don't skip.
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
         return;
     }
     const float dorig0 = dorigin[idbatch * 3 + 0];
@@ -817,13 +821,11 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
 
     const float d = r1 + dr1 * idr;
     const float t = theta1 + dtheta1 * idtheta;
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        return;
-    }
-
+    // Guard band pixels |t| > 1 hold the smooth continuation of the azimuth
+    // signal past the fold: clamp the cosine to zero and keep the d^2 term
+    // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
-    const float cost = sqrtf(1.0f - t*t);
+    const float cost = sqrtf(fmaxf(0.0f, 1.0f - t*t));
     const float dz = sqrtf(z1*z1 + d*d);
 
     complex64_t pixel{};
@@ -832,9 +834,13 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
         const complex64_t *img = id == 0 ? img0 : img1;
         const float dorig0 = dorigin[id * 3 + 0];
         const float dorig1 = dorigin[id * 3 + 1];
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
+        const float rp2 = d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint);
+        const float rp = sqrtf(fmaxf(rp2, 0.0f));
+        // tp = y'/rp instead of sin(atan(y'/x')): identical inside |t| <= 1
+        // (there rp^2 = x'^2 + y'^2), but it continues past |tp| = 1 and so
+        // indexes into the source grid guard band where the continued
+        // samples live; the atan form folds back to |tp| <= 1.
+        const float tp = (d*sint + dorig1) / rp;
 
         const float dri = (rp - r0[id]) / dr[id];
         const float dti = (tp - theta0[id]) / dtheta[id];
@@ -882,13 +888,11 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
 
     const float d = r1 + dr1 * idr;
     const float t = theta1 + dtheta1 * idtheta;
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        return;
-    }
-
+    // Guard band pixels |t| > 1 hold the smooth continuation of the azimuth
+    // signal past the fold: clamp the cosine to zero and keep the d^2 term
+    // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
-    const float cost = sqrtf(1.0f - t*t);
+    const float cost = sqrtf(fmaxf(0.0f, 1.0f - t*t));
     const float dz = sqrtf(z1*z1 + d*d);
 
     complex64_t pixel{};
@@ -898,9 +902,13 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
         const complex64_t *img = id == 0 ? img0 : img1;
         const float dorig0 = dorigin[id * 3 + 0];
         const float dorig1 = dorigin[id * 3 + 1];
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
+        const float rp2 = d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint);
+        const float rp = sqrtf(fmaxf(rp2, 0.0f));
+        // tp = y'/rp instead of sin(atan(y'/x')): identical inside |t| <= 1
+        // (there rp^2 = x'^2 + y'^2), but it continues past |tp| = 1 and so
+        // indexes into the source grid guard band where the continued
+        // samples live; the atan form folds back to |tp| <= 1.
+        const float tp = (d*sint + dorig1) / rp;
 
         const float dri = (rp - r0[id]) / dr[id];
         const float dti = (tp - theta0[id]) / dtheta[id];
@@ -951,13 +959,11 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
 
     const float d = r1 + dr1 * idr;
     const float t = theta1 + dtheta1 * idtheta;
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        return;
-    }
-
+    // Guard band pixels |t| > 1 hold the smooth continuation of the azimuth
+    // signal past the fold: clamp the cosine to zero and keep the d^2 term
+    // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
-    const float cost = sqrtf(1.0f - t*t);
+    const float cost = sqrtf(fmaxf(0.0f, 1.0f - t*t));
     const float dz = sqrtf(z1*z1 + d*d);
 
     complex64_t pixel{};
@@ -966,9 +972,13 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
         const complex64_t *img = id == 0 ? img0 : img1;
         const float dorig0 = dorigin[id * 3 + 0];
         const float dorig1 = dorigin[id * 3 + 1];
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
+        const float rp2 = d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint);
+        const float rp = sqrtf(fmaxf(rp2, 0.0f));
+        // tp = y'/rp instead of sin(atan(y'/x')): identical inside |t| <= 1
+        // (there rp^2 = x'^2 + y'^2), but it continues past |tp| = 1 and so
+        // indexes into the source grid guard band where the continued
+        // samples live; the atan form folds back to |tp| <= 1.
+        const float tp = (d*sint + dorig1) / rp;
 
         const float dri = (rp - r0[id]) / dr[id];
         const float dti = (tp - theta0[id]) / dtheta[id];
@@ -1050,17 +1060,11 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
     const int w_out_idx = should_write_weight ?
                           (idr / dec) * out_ntheta_dec + (idtheta / dec) : 0;
 
-    if (t < -1.0f || t > 1.0f) {
-        out[idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
-        if (should_write_weight) {
-            w1_out[w_out_idx] = 0.0f;
-            w2_out[w_out_idx] = 0.0f;
-        }
-        return;
-    }
-
+    // Guard band pixels |t| > 1 hold the smooth continuation of the azimuth
+    // signal past the fold: clamp the cosine to zero and keep the d^2 term
+    // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
-    const float cost = sqrtf(fmaf(-t, t, 1.0f));
+    const float cost = sqrtf(fmaxf(0.0f, fmaf(-t, t, 1.0f)));
     const float dz = hypotf(z1, d);
 
     // Accumulate unnormalized A values and total W1, W2
@@ -1085,11 +1089,13 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
         const float dorig1 = __ldg(&dorigin[id * 3 + 1]);
         const float dorig2 = __ldg(&dorigin[id * 3 + 2]);
 
-        const float d_dorig0 = d * cost;
-        const float d_dorig1 = d * sint;
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
+        const float rp2 = d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint);
+        const float rp = sqrtf(fmaxf(rp2, 0.0f));
+        // tp = y'/rp instead of sin(atan(y'/x')): identical inside |t| <= 1
+        // (there rp^2 = x'^2 + y'^2), but it continues past |tp| = 1 and so
+        // indexes into the source grid guard band where the continued
+        // samples live; the atan form folds back to |tp| <= 1.
+        const float tp = (d*sint + dorig1) / rp;
 
         const float r0_val = __ldg(&r0[id]);
         const float dr_val = __ldg(&dr[id]);

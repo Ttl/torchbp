@@ -13,6 +13,13 @@ from ._utils import AntennaPattern, unpack_polar_grid
 if TYPE_CHECKING:
     from ..grid import PolarGrid
 
+# Recursion floor: stop splitting subapertures where the steady-state theta
+# guard band would exceed this fraction of the subaperture image (see the
+# min_core comment in _ffbp_impl). 1/3 measured fastest on CPU (order 6):
+# stricter fractions stop profitable splits (0.1 was 2.3x slower), while
+# unbounded splitting wastes ~25% on guard-dominated tiny subapertures.
+_GUARD_STOP_FRAC = 1.0 / 3.0
+
 
 def compute_subaperture_illumination(
     pos: Tensor,
@@ -170,6 +177,7 @@ def ffbp(
     weight_map_downsample: int = 1,
     weight_eps: float | None = None,
     afbp_nsub: int = 1,
+    guard_max_ratio: float = 0.125,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -195,9 +203,22 @@ def ffbp(
         Position of the platform at each data point. Shape should be [nsweeps, 3].
         Batched input is not supported.
     stages : int
-        Number of recursions.
+        Number of recursions. This is an upper bound: the recursion also
+        stops early where a further split would make the subaperture grids
+        guard band dominated (guard above ~1/3 of the subaperture image,
+        reached when the subaperture core drops below ~8 * (order/2 + 2)
+        theta bins), where deeper splitting costs more in guard columns
+        than it saves in backprojection. Large values are therefore safe.
     divisions : int
         Number of subapertures divisions per stage. Default is 2.
+
+        Subaperture grids at every level include an automatically sized
+        theta guard band so that the merge interpolation has full window
+        support at the scene theta edges. The guard band can extend past
+        |theta| = 1 (e.g. with a full 180 degree scene), where the
+        backprojection and merge kernels evaluate the smooth continuation
+        of the azimuth signal past the fold, so edge accuracy does not
+        depend on the subaperture size.
     d0 : float
         Zero range correction.
     interp_method : tuple
@@ -259,6 +280,18 @@ def ffbp(
         is that ``stages`` can be reduced by about ``log2(afbp_nsub)``
         merge levels at constant total cost, which does reduce the error.
         Default is 1 (direct backprojection).
+    guard_max_ratio : float
+        Cap of the automatic theta guard band width, per side, as a
+        fraction of the subaperture grid core theta bins (a minimum of a
+        few interpolation windows is always kept). The guard band adds
+        this fraction to every image in the merge tree, so it bounds the
+        memory overhead to ``1 + 2 * guard_max_ratio``. When the
+        subaperture origin offsets are comparable to the near range, full
+        interpolation support at the scene theta edges can require a guard
+        wider than the cap; a warning is emitted and edge accuracy at near
+        range degrades gracefully instead of exhausting memory. Increase
+        for full edge accuracy at more memory, decrease (0 gives the
+        minimum window support) for less memory. Default is 0.125.
 
     Returns
     -------
@@ -311,6 +344,10 @@ def ffbp(
             att=att, g=g, g_extent=g_extent,
         )[0]
 
+    # Worst (needed / cap) guard shortfall over the whole merge tree,
+    # collected during the recursion so that a capped guard warns once per
+    # call instead of once per tree node.
+    guard_shortfall = [0.0, 0, 0]
     result = _ffbp_impl(
         data, grid, fc, r_res, pos, stages, divisions, d0, interp_method,
         oversample_r, oversample_theta, dealias, data_fmod, alias_fmod,
@@ -318,7 +355,18 @@ def ffbp(
         att, g, g_extent, weight_map_downsample,
         is_top_level=True,
         afbp_nsub=afbp_nsub,
+        guard_max_ratio=guard_max_ratio,
+        guard_shortfall=guard_shortfall,
     )
+    # A small shortfall only truncates the window support of guard bins,
+    # whose error reaches the scene attenuated by the interpolation kernel
+    # tails; warn when a large part of the support is missing.
+    if guard_shortfall[0] > 2.0:
+        warn(f"ffbp: theta guard band capped at {guard_shortfall[2]} bins "
+             f"({guard_shortfall[1]} needed for full interpolation support "
+             f"at the near range edge). Edge accuracy at near range may be "
+             f"reduced; increase guard_max_ratio (more memory) if it "
+             f"matters.")
     # _ffbp_impl returns (img, w1_map, w2_map, weight_grid)
     # Without an antenna pattern the image is already normalized
     # With it the Wiener normalization is applied here
@@ -353,43 +401,147 @@ def _ffbp_impl(
     is_top_level: bool = True,
     pos_z: list | None = None,
     afbp_nsub: int = 1,
+    core_theta: tuple | None = None,
+    guard_max_ratio: float = 0.125,
+    pos_xy: list | None = None,
+    guard_shortfall: list | None = None,
 ) -> Tensor:
-    """Internal implementation of ffbp with precomputed polynomial coefficients."""
+    """Internal implementation of ffbp with precomputed polynomial coefficients.
+
+    ``core_theta`` is the scene theta extent, constant down the recursion;
+    the node grid covers it plus a guard band (possibly asymmetric) whose
+    bins carry valid signal but are only consumed as interpolation window
+    support by the parent's merges. The guard band may extend past
+    |theta| = 1, where the backprojection and merge kernels compute the
+    smooth continuation of the azimuth signal (exact for a straight
+    track). Each level sizes its children's guard so that every lookup
+    window of its own merges lands inside the child grids, up to a cap of
+    ``guard_max_ratio`` of the child core bins per side.
+    """
     nsweeps = data.shape[0]
     use_antenna_pattern = g is not None
 
     if pos_z is None:
-        # Sweep z coordinates as Python floats: the z0/new_z scalars then
-        # never touch the device (one sync here instead of one per tree
-        # node on GPU). center_pos doesn't modify z, so plain slices of
-        # this list stay valid down the recursion.
+        # Sweep coordinates as Python floats: the z0/new_z and guard sizing
+        # scalars then never touch the device (one sync here instead of one
+        # per tree node on GPU). center_pos doesn't modify z, so plain
+        # slices of these lists stay valid down the recursion (x/y are only
+        # used for origin differences, which centering doesn't change).
         pos_z = pos[:, 2].tolist()
+    if pos_xy is None:
+        pos_xy = pos[:, :2].tolist()
 
-    imgs = []
+    # Scene (core) theta extent; the node grid is the core plus its guard
+    # band.
+    if core_theta is None:
+        core_theta = grid["theta"]
+    core_t0, core_t1 = core_theta
+    theta0_g, theta1_g = grid["theta"]
+    dtheta_node = (theta1_g - theta0_g) / grid["ntheta"]
+    core_ntheta = round((core_t1 - core_t0) / dtheta_node)
+
     # Split at rounded boundaries so that no sweeps are dropped when
     # divisions does not divide nsweeps. Subaperture sizes differ by at most
     # one sweep, which the merge handles.
     bounds = [round(i * nsweeps / divisions) for i in range(divisions + 1)]
+
+    # Children guard sizing. A merge output pixel at theta = t reads the
+    # child image at tp = (d*t + dy)/rp, so the child grid must cover the
+    # image of this node's own grid edges under that map, plus the
+    # interpolation window. The shift tp - t has one sign per child (set by
+    # the along-track origin offset dy), so the guard is one-sided per
+    # child up to the window margin. It is evaluated with the exact kernel
+    # formula: the linearization |dy|/r0 wildly overestimates when the
+    # subaperture offsets are comparable to the near range.
+    div_xy = [pos_xy[bounds[i]:bounds[i + 1]] for i in range(divisions)]
+    means = [(sum(x for x, _ in s) / len(s), sum(y for _, y in s) / len(s))
+             for s in div_xy]
+    cx = sum(m[0] for m in means) / divisions
+    cy = sum(m[1] for m in means) / divisions
+    r0_min, r1_max = grid["r"]
+
+    def _tp_shift(te: float, dy: float, dx: float, d: float) -> float:
+        # Lookup shift tp - te of the merge transform, same math as the
+        # kernels.
+        ct = math.sqrt(max(0.0, 1.0 - te * te))
+        rp2 = d * d + dx * dx + dy * dy + 2.0 * d * (dy * te + dx * ct)
+        rp = math.sqrt(max(rp2, 1e-12))
+        return (d * te + dy) / rp - te
+
+    # Interpolation window half width in bins, plus one bin of rounding
+    # slack.
+    a_bins = interp_method[1] // 2 + 1
+
+    imgs = []
     for d_idx in range(divisions):
         i0, i1 = bounds[d_idx], bounds[d_idx + 1]
         pos_local, origin_local = center_pos(pos[i0:i1])
         pos_z_local = pos_z[i0:i1]
+        pos_xy_local = pos_xy[i0:i1]
         z0 = sum(pos_z_local) / len(pos_z_local)
+        # Oversample the subaperture grid to leave aliasing margin for the
+        # merges. Applies to both the recursive and the base backprojection
+        # branch; deeper levels receive oversample=1 since the grid is
+        # already increased.
+        core_nt_child = (core_ntheta + divisions - 1) // divisions
+        core_nt_child = int(oversample_theta * core_nt_child)
+        dth_child = (core_t1 - core_t0) / core_nt_child
+
+        # Worst-case signed lookup shifts at the node grid edges over the
+        # swath and over the merge-chain origin variation (dy = 0 covers
+        # the no-shift window; the 0.5/1.5 factors bound the intermediate
+        # pairwise-mean origins of unbalanced in-node merge chains).
+        dy = cy - means[d_idx][1]
+        dx = cx - means[d_idx][0]
+        cand = [(sy * dy, sx * dx, d)
+                for sy in (0.0, 0.5, 1.5) for sx in (-1.5, 1.5)
+                for d in (r0_min, r1_max)]
+        s_hi = max(_tp_shift(theta1_g, *c) for c in cand)
+        s_lo = min(_tp_shift(theta0_g, *c) for c in cand)
+
+        # The useful support saturates a couple of interpolation windows
+        # past the fold: beyond |theta| = 1 the child image holds only the
+        # smooth continuation of the scene content near the fold, so
+        # lookups further out add nothing. Without the clamp the exact
+        # shift diverges when a grid edge past the fold combines with a
+        # subaperture origin offset near the pixel ground range (rp -> 0).
+        fold_margin = 2 * a_bins * dth_child
+        hi_req = min(theta1_g + s_hi, max(theta1_g, 1.0) + fold_margin)
+        lo_req = max(theta0_g + s_lo, min(theta0_g, -1.0) - fold_margin)
+
+        # Guard bins per side: cover [lo_req, hi_req] plus the window,
+        # never shrinking inside the core. Cap the guard to bound the
+        # memory overhead: with subaperture offsets comparable to the near
+        # range the shift can reach a large fraction of the whole theta
+        # domain, which would multiply every image in the tree.
+        n_lo = math.ceil((core_t0 - lo_req) / dth_child) + a_bins + 1
+        n_hi = math.ceil((hi_req - core_t1) / dth_child) + a_bins + 1
+        g_cap = max(4 * a_bins, int(guard_max_ratio * core_nt_child))
+        if guard_shortfall is not None and max(n_lo, n_hi) > g_cap:
+            ratio = max(n_lo, n_hi) / g_cap
+            if ratio > guard_shortfall[0]:
+                guard_shortfall[:] = [ratio, max(n_lo, n_hi), g_cap]
+        n_lo = min(max(n_lo, 0), g_cap)
+        n_hi = min(max(n_hi, 0), g_cap)
+
         grid_local = deepcopy(grid)
-        grid_local["ntheta"] = (grid["ntheta"] + divisions - 1) // divisions
-        # Oversample the subaperture grid to leave interpolation margin for
-        # the merges. Applies to both the recursive and the base
-        # backprojection branch; deeper levels receive oversample=1 since
-        # the grid is already increased.
+        grid_local["theta"] = (core_t0 - n_lo * dth_child,
+                               core_t1 + n_hi * dth_child)
+        grid_local["ntheta"] = core_nt_child + n_lo + n_hi
         grid_local["nr"] = int(oversample_r * grid_local["nr"])
-        grid_local["ntheta"] = int(oversample_theta * grid_local["ntheta"])
         data_local = data[i0:i1]
         att_local = att[i0:i1] if att is not None else None
 
-        # TODO: Better edge handling for interpolation.
-        # Interpolation doesn't work too well with too small image due to edges.
-        # Limit the minimum image size to avoid large interpolation errors.
-        if stages > 1 and len(data_local) > 128:
+        # Minimum subaperture size: deep in the tree the guard settles to
+        # its window-support fixed point of ~2*(a_bins+1) bins per side
+        # (each level inherits half the parent guard extent in its own
+        # bins, plus the window), while the core halves per level, so ever
+        # deeper splits become guard-dominated and stop paying off. Stop
+        # splitting when the next level's core would put the fixed-point
+        # guard above _GUARD_STOP_FRAC of the subaperture image.
+        min_core = int(4 * (a_bins + 1) * (1.0 / _GUARD_STOP_FRAC - 1.0))
+        next_core = (core_nt_child + divisions - 1) // divisions
+        if stages > 1 and len(data_local) >= 2 * divisions and next_core >= min_core:
             img, w1_map, w2_map, weight_grid = _ffbp_impl(
                 data_local,
                 grid_local,
@@ -415,6 +567,10 @@ def _ffbp_impl(
                 is_top_level=False,
                 pos_z=pos_z_local,
                 afbp_nsub=afbp_nsub,
+                core_theta=core_theta,
+                guard_max_ratio=guard_max_ratio,
+                pos_xy=pos_xy_local,
+                guard_shortfall=guard_shortfall,
             )
         else:
             # When using antenna pattern, request unnormalized output
@@ -476,8 +632,17 @@ def _ffbp_impl(
             grid_polar_new = grid
             alias = not dealias
         else:
-            grid_polar_new = deepcopy(img1[1])
-            grid_polar_new["ntheta"] += img2[1]["ntheta"]
+            # Union of the source extents (the per-child guard bands are
+            # one-sided, so the extents differ) at half the source theta
+            # step: the azimuth bandwidth doubles when the subapertures
+            # merge.
+            g1, g2 = img1[1], img2[1]
+            t0_u = min(g1["theta"][0], g2["theta"][0])
+            t1_u = max(g1["theta"][1], g2["theta"][1])
+            dth_u = 0.5 * (g1["theta"][1] - g1["theta"][0]) / g1["ntheta"]
+            grid_polar_new = deepcopy(g1)
+            grid_polar_new["theta"] = (t0_u, t1_u)
+            grid_polar_new["ntheta"] = round((t1_u - t0_u) / dth_u)
             out_alias = True
 
         i1 = img1[2]

@@ -20,6 +20,8 @@ static void polar_interp_kernel_linear_cpu(const c10::complex<T> *img, c10::comp
         t = sinf(asinf(t) - rotation);
     }
     if (t < -1.0f || t > 1.0f) {
+        // The output tensor is uninitialized; write zeros, don't skip.
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
         return;
     }
     const T dorig0 = dorigin[idbatch * 3 + 0];
@@ -69,6 +71,8 @@ static void polar_interp_kernel_lanczos_cpu(const complex64_t *img, complex64_t 
         t = sinf(asinf(t) - rotation);
     }
     if (t < -1.0f || t > 1.0f) {
+        // The output tensor is uninitialized; write zeros, don't skip.
+        out[idbatch * Nr1 * Ntheta1 + idr*Ntheta1 + idtheta] = {0.0f, 0.0f};
         return;
     }
     const float dorig0 = dorigin[idbatch * 3 + 0];
@@ -780,7 +784,7 @@ std::vector<at::Tensor> polar_to_cart_linear_grad_cpu(
 constexpr int MERGE_CHUNK = 256;
 
 // Geometry + phase pass for one input image. dri_buf < 0 marks pixels that
-// fall outside the input grid (or outside |theta| <= 1).
+// fall outside the input grid.
 static void ffbp_merge2_geom_pass_cpu(float d, float dz, float theta1,
         float dtheta1, int tb, float dorig0, float dorig1, float dorig2,
         float z1, float ref_phase, float r0, float dr, float theta0,
@@ -791,19 +795,25 @@ static void ffbp_merge2_geom_pass_cpu(float d, float dz, float theta1,
 #pragma omp simd
     for (int q = 0; q < nchunk; q++) {
         const float t = theta1 + dtheta1 * (tb + q);
-        const bool tok = (t >= -1.0f) & (t <= 1.0f);
-        // Zero theta on the out-of-range lanes so sqrtf sees a non-negative
-        // argument and no NaNs enter the pipeline.
-        const float sint = tok ? t : 0.0f;
-        const float cost = sqrtf(1.0f - sint*sint);
-        const float rp = sqrtf(d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint));
-        const float arg = (d*sint + dorig1) / (d*cost + dorig0);
-        const float tp = arg / sqrtf(1.0f + arg*arg);
+        // Guard band pixels |t| > 1 hold the smooth continuation of the
+        // azimuth signal past the fold: clamp the cosine to zero and keep
+        // the d^2 term of rp (this is the same continuation the
+        // backprojection kernel produces, see its distance note).
+        const float sint = t;
+        const float ct2 = 1.0f - t*t;
+        const float cost = ct2 > 0.0f ? sqrtf(ct2) : 0.0f;
+        const float rp2 = d*d + dorig0*dorig0 + dorig1*dorig1 + 2*d*(dorig0*cost + dorig1*sint);
+        const float rp = sqrtf(rp2 > 0.0f ? rp2 : 0.0f);
+        // tp = y'/rp instead of sin(atan(y'/x')): identical inside |t| <= 1
+        // (there rp^2 = x'^2 + y'^2), but it continues past |tp| = 1 and so
+        // indexes into the source grid guard band where the continued
+        // samples live; the atan form folds back to |tp| <= 1.
+        const float tp = (d*sint + dorig1) / rp;
 
         const float dri = (rp - r0) / dr;
         const float dti = (tp - theta0) / dtheta;
 
-        const bool ok = tok & (dri >= 0.0f) & (dri < Nr-1) &
+        const bool ok = (dri >= 0.0f) & (dri < Nr-1) &
                         (dti >= 0.0f) & (dti < Ntheta-1);
 
         const float rpz = sqrtf(z0*z0 + rp*rp);
