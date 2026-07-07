@@ -950,81 +950,109 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cpu(
     ret.push_back(pos_grad);
     return ret;
 }
-static void compute_illumination_kernel_cpu(
+// One output row of the decimated illumination maps, theta in chunks.
+// Structured for SIMD like backprojection_polar_2d_row_cpu: per sweep, a
+// vectorizable angle pass (asinf_fast/atan2f_fast, matching the
+// backprojection kernel's gain-lookup conventions) writes the bilinear
+// pattern coordinates to small buffers, then a scalar pass gathers the
+// gain and accumulates the moments. gi = -1 marks out-of-pattern pixels,
+// which contribute exactly zero: the merge gating and the Wiener
+// normalization rely on W counting exactly the gains that weight A.
+static void compute_illumination_row_cpu(
           const float* pos,
           const float* att,
           const float* g,
           float* w1_out,
           float* w2_out,
           int nsweeps,
-          float r0, float dr, float theta0, float dtheta, int nr, int ntheta,
+          float r0, float dr, float theta0, float dtheta,
           float g_el0, float g_del, float g_az0, float g_daz, int g_nel, int g_naz,
-          int decimation, int idx) {
+          int decimation, int out_ntheta, int out_idr) {
+    constexpr int CHUNK = 256;
+    float x_buf[CHUNK], y_buf[CHUNK];
+    float w1_buf[CHUNK], w2_buf[CHUNK];
+    float ef_buf[CHUNK], af_buf[CHUNK];
+    int gi_buf[CHUNK];
 
-    const int out_ntheta = (ntheta + decimation - 1) / decimation;
-    const int out_nr = (nr + decimation - 1) / decimation;
+    const float r = r0 + dr * (out_idr * decimation);
+    const float r2 = r * r;
+    float* w1_row = w1_out + (size_t)out_idr * out_ntheta;
+    float* w2_row = w2_out + (size_t)out_idr * out_ntheta;
 
-    if (idx >= out_nr * out_ntheta) return;
+    for (int tb = 0; tb < out_ntheta; tb += CHUNK) {
+        const int nchunk = std::min(CHUNK, out_ntheta - tb);
 
-    const int out_idtheta = idx % out_ntheta;
-    const int out_idr = idx / out_ntheta;
-
-    const int full_idr = out_idr * decimation;
-    const int full_idtheta = out_idtheta * decimation;
-
-    const float r = r0 + dr * full_idr;
-    const float t = theta0 + dtheta * full_idtheta;  // t is sin(theta)
-    // Clamped cosine + polar-form distance: guard band grids extend past
-    // |theta| = 1 (see the backprojection kernel note).
-    const float ct2 = 1.0f - t*t;
-    const float cost = ct2 > 0.0f ? sqrtf(ct2) : 0.0f;
-    const float x = r * cost;
-    const float y = r * t;
-
-    float w1 = 0.0f;
-    float w2 = 0.0f;
-
-    for (int i = 0; i < nsweeps; i++) {
-        const float pos_x = pos[i * 3 + 0];
-        const float pos_y = pos[i * 3 + 1];
-        const float pos_z = pos[i * 3 + 2];
-
-        const float px = x - pos_x;
-        const float py = y - pos_y;
-        const float d2 = r*r + pos_x*pos_x + pos_y*pos_y + pos_z*pos_z
-                       - 2.0f * (x * pos_x + y * pos_y);
-        const float d = sqrtf(d2 > 0.0f ? d2 : 0.0f);
-
-        const float look_angle = asinf(std::max(-1.0f, std::min(1.0f, -pos_z / d)));
-
-        float att_el = 0.0f;
-        float att_az = 0.0f;
-        if (att != nullptr) {
-            att_el = att[i * 3 + 0];
-            att_az = att[i * 3 + 2];
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            const float t = theta0 + dtheta * ((tb + q) * decimation);  // sin(theta)
+            // Clamped cosine + polar-form distance: guard band grids
+            // extend past |theta| = 1 (see the backprojection kernel
+            // note).
+            const float ct2 = 1.0f - t*t;
+            x_buf[q] = r * (ct2 > 0.0f ? sqrtf(ct2) : 0.0f);
+            y_buf[q] = r * t;
+            w1_buf[q] = 0.0f;
+            w2_buf[q] = 0.0f;
         }
 
-        const float el = look_angle - att_el;
-        const float az = atan2f(py, px) - att_az;
+        for (int i = 0; i < nsweeps; i++) {
+            const float pos_x = pos[i * 3 + 0];
+            const float pos_y = pos[i * 3 + 1];
+            const float pos_z = pos[i * 3 + 2];
+            const float r2pn2 = r2 + pos_x*pos_x + pos_y*pos_y + pos_z*pos_z;
+            float att_el = 0.0f;
+            float att_az = 0.0f;
+            if (att != nullptr) {
+                att_el = att[i * 3 + 0];
+                att_az = att[i * 3 + 2];
+            }
 
-        const float el_idx = (el - g_el0) / g_del;
-        const float az_idx = (az - g_az0) / g_daz;
+            // Angle pass: bilinear antenna pattern coordinates.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float px = x_buf[q] - pos_x;
+                const float py = y_buf[q] - pos_y;
+                const float d2 = r2pn2 - 2.0f * (x_buf[q] * pos_x + y_buf[q] * pos_y);
+                const float d = sqrtf(d2 > 0.0f ? d2 : 0.0f);
+                const float sin_l = -pos_z / d;
+                const float look_angle = asinf_fast(sin_l < -1.0f ? -1.0f : sin_l);
+                const float el = look_angle - att_el;
+                const float az = atan2f_fast(py, px) - att_az;
 
-        if (el_idx >= 0 && el_idx < g_nel - 1 && az_idx >= 0 && az_idx < g_naz - 1) {
-            const int el_int = (int)el_idx;
-            const int az_int = (int)az_idx;
-            const float el_frac = el_idx - el_int;
-            const float az_frac = az_idx - az_int;
+                const float el_idx = (el - g_el0) / g_del;
+                const float az_idx = (az - g_az0) / g_daz;
+                const int el_int = (int)el_idx;
+                const int az_int = (int)az_idx;
+                const bool ok = (el_idx >= 0.0f) & (el_int + 1 < g_nel) &
+                                (az_idx >= 0.0f) & (az_int + 1 < g_naz);
+                ef_buf[q] = el_idx - el_int;
+                af_buf[q] = az_idx - az_int;
+                gi_buf[q] = ok ? el_int * g_naz + az_int : -1;
+            }
+            // Scalar pass: gain gather, accumulate the moments.
+            for (int q = 0; q < nchunk; q++) {
+                const int gi = gi_buf[q];
+                if (gi < 0) {
+                    continue;
+                }
+                const float ef = ef_buf[q], af = af_buf[q];
+                const float v00 = g[gi],         v01 = g[gi + 1];
+                const float v10 = g[gi + g_naz], v11 = g[gi + g_naz + 1];
+                const float w = v00 * (1.0f - ef) * (1.0f - af)
+                              + v01 * (1.0f - ef) * af
+                              + v10 * ef * (1.0f - af)
+                              + v11 * ef * af;
+                w1_buf[q] += w;
+                w2_buf[q] += w * w;
+            }
+        }
 
-            const float gain = interp2d<float>(g, g_nel, g_naz, el_int, el_frac, az_int, az_frac);
-
-            w1 += gain;
-            w2 += gain * gain;
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            w1_row[tb + q] = w1_buf[q];
+            w2_row[tb + q] = w2_buf[q];
         }
     }
-
-    w1_out[idx] = w1;
-    w2_out[idx] = w2;
 }
 
 std::vector<at::Tensor> compute_illumination_cpu(
@@ -1080,11 +1108,11 @@ std::vector<at::Tensor> compute_illumination_cpu(
     omp_set_num_threads(omp_get_num_procs());
 
 #pragma omp parallel for
-    for (int idx = 0; idx < out_nr * out_ntheta; idx++) {
-        compute_illumination_kernel_cpu(
+    for (int idr = 0; idr < out_nr; idr++) {
+        compute_illumination_row_cpu(
                 pos_ptr, att_ptr, g_ptr, w1_out_ptr, w2_out_ptr, nsweeps,
-                r0, dr, theta0, dtheta, nr, ntheta,
-                g_el0, g_del, g_az0, g_daz, g_nel, g_naz, dec, idx);
+                r0, dr, theta0, dtheta,
+                g_el0, g_del, g_az0, g_daz, g_nel, g_naz, dec, out_ntheta, idr);
     }
 
     std::vector<at::Tensor> ret;
