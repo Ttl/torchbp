@@ -409,6 +409,149 @@ class TestPolarToCartLinear(TestCase):
         self._opcheck("cuda")
 
 
+class TestCartToPolarLinear(TestCase):
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.float32):
+        def make_tensor(size, dtype=dtype):
+            x = torch.randn(
+                size, device=device, requires_grad=requires_grad, dtype=dtype
+            )
+            return x
+
+        def make_nondiff_tensor(size, dtype=dtype):
+            return torch.randn(size, device=device, requires_grad=False, dtype=dtype)
+
+        complex_dtype = torch.complex64 if dtype == torch.float32 else torch.complex128
+        nbatch = 2
+        grid_cart = {"x": (12, 18), "y": (-5, 5), "nx": 3, "ny": 3}
+        grid_polar = {"r": (10, 20), "theta": (-1, 1), "nr": 2, "ntheta": 2}
+        origin = 0.1 * make_tensor((nbatch, 3), dtype=dtype)
+        origin[:, 2] += 4  # Offset height
+        args = {
+            "img": make_tensor(
+                (nbatch, grid_cart["nx"], grid_cart["ny"]), dtype=complex_dtype
+            ),
+            "origin": origin,
+            "grid_cart": grid_cart,
+            "grid_polar": grid_polar,
+            "fc": 6e9,
+            "rotation": 0.1,
+            "alias_fmod": uniform(0, 2 * torch.pi),
+        }
+        return [args]
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_and_gpu_grad(self):
+        samples = self.sample_inputs("cuda", requires_grad=True)
+        for sample in samples:
+            sample_cpu = {
+                k: sample[k].detach().cpu()
+                if isinstance(sample[k], torch.Tensor)
+                else sample[k]
+                for k in sample.keys()
+            }
+            for k in sample.keys():
+                if isinstance(sample[k], torch.Tensor) and sample[k].requires_grad:
+                    sample_cpu[k].requires_grad = True
+
+            res_gpu = torchbp.ops.cart_to_polar_linear(**sample)
+            loss_gpu = torch.mean(torch.abs(res_gpu))
+            loss_gpu.backward()
+            grads_gpu = [
+                sample[k].cpu()
+                for k in sample.keys()
+                if isinstance(sample[k], torch.Tensor) and sample[k].requires_grad
+            ]
+
+            res_cpu = torchbp.ops.cart_to_polar_linear(**sample_cpu)
+            loss_cpu = torch.mean(torch.abs(res_cpu))
+            loss_cpu.backward()
+            grads_cpu = [
+                sample_cpu[k]
+                for k in sample_cpu.keys()
+                if isinstance(sample_cpu[k], torch.Tensor)
+                and sample_cpu[k].requires_grad
+            ]
+            torch.testing.assert_close(grads_cpu, grads_gpu, atol=1e-3, rtol=1e-2)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_and_gpu(self):
+        samples = self.sample_inputs("cuda")
+        for sample in samples:
+            res_gpu = torchbp.ops.cart_to_polar_linear(**sample).cpu()
+            sample_cpu = {
+                k: sample[k].cpu() if isinstance(sample[k], torch.Tensor) else sample[k]
+                for k in sample.keys()
+            }
+            res_cpu = torchbp.ops.cart_to_polar_linear(**sample_cpu)
+            torch.testing.assert_close(res_cpu, res_gpu, rtol=5e-4, atol=5e-4)
+
+    def test_inverse_of_polar_to_cart(self):
+        # polar -> cart -> polar round trip on a smooth image recovers the
+        # input away from the grid edges.
+        device = "cpu"
+        grid_polar = {"r": (50.0, 100.0), "theta": (-0.5, 0.5), "nr": 128, "ntheta": 128}
+        grid_cart = {"x": (60.0, 90.0), "y": (-25.0, 25.0), "nx": 512, "ny": 512}
+        fc = 6e9
+
+        # Bandlimited smooth complex image on the polar grid
+        img = torch.randn(16, 16, dtype=torch.complex64, device=device)
+        img = torch.fft.ifft2(F.pad(torch.fft.fft2(img), (0, 112, 0, 112)))
+        img = img / img.abs().max()
+
+        origin = torch.tensor([0.0, 0.0, 30.0], device=device)
+        cart = torchbp.ops.polar_to_cart(img, origin, grid_polar, grid_cart, fc)
+        back = torchbp.ops.cart_to_polar(cart[0], origin, grid_cart, grid_polar, fc)
+
+        r = torch.linspace(*grid_polar["r"], grid_polar["nr"] + 1)[:-1]
+        t = torch.linspace(*grid_polar["theta"], grid_polar["ntheta"] + 1)[:-1]
+        rg, tg = torch.meshgrid(r, t, indexing="ij")
+        x = rg * torch.sqrt(1 - tg**2)
+        y = rg * tg
+        mask = (x > 62) & (x < 88) & (y > -23) & (y < 23)
+        err = (back[0] - img).abs()[mask].max().item()
+        self.assertLess(err, 0.05)
+
+    def _test_gradients(self, device, dtype=torch.float32):
+        samples = self.sample_inputs(device, requires_grad=True, dtype=dtype)
+        eps = 5e-4 if dtype == torch.float32 else 1e-4
+        rtol = 0.15 if dtype == torch.float32 else 0.05
+        for args in samples:
+            torch.autograd.gradcheck(
+                torchbp.ops.cart_to_polar_linear,
+                list(args.values()),
+                eps=eps,  # This test is very sensitive to eps
+                rtol=rtol,  # Also to rtol
+            )
+
+    def test_gradients_cpu(self):
+        # float64 not tested: CPU forward supports only complex64/float32
+        self._test_gradients("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_gradients_cuda(self):
+        self._test_gradients("cuda")
+
+    def _opcheck(self, device):
+        from torchbp.ops.polar_interp import _prepare_cart_to_polar_linear_args
+
+        samples = self.sample_inputs(device, requires_grad=True)
+        samples.extend(self.sample_inputs(device, requires_grad=False))
+        for args in samples:
+            cpp_args = _prepare_cart_to_polar_linear_args(**args)
+            opcheck(
+                torch.ops.torchbp.cart_to_polar_linear,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
 class TestBackprojectionPolar(TestCase):
     def sample_inputs(self, device, *, requires_grad=False):
         def make_tensor(size, dtype=torch.float32):

@@ -741,6 +741,530 @@ at::Tensor polar_to_cart_lanczos_cuda(
 	return out;
 }
 
+// Inverse of polar_to_cart_kernel_linear. The Cartesian image contains the
+// range carrier (polar_to_cart applies it after interpolation), so each
+// interpolation tap is demodulated with the carrier evaluated at its own
+// Cartesian grid point before the taps are combined. This is exactly
+// interpolation of the pixelwise demodulated (dealiased) image and the
+// output matches a dealiased polar image with alias_fmod modulation.
+template<typename T>
+__global__ void cart_to_polar_kernel_linear(const T *img, T *out,
+        const float *origin, float rotation, float ref_phase, float x0,
+        float dx, float y0, float dy, int Nx, int Ny, float r0, float dr,
+        float theta0, float dtheta, int Nr, int Ntheta, float alias_fmod) {
+    const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = id1 % Ntheta;
+    const int idr = id1 / Ntheta;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (id1 >= Nr * Ntheta) {
+        return;
+    }
+
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
+    const float d = r0 + dr * idr;
+    const float t = theta0 + dtheta * idtheta;
+    // cost >= 0 restricts to the same forward half plane as the cosa >= 0
+    // condition in polar_to_cart.
+    const float cost = sqrtf(1.0f - t*t);
+    // Rotate the polar frame angle back to the Cartesian frame.
+    const float rs = sinf(rotation);
+    const float rc = cosf(rotation);
+    const float sina = rc * t + rs * cost;
+    const float cosa = rc * cost - rs * t;
+    const float x = orig0 + d * cosa;
+    const float y = orig1 + d * sina;
+    const float xi = (x - x0) / dx;
+    const float yi = (y - y0) / dy;
+
+    const int xi_int = xi;
+    const float xi_frac = xi - xi_int;
+    const int yi_int = yi;
+    const float yi_frac = yi - yi_int;
+
+    if (t >= -1.0f && t <= 1.0f && xi >= 0.0f && xi_int < Nx-1 && yi >= 0.0f && yi_int < Ny-1) {
+        if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+            const float wx[2] = {1.0f - xi_frac, xi_frac};
+            const float wy[2] = {1.0f - yi_frac, yi_frac};
+            complex64_t v = {0.0f, 0.0f};
+            for (int a = 0; a < 2; a++) {
+                const float xk = x0 + dx * (xi_int + a);
+                const float xk2 = (xk-orig0)*(xk-orig0);
+                for (int b = 0; b < 2; b++) {
+                    const float yk = y0 + dy * (yi_int + b);
+                    const float dk = sqrtf(xk2 + (yk-orig1)*(yk-orig1));
+                    const float dzk = sqrtf(dk*dk + orig2*orig2);
+                    float ref_sin, ref_cos;
+                    sincospif(-(ref_phase * dzk - alias_fmod * (dk - r0) / dr), &ref_sin, &ref_cos);
+                    const complex64_t ref = {ref_cos, ref_sin};
+                    v += wx[a] * wy[b] * ref * img[idbatch * Nx * Ny + (xi_int+a)*Ny + yi_int+b];
+                }
+            }
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = v;
+        } else {
+            T v = interp2d<T>(&img[idbatch * Nx * Ny], Nx, Ny, xi_int, xi_frac, yi_int, yi_frac);
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = v;
+        }
+    } else {
+        if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = {0.0f, 0.0f};
+        } else {
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = 0.0f;
+        }
+    }
+}
+
+__global__ void cart_to_polar_kernel_linear_grad(const complex64_t *img,
+        const float *origin, float rotation, float ref_phase, float x0,
+        float dx, float y0, float dy, int Nx, int Ny, float r0, float dr,
+        float theta0, float dtheta, int Nr, int Ntheta, float alias_fmod,
+        const complex64_t *grad, complex64_t *img_grad, float *origin_grad) {
+    const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = id1 % Ntheta;
+    const int idr = id1 / Ntheta;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
+    const float d = r0 + dr * idr;
+    const float t = theta0 + dtheta * idtheta;
+    const float cost = sqrtf(1.0f - t*t);
+    const float rs = sinf(rotation);
+    const float rc = cosf(rotation);
+    const float sina = rc * t + rs * cost;
+    const float cosa = rc * cost - rs * t;
+    const float x = orig0 + d * cosa;
+    const float y = orig1 + d * sina;
+    const float xi = (x - x0) / dx;
+    const float yi = (y - y0) / dy;
+
+    // Out-of-range threads can't return early because every lane in the warp
+    // must participate in the shuffle reduction below. They stay alive with
+    // zero contributions instead.
+    const bool active = id1 < Nr * Ntheta;
+
+    const int xi_int = xi;
+    const float xi_frac = xi - xi_int;
+    const int yi_int = yi;
+    const float yi_frac = yi - yi_int;
+
+    float g_origin0 = 0.0f;
+    float g_origin1 = 0.0f;
+    float g_origin2 = 0.0f;
+
+    if (active && t >= -1.0f && t <= 1.0f && xi >= 0.0f && xi_int < Nx-1 && yi >= 0.0f && yi_int < Ny-1) {
+        const complex64_t g = grad[idbatch * Nr * Ntheta + idr*Ntheta + idtheta];
+        const float wx[2] = {1.0f - xi_frac, xi_frac};
+        const float dwx[2] = {-1.0f, 1.0f};
+        const float wy[2] = {1.0f - yi_frac, yi_frac};
+        const float dwy[2] = {-1.0f, 1.0f};
+        const complex64_t I = {0.0f, 1.0f};
+
+        complex64_t dout_dorig0 = {0.0f, 0.0f};
+        complex64_t dout_dorig1 = {0.0f, 0.0f};
+        complex64_t dout_dorig2 = {0.0f, 0.0f};
+        for (int a = 0; a < 2; a++) {
+            const float xk = x0 + dx * (xi_int + a);
+            for (int b = 0; b < 2; b++) {
+                const float yk = y0 + dy * (yi_int + b);
+                const float dk = sqrtf((xk-orig0)*(xk-orig0) + (yk-orig1)*(yk-orig1));
+                const float dzk = sqrtf(dk*dk + orig2*orig2);
+                float ref_sin, ref_cos;
+                sincospif(-(ref_phase * dzk - alias_fmod * (dk - r0) / dr), &ref_sin, &ref_cos);
+                const complex64_t ref = {ref_cos, ref_sin};
+                const complex64_t vk = ref * img[idbatch * Nx * Ny + (xi_int+a)*Ny + yi_int+b];
+
+                if (img_grad != nullptr) {
+                    const complex64_t gk = g * wx[a] * wy[b] * cuda::std::conj(ref);
+                    float2 *xg = (float2*)&img_grad[idbatch * Nx * Ny + (xi_int+a)*Ny + yi_int+b];
+                    atomicAdd(&xg->x, gk.real());
+                    atomicAdd(&xg->y, gk.imag());
+                }
+
+                if (origin_grad != nullptr) {
+                    // The interpolation point moves one-to-one with the
+                    // origin; the tap positions and the range and angle are
+                    // fixed by the output grid.
+                    const complex64_t dref_scale = -I * kPI * (ref_phase / dzk - alias_fmod / (dk * dr));
+                    dout_dorig0 += (dwx[a] / dx) * wy[b] * vk
+                        + wx[a] * wy[b] * vk * (dref_scale * (orig0 - xk));
+                    dout_dorig1 += wx[a] * (dwy[b] / dy) * vk
+                        + wx[a] * wy[b] * vk * (dref_scale * (orig1 - yk));
+                    dout_dorig2 += wx[a] * wy[b] * vk * (-I * kPI * ref_phase * orig2 / dzk);
+                }
+            }
+        }
+
+        if (origin_grad != nullptr) {
+            g_origin0 = cuda::std::real(g * cuda::std::conj(dout_dorig0));
+            g_origin1 = cuda::std::real(g * cuda::std::conj(dout_dorig1));
+            g_origin2 = cuda::std::real(g * cuda::std::conj(dout_dorig2));
+        }
+    }
+
+    if (origin_grad != nullptr) {
+        for (int offset = 16; offset > 0; offset /= 2) {
+            g_origin0 += __shfl_down_sync(FULL_MASK, g_origin0, offset);
+            g_origin1 += __shfl_down_sync(FULL_MASK, g_origin1, offset);
+            g_origin2 += __shfl_down_sync(FULL_MASK, g_origin2, offset);
+        }
+
+        if (threadIdx.x % 32 == 0) {
+            atomicAdd(&(origin_grad[idbatch * 3 + 0]), g_origin0);
+            atomicAdd(&(origin_grad[idbatch * 3 + 1]), g_origin1);
+            atomicAdd(&(origin_grad[idbatch * 3 + 2]), g_origin2);
+        }
+    }
+}
+
+// Inverse of polar_to_cart_kernel_lanczos. See cart_to_polar_kernel_linear
+// for why every tap is demodulated with its own carrier: the phase varies in
+// both dimensions so lanczos_interp_2d cannot be used for the complex path.
+template<typename T>
+__global__ void cart_to_polar_kernel_lanczos(const T *img, T *out,
+        const float *origin, float rotation, float ref_phase, float x0,
+        float dx, float y0, float dy, int Nx, int Ny, float r0, float dr,
+        float theta0, float dtheta, int Nr, int Ntheta, float alias_fmod,
+        int order) {
+    const int id1 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idtheta = id1 % Ntheta;
+    const int idr = id1 / Ntheta;
+    const int idbatch = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (id1 >= Nr * Ntheta) {
+        return;
+    }
+
+    const float orig0 = origin[idbatch * 3 + 0];
+    const float orig1 = origin[idbatch * 3 + 1];
+    const float orig2 = origin[idbatch * 3 + 2];
+    const float d = r0 + dr * idr;
+    const float t = theta0 + dtheta * idtheta;
+    const float cost = sqrtf(1.0f - t*t);
+    const float rs = sinf(rotation);
+    const float rc = cosf(rotation);
+    const float sina = rc * t + rs * cost;
+    const float cosa = rc * cost - rs * t;
+    const float x = orig0 + d * cosa;
+    const float y = orig1 + d * sina;
+    const float xi = (x - x0) / dx;
+    const float yi = (y - y0) / dy;
+
+    const int xi_int = xi;
+    const int yi_int = yi;
+
+    if (t >= -1.0f && t <= 1.0f && xi >= 0.0f && xi_int < Nx-1 && yi >= 0.0f && yi_int < Ny-1) {
+        if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+            const float a = 0.5f * order;
+            const int start_x = max(0, (int)ceilf(xi - a));
+            const int end_x = min(Nx-1, (int)floorf(xi + a));
+            const int start_y = max(0, (int)ceilf(yi - a));
+            const int end_y = min(Ny-1, (int)floorf(yi + a));
+            complex64_t sum = {0.0f, 0.0f};
+            for (int i = start_x; i <= end_x; i++) {
+                const float wx = lanczos_kernel(xi - i, a);
+                const float xk = x0 + dx * i;
+                const float xk2 = (xk-orig0)*(xk-orig0);
+                complex64_t row_sum = {0.0f, 0.0f};
+                for (int j = start_y; j <= end_y; j++) {
+                    const float wy = lanczos_kernel(yi - j, a);
+                    const float yk = y0 + dy * j;
+                    const float dk = sqrtf(xk2 + (yk-orig1)*(yk-orig1));
+                    const float dzk = sqrtf(dk*dk + orig2*orig2);
+                    float ref_sin, ref_cos;
+                    sincospif(-(ref_phase * dzk - alias_fmod * (dk - r0) / dr), &ref_sin, &ref_cos);
+                    const complex64_t ref = {ref_cos, ref_sin};
+                    row_sum += wy * ref * img[idbatch * Nx * Ny + i*Ny + j];
+                }
+                sum += wx * row_sum;
+            }
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = sum;
+        } else {
+            T v = lanczos_interp_2d<T, T>(
+                    &img[idbatch * Nx * Ny], Nx, Ny, xi, yi, order);
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = v;
+        }
+    } else {
+        if constexpr (::cuda::std::is_same_v<T, complex64_t>) {
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = {0.0f, 0.0f};
+        } else {
+            out[idbatch * Nr * Ntheta + idr*Ntheta + idtheta] = 0.0f;
+        }
+    }
+}
+
+at::Tensor cart_to_polar_linear_cuda(
+          const at::Tensor &img,
+          const at::Tensor &origin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double x0,
+          double y0,
+          double dx,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double alias_fmod) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
+	at::Tensor origin_contig = origin.contiguous();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor out = torch::empty({nbatch, Nr, Ntheta}, img_contig.options());
+	const float* origin_ptr = origin_contig.data_ptr<float>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr * Ntheta;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+	if (img.dtype() == at::kComplexFloat) {
+        c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+        c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+        cart_to_polar_kernel_linear<complex64_t>
+              <<<block_count, thread_per_block, 0, stream>>>(
+                      (const complex64_t*)img_ptr,
+                      (complex64_t*)out_ptr,
+                      origin_ptr,
+                      rotation,
+                      ref_phase,
+                      x0,
+                      dx,
+                      y0,
+                      dy,
+                      Nx,
+                      Ny,
+                      r0,
+                      dr,
+                      theta0,
+                      dtheta,
+                      Nr,
+                      Ntheta,
+                      alias_fmod/kPI
+                      );
+    } else {
+        float* img_ptr = img_contig.data_ptr<float>();
+        float* out_ptr = out.data_ptr<float>();
+        cart_to_polar_kernel_linear<float>
+              <<<block_count, thread_per_block, 0, stream>>>(
+                      img_ptr,
+                      out_ptr,
+                      origin_ptr,
+                      rotation,
+                      ref_phase,
+                      x0,
+                      dx,
+                      y0,
+                      dy,
+                      Nx,
+                      Ny,
+                      r0,
+                      dr,
+                      theta0,
+                      dtheta,
+                      Nr,
+                      Ntheta,
+                      alias_fmod/kPI
+                      );
+    }
+	return out;
+}
+
+std::vector<at::Tensor> cart_to_polar_linear_grad_cuda(
+          const at::Tensor &grad,
+          const at::Tensor &img,
+          const at::Tensor &origin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double x0,
+          double y0,
+          double dx,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double alias_fmod) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat);
+	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CUDA);
+	at::Tensor origin_contig = origin.contiguous();
+	const float* origin_ptr = origin_contig.data_ptr<float>();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor grad_contig = grad.contiguous();
+    c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+    c10::complex<float>* grad_ptr = grad_contig.data_ptr<c10::complex<float>>();
+    at::Tensor img_grad;
+    c10::complex<float>* img_grad_ptr = nullptr;
+    if (img.requires_grad()) {
+        img_grad = torch::zeros_like(img);
+        img_grad_ptr = img_grad.data_ptr<c10::complex<float>>();
+    } else {
+        img_grad = torch::Tensor();
+    }
+
+    at::Tensor origin_grad;
+	float* origin_grad_ptr = nullptr;
+    if (origin.requires_grad()) {
+        origin_grad = torch::zeros_like(origin);
+        origin_grad_ptr = origin_grad.data_ptr<float>();
+    } else {
+        origin_grad = torch::Tensor();
+    }
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr * Ntheta;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cart_to_polar_kernel_linear_grad
+          <<<block_count, thread_per_block, 0, stream>>>(
+                  (const complex64_t*)img_ptr,
+                  origin_ptr,
+                  rotation,
+                  ref_phase,
+                  x0,
+                  dx,
+                  y0,
+                  dy,
+                  Nx,
+                  Ny,
+                  r0,
+                  dr,
+                  theta0,
+                  dtheta,
+                  Nr,
+                  Ntheta,
+                  alias_fmod/kPI,
+                  (const complex64_t*)grad_ptr,
+                  (complex64_t*)img_grad_ptr,
+                  origin_grad_ptr
+                  );
+    std::vector<at::Tensor> ret;
+    ret.push_back(img_grad);
+    ret.push_back(origin_grad);
+	return ret;
+}
+
+at::Tensor cart_to_polar_lanczos_cuda(
+          const at::Tensor &img,
+          const at::Tensor &origin,
+          int64_t nbatch,
+          double rotation,
+          double fc,
+          double x0,
+          double y0,
+          double dx,
+          double dy,
+          int64_t Nx,
+          int64_t Ny,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double alias_fmod,
+          int64_t order) {
+	TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat);
+	TORCH_CHECK(origin.dtype() == at::kFloat);
+	TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CUDA);
+	TORCH_INTERNAL_ASSERT(origin.device().type() == at::DeviceType::CUDA);
+	at::Tensor origin_contig = origin.contiguous();
+	at::Tensor img_contig = img.contiguous();
+	at::Tensor out = torch::empty({nbatch, Nr, Ntheta}, img_contig.options());
+	const float* origin_ptr = origin_contig.data_ptr<float>();
+
+	dim3 thread_per_block = {256, 1};
+	// Up-rounding division.
+    int blocks = Nr * Ntheta;
+	unsigned int block_x = (blocks + thread_per_block.x - 1) / thread_per_block.x;
+	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch), 1};
+
+    const float ref_phase = 4.0f * fc / kC0;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+	if (img.dtype() == at::kComplexFloat) {
+        c10::complex<float>* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+        c10::complex<float>* out_ptr = out.data_ptr<c10::complex<float>>();
+        cart_to_polar_kernel_lanczos<complex64_t>
+              <<<block_count, thread_per_block, 0, stream>>>(
+                      (const complex64_t*)img_ptr,
+                      (complex64_t*)out_ptr,
+                      origin_ptr,
+                      rotation,
+                      ref_phase,
+                      x0,
+                      dx,
+                      y0,
+                      dy,
+                      Nx,
+                      Ny,
+                      r0,
+                      dr,
+                      theta0,
+                      dtheta,
+                      Nr,
+                      Ntheta,
+                      alias_fmod/kPI,
+                      order
+                      );
+    } else {
+        float* img_ptr = img_contig.data_ptr<float>();
+        float* out_ptr = out.data_ptr<float>();
+        cart_to_polar_kernel_lanczos<float>
+              <<<block_count, thread_per_block, 0, stream>>>(
+                      img_ptr,
+                      out_ptr,
+                      origin_ptr,
+                      rotation,
+                      ref_phase,
+                      x0,
+                      dx,
+                      y0,
+                      dy,
+                      Nx,
+                      Ny,
+                      r0,
+                      dr,
+                      theta0,
+                      dtheta,
+                      Nr,
+                      Ntheta,
+                      alias_fmod/kPI,
+                      order
+                      );
+    }
+	return out;
+}
+
 at::Tensor polar_interp_linear_cuda(
           const at::Tensor &img,
           const at::Tensor &dorigin,
@@ -2024,6 +2548,9 @@ TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
   m.impl("polar_to_cart_linear", &polar_to_cart_linear_cuda);
   m.impl("polar_to_cart_linear_grad", &polar_to_cart_linear_grad_cuda);
   m.impl("polar_to_cart_lanczos", &polar_to_cart_lanczos_cuda);
+  m.impl("cart_to_polar_linear", &cart_to_polar_linear_cuda);
+  m.impl("cart_to_polar_linear_grad", &cart_to_polar_linear_grad_cuda);
+  m.impl("cart_to_polar_lanczos", &cart_to_polar_lanczos_cuda);
 }
 
 }

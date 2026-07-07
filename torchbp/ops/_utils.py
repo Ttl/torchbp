@@ -101,6 +101,32 @@ def check_polar_grid_matches_img(img: Tensor, nr: int, ntheta: int) -> None:
         )
 
 
+def check_cartesian_grid_matches_img(img: Tensor, nx: int, ny: int) -> None:
+    """Validate that a Cartesian grid's dimensions match the image tensor.
+
+    Parameters
+    ----------
+    img : Tensor
+        Image tensor, shape (nx, ny) or (nbatch, nx, ny)
+    nx : int
+        Number of x bins from the Cartesian grid.
+    ny : int
+        Number of y bins from the Cartesian grid.
+
+    Raises
+    ------
+    ValueError
+        If the image's last two dimensions don't match (nx, ny).
+    """
+    img_nx, img_ny = img.shape[-2], img.shape[-1]
+    if (img_nx, img_ny) != (nx, ny):
+        raise ValueError(
+            f"Cartesian grid (nx={nx}, ny={ny}) does not match image "
+            f"shape {tuple(img.shape)} (expected last two dims "
+            f"({nx}, {ny}))."
+        )
+
+
 class AntennaPattern:
     """Encapsulate antenna gain pattern and extent.
 
