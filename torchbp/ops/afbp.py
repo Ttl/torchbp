@@ -204,8 +204,10 @@ def afbp(
     weight_map_downsample : int
         Decimation of the illumination weight maps used by the
         ``normalize=True`` antenna path, as in :func:`ffbp`. The maps are
-        smooth, so the default 4 is usually accurate; computing them at
-        full resolution can cost more than the backprojection itself.
+        additionally computed from a ``1/nsub`` subset of the pulses (the
+        per-pulse footprints move slowly along the aperture); computed
+        from every pulse they can cost more than the backprojection
+        itself.
     weight_eps : float or None
         Regularization of the antenna normalization, see :func:`ffbp`.
 
@@ -242,9 +244,14 @@ def afbp(
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             guard_theta=guard_theta, att=att, g=g, g_extent=g_extent,
             normalize=False, _batched_fusion=_batched_fusion)
-        from .ffbp import compute_subaperture_illumination, _weighted_normalize
-        w1, w2 = compute_subaperture_illumination(
-            pos, att, g, g_extent, grid, decimation=weight_map_downsample)
+        from .ffbp import _illumination_pulse_decimated, _weighted_normalize
+        # The per-pulse footprints move slowly along the aperture, so the
+        # maps can be computed from a pulse subset (computed from every
+        # pulse they can cost more than the whole backprojection); the map
+        # grid itself must stay fine to resolve the sharp footprint
+        # boundaries, see _illumination_pulse_decimated.
+        w1, w2 = _illumination_pulse_decimated(
+            pos, att, g, g_extent, grid, weight_map_downsample, nsub)
         return _weighted_normalize(img, w1, w2, eps=weight_eps)
 
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)

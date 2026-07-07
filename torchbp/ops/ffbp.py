@@ -70,6 +70,47 @@ def compute_subaperture_illumination(
     )
 
 
+def _illumination_pulse_decimated(
+    pos: Tensor,
+    att: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: dict,
+    decimation: int,
+    pulse_decimation: int,
+) -> tuple[Tensor, Tensor]:
+    """Illumination moment maps from a ``1/pulse_decimation`` subset of the
+    pulses, scaled back to the full pulse count.
+
+    The maps are sums of per-pulse antenna footprints that move only
+    slowly from pulse to pulse (yaw rate and parallax), so sampling the
+    pulses is accurate while the full map resolution is kept. Coarsening
+    the map grid instead is not safe: the footprint has sharp boundaries
+    (the gain lookup cuts to exactly zero at the pattern table extent, and
+    the polar domain fold at |theta| >= 1 puts guard cells outside it)
+    which map-domain interpolation would smear over a coarsened cell,
+    visibly dimming the scene edges. Used by the afbp base level, which
+    stands in for log2(nsub) recursion levels whose per-node illumination
+    would have cost 1/nsub as much; pulse decimation recovers the same
+    total cost with none of the resolution loss.
+    """
+    n = pos.shape[0]
+    k = max(1, min(int(pulse_decimation), n))
+    # Keep a minimum number of pulses so that footprint motion over the
+    # aperture (yaw oscillation, parallax) stays well sampled.
+    m = max(-(-n // k), min(n, 32))
+    if m < n:
+        idx = torch.linspace(0, n - 1, m, device=pos.device).round().long()
+        pos = pos[idx]
+        att = att[idx] if att is not None else None
+    w1, w2 = compute_subaperture_illumination(
+        pos, att, g, g_extent, grid, decimation=decimation)
+    if m < n:
+        w1 = w1 * (n / m)
+        w2 = w2 * (n / m)
+    return w1, w2
+
+
 def _weighted_normalize(
     A: Tensor,
     w1: Tensor,
@@ -275,10 +316,15 @@ def ffbp(
         If greater than 1, compute the base level subaperture images with
         :func:`afbp` using this many sub-subapertures instead of direct
         backprojection, which reduces the base level cost roughly
-        ``afbp_nsub`` times. This does not change the output accuracy,
+        ``afbp_nsub`` times. This does not change the image accuracy,
         which stays dominated by the merge interpolation error; the gain
         is that ``stages`` can be reduced by about ``log2(afbp_nsub)``
         merge levels at constant total cost, which does reduce the error.
+        With an antenna pattern the base illumination maps are computed
+        from a ``1/afbp_nsub`` subset of the pulses (see
+        :func:`_illumination_pulse_decimated`), so their cost also drops
+        ``afbp_nsub`` times instead of dominating the base level, at full
+        map resolution.
         Default is 1 (direct backprojection).
     guard_max_ratio : float
         Cap of the automatic theta guard band width, per side, as a
@@ -595,11 +641,16 @@ def _ffbp_impl(
             w2_map = None
             weight_grid = None
             if use_antenna_pattern:
-                # Compute illumination with decimation
-                # CUDA kernel outputs at decimated resolution directly
-                w1_map, w2_map = compute_subaperture_illumination(
+                # An afbp base level stands in for log2(afbp_nsub) more
+                # recursion levels whose per-node illumination would have
+                # cost 1/afbp_nsub as much; decimate the pulses by the
+                # same factor to match, otherwise the maps cost more than
+                # the afbp base itself. afbp_nsub=1 reduces to the plain
+                # decimated maps. CUDA kernel outputs at decimated
+                # resolution directly.
+                w1_map, w2_map = _illumination_pulse_decimated(
                     pos_local, att_local, g, g_extent, grid_local,
-                    decimation=weight_map_downsample
+                    weight_map_downsample, afbp_nsub
                 )
                 # Create weight grid matching output dimensions
                 dec = weight_map_downsample
