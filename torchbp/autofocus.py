@@ -33,7 +33,12 @@ from copy import deepcopy
 
 
 def pga_estimator(
-    g: Tensor, estimator: str = "wls", eps: float = 1e-6, return_weight: bool = False
+    g: Tensor,
+    estimator: str = "wls",
+    eps: float = 1e-6,
+    return_weight: bool = False,
+    weight: Tensor | None = None,
+    weight_gate: float = 0.2,
 ) -> Union[Tuple[Tensor, Tensor], Tensor]:
     """
     Estimate phase error from set of measurements.
@@ -49,6 +54,20 @@ def pga_estimator(
             - "wls": Weighted least squares using estimated signal-to-clutter weighting. [3]_
     eps : float
         Minimum weight for weighted PGA.
+    weight : Tensor or None
+        Optional non-negative per-sample weight, shape [Ntargets, Nazimuth],
+        e.g. the two-way antenna amplitude toward each target at each
+        measurement. Weights are normalized per target. Samples with zero
+        weight (target outside the antenna beam) do not contribute to the
+        phase estimate; measurements where no target has weight get zero
+        phase gradient. With "wls" the signal-to-clutter weights are
+        estimated from the antenna-envelope-flattened amplitudes of the
+        in-beam samples only. With "ml" the samples are gated by the weight
+        before the SVD.
+    weight_gate : float
+        Relative weight (to each target's maximum) below which a sample is
+        considered out of beam for the "wls" amplitude statistics and the
+        "ml" gating.
 
     References
     ----------
@@ -70,12 +89,33 @@ def pga_estimator(
     phi : Tensor
         Solved phase error.
     """
+    tiny = 1e-12
+    if weight is not None:
+        wn = weight / torch.clamp(
+            torch.amax(weight, dim=1, keepdim=True), min=tiny
+        )
+        in_beam = wn > weight_gate
+        # Weight for the phase-difference products between consecutive
+        # measurements: both samples of the pair must be in the beam.
+        wpair = wn * torch.nn.functional.pad(wn[..., :-1], (1, 0))
     if estimator == "ml":
-        u, s, v = torch.linalg.svd(g)
+        gw = g if weight is None else g * in_beam
+        u, s, v = torch.linalg.svd(gw)
         phi = torch.angle(v[0, :])
     elif estimator == "wls":
-        c = torch.mean(torch.abs(g), dim=1, keepdim=True)
-        d = torch.mean(torch.abs(g) ** 2, dim=1, keepdim=True)
+        if weight is None:
+            c = torch.mean(torch.abs(g), dim=1, keepdim=True)
+            d = torch.mean(torch.abs(g) ** 2, dim=1, keepdim=True)
+        else:
+            # Flatten the antenna envelope so the amplitude statistics
+            # measure signal-to-clutter ratio instead of the beam
+            # modulation, and use only in-beam samples.
+            ga = in_beam * torch.abs(g) / torch.clamp(wn, min=weight_gate)
+            n_in = torch.clamp(
+                torch.sum(in_beam, dim=1, keepdim=True), min=1
+            )
+            c = torch.sum(ga, dim=1, keepdim=True) / n_in
+            d = torch.sum(ga**2, dim=1, keepdim=True) / n_in
         w = (
             torch.nan_to_num(
                 d / (2 * (2 * c**2 - d) - 2 * c * torch.sqrt(4 * c**2 - 3 * d))
@@ -83,18 +123,23 @@ def pga_estimator(
             + eps
         )
         gshift = torch.nn.functional.pad(g[..., :-1], (1, 0))
-        phidot = torch.angle(
-            torch.sum((w / torch.max(w)) * (g * torch.conj(gshift)), dim=0)
-        )
+        prod = g * torch.conj(gshift)
+        if weight is not None:
+            prod = wpair * prod
+        phidot = torch.angle(torch.sum((w / torch.max(w)) * prod, dim=0))
         phi = torch.cumsum(phidot, dim=0)
         if return_weight:
             return phi, w
     elif estimator == "pd":
         z = torch.zeros((g.shape[0], 1), device=g.device, dtype=g.dtype)
         gdot = torch.diff(g, prepend=z, dim=-1)
-        phidot = torch.sum((torch.conj(g) * gdot).imag, dim=0) / torch.sum(
-            torch.abs(g) ** 2, dim=0
-        )
+        if weight is None:
+            num = torch.sum((torch.conj(g) * gdot).imag, dim=0)
+            den = torch.sum(torch.abs(g) ** 2, dim=0)
+        else:
+            num = torch.sum(wpair * (torch.conj(g) * gdot).imag, dim=0)
+            den = torch.sum(wpair * torch.abs(g) ** 2, dim=0)
+        phidot = torch.where(den > tiny, num / torch.clamp(den, min=tiny), 0.0)
         phi = torch.cumsum(phidot, dim=0)
     else:
         raise ValueError(f"Unknown estimator {estimator}")
@@ -233,6 +278,144 @@ def _pixel_to_world(
     return torch.stack([x, y, z], dim=1)
 
 
+def _antenna_weights(
+    target_pos: Tensor, pos: Tensor, att: Tensor, g: Tensor, g_extent: list
+) -> Tensor:
+    """Two-way antenna amplitude toward each target from each position.
+
+    Mirrors the bilinear antenna gain lookup in the backprojection kernels:
+    elevation is the look angle relative to the antenna roll, azimuth the
+    target bearing relative to the antenna yaw, and ``g`` is sampled
+    bilinearly over ``g_extent``. Angles outside the pattern get zero
+    weight. Pitch is ignored, matching the kernels.
+
+    Parameters
+    ----------
+    target_pos : Tensor
+        Target positions. Shape [ntargets, 3].
+    pos : Tensor
+        Platform positions. Shape [nsweeps, 3].
+    att : Tensor
+        Antenna rotation [roll, pitch, yaw] per sweep. Shape [nsweeps, 3].
+    g : Tensor
+        Square-root of two-way antenna gain. Shape [elevation, azimuth].
+    g_extent : list
+        [g_el0, g_az0, g_el1, g_az1] pattern extent in radians.
+
+    Returns
+    -------
+    w : Tensor
+        Antenna amplitude weight. Shape [ntargets, nsweeps].
+    """
+    g_el0, g_az0, g_el1, g_az1 = g_extent
+    g_nel, g_naz = g.shape
+    g_del = (g_el1 - g_el0) / g_nel
+    g_daz = (g_az1 - g_az0) / g_naz
+
+    dx = target_pos[:, 0][:, None] - pos[None, :, 0]
+    dy = target_pos[:, 1][:, None] - pos[None, :, 1]
+    dz = target_pos[:, 2][:, None] - pos[None, :, 2]
+    d = torch.sqrt(dx**2 + dy**2 + dz**2)
+    el = torch.arcsin(torch.clamp(dz / d, -1.0, 1.0)) - att[None, :, 0]
+    az = torch.arctan2(dy, dx) - att[None, :, 2]
+
+    el_idx = (el - g_el0) / g_del
+    az_idx = (az - g_az0) / g_daz
+    el0 = torch.floor(el_idx)
+    az0 = torch.floor(az_idx)
+    ef = el_idx - el0
+    af = az_idx - az0
+    valid = (
+        (el_idx >= 0)
+        & (el0 + 1 < g_nel)
+        & (az_idx >= 0)
+        & (az0 + 1 < g_naz)
+    )
+    el0 = torch.clamp(el0.long(), 0, g_nel - 2)
+    az0 = torch.clamp(az0.long(), 0, g_naz - 2)
+    v00 = g[el0, az0]
+    v01 = g[el0, az0 + 1]
+    v10 = g[el0 + 1, az0]
+    v11 = g[el0 + 1, az0 + 1]
+    w = (
+        v00 * (1 - ef) * (1 - af)
+        + v01 * (1 - ef) * af
+        + v10 * ef * (1 - af)
+        + v11 * ef * af
+    )
+    return torch.where(valid, w, torch.zeros_like(w))
+
+
+def _weighted_detrend(x: Tensor, w: Tensor | None) -> Tensor:
+    """Remove weighted linear trend from 1D tensor ``x``.
+
+    ``w`` holds non-negative per-sample weights; ``None`` falls back to
+    the unweighted :func:`torchbp.util.detrend`. Degenerate weights (all
+    zero or concentrated on one sample) remove only the weighted mean.
+    """
+    if w is None:
+        return detrend(x)
+    n = x.shape[0]
+    k = torch.arange(n, device=x.device, dtype=x.dtype) / n
+    wsum = torch.sum(w)
+    if wsum <= 0:
+        return x
+    km = torch.sum(w * k) / wsum
+    xm = torch.sum(w * x) / wsum
+    kk = torch.sum(w * (k - km) ** 2)
+    if kk <= 0:
+        return x - xm
+    a = torch.sum(w * (k - km) * (x - xm)) / kk
+    return x - (xm + a * (k - km))
+
+
+def _select_targets(
+    img: Tensor,
+    target_threshold_db: float,
+    isolation_db: float = 0.0,
+    isolation_guard: int = 5,
+    isolation_window: int = 30,
+) -> tuple[Tensor, Tensor]:
+    """Pick autofocus targets from a (sub)image: at most one per row.
+
+    Takes the strongest pixel of each row (second image axis), keeps the
+    ones within ``target_threshold_db`` of the strongest pick, and when
+    ``isolation_db > 0`` additionally requires the peak to exceed the mean
+    amplitude of the surrounding cells along the row (excluding a
+    ``isolation_guard`` half-width around the peak, out to
+    ``isolation_window``) by ``isolation_db``. This rejects targets embedded
+    in extended clutter, e.g. building walls, that violate the point-target
+    assumption. If the isolation screen rejects every candidate (e.g. a
+    heavily defocused early iteration), it falls back to amplitude-only
+    selection.
+
+    Returns
+    -------
+    rows, cols : Tensor
+        Integer image indices of the selected targets.
+    """
+    a_img = torch.abs(img)
+    rpeaks = torch.argmax(a_img, dim=1)
+    rows = torch.arange(img.shape[0], device=img.device)
+    a = a_img[rows, rpeaks]
+    keep = a > torch.max(a) * 10 ** (-target_threshold_db / 20)
+    if isolation_db > 0 and img.shape[1] > 2 * (isolation_guard + 1):
+        window = min(isolation_window, img.shape[1] // 2)
+        guard = min(isolation_guard, window - 1)
+        offsets = torch.cat(
+            [
+                torch.arange(-window, -guard, device=img.device),
+                torch.arange(guard + 1, window + 1, device=img.device),
+            ]
+        )
+        cols = torch.clamp(rpeaks[:, None] + offsets[None, :], 0, img.shape[1] - 1)
+        clutter = torch.mean(torch.gather(a_img, 1, cols), dim=1)
+        isolated = a > clutter * 10 ** (isolation_db / 20)
+        if torch.any(keep & isolated):
+            keep = keep & isolated
+    return rows[keep], rpeaks[keep]
+
+
 # Image formation algorithm registry for GPGA. Maps algorithm name to
 # (function, grid kind, accepts antenna pattern, default image_opts). "bp"
 # resolves to the polar or Cartesian direct backprojection by grid type.
@@ -323,6 +506,10 @@ def gpga(
     min_window: int = 5,
     d0: float = 0.0,
     target_threshold_db: float = 20,
+    isolation_db: float = 6.0,
+    isolation_guard: int = 5,
+    isolation_window: int = 30,
+    beam_gate: float = 0.2,
     remove_trend: bool = True,
     estimator: str = "pd",
     lowpass_window: str = "boxcar",
@@ -391,11 +578,33 @@ def gpga(
     target_threshold_db : float
         Filter out targets that are this many dB below the maximum amplitude
         target.
+    isolation_db : float
+        Reject targets whose peak is less than this many dB above the mean
+        amplitude of the surrounding cells along the second image axis
+        (excluding a guard band around the peak). Screens out targets
+        embedded in extended clutter, e.g. building walls, that violate
+        the point-target assumption. 0 disables the screen. If no target
+        passes the screen, selection falls back to amplitude only.
+    isolation_guard : int
+        Half-width in pixels of the guard band around the peak excluded
+        from the clutter estimate.
+    isolation_window : int
+        Half-width in pixels of the clutter estimation window.
+    beam_gate : float
+        When the antenna pattern (``att``, ``g``, ``g_extent``) is given,
+        target samples whose two-way antenna amplitude is below ``beam_gate``
+        times that target's maximum are zeroed and excluded from the phase
+        estimate. This makes the estimate robust to discontinuous target
+        illumination (stripmap-like collections), where out-of-beam samples
+        contain unrelated clutter from the same range ring.
     remove_trend : bool
         Remove linear trend in phase correction.
     estimator : str
         Estimator to use.
         See `pga_estimator` function for possible choices.
+        With discontinuous illumination (antenna weighting on a
+        stripmap-like collection) "wls" is recommended: "pd" accumulates a
+        drift as targets enter and leave the beam.
     lowpass_window : str
         FFT window to use for lowpass filtering.
         See `scipy.get_window` for syntax.
@@ -413,6 +622,9 @@ def gpga(
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
+        When given together with ``att`` and ``g_extent``, the pattern is
+        also used to weight the per-target phase history samples (see
+        ``beam_gate``).
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1].
         g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
@@ -445,6 +657,10 @@ def gpga(
 
     pos_new = pos.clone()
 
+    use_antenna_weight = (
+        att is not None and g is not None and g_extent is not None
+    )
+
     if window_width is None:
         window_width = data.shape[0]
 
@@ -455,25 +671,36 @@ def gpga(
         lp_w = fft_lowpass_filter_precalculate_window(
             pos_new.shape[0], window_width, img.device, lowpass_window, fast_len=True
         )
-        rpeaks = torch.argmax(torch.abs(img), dim=1)
-        a = torch.abs(img[torch.arange(img.size(0)), rpeaks])
-        max_a = torch.max(a)
-
-        target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
-        i_idx = target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
-        j_idx = rpeaks[target_idx].to(torch.float32)
-        target_pos = _pixel_to_world(grid, i_idx, j_idx)
+        rows, cols = _select_targets(
+            img, target_threshold_db, isolation_db, isolation_guard,
+            isolation_window,
+        )
+        target_pos = _pixel_to_world(
+            grid, rows.to(torch.float32), cols.to(torch.float32)
+        )
 
         # Get range profile samples for each target
         target_data = gpga_backprojection_2d_core(
             target_pos, data, pos_new, fc, r_res, d0, interp_method=interp_method, data_fmod=data_fmod
         )
+        target_w = None
+        if use_antenna_weight:
+            target_w = _antenna_weights(target_pos, pos_new, att, g, g_extent)
+            # Zero the out-of-beam samples before lowpass filtering so
+            # unrelated clutter at the target's range ring is not smeared
+            # into the illuminated interval.
+            wn = target_w / torch.clamp(
+                torch.amax(target_w, dim=1, keepdim=True), min=1e-12
+            )
+            target_data = target_data * (wn > beam_gate)
         # Filter samples
         if window_width is not None and window_width < target_data.shape[1]:
             target_data = fft_lowpass_filter_window(
                 target_data, window=lp_w, window_width=window_width
             )
-        phi = pga_estimator(target_data, estimator, eps)
+        phi = pga_estimator(
+            target_data, estimator, eps, weight=target_w, weight_gate=beam_gate
+        )
         phi_sum = unwrap(phi_sum + phi)
         if remove_trend:
             phi_sum = detrend(phi_sum)
@@ -507,11 +734,16 @@ def gpga_tde(
     min_window: int = 5,
     d0: float = 0.0,
     target_threshold_db: float = 20,
+    isolation_db: float = 6.0,
+    isolation_guard: int = 5,
+    isolation_window: int = 30,
+    beam_gate: float = 0.2,
     remove_trend: bool = True,
     lowpass_window: str = "boxcar",
     eps: float = 1e-6,
     interp_method: str = "linear",
     estimate_z: bool = True,
+    solve_threshold: float = 0.05,
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
@@ -576,6 +808,28 @@ def gpga_tde(
     target_threshold_db : float
         Filter out targets that are this many dB below the maximum amplitude
         target.
+    isolation_db : float
+        Reject targets whose peak is less than this many dB above the mean
+        amplitude of the surrounding cells along the second image axis
+        (excluding a guard band around the peak). Screens out targets
+        embedded in extended clutter, e.g. building walls, that violate
+        the point-target assumption. 0 disables the screen. If no target
+        in a block passes the screen, selection falls back to amplitude
+        only.
+    isolation_guard : int
+        Half-width in pixels of the guard band around the peak excluded
+        from the clutter estimate.
+    isolation_window : int
+        Half-width in pixels of the clutter estimation window.
+    beam_gate : float
+        When the antenna pattern (``att``, ``g``, ``g_extent``) is given,
+        target samples whose two-way antenna amplitude is below ``beam_gate``
+        times that target's maximum are zeroed and excluded from the phase
+        estimate, and each block's contribution to the position solve is
+        weighted per sweep by its illumination. This makes the estimate
+        robust to discontinuous target illumination (stripmap-like
+        collections), where out-of-beam samples contain unrelated clutter
+        from the same range ring.
     remove_trend : bool
         Remove linear trend in phase correction.
     lowpass_window : str
@@ -589,6 +843,14 @@ def gpga_tde(
         ("lanczos", N): Lanczos interpolation with order 2*N+1.
     estimate_z : bool
         Estimate Z-axis position error. Default is True.
+    solve_threshold : float
+        Relative eigenvalue threshold of the per-sweep position solve.
+        Directions of the normal matrix with eigenvalues below this
+        fraction of the largest one are considered unobservable at that
+        sweep and get zero position update. Raise it if unobservable
+        directions (e.g. along-track at broadside with a narrow beam)
+        accumulate noise; lower it if a weakly observed direction that
+        should be estimated is being suppressed.
     att : Tensor
         Antenna rotation tensor.
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
@@ -597,6 +859,9 @@ def gpga_tde(
         Square-root of two-way antenna gain in spherical coordinates, shape: [elevation, azimuth].
         If TX antenna equals RX antenna, then this should be just antenna gain.
         (0, 0) angle is at the beam center.
+        When given together with ``att`` and ``g_extent``, the pattern is
+        also used to weight the per-target phase history samples and the
+        per-sweep position solve (see ``beam_gate``).
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1].
         g_el0, g_el1 are grx and gtx elevation axis start and end values. Units
@@ -634,6 +899,10 @@ def gpga_tde(
 
     pos_new = pos.clone()
 
+    use_antenna_weight = (
+        att is not None and g is not None and g_extent is not None
+    )
+
     if window_width is None:
         window_width = data.shape[0] // azimuth_divisions
 
@@ -653,8 +922,12 @@ def gpga_tde(
         dtype=torch.float32,
         device=data.device,
     )
+    # Per-block, per-sweep weight for the position solve. Without antenna
+    # information a block has the same weight at every sweep; with it the
+    # weight follows the block's illumination so sweeps that never saw the
+    # block do not constrain the solution.
     local_w = torch.zeros(
-        (range_divisions * azimuth_divisions, 1),
+        (range_divisions * azimuth_divisions, data.shape[0]),
         dtype=torch.float32,
         device=data.device,
     )
@@ -678,16 +951,15 @@ def gpga_tde(
                 jr1 = (jr + 1) * azdiv if jr < azimuth_divisions - 1 else None
                 local_img = img[ir * rdiv : ir1, jr * azdiv : jr1]
 
-                rpeaks = torch.argmax(torch.abs(local_img), dim=1)
-                a = torch.abs(local_img[torch.arange(local_img.size(0)), rpeaks])
-                max_a = torch.max(a)
-
-                target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
-                if not torch.any(target_idx):
+                rows, cols = _select_targets(
+                    local_img, target_threshold_db, isolation_db,
+                    isolation_guard, isolation_window,
+                )
+                if rows.numel() == 0:
                     # No usable targets in this block (e.g. never
                     # illuminated). Zero weight excludes it from the
                     # position solve; centers just need to be finite.
-                    local_w[ir * azimuth_divisions + jr] = 0
+                    local_w[ir * azimuth_divisions + jr, :] = 0
                     local_d[ir * azimuth_divisions + jr, :] = 0
                     mid = _pixel_to_world(
                         grid,
@@ -704,10 +976,8 @@ def gpga_tde(
                     local_centers[ir * azimuth_divisions + jr, 1] = mid[1]
                     continue
                 # Absolute image indices of the targets in this block.
-                i_idx = ir * rdiv + target_idx.nonzero(as_tuple=True)[0].to(
-                    torch.float32
-                )
-                j_idx = jr * azdiv + rpeaks[target_idx].to(torch.float32)
+                i_idx = ir * rdiv + rows.to(torch.float32)
+                j_idx = jr * azdiv + cols.to(torch.float32)
                 target_pos = _pixel_to_world(grid, i_idx, j_idx)
 
                 # Get range profile samples for each target
@@ -721,15 +991,40 @@ def gpga_tde(
                     interp_method=interp_method,
                     data_fmod=data_fmod,
                 )
+                target_w = None
+                if use_antenna_weight:
+                    target_w = _antenna_weights(
+                        target_pos, pos_new, att, g, g_extent
+                    )
+                    # Zero the out-of-beam samples before lowpass filtering
+                    # so unrelated clutter at the target's range ring is not
+                    # smeared into the illuminated interval.
+                    awn = target_w / torch.clamp(
+                        torch.amax(target_w, dim=1, keepdim=True), min=1e-12
+                    )
+                    target_data = target_data * (awn > beam_gate)
                 # Filter samples
                 if window_width is not None and window_width < target_data.shape[1]:
                     target_data = fft_lowpass_filter_window(
                         target_data, window=lp_w, window_width=window_width
                     )
-                phi, w = pga_estimator(target_data, "wls", eps, return_weight=True)
-                local_w[ir * azimuth_divisions + jr] = 1 / torch.sum(1 / w)
+                phi, w = pga_estimator(
+                    target_data, "wls", eps, return_weight=True,
+                    weight=target_w, weight_gate=beam_gate,
+                )
+                block_w = 1 / torch.sum(1 / w)
+                beam_w = None
+                if use_antenna_weight:
+                    # Per-sweep illumination of this block: SCR-weighted
+                    # two-way antenna power over its targets.
+                    wn_t = w[:, 0] / torch.max(w)
+                    beam_w = torch.sum(wn_t[:, None] * awn**2, dim=0)
+                    beam_w = beam_w / torch.clamp(torch.max(beam_w), min=1e-12)
+                    local_w[ir * azimuth_divisions + jr, :] = block_w * beam_w
+                else:
+                    local_w[ir * azimuth_divisions + jr, :] = block_w
                 phi = unwrap(phi)
-                phi = detrend(phi)
+                phi = _weighted_detrend(phi, beam_w)
                 # Phase to distance
                 c0 = 299792458
                 d = phi * c0 / (4 * torch.pi * fc)
@@ -770,19 +1065,47 @@ def gpga_tde(
         else:
             m = torch.stack([cos_az * cos_el, sin_az * cos_el], dim=-1)
 
-        w = torch.sqrt(local_w).unsqueeze(0)
-        w = w / torch.max(w)
+        w = torch.sqrt(local_w).transpose(0, 1).unsqueeze(-1)  # [nsweeps, nblocks, 1]
+        w = w / torch.clamp(torch.max(w), min=1e-12)
         s = local_d.unsqueeze(0).transpose(0, 2)
 
         # Solve for 2D/3D position change for each data position from
-        # distances from each position to local image centers
-        d_solved = torch.linalg.lstsq(w * m, w * s).solution
-        d_solved = d_solved.squeeze().transpose(0, 1)
+        # distances from each position to local image centers. Truncated
+        # eigenvalue solve of the normal equations instead of a plain
+        # lstsq: with a narrow beam (stripmap) all blocks a sweep can see
+        # lie in nearly the same direction, so some position directions
+        # (e.g. along-track at broadside) are unobservable at that sweep
+        # and a full-rank solve amplifies noise into them. Truncation
+        # leaves unobserved directions, and sweeps no block observed at
+        # all, with zero update.
+        A = w * m
+        b = w * s
+        AtA = A.transpose(-1, -2) @ A
+        Atb = A.transpose(-1, -2) @ b
+        evals, evecs = torch.linalg.eigh(AtA)
+        evinv = torch.where(
+            evals > solve_threshold * evals[..., -1:], 1 / evals, 0.0
+        )
+        d_solved = evecs @ (
+            evinv.unsqueeze(-1) * (evecs.transpose(-1, -2) @ Atb)
+        )
+        d_solved = d_solved.squeeze(-1).transpose(0, 1)
 
+        # Per-sweep coverage for trend removal and the convergence metric so
+        # sweeps that no block observed do not dilute them.
+        coverage = torch.sum(local_w, dim=0)
+        coverage_sum = torch.clamp(torch.sum(coverage), min=1e-12)
         if remove_trend:
-            d_solved[0] = detrend(d_solved[0])
+            d_solved[0] = _weighted_detrend(
+                d_solved[0], coverage if use_antenna_weight else None
+            )
         rms_error = (
-            4 * torch.pi * torch.sqrt(torch.mean(torch.square(d_solved / wl))).item()
+            4
+            * torch.pi
+            * torch.sqrt(
+                torch.sum(coverage * torch.mean(torch.square(d_solved / wl), dim=0))
+                / coverage_sum
+            ).item()
         )
         if verbose:
             print(f"{i+1}, {window_width}, {rms_error}")
