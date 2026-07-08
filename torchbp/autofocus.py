@@ -3,16 +3,19 @@ import torch
 import numpy as np
 from torch import Tensor
 from typing import TYPE_CHECKING, Union, Tuple
-from .grid import unpack_polar_grid
+from .grid import unpack_polar_grid, unpack_cartesian_grid
 
 if TYPE_CHECKING:
-    from .grid import PolarGrid
+    from .grid import PolarGrid, CartesianGrid
 from .ops import (
     backprojection_polar_2d,
     backprojection_cart_2d,
     gpga_backprojection_2d_core,
     blocksvd_alpha,
     ffbp,
+    afbp,
+    cfbp,
+    cfbp_adaptive,
 )
 from .ops import entropy
 from .util import (
@@ -187,13 +190,133 @@ def pga(
     return img, phi_sum
 
 
-def gpga_bp_polar(
+def _grid_is_polar(grid: "PolarGrid | CartesianGrid | dict") -> bool:
+    """Return True for a polar grid, False for a Cartesian one.
+
+    Uses the same duck typing as :func:`torchbp.grid.unpack_polar_grid` /
+    :func:`torchbp.grid.unpack_cartesian_grid` so both grid objects and legacy
+    dicts work.
+    """
+    if hasattr(grid, "r0") or hasattr(grid, "x0"):
+        return hasattr(grid, "r0")
+    if isinstance(grid, dict):
+        if "r" in grid and "theta" in grid:
+            return True
+        if "x" in grid and "y" in grid:
+            return False
+    raise ValueError(
+        "grid must be a PolarGrid, CartesianGrid, or an equivalent dict"
+    )
+
+
+def _pixel_to_world(
+    grid: "PolarGrid | CartesianGrid | dict", i_idx: Tensor, j_idx: Tensor
+) -> Tensor:
+    """Map image pixel indices to Cartesian world coordinates.
+
+    ``i_idx`` indexes the first image axis (range for polar, x for Cartesian),
+    ``j_idx`` the second (azimuth/theta for polar, y for Cartesian). Indices may
+    be fractional (float tensors) so block centers work too. Returns a
+    ``[N, 3]`` tensor of ``(x, y, z)`` with ``z = 0``.
+    """
+    if _grid_is_polar(grid):
+        r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+        r = r0 + dr * i_idx
+        theta = theta0 + dtheta * j_idx
+        x = r * torch.sqrt(1 - theta**2)
+        y = r * theta
+    else:
+        x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
+        x = x0 + dx * i_idx
+        y = y0 + dy * j_idx
+    z = torch.zeros_like(x)
+    return torch.stack([x, y, z], dim=1)
+
+
+# Image formation algorithm registry for GPGA. Maps algorithm name to
+# (function, grid kind, accepts antenna pattern, default image_opts). "bp"
+# resolves to the polar or Cartesian direct backprojection by grid type.
+_GPGA_POLAR_ALGOS = {
+    "bp": (backprojection_polar_2d, True, {}),
+    "ffbp": (ffbp, True, {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}),
+    "afbp": (afbp, True, {}),
+}
+_GPGA_CART_ALGOS = {
+    "bp": (backprojection_cart_2d, False, {}),
+    "cfbp": (cfbp, False, {"stages": 4}),
+    "cfbp_adaptive": (cfbp_adaptive, False, {"stages": 4}),
+}
+
+
+def _make_image_former(
+    algorithm: str,
+    grid: "PolarGrid | CartesianGrid | dict",
+    data: Tensor,
+    fc: float,
+    r_res: float,
+    d0: float,
+    data_fmod: float,
+    att: Tensor | None,
+    g: Tensor | None,
+    g_extent: list | None,
+    image_opts: dict | None,
+):
+    """Build a ``form_image(pos) -> 2D image`` closure for GPGA.
+
+    Selects the image formation algorithm by name and grid type, merges
+    ``image_opts`` over the algorithm's defaults, forwards antenna pattern
+    arguments only to algorithms that accept them, and normalizes the output to
+    a bare 2D tensor.
+    """
+    is_polar = _grid_is_polar(grid)
+    table = _GPGA_POLAR_ALGOS if is_polar else _GPGA_CART_ALGOS
+    if algorithm not in table:
+        kind = "polar" if is_polar else "Cartesian"
+        raise ValueError(
+            f"algorithm {algorithm!r} is not available for a {kind} grid. "
+            f"Choose one of {sorted(table)}."
+        )
+    func, accepts_antenna, defaults = table[algorithm]
+
+    has_antenna = att is not None or g is not None or g_extent is not None
+    if has_antenna and not accepts_antenna:
+        raise ValueError(
+            f"algorithm {algorithm!r} does not support antenna pattern "
+            "arguments (att/g/g_extent)."
+        )
+
+    opts = dict(defaults)
+    if image_opts is not None:
+        opts.update(image_opts)
+
+    if algorithm == "afbp" and "nsub" not in opts:
+        raise ValueError(
+            "algorithm 'afbp' requires the number of subapertures; pass "
+            "image_opts={'nsub': N}."
+        )
+
+    def form_image(p):
+        kwargs = dict(opts)
+        kwargs.update(d0=d0, data_fmod=data_fmod)
+        if accepts_antenna:
+            kwargs.update(att=att, g=g, g_extent=g_extent)
+        img = func(data, grid, fc, r_res, p, **kwargs)
+        if img.dim() == 3:
+            img = img[0]
+        return img
+
+    return form_image
+
+
+def gpga(
     img: Tensor | None,
     data: Tensor,
     pos: Tensor,
     fc: float,
     r_res: float,
-    grid_polar: "PolarGrid | dict",
+    grid: "PolarGrid | CartesianGrid | dict",
+    algorithm: str = "bp",
+    image_opts: dict | None = None,
     window_width: int | None = None,
     max_iters: int = 10,
     window_exp: float = 0.7,
@@ -208,19 +331,21 @@ def gpga_bp_polar(
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
-    use_ffbp: bool = False,
-    ffbp_opts: dict | None = None,
     data_fmod: float = 0
 ) -> tuple[Tensor, Tensor]:
     """
-    Generalized phase gradient autofocus using 2D polar coordinate
-    backprojection image formation. [1]_
+    Generalized phase gradient autofocus. [1]_
+
+    Works with any image formation algorithm in the library and with both
+    polar and Cartesian grids. The grid type is detected automatically and the
+    image formation algorithm is selected with ``algorithm``.
 
     Parameters
     ----------
     img : Tensor or None
-        Complex input image. Shape should be: [Range, azimuth].
-        If None image is generated from the data.
+        Complex input image. Shape should be: [Range, azimuth] for a polar
+        grid or [x, y] for a Cartesian grid. If None image is generated from
+        the data.
     data : Tensor
         Range compressed input data. Shape should be [nsweeps, samples].
     pos : Tensor
@@ -231,13 +356,27 @@ def gpga_bp_polar(
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
-    grid_polar : PolarGrid or dict
-        Polar grid definition. Can be:
+    grid : PolarGrid, CartesianGrid or dict
+        Image grid definition. Can be:
 
         - PolarGrid object: PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)
-        - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
-
-        where theta is sin of angle (-1, 1 for 180 degree view).
+          (theta is sin of angle, -1 to 1 for 180 degree view), or the
+          equivalent dict {"r": ..., "theta": ..., "nr": ..., "ntheta": ...}.
+        - CartesianGrid object: CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny),
+          or the equivalent dict {"x": ..., "y": ..., "nx": ..., "ny": ...}.
+    algorithm : str
+        Image formation algorithm. For a polar grid: "bp"
+        (:func:`torchbp.ops.backprojection_polar_2d`, default), "ffbp"
+        (:func:`torchbp.ops.ffbp`) or "afbp" (:func:`torchbp.ops.afbp`). For a
+        Cartesian grid: "bp" (:func:`torchbp.ops.backprojection_cart_2d`,
+        default), "cfbp" (:func:`torchbp.ops.cfbp`) or "cfbp_adaptive"
+        (:func:`torchbp.ops.cfbp_adaptive`).
+    image_opts : dict or None
+        Extra keyword arguments for the image formation algorithm, merged over
+        per-algorithm defaults. "ffbp" defaults to
+        {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4};
+        "cfbp"/"cfbp_adaptive" default to {"stages": 4}; "afbp" requires
+        {"nsub": N}.
     window_width : int or None
         Initial low-pass filter window width in samples. None for initial
         maximum size.
@@ -280,10 +419,7 @@ def gpga_bp_polar(
         in radians. -pi/2 + +pi/2 if including data over the whole sphere.
         g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
         radians. -pi to +pi if including data over the whole sphere.
-    use_ffbp : bool
-        Use fast factorized backprojection for image formation.
-    ffbp_opts : dict
-        Dictionary of options for ffbp.
+        Antenna pattern arguments are only supported by the polar algorithms.
     data_fmod : float
         Range modulation frequency applied to input data.
 
@@ -300,25 +436,13 @@ def gpga_bp_polar(
     phi : Tensor
         Solved phase error.
     """
-    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
-
-    def form_image(p):
-        if use_ffbp:
-            opts = {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}
-            if ffbp_opts is not None:
-                opts.update(ffbp_opts)
-            return ffbp(data, grid_polar, fc, r_res, p, d0=d0,
-                    data_fmod=data_fmod, g=g, g_extent=g_extent, att=att,
-                    **opts)
-        return backprojection_polar_2d(data, grid_polar, fc, r_res, p,
-                d0=d0, data_fmod=data_fmod, g=g, g_extent=g_extent,
-                att=att)[0]
+    form_image = _make_image_former(
+        algorithm, grid, data, fc, r_res, d0, data_fmod,
+        att, g, g_extent, image_opts,
+    )
 
     phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
 
-    theta = theta0 + dtheta * torch.arange(
-        ntheta, device=data.device, dtype=torch.float32
-    )
     pos_new = pos.clone()
 
     if window_width is None:
@@ -336,13 +460,9 @@ def gpga_bp_polar(
         max_a = torch.max(a)
 
         target_idx = a > max_a * 10 ** (-target_threshold_db / 20)
-        target_theta = theta0 + dtheta * rpeaks[target_idx].to(torch.float32)
-        target_r = r0 + dr * target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
-
-        x = target_r * torch.sqrt(1 - target_theta**2)
-        y = target_r * target_theta
-        z = torch.zeros_like(target_r)
-        target_pos = torch.stack([x, y, z], dim=1)
+        i_idx = target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
+        j_idx = rpeaks[target_idx].to(torch.float32)
+        target_pos = _pixel_to_world(grid, i_idx, j_idx)
 
         # Get range profile samples for each target
         target_data = gpga_backprojection_2d_core(
@@ -369,15 +489,17 @@ def gpga_bp_polar(
     return img, phi_sum
 
 
-def gpga_bp_polar_tde(
+def gpga_tde(
     img: Tensor | None,
     data: Tensor,
     pos: Tensor,
     fc: float,
     r_res: float,
-    grid_polar: "PolarGrid | dict",
+    grid: "PolarGrid | CartesianGrid | dict",
     azimuth_divisions: int,
     range_divisions: int,
+    algorithm: str = "bp",
+    image_opts: dict | None = None,
     window_width: int | None = None,
     rms_error_limit: float = 0.05,
     max_iters: int = 20,
@@ -393,14 +515,16 @@ def gpga_bp_polar_tde(
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
-    use_ffbp: bool = False,
-    ffbp_opts: dict | None = None,
     verbose: bool = False,
     data_fmod: float = 0,
 ) -> tuple[Tensor, Tensor]:
     """
-    Generalized phase gradient autofocus [1]_ using 2D polar coordinate
-    backprojection image formation.
+    Generalized phase gradient autofocus [1]_ with time-domain error (TDE) 3D
+    position estimation.
+
+    Works with any image formation algorithm in the library and with both
+    polar and Cartesian grids (see :func:`gpga` for ``algorithm`` /
+    ``image_opts`` / ``grid``).
 
     Estimates 3D position error by dividing the image into subimages, estimating
     slant range error to each subimage, and then solving for 3D position error
@@ -425,17 +549,17 @@ def gpga_bp_polar_tde(
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
         and oversample is FFT oversampling factor.
-    grid_polar : PolarGrid or dict
-        Polar grid definition. Can be:
-
-        - PolarGrid object: PolarGrid(r_range=(r0, r1), theta_range=(theta0, theta1), nr=nr, ntheta=ntheta)
-        - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
-
-        where theta is sin of angle (-1, 1 for 180 degree view).
+    grid : PolarGrid, CartesianGrid or dict
+        Image grid definition (polar or Cartesian). See :func:`gpga`.
     azimuth_divisions : int
         Number of divisions for local images in azimuth direction.
     range_divisions : int
         Number of divisions for local images in range direction.
+    algorithm : str
+        Image formation algorithm. See :func:`gpga`.
+    image_opts : dict or None
+        Extra keyword arguments for the image formation algorithm. See
+        :func:`gpga`.
     window_width : int or None
         Initial low-pass filter window width in samples. None for initial
         maximum size.
@@ -479,10 +603,7 @@ def gpga_bp_polar_tde(
         in radians. -pi/2 + +pi/2 if including data over the whole sphere.
         g_az0, g_az1 are grx and gtx azimuth axis start and end values. Units in
         radians. -pi to +pi if including data over the whole sphere.
-    use_ffbp : bool
-        Use fast factorized backprojection for image formation.
-    ffbp_opts : dict
-        Dictionary of options for ffbp.
+        Antenna pattern arguments are only supported by the polar algorithms.
     verbose : bool
         Print progress stats.
     data_fmod : float
@@ -506,24 +627,11 @@ def gpga_bp_polar_tde(
     pos_new : Tensor
         Solved 3D position error.
     """
-    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
-
-    def form_image(p):
-        if use_ffbp:
-            opts = {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}
-            if ffbp_opts is not None:
-                opts.update(ffbp_opts)
-            return ffbp(data, grid_polar, fc, r_res, p, d0=d0,
-                    data_fmod=data_fmod, g=g, g_extent=g_extent, att=att,
-                    **opts)
-        return backprojection_polar_2d(data, grid_polar, fc, r_res, p,
-                d0=d0, data_fmod=data_fmod, g=g, g_extent=g_extent,
-                att=att)[0]
-
-    r = r0 + dr * torch.arange(nr, device=data.device, dtype=torch.float32)
-    theta = theta0 + dtheta * torch.arange(
-        ntheta, device=data.device, dtype=torch.float32
+    form_image = _make_image_former(
+        algorithm, grid, data, fc, r_res, d0, data_fmod,
+        att, g, g_extent, image_opts,
     )
+
     pos_new = pos.clone()
 
     if window_width is None:
@@ -581,28 +689,26 @@ def gpga_bp_polar_tde(
                     # position solve; centers just need to be finite.
                     local_w[ir * azimuth_divisions + jr] = 0
                     local_d[ir * azimuth_divisions + jr, :] = 0
-                    local_centers[ir * azimuth_divisions + jr, 0] = (
-                        r0 + dr * (ir * rdiv + local_img.shape[0] / 2)
-                    )
-                    local_centers[ir * azimuth_divisions + jr, 1] = (
-                        theta0 + dtheta * (jr * azdiv + local_img.shape[1] / 2)
-                    )
+                    mid = _pixel_to_world(
+                        grid,
+                        torch.tensor(
+                            [ir * rdiv + local_img.shape[0] / 2],
+                            device=data.device,
+                        ),
+                        torch.tensor(
+                            [jr * azdiv + local_img.shape[1] / 2],
+                            device=data.device,
+                        ),
+                    )[0]
+                    local_centers[ir * azimuth_divisions + jr, 0] = mid[0]
+                    local_centers[ir * azimuth_divisions + jr, 1] = mid[1]
                     continue
-                target_theta = (
-                    theta0
-                    + dtheta * jr * azdiv
-                    + dtheta * rpeaks[target_idx].to(torch.float32)
+                # Absolute image indices of the targets in this block.
+                i_idx = ir * rdiv + target_idx.nonzero(as_tuple=True)[0].to(
+                    torch.float32
                 )
-                target_r = (
-                    r0
-                    + dr * ir * rdiv
-                    + dr * target_idx.nonzero(as_tuple=True)[0].to(torch.float32)
-                )
-
-                x = target_r * torch.sqrt(1 - target_theta**2)
-                y = target_r * target_theta
-                z = torch.zeros_like(target_r)
-                target_pos = torch.stack([x, y, z], dim=1)
+                j_idx = jr * azdiv + rpeaks[target_idx].to(torch.float32)
+                target_pos = _pixel_to_world(grid, i_idx, j_idx)
 
                 # Get range profile samples for each target
                 target_data = gpga_backprojection_2d_core(
@@ -629,18 +735,20 @@ def gpga_bp_polar_tde(
                 d = phi * c0 / (4 * torch.pi * fc)
                 local_d[ir * azimuth_divisions + jr, :] = d
 
-                # Normalize to avoid overflow with near-noiseless targets
+                # Normalize to avoid overflow with near-noiseless targets.
+                # Average the target world coordinates directly so the block
+                # center is grid-agnostic (polar or Cartesian).
                 wn = w[:, 0] / torch.max(w)
                 local_centers[ir * azimuth_divisions + jr, 0] = torch.sum(
-                    wn * target_r
+                    wn * target_pos[:, 0]
                 ) / torch.sum(wn)
                 local_centers[ir * azimuth_divisions + jr, 1] = torch.sum(
-                    wn * target_theta
+                    wn * target_pos[:, 1]
                 ) / torch.sum(wn)
 
-        # Local image centers in Cartesian coordinates
-        local_y = local_centers[:, 0] * local_centers[:, 1]
-        local_x = local_centers[:, 0] * torch.sqrt(1 - local_centers[:, 1] ** 2)
+        # Local image centers in Cartesian world coordinates
+        local_x = local_centers[:, 0]
+        local_y = local_centers[:, 1]
         # Ground range from each position to local image centers
         local_r = torch.sqrt(
             (pos_new[:, 0][:, None] - local_x[None, :]) ** 2

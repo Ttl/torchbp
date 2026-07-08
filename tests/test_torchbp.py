@@ -4045,7 +4045,7 @@ class TestLowpassFilterWindow(TestCase):
         Regression: `fft_lowpass_filter_window` used to try to unpack
         `w, pad_size = fft_lowpass_filter_precalculate_window(...)`, but
         that helper only returns the window Tensor, so any call passing a
-        string window (e.g. the "boxcar" default of `gpga_bp_polar`)
+        string window (e.g. the "boxcar" default of `gpga`)
         raised `ValueError: too many values to unpack`.
         """
         from torchbp.util import (
@@ -4183,7 +4183,7 @@ class TestGpgaBpPolar(TestCase):
         img_blur = torchbp.ops.backprojection_polar_2d(
             data, self.grid_polar, self.fc, self.r_res, pos
         )[0]
-        img_focus, phi = torchbp.autofocus.gpga_bp_polar(
+        img_focus, phi = torchbp.autofocus.gpga(
             None, data, pos, self.fc, self.r_res, self.grid_polar,
             max_iters=8, target_threshold_db=15,
         )
@@ -4211,7 +4211,7 @@ class TestGpgaBpPolar(TestCase):
         self.assertLess(resid, 0.4 * dx.pow(2).mean().sqrt().item())
 
     def test_ffbp_image_formation(self):
-        # use_ffbp swaps the image formation for fast factorized
+        # algorithm="ffbp" swaps the image formation for fast factorized
         # backprojection but should drive the same autofocus solution.
         targets, amps, pos = self._scene()
         dx = 4e-3 * torch.sin(
@@ -4222,12 +4222,12 @@ class TestGpgaBpPolar(TestCase):
         data = self._make_data(targets, amps, pos_true)
 
         common = dict(max_iters=8, target_threshold_db=15)
-        img_bp, phi_bp = torchbp.autofocus.gpga_bp_polar(
+        img_bp, phi_bp = torchbp.autofocus.gpga(
             None, data, pos, self.fc, self.r_res, self.grid_polar, **common
         )
-        img_ff, phi_ff = torchbp.autofocus.gpga_bp_polar(
+        img_ff, phi_ff = torchbp.autofocus.gpga(
             None, data, pos, self.fc, self.r_res, self.grid_polar,
-            use_ffbp=True, ffbp_opts={"stages": 4}, **common
+            algorithm="ffbp", image_opts={"stages": 4}, **common
         )
 
         self.assertTrue(torch.isfinite(img_ff).all())
@@ -4265,7 +4265,7 @@ class TestGpgaBpPolarTde(TestGpgaBpPolar):
         img_blur = torchbp.ops.backprojection_polar_2d(
             data, self.grid_polar, self.fc, self.r_res, pos
         )[0]
-        img_focus, pos_new = torchbp.autofocus.gpga_bp_polar_tde(
+        img_focus, pos_new = torchbp.autofocus.gpga_tde(
             None, data, pos, self.fc, self.r_res, self.grid_polar,
             azimuth_divisions=2, range_divisions=2, estimate_z=False,
             max_iters=8, target_threshold_db=15,
@@ -4296,13 +4296,102 @@ class TestGpgaBpPolarTde(TestGpgaBpPolar):
         grid_dead["r"] = (80.0, 400.0)
         grid_dead["nr"] = 128
 
-        img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(
+        img, pos_new = torchbp.autofocus.gpga_tde(
             None, data, pos, self.fc, self.r_res, grid_dead,
             azimuth_divisions=2, range_divisions=4, estimate_z=False,
-            max_iters=2, use_ffbp=True, ffbp_opts={"stages": 3},
+            max_iters=2, algorithm="ffbp", image_opts={"stages": 3},
         )
         self.assertTrue(torch.isfinite(img).all())
         self.assertTrue(torch.isfinite(pos_new).all())
+
+
+class TestGpgaCartesian(TestGpgaBpPolar):
+    """End-to-end GPGA on a Cartesian grid (BP and CFBP image formation).
+
+    Reuses the polar scene/data helpers but images on a CartesianGrid,
+    exercising the grid-agnostic pixel->world mapping and Cartesian image
+    formers. The parent's polar-only tests are disabled.
+    """
+
+    grid_cart = {"x": (85.0, 115.0), "y": (-20.0, 20.0), "nx": 96, "ny": 128}
+
+    # Disable the inherited polar tests.
+    def test_focuses_range_motion_error(self):
+        pass
+
+    def test_ffbp_image_formation(self):
+        pass
+
+    def _scene_with_error(self):
+        targets, amps, pos = self._scene()
+        dx = 4e-3 * torch.sin(
+            2 * torch.pi * 2 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+        return data, pos
+
+    def test_cart_bp_focuses_range_motion_error(self):
+        data, pos = self._scene_with_error()
+        img_blur = torchbp.ops.backprojection_cart_2d(
+            data, self.grid_cart, self.fc, self.r_res, pos
+        )[0]
+        img_focus, phi = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_cart,
+            algorithm="bp", max_iters=8, target_threshold_db=15,
+        )
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(phi).all())
+        self.assertGreater(
+            self._sharpness(img_focus).item(),
+            1.3 * self._sharpness(img_blur).item(),
+        )
+
+    def test_cfbp_image_formation(self):
+        # algorithm="cfbp" swaps the Cartesian image formation for Cartesian
+        # factorized backprojection but should drive the same autofocus
+        # solution as direct Cartesian backprojection.
+        data, pos = self._scene_with_error()
+        common = dict(max_iters=8, target_threshold_db=15)
+        img_bp, phi_bp = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_cart,
+            algorithm="bp", **common
+        )
+        img_cf, phi_cf = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_cart,
+            algorithm="cfbp", image_opts={"stages": 4}, **common
+        )
+        self.assertTrue(torch.isfinite(img_cf).all())
+        self.assertTrue(torch.isfinite(phi_cf).all())
+        self.assertEqual(img_cf.shape, img_bp.shape)
+        corr = torch.corrcoef(torch.stack([phi_bp, phi_cf]))[0, 1]
+        self.assertGreater(corr.item(), 0.9)
+
+    def test_tde_cart_focuses(self):
+        data, pos = self._scene_with_error()
+        img_blur = torchbp.ops.backprojection_cart_2d(
+            data, self.grid_cart, self.fc, self.r_res, pos
+        )[0]
+        img_focus, pos_new = torchbp.autofocus.gpga_tde(
+            None, data, pos, self.fc, self.r_res, self.grid_cart,
+            azimuth_divisions=2, range_divisions=2, estimate_z=False,
+            algorithm="bp", max_iters=8, target_threshold_db=15,
+        )
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(pos_new).all())
+        self.assertGreater(
+            self._sharpness(img_focus).item(),
+            1.3 * self._sharpness(img_blur).item(),
+        )
+
+    def test_antenna_args_rejected_for_cartesian(self):
+        data, pos = self._scene_with_error()
+        with self.assertRaises(ValueError):
+            torchbp.autofocus.gpga(
+                None, data, pos, self.fc, self.r_res, self.grid_cart,
+                algorithm="cfbp", g=torch.ones(4, 4), max_iters=1,
+            )
 
 
 class TestCFBP(TestCase):

@@ -171,11 +171,12 @@ if __name__ == "__main__":
         print("Calculating autofocus. This might take a while.")
         torch.cuda.synchronize()
         tstart = time.time()
-        sar_img, pos_new = torchbp.autofocus.gpga_bp_polar_tde(
+        sar_img, pos_new = torchbp.autofocus.gpga_tde(
             None, fsweeps, pos_centered, fc, r_res,
             grid_polar_autofocus, d0=d0,
             azimuth_divisions=8, range_divisions=8,
-            use_ffbp=ffbp, data_fmod=data_fmod, verbose=True
+            algorithm="ffbp" if ffbp else "bp",
+            data_fmod=data_fmod, verbose=True
         )
         torch.cuda.synchronize()
         print(f"Autofocus done in {time.time() - tstart:.3g} s")
