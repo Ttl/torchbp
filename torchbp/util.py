@@ -479,6 +479,44 @@ def detrend(x: Tensor) -> Tensor:
     return x - (a * k + b)
 
 
+def weighted_detrend(x: Tensor, w: Tensor | None) -> Tensor:
+    """
+    Removes weighted linear trend.
+
+    The removed line is the weighted least squares fit, so samples with
+    zero weight do not affect the fit but the line is still subtracted
+    over the whole tensor. Degenerate weights (all zero or concentrated
+    on one sample) remove only the weighted mean.
+
+    Parameters
+    ----------
+    x : Tensor
+        Input tensor. Should be 1 dimensional.
+    w : Tensor or None
+        Non-negative per-sample weights with the same shape as ``x``.
+        None falls back to the unweighted :func:`detrend`.
+
+    Returns
+    -------
+    x : Tensor
+        x with weighted linear trend removed.
+    """
+    if w is None:
+        return detrend(x)
+    n = x.shape[0]
+    k = torch.arange(n, device=x.device, dtype=x.dtype) / n
+    wsum = torch.sum(w)
+    if wsum <= 0:
+        return x
+    km = torch.sum(w * k) / wsum
+    xm = torch.sum(w * x) / wsum
+    kk = torch.sum(w * (k - km) ** 2)
+    if kk <= 0:
+        return x - xm
+    a = torch.sum(w * (k - km) * (x - xm)) / kk
+    return x - (xm + a * (k - km))
+
+
 def entropy(x: Tensor) -> Tensor:
     """
     Calculates entropy:

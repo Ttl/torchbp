@@ -22,6 +22,7 @@ from .util import (
     unwrap,
     unwrap_ref,
     detrend,
+    weighted_detrend,
     conv_lowpass_filter,
     fft_lowpass_filter_precalculate_window,
     fft_lowpass_filter_window,
@@ -156,6 +157,8 @@ def pga(
     offload: bool = False,
     estimator: str = "wls",
     eps: float = 1e-6,
+    spectrum_support: bool = True,
+    support_gate: float = 0.01,
 ) -> tuple[Tensor, Tensor]:
     """
     Phase gradient autofocus
@@ -182,26 +185,61 @@ def pga(
         See `pga_estimator` function for possible choices.
     eps : float
         Minimum weight for weighted PGA.
+    spectrum_support : bool
+        Restrict the estimate to azimuth spectrum bins that have signal.
+        If the azimuth axis is oversampled (e.g. a ``cfbp`` image resampled
+        with ``cart_to_polar``), part of the spectrum is noise only. Without
+        gating, the noise bins corrupt the estimator statistics and bias the
+        trend removal, which shifts the image. The support is measured from
+        the mean azimuth power spectrum, the phase estimate is integrated
+        along the occupied band and the trend fit is weighted by the
+        spectrum power.
+    support_gate : float
+        Azimuth spectrum bins with mean power below this fraction of the
+        maximum are considered unoccupied.
 
     Returns
     -------
     img : Tensor
         Focused image.
     phi : Tensor
-        Solved phase error.
+        Solved phase error. Only meaningful over the occupied azimuth
+        spectrum bins.
     """
     if img.ndim != 2:
         raise ValueError("Input image should be 2D.")
     if window_exp > 1 or window_exp < 0:
         raise ValueError(f"Invalid window_exp {window_exp}")
     nr, ntheta = img.shape
-    phi_sum = torch.zeros(ntheta, device=img.device)
+    phi_sum = torch.zeros(ntheta, device=img.device, dtype=img.real.dtype)
     if window_width is None:
         window_width = ntheta
     if window_width > ntheta:
         window_width = ntheta
-    x = np.arange(ntheta)
     dev = img.device
+
+    # Spectrum magnitude is invariant over the iterations since only phase
+    # corrections are applied, so the support is solved only once.
+    est_weight = None
+    det_weight = None
+    k_gap = 0
+    if spectrum_support:
+        spec_pwr = torch.mean(
+            torch.abs(torch.fft.fft(img, axis=-1)) ** 2, dim=0
+        )
+        support = spec_pwr / torch.clamp(torch.max(spec_pwr), min=1e-30)
+        mask = support > support_gate
+        # Start the phase integration and unwrapping from the least occupied
+        # bin so that they traverse the occupied band contiguously even when
+        # the band wraps around the array edge (spectrum not centered).
+        w0 = max(3, ntheta // 64)
+        s_smooth = sum(
+            torch.roll(spec_pwr, j) for j in range(-(w0 // 2), w0 // 2 + 1)
+        )
+        k_gap = int(torch.argmin(s_smooth))
+        est_weight = torch.roll(mask, -k_gap).to(img.real.dtype)[None, :]
+        det_weight = torch.roll(support * mask, -k_gap)
+
     for i in range(max_iters):
         window = int(window_width * window_exp**i)
         if window < min_window:
@@ -217,13 +255,19 @@ def pga(
         if offload:
             img = img.to(device="cpu")
         # Apply window
-        g[:, 1 + window // 2 : 1 - window // 2] = 0
+        g[:, 1 + window // 2 : ntheta - window // 2] = 0
         # IFFT across theta
         g = torch.fft.fft(g, axis=-1)
-        phi = pga_estimator(g, estimator, eps)
+        if spectrum_support:
+            g = torch.roll(g, -k_gap, dims=-1)
+        phi = pga_estimator(g, estimator, eps, weight=est_weight)
         del g
         if remove_trend:
-            phi = detrend(unwrap(phi))
+            # Unwrap and fit the trend in the rolled frame where the
+            # occupied band is contiguous and the estimate is smooth.
+            phi = weighted_detrend(unwrap(phi), det_weight)
+        if spectrum_support:
+            phi = torch.roll(phi, k_gap, dims=-1)
         phi_sum += phi
 
         if offload:
@@ -344,29 +388,6 @@ def _antenna_weights(
         + v11 * ef * af
     )
     return torch.where(valid, w, torch.zeros_like(w))
-
-
-def _weighted_detrend(x: Tensor, w: Tensor | None) -> Tensor:
-    """Remove weighted linear trend from 1D tensor ``x``.
-
-    ``w`` holds non-negative per-sample weights; ``None`` falls back to
-    the unweighted :func:`torchbp.util.detrend`. Degenerate weights (all
-    zero or concentrated on one sample) remove only the weighted mean.
-    """
-    if w is None:
-        return detrend(x)
-    n = x.shape[0]
-    k = torch.arange(n, device=x.device, dtype=x.dtype) / n
-    wsum = torch.sum(w)
-    if wsum <= 0:
-        return x
-    km = torch.sum(w * k) / wsum
-    xm = torch.sum(w * x) / wsum
-    kk = torch.sum(w * (k - km) ** 2)
-    if kk <= 0:
-        return x - xm
-    a = torch.sum(w * (k - km) * (x - xm)) / kk
-    return x - (xm + a * (k - km))
 
 
 def _select_targets(
@@ -684,6 +705,7 @@ def gpga(
             target_pos, data, pos_new, fc, r_res, d0, interp_method=interp_method, data_fmod=data_fmod
         )
         target_w = None
+        beam_w = None
         if use_antenna_weight:
             target_w = _antenna_weights(target_pos, pos_new, att, g, g_extent)
             # Zero the out-of-beam samples before lowpass filtering so
@@ -693,6 +715,10 @@ def gpga(
                 torch.amax(target_w, dim=1, keepdim=True), min=1e-12
             )
             target_data = target_data * (wn > beam_gate)
+            # Per-sweep illumination for the trend fit. Sweeps that no
+            # target illuminates only hold a constant extrapolated phase
+            # and would bias an unweighted line fit.
+            beam_w = torch.sum(wn**2, dim=0)
         # Filter samples
         if window_width is not None and window_width < target_data.shape[1]:
             target_data = fft_lowpass_filter_window(
@@ -703,7 +729,7 @@ def gpga(
         )
         phi_sum = unwrap(phi_sum + phi)
         if remove_trend:
-            phi_sum = detrend(phi_sum)
+            phi_sum = weighted_detrend(phi_sum, beam_w)
         # Phase to distance
         c0 = 299792458
         d = phi_sum * c0 / (4 * torch.pi * fc)
@@ -1024,7 +1050,7 @@ def gpga_tde(
                 else:
                     local_w[ir * azimuth_divisions + jr, :] = block_w
                 phi = unwrap(phi)
-                phi = _weighted_detrend(phi, beam_w)
+                phi = weighted_detrend(phi, beam_w)
                 # Phase to distance
                 c0 = 299792458
                 d = phi * c0 / (4 * torch.pi * fc)
@@ -1096,7 +1122,7 @@ def gpga_tde(
         coverage = torch.sum(local_w, dim=0)
         coverage_sum = torch.clamp(torch.sum(coverage), min=1e-12)
         if remove_trend:
-            d_solved[0] = _weighted_detrend(
+            d_solved[0] = weighted_detrend(
                 d_solved[0], coverage if use_antenna_weight else None
             )
         rms_error = (
