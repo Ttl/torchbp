@@ -769,7 +769,7 @@ def gpga_tde(
     eps: float = 1e-6,
     interp_method: str = "linear",
     estimate_z: bool = True,
-    solve_threshold: float = 0.05,
+    solve_threshold: float = 3e-3,
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
@@ -871,12 +871,13 @@ def gpga_tde(
         Estimate Z-axis position error. Default is True.
     solve_threshold : float
         Relative eigenvalue threshold of the per-sweep position solve.
-        Directions of the normal matrix with eigenvalues below this
-        fraction of the largest one are considered unobservable at that
-        sweep and get zero position update. Raise it if unobservable
-        directions (e.g. along-track at broadside with a narrow beam)
-        accumulate noise; lower it if a weakly observed direction that
-        should be estimated is being suppressed.
+        Directions of the per-sweep normal matrix with eigenvalues below
+        this fraction of the largest eigenvalue over all sweeps are
+        considered unobservable at that sweep and get zero position
+        update. Raise it if unobservable directions (e.g. along-track at
+        broadside with a narrow beam) accumulate noise; lower it if a
+        weakly observed direction that should be estimated is being
+        suppressed.
     att : Tensor
         Antenna rotation tensor.
         [Roll, pitch, yaw]. Only yaw is used and only if beamwidth < Pi to filter
@@ -1103,14 +1104,19 @@ def gpga_tde(
         # (e.g. along-track at broadside) are unobservable at that sweep
         # and a full-rank solve amplifies noise into them. Truncation
         # leaves unobserved directions, and sweeps no block observed at
-        # all, with zero update.
+        # all, with zero update. The threshold is relative to the largest
+        # eigenvalue over all sweeps: noise amplification scales with the
+        # absolute eigenvalue, and a per-sweep relative threshold would
+        # also truncate weakly but usefully observed directions (e.g. z
+        # from a limited elevation angle spread) on sweeps where every
+        # direction is observed about equally well.
         A = w * m
         b = w * s
         AtA = A.transpose(-1, -2) @ A
         Atb = A.transpose(-1, -2) @ b
         evals, evecs = torch.linalg.eigh(AtA)
         evinv = torch.where(
-            evals > solve_threshold * evals[..., -1:], 1 / evals, 0.0
+            evals > solve_threshold * torch.max(evals), 1 / evals, 0.0
         )
         d_solved = evecs @ (
             evinv.unsqueeze(-1) * (evecs.transpose(-1, -2) @ Atb)
