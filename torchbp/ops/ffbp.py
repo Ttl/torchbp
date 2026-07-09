@@ -502,8 +502,11 @@ def _ffbp_impl(
     div_xy = [pos_xy[bounds[i]:bounds[i + 1]] for i in range(divisions)]
     means = [(sum(x for x, _ in s) / len(s), sum(y for _, y in s) / len(s))
              for s in div_xy]
-    cx = sum(m[0] for m in means) / divisions
-    cy = sum(m[1] for m in means) / divisions
+    # True centroid over all node pulses. The final merge lands on this same
+    # centroid via pulse-count-weighted origins in the merge chain below.
+    n_all = len(pos_xy)
+    cx = sum(x for x, _ in pos_xy) / n_all
+    cy = sum(y for _, y in pos_xy) / n_all
     r0_min, r1_max = grid["r"]
 
     def _tp_shift(te: float, dy: float, dx: float, d: float) -> float:
@@ -704,17 +707,21 @@ def _ffbp_impl(
                     "ntheta": out_ntheta,
                 }
 
-        imgs.append((origin_local[0], grid_local, img, z0, w1_map, w2_map, weight_grid))
+        imgs.append((origin_local[0], grid_local, img, z0, w1_map, w2_map,
+                     weight_grid, len(data_local)))
 
-    while len(imgs) > 1:
-        img1 = imgs[0]
-        img2 = imgs[1]
-        new_origin = 0.5 * img1[0] + 0.5 * img2[0]
-        new_z = 0.5 * (img1[3] + img2[3])
+    def _merge_pair(img1, img2, is_final_merge):
+        # Pulse-count-weighted origin so the running frame tracks the true phase
+        # center of the combined pulses. Plain 0.5/0.5 averaging only reaches
+        # the node centroid for balanced trees. Weighting makes the final merge
+        # land exactly on the node centroid, the frame the parent expects.
+        n1, n2 = img1[7], img2[7]
+        nsum = n1 + n2
+        new_origin = (n1 * img1[0] + n2 * img2[0]) / nsum
+        new_z = (n1 * img1[3] + n2 * img2[3]) / nsum
         alias = False
         # output_alias only applies to final merge
         out_alias = output_alias
-        is_final_merge = len(imgs) == 2
         if is_final_merge:
             # Interpolate the final image to the desired grid.
             grid_polar_new = grid
@@ -807,15 +814,25 @@ def _ffbp_impl(
             w2_out = None
             merged_weight_grid = None
 
-        imgs[0] = None
-        imgs[1] = None
-        del i1
-        del img1
-        del i2
-        del img2
+        return (new_origin, grid_polar_new, img_sum, new_z, w1_out, w2_out,
+                merged_weight_grid, nsum)
 
-        merged = (new_origin, grid_polar_new, img_sum, new_z, w1_out, w2_out, merged_weight_grid)
-        imgs = imgs[2:] + [merged]
+    # Balanced reduction: each pass merges adjacent pairs and carries a trailing
+    # odd image to the next pass. Adjacency keeps every intermediate
+    # a contiguous aperture, the pass structure keeps the tree log-depth for any
+    # divisions. The final merge is the single pair of the last pass (len == 2).
+    while len(imgs) > 1:
+        is_final_pass = len(imgs) == 2
+        next_imgs = []
+        for k in range(0, len(imgs) - 1, 2):
+            merged = _merge_pair(imgs[k], imgs[k + 1], is_final_pass)
+            imgs[k] = None
+            imgs[k + 1] = None
+            next_imgs.append(merged)
+        if len(imgs) % 2 == 1:
+            # Odd trailing image carried unmerged to the next pass.
+            next_imgs.append(imgs[-1])
+        imgs = next_imgs
 
     # Return different values depending on whether we're at top level or recursive
     # At top level (called from ffbp), just return the image

@@ -4967,6 +4967,36 @@ class TestFFBPLongBaseline(TestCase):
             self.assertGreater(ratio, 0.9,
                                f"target r={r} th={th} dimmed to {ratio:.3f}")
 
+    def test_odd_divisions_cpu(self):
+        # The pairwise merge chain must land on the node centroid and merge
+        # adjacent subapertures for ANY divisions, not just powers of two.
+        # Odd/non-power-of-two divisions previously drifted the output frame
+        # (0.5/0.5 origin averaging) and merged non-adjacent subapertures
+        # (gapped aperture -> azimuth aliasing), collapsing targets (e.g.
+        # divisions=3 broadside to 0.13, divisions=5 to 0.31). The result must
+        # not depend on divisions: every count should match divisions=2.
+        r0f, r1f, th0, th1 = 100.0, 180.0, -0.3, 0.3
+        grid = {"r": (r0f, r1f), "theta": (th0, th1), "nr": 200, "ntheta": 256}
+        # Broadside (th=0) has no range shift, so it isolates the frame-drift
+        # and merge-order bugs from the range-guard geometry.
+        targets = [(140.0, 0.0), (120.0, 0.2), (170.0, -0.22), (110.0, 0.25)]
+        data, pos = self._scene(grid, targets)
+        ref = torchbp.ops.backprojection_polar_2d(
+            data, grid, self.fc, self.r_res, pos)[0]
+        base = self._peaks(ref, torchbp.ops.ffbp(
+            data, grid, self.fc, self.r_res, pos, stages=5, divisions=2,
+            grid_oversample=2.0), grid, targets)
+        for divisions in (3, 4, 5, 7):
+            out = torchbp.ops.ffbp(
+                data, grid, self.fc, self.r_res, pos, stages=5,
+                divisions=divisions, grid_oversample=2.0)
+            ratios = self._peaks(ref, out, grid, targets)
+            for (r, th), ratio, base_ratio in zip(targets, ratios, base):
+                self.assertAlmostEqual(
+                    ratio, base_ratio, delta=0.05,
+                    msg=f"divisions={divisions} target r={r} th={th}: peak "
+                        f"{ratio:.3f} vs divisions=2 {base_ratio:.3f}")
+
 
 if __name__ == "__main__":
     unittest.main()
