@@ -4892,5 +4892,81 @@ class TestAFBP(TestCase):
         self.assertLess(rel, 2e-2)
 
 
+class TestFFBPLongBaseline(TestCase):
+    """On a long baseline the subapertures away from the merge origin see the
+    far/near scene at a shifted range (largest toward |theta| = 1). Their
+    grids must extend in range so the merge lookups stay inside them,
+    otherwise edge targets at high |theta| lose the contribution of the
+    offset subapertures and dim. See the range guard band in _ffbp_impl."""
+
+    fc = 6e9
+    r_res = 0.5
+    nsamples = 600
+    nsweeps = 1024
+
+    def _scene(self, grid, targets, device="cpu"):
+        c0 = 299792458.0
+        lam = c0 / self.fc
+        pos = torch.zeros((self.nsweeps, 3), device=device)
+        # Aperture ~25 m: offset of the top-level subapertures from the merge
+        # origin is a several-meter fraction of the ~100 m range, enough to
+        # push rp off the grid by many range bins at |theta| ~ 0.8.
+        pos[:, 1] = (lam / 4) * (torch.arange(self.nsweeps, device=device)
+                                 - self.nsweeps / 2)
+        data = torch.zeros((self.nsweeps, self.nsamples),
+                           dtype=torch.complex64, device=device)
+        i = torch.arange(self.nsamples, dtype=torch.float64, device=device)
+        for r, th in targets:
+            tx = r * np.sqrt(1 - th * th)
+            ty = r * th
+            d = torch.sqrt((pos[:, 0].double() - tx) ** 2
+                           + (pos[:, 1].double() - ty) ** 2
+                           + pos[:, 2].double() ** 2)
+            env = torch.special.sinc(
+                (i[None, :] * self.r_res - d[:, None]) / (2 * self.r_res))
+            ph = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)[:, None]
+            data += (env * ph).to(torch.complex64)
+        return data, pos
+
+    def _peaks(self, ref, out, grid, targets):
+        (r0, r1), (t0, t1) = grid["r"], grid["theta"]
+        dr = (r1 - r0) / grid["nr"]
+        dth = (t1 - t0) / grid["ntheta"]
+        ratios = []
+        for r, th in targets:
+            ri = int(round((r - r0) / dr))
+            ti = int(round((th - t0) / dth))
+            a = ref[max(0, ri - 3):ri + 4, max(0, ti - 3):ti + 4].abs().max()
+            b = out[max(0, ri - 3):ri + 4, max(0, ti - 3):ti + 4].abs().max()
+            ratios.append((b / a).item())
+        return ratios
+
+    def test_edge_targets_recovered_cpu(self):
+        # Targets pinned to the range edges at high |theta|, where an offset
+        # subaperture's rp leaves the [r0, r1] grid without the range guard.
+        c0 = 299792458.0
+        lam = c0 / self.fc
+        aperture = (lam / 4) * (self.nsweeps - 1)
+        r0f, r1f, th0, th1 = 100.0, 180.0, -0.85, 0.85
+        # Sample azimuth finely enough for the aperture (else the scene
+        # aliases regardless of the merge geometry).
+        ntheta = int(np.ceil((th1 - th0) / (lam / (2 * aperture))))
+        grid = {"r": (r0f, r1f), "theta": (th0, th1), "nr": 200,
+                "ntheta": ntheta}
+        targets = [(140.0, 0.0), (178.0, 0.82), (178.0, -0.82),
+                   (102.0, 0.82), (102.0, -0.82)]
+        data, pos = self._scene(grid, targets)
+        ref = torchbp.ops.backprojection_polar_2d(
+            data, grid, self.fc, self.r_res, pos)[0]
+        out = torchbp.ops.ffbp(
+            data, grid, self.fc, self.r_res, pos, stages=6, grid_oversample=2.0)
+        ratios = self._peaks(ref, out, grid, targets)
+        # Broadside (no range shift) is a control; the edge targets are the
+        # ones the range guard rescues. Without the guard they sit near 0.58.
+        for (r, th), ratio in zip(targets, ratios):
+            self.assertGreater(ratio, 0.9,
+                               f"target r={r} th={th} dimmed to {ratio:.3f}")
+
+
 if __name__ == "__main__":
     unittest.main()

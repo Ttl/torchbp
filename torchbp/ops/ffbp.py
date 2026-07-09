@@ -514,6 +514,17 @@ def _ffbp_impl(
         rp = math.sqrt(max(rp2, 1e-12))
         return (d * te + dy) / rp - te
 
+    def _rp_shift(te: float, dy: float, dx: float, d: float) -> float:
+        # Lookup range shift rp - d of the merge transform, same math as the
+        # kernels. A subaperture whose origin is offset from the merge frame
+        # by (dx, dy) sees a pixel at range rp != d; the shift is largest in
+        # magnitude (-> |offset| along the line of sight) toward |theta| = 1,
+        # where the along-track offset is radial, and vanishes at broadside.
+        ct = math.sqrt(max(0.0, 1.0 - te * te))
+        rp2 = d * d + dx * dx + dy * dy + 2.0 * d * (dy * te + dx * ct)
+        rp = math.sqrt(max(rp2, 1e-12))
+        return rp - d
+
     # Interpolation window half width in bins, plus one bin of rounding
     # slack.
     a_bins = interp_method[1] // 2 + 1
@@ -545,6 +556,15 @@ def _ffbp_impl(
         s_hi = max(_tp_shift(theta1_g, *c) for c in cand)
         s_lo = min(_tp_shift(theta0_g, *c) for c in cand)
 
+        # Range shift at the node grid edges. Unlike the theta shift the
+        # radial extreme need not fall on one theta edge (the offset
+        # direction can lie between them), so both edges are checked for
+        # each of the max (far, extends r1) and min (near, lowers r0) shift.
+        rs_hi = max(_rp_shift(te, *c) for c in cand
+                    for te in (theta0_g, theta1_g))
+        rs_lo = min(_rp_shift(te, *c) for c in cand
+                    for te in (theta0_g, theta1_g))
+
         # The useful support saturates a couple of interpolation windows
         # past the fold: beyond |theta| = 1 the child image holds only the
         # smooth continuation of the scene content near the fold, so
@@ -570,11 +590,28 @@ def _ffbp_impl(
         n_lo = min(max(n_lo, 0), g_cap)
         n_hi = min(max(n_hi, 0), g_cap)
 
+        # Range guard bins per side (mirror of the theta guard): cover the
+        # signed range shift plus the interpolation window so every merge
+        # lookup lands inside the child grid. On a long baseline the offset
+        # subapertures away from the origin need a longer maximum range to
+        # hold the far scene at |theta| ~ 1; the near range is lowered by
+        # the same mechanism for the opposite-looking pixels. Clamp the near
+        # range at zero. The range bandwidth is unchanged by the split, so
+        # the guard bins keep the (oversampled) core range step.
+        nr_over = int(oversample_r * grid["nr"])
+        dr_child = (r1_max - r0_min) / nr_over
+        n_r_hi = math.ceil(max(0.0, rs_hi) / dr_child) + a_bins + 1
+        n_r_lo = math.ceil(max(0.0, -rs_lo) / dr_child) + a_bins + 1
+        n_r_lo = min(n_r_lo, int(r0_min / dr_child))
+        r0_child = r0_min - n_r_lo * dr_child
+        r1_child = r1_max + n_r_hi * dr_child
+
         grid_local = deepcopy(grid)
         grid_local["theta"] = (core_t0 - n_lo * dth_child,
                                core_t1 + n_hi * dth_child)
         grid_local["ntheta"] = core_nt_child + n_lo + n_hi
-        grid_local["nr"] = int(oversample_r * grid_local["nr"])
+        grid_local["r"] = (r0_child, r1_child)
+        grid_local["nr"] = nr_over + n_r_lo + n_r_hi
         data_local = data[i0:i1]
         att_local = att[i0:i1] if att is not None else None
 
@@ -691,9 +728,17 @@ def _ffbp_impl(
             t0_u = min(g1["theta"][0], g2["theta"][0])
             t1_u = max(g1["theta"][1], g2["theta"][1])
             dth_u = 0.5 * (g1["theta"][1] - g1["theta"][0]) / g1["ntheta"]
+            # Union of the source range extents too (the per-child range
+            # guard is asymmetric, so they differ). The range bandwidth does
+            # not change on merge, so the step is kept (no 0.5 factor).
+            r0_u = min(g1["r"][0], g2["r"][0])
+            r1_u = max(g1["r"][1], g2["r"][1])
+            dr_u = (g1["r"][1] - g1["r"][0]) / g1["nr"]
             grid_polar_new = deepcopy(g1)
             grid_polar_new["theta"] = (t0_u, t1_u)
             grid_polar_new["ntheta"] = round((t1_u - t0_u) / dth_u)
+            grid_polar_new["r"] = (r0_u, r1_u)
+            grid_polar_new["nr"] = round((r1_u - r0_u) / dr_u)
             out_alias = True
 
         i1 = img1[2]
