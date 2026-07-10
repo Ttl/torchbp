@@ -38,7 +38,14 @@ if __name__ == "__main__":
     angle_window = ("taylor", 4, 50)
     # FFT oversampling factor. Increase to decrease interpolation error.
     fft_oversample = 1.5
-    dev = torch.device("cuda")
+    if torch.cuda.is_available():
+        dev = "cuda"
+    else:
+        dev = "cpu"
+    print("Device:", dev)
+
+    synchronize = lambda: None if dev == "cpu" else torch.cuda.synchronize()
+
     # Distance in radar data corresponding to zero actual distance
     # Slightly higher than zero due to antenna feedlines and other delays.
     d0 = 0.5
@@ -169,7 +176,7 @@ if __name__ == "__main__":
 
     if autofocus:
         print("Calculating autofocus. This might take a while.")
-        torch.cuda.synchronize()
+        synchronize()
         tstart = time.time()
         sar_img, pos_new = torchbp.autofocus.gpga_tde(
             None, fsweeps, pos_centered, fc, r_res,
@@ -178,7 +185,7 @@ if __name__ == "__main__":
             algorithm="ffbp" if ffbp else "bp",
             data_fmod=data_fmod, verbose=True
         )
-        torch.cuda.synchronize()
+        synchronize()
         print(f"Autofocus done in {time.time() - tstart:.3g} s")
 
         plt.figure()
@@ -192,7 +199,7 @@ if __name__ == "__main__":
         pos_centered = pos_new
 
     print("Focusing final image")
-    torch.cuda.synchronize()
+    synchronize()
     tstart = time.time()
     if ffbp:
         sar_img = torchbp.ops.ffbp(
@@ -205,7 +212,7 @@ if __name__ == "__main__":
             fsweeps, grid_polar, fc, r_res, pos_centered, d0,
             data_fmod=data_fmod
         )[0]
-    torch.cuda.synchronize()
+    synchronize()
     print(f"Final image created in {time.time() - tstart:.3g} s")
     print("Entropy", torchbp.util.entropy(sar_img).item())
     sar_img = sar_img.cpu().numpy()

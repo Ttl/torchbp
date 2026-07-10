@@ -20,7 +20,11 @@ if __name__ == "__main__":
     grid = CartesianGrid.from_dict(grid_dict)
     grid_polar = PolarGrid.from_dict(grid_polar_dict)
 
-    dev = "cuda"
+    if torch.cuda.is_available():
+        dev = "cuda"
+    else:
+        dev = "cpu"
+    print("Device:", dev)
     sar_img = torch.from_numpy(sar_img).to(dtype=torch.complex64, device=dev)
     fc = mission["fc"]
     print("Entropy", entropy(sar_img).item())
