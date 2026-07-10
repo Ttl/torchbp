@@ -82,6 +82,7 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("mul_2d_interp_linear(Tensor a, Tensor b, int nbatch, int Na0, int Na1, int Nb0, int Nb1) -> Tensor");
   m.def("resample_2d_lanczos(Tensor img, Tensor shift_r, Tensor shift_az, int nbatch, int Nr, int Naz, int order) -> Tensor");
   m.def("resample_2d_knab(Tensor img, Tensor shift_r, Tensor shift_az, int nbatch, int Nr, int Naz, int order, float oversample) -> Tensor");
+  m.def("afbp_fuse(Tensor S, Tensor nua, Tensor xs, Tensor inv_kr, Tensor x_half, Tensor band, float x_c, float x_taper, int kmax) -> Tensor");
 }
 
 }

@@ -504,6 +504,14 @@ def afbp(
         nua = torch.fft.fftfreq(n_fine, d=dtheta, dtype=torch.float64, device=device)
         nua_f = nua.float()
         xs_f32 = x_s.float().to(device)
+        # Fused kernel for the placement + gather + accumulate between the
+        # range FFTs: it computes the per-element placement on the fly from
+        # the 1-D tables instead of materializing several [nrf, n_fine]
+        # intermediates per contribution. The tensor-op fallback is kept
+        # for gradients (the op has no autograd; the spectrum gathers are
+        # in the data/pos gradient path) and for non-CPU devices.
+        use_fused = device.type == "cpu" and not (
+            torch.is_grad_enabled() and Sa.requires_grad)
         fine = Sa.new_zeros((nr, n_fine))
         for b0, b1 in zip(row_bounds[:-1], row_bounds[1:]):
             nrb = b1 - b0
@@ -523,9 +531,8 @@ def afbp(
             # carry no signal, park them on a harmless value.
             kr = torch.where(kr.abs() < 1e-6, torch.full_like(kr, 1e-6), kr)
             # Along-track position owning each (range wavenumber row,
-            # azimuth bin).
+            # azimuth bin) is x_eq = nua * inv_kr.
             inv_kr = (-2.0 * math.pi / (kr * fac_b)).float()  # [nrf]
-            x_eq = nua_f[None, :] * inv_kr[:, None]
             # Each subaperture patch is reconstructed over a full
             # decimated band centered on the patch: the overlapping
             # regions of adjacent subapertures are summed, which keeps the
@@ -540,18 +547,25 @@ def afbp(
             # span on the subaperture positions makes the placement
             # consistent with the aliased carrier a direct backprojection
             # of an off-center track produces (no-op for a centered one).
-            band = (2.0 * math.pi / (kr * fac_b * dtheta)).abs().float()[:, None]
-            x_eq = torch.remainder(x_eq - x_c + band / 2, band) + (x_c - band / 2)
-            u0 = torch.bucketize(x_eq - x_half[:, None], xs_f32)
-            rows = torch.arange(nrf, device=device)[:, None]
-            fine_b = Sb.new_zeros((nrf, n_fine))
-            for k in range(kmax):
-                uk = u0 + k
-                u = uk.clamp(max=nsub - 1)
-                w = _region_weight(
-                    (x_eq - xs_f32[u]).abs(), x_half[:, None], x_taper)
-                w = w * (uk < nsub)
-                fine_b += Sb[u, rows, cols] * w
+            band = (2.0 * math.pi / (kr * fac_b * dtheta)).abs().float()  # [nrf]
+            if use_fused:
+                fine_b = torch.ops.torchbp.afbp_fuse.default(
+                    Sb, nua_f, xs_f32, inv_kr, x_half, band,
+                    x_c, x_taper, kmax)
+            else:
+                x_eq = nua_f[None, :] * inv_kr[:, None]
+                bnd = band[:, None]
+                x_eq = torch.remainder(x_eq - x_c + bnd / 2, bnd) + (x_c - bnd / 2)
+                u0 = torch.bucketize(x_eq - x_half[:, None], xs_f32)
+                rows = torch.arange(nrf, device=device)[:, None]
+                fine_b = Sb.new_zeros((nrf, n_fine))
+                for k in range(kmax):
+                    uk = u0 + k
+                    u = uk.clamp(max=nsub - 1)
+                    w = _region_weight(
+                        (x_eq - xs_f32[u]).abs(), x_half[:, None], x_taper)
+                    w = w * (uk < nsub)
+                    fine_b += Sb[u, rows, cols] * w
             fine[b0:b1] = torch.fft.ifft(fine_b, dim=-2)[:nrb]
         fine *= nsub
         return _afbp_finish(fine, grid, fc, alias_fmod, z0, dealias,
