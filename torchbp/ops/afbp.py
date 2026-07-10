@@ -391,15 +391,21 @@ def afbp(
     # Padded chunks for one batched backprojection call, built with single
     # gathers instead of per-chunk copies. Rows past a chunk end repeat
     # its last pulse; the repeated data rows are zeroed, which makes the
-    # padding exact.
-    idx = (torch.tensor(bounds[:-1], device=device)[:, None]
-           + torch.arange(m, device=device)[None, :])
-    ends = torch.tensor(bounds[1:], device=device)[:, None]
-    valid = idx < ends
-    idx = torch.minimum(idx, ends - 1).reshape(-1)
-    data_b = data[idx].view(nsub, m, nsamples) * valid[:, :, None]
-    pos_b = pos[idx].view(nsub, m, 3)
-    att_b = att[idx].view(nsub, m, 3) if att is not None else None
+    # padding exact. Equal chunks need no padding at all and the gather
+    # reduces to a reshape.
+    if nsweeps % nsub == 0:
+        data_b = data.reshape(nsub, m, nsamples)
+        pos_b = pos.reshape(nsub, m, 3)
+        att_b = att.reshape(nsub, m, 3) if att is not None else None
+    else:
+        idx = (torch.tensor(bounds[:-1], device=device)[:, None]
+               + torch.arange(m, device=device)[None, :])
+        ends = torch.tensor(bounds[1:], device=device)[:, None]
+        valid = idx < ends
+        idx = torch.minimum(idx, ends - 1).reshape(-1)
+        data_b = data[idx].view(nsub, m, nsamples) * valid[:, :, None]
+        pos_b = pos[idx].view(nsub, m, 3)
+        att_b = att[idx].view(nsub, m, 3) if att is not None else None
 
     # The kernel dealias path does not support gradients; with gradients
     # the carrier is instead removed with a differentiable multiply, which
@@ -430,8 +436,10 @@ def afbp(
     # component exp(-1j*k*x_u*rd*alpha) of a dealiased image lands at
     # azimuth frequency -k*x_u*rd/(2*pi) cycles per unit theta. The
     # subapertures are processed in ascending x_u order so that the
-    # per-bin contributors form a contiguous index run.
-    imgs = imgs[order.to(device)]
+    # per-bin contributors form a contiguous index run. An ascending track
+    # is already in order; skip the permute copy then.
+    if not torch.equal(order, torch.arange(nsub)):
+        imgs = imgs[order.to(device)]
     Sa = torch.fft.fft(imgs, dim=-1)
 
     # Range blocks: rd(r) varies over the swath and after the range FFT
@@ -461,7 +469,6 @@ def afbp(
     else:
         row_bounds = [0, nr]
 
-    xs_dev = x_s.to(device)
     x_c = float(0.5 * (x_s[0] + x_s[-1]))
     spacing_min = max(float(spacing.min()), 1e-9)
     cols = (torch.arange(n_fine, device=device) % n_c)[None, :]
@@ -488,7 +495,15 @@ def afbp(
         # times more memory (small near-range blocks pad to the shared FFT
         # length and the gathers broadcast large index tensors), while the
         # per-op overhead the batching avoids is negligible.
+        #
+        # As in the batched path, the placement is computed in float64 only
+        # for the small 1-D tables and used in float32: the placement only
+        # needs to be accurate to a small fraction of a subaperture
+        # spacing, and float64 weights would also promote the spectrum
+        # accumulation to complex128.
         nua = torch.fft.fftfreq(n_fine, d=dtheta, dtype=torch.float64, device=device)
+        nua_f = nua.float()
+        xs_f32 = x_s.float().to(device)
         fine = Sa.new_zeros((nr, n_fine))
         for b0, b1 in zip(row_bounds[:-1], row_bounds[1:]):
             nrb = b1 - b0
@@ -509,7 +524,8 @@ def afbp(
             kr = torch.where(kr.abs() < 1e-6, torch.full_like(kr, 1e-6), kr)
             # Along-track position owning each (range wavenumber row,
             # azimuth bin).
-            x_eq = -2.0 * math.pi * nua[None, :] / (kr[:, None] * fac_b)
+            inv_kr = (-2.0 * math.pi / (kr * fac_b)).float()  # [nrf]
+            x_eq = nua_f[None, :] * inv_kr[:, None]
             # Each subaperture patch is reconstructed over a full
             # decimated band centered on the patch: the overlapping
             # regions of adjacent subapertures are summed, which keeps the
@@ -518,22 +534,22 @@ def afbp(
             # edges) is zero. Only the subapertures whose region covers a
             # bin contribute: a contiguous run of at most ~(region width /
             # subaperture spacing) + 1 indices independent of nsub.
-            x_half = (math.pi * n_c / (n_fine * dtheta) / (kr * fac_b)).abs()
+            x_half = (math.pi * n_c / (n_fine * dtheta) / (kr * fac_b)).abs().float()
             kmax = min(nsub, int(math.ceil(2.0 * float(x_half.max()) / spacing_min)) + 1)
             # x_eq spans one alias band of the fine grid; recentering the
             # span on the subaperture positions makes the placement
             # consistent with the aliased carrier a direct backprojection
             # of an off-center track produces (no-op for a centered one).
-            band = (2.0 * math.pi / (kr * fac_b * dtheta)).abs()[:, None]
+            band = (2.0 * math.pi / (kr * fac_b * dtheta)).abs().float()[:, None]
             x_eq = torch.remainder(x_eq - x_c + band / 2, band) + (x_c - band / 2)
-            u0 = torch.bucketize(x_eq - x_half[:, None], xs_dev)
+            u0 = torch.bucketize(x_eq - x_half[:, None], xs_f32)
             rows = torch.arange(nrf, device=device)[:, None]
             fine_b = Sb.new_zeros((nrf, n_fine))
             for k in range(kmax):
                 uk = u0 + k
                 u = uk.clamp(max=nsub - 1)
                 w = _region_weight(
-                    (x_eq - xs_dev[u]).abs(), x_half[:, None], x_taper)
+                    (x_eq - xs_f32[u]).abs(), x_half[:, None], x_taper)
                 w = w * (uk < nsub)
                 fine_b += Sb[u, rows, cols] * w
             fine[b0:b1] = torch.fft.ifft(fine_b, dim=-2)[:nrb]
