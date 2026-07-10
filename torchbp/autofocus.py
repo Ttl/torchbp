@@ -105,8 +105,9 @@ def pga_estimator(
         phi = torch.angle(v[0, :])
     elif estimator == "wls":
         if weight is None:
-            c = torch.mean(torch.abs(g), dim=1, keepdim=True)
-            d = torch.mean(torch.abs(g) ** 2, dim=1, keepdim=True)
+            ga = torch.abs(g)
+            c = torch.mean(ga, dim=1, keepdim=True)
+            d = torch.mean(torch.square(ga), dim=1, keepdim=True)
         else:
             # Flatten the antenna envelope so the amplitude statistics
             # measure signal-to-clutter ratio instead of the beam
@@ -116,18 +117,20 @@ def pga_estimator(
                 torch.sum(in_beam, dim=1, keepdim=True), min=1
             )
             c = torch.sum(ga, dim=1, keepdim=True) / n_in
-            d = torch.sum(ga**2, dim=1, keepdim=True) / n_in
+            d = torch.sum(torch.square(ga), dim=1, keepdim=True) / n_in
         w = (
             torch.nan_to_num(
                 d / (2 * (2 * c**2 - d) - 2 * c * torch.sqrt(4 * c**2 - 3 * d))
             )
             + eps
         )
-        gshift = torch.nn.functional.pad(g[..., :-1], (1, 0))
-        prod = g * torch.conj(gshift)
+        # Pairwise products on views; the first product (against the
+        # zero-padded sample) is identically zero, so only pad phidot.
+        prod = g[..., 1:] * torch.conj(g[..., :-1])
         if weight is not None:
-            prod = wpair * prod
+            prod = wpair[..., 1:] * prod
         phidot = torch.angle(torch.sum((w / torch.max(w)) * prod, dim=0))
+        phidot = torch.nn.functional.pad(phidot, (1, 0))
         phi = torch.cumsum(phidot, dim=0)
         if return_weight:
             return phi, w
@@ -669,6 +672,12 @@ def gpga(
     phi : Tensor
         Solved phase error.
     """
+    # A lazy conjugate view (e.g. data straight from fft(...).conj()) is
+    # materialized by the dispatcher on every custom-op call, which the
+    # iteration loop makes hundreds of times; resolve it once. No-op for
+    # regular tensors.
+    data = data.resolve_conj()
+
     form_image = _make_image_former(
         algorithm, grid, data, fc, r_res, d0, data_fmod,
         att, g, g_extent, image_opts,
@@ -919,6 +928,12 @@ def gpga_tde(
     pos_new : Tensor
         Solved 3D position error.
     """
+    # A lazy conjugate view (e.g. data straight from fft(...).conj()) is
+    # materialized by the dispatcher on every custom-op call, which the
+    # iteration loop makes hundreds of times; resolve it once. No-op for
+    # regular tensors.
+    data = data.resolve_conj()
+
     form_image = _make_image_former(
         algorithm, grid, data, fc, r_res, d0, data_fmod,
         att, g, g_extent, image_opts,

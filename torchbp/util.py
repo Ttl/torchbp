@@ -1040,7 +1040,8 @@ def fft_lowpass_filter_window(
             circular_conv=circular_conv, fast_len=fast_len
         )
 
-    filtered_data = torch.fft.ifft(fdata * w, dim=-1)
+    fdata *= w
+    filtered_data = torch.fft.ifft(fdata, dim=-1)
 
     # Trim to original length
     filtered_data = filtered_data[..., :N]

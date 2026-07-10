@@ -1791,44 +1791,68 @@ at::Tensor projection_cart_2d_cpu(
     return data;
 }
 // Generalized phase gradient autofocus: demodulated phase of each target for
-// every sweep. Mirrors gpga_backprojection_2d_kernel in cuda/backproj.cu
-// (complex64 data, linear range interpolation).
-static void gpga_backprojection_2d_kernel_cpu(
-          const float* target_pos, const complex64_t* data, const float* pos,
+// every sweep. Same math as gpga_backprojection_2d_kernel in cuda/backproj.cu
+// (complex64 data, linear range interpolation), restructured per sweep for
+// memory locality: all targets of one sweep gather from the same data row
+// (targets arrive sorted by range, so the row accesses are nearly
+// sequential), where a target-outer order would touch a different
+// ~100 KB-distant row on every iteration and be DRAM latency bound.
+// Structured like backprojection_polar_2d_row_cpu: a vectorizable geometry
+// + phase pass into small buffers, then a scalar gather pass.
+static void gpga_backprojection_2d_sweep_cpu(
+          const float* tx, const float* ty, const float* tz,
+          const complex64_t* data, const float* pos,
           complex64_t* data_out, int sweep_samples, int nsweeps,
           float ref_phase, float delta_r, int Ntarget, float d0, float data_fmod,
-          int idtarget, int idsweep) {
-    if (idtarget >= Ntarget || idsweep >= nsweeps) return;
+          int idsweep) {
+    constexpr int CHUNK = 256;
+    float frac_buf[CHUNK], cs_buf[CHUNK], sn_buf[CHUNK];
+    int idx_buf[CHUNK];
 
-    const float x = target_pos[idtarget * 3 + 0];
-    const float y = target_pos[idtarget * 3 + 1];
-    const float z = target_pos[idtarget * 3 + 2];
+    const float pos_x = pos[idsweep * 3 + 0];
+    const float pos_y = pos[idsweep * 3 + 1];
+    const float pos_z = pos[idsweep * 3 + 2];
+    const float* data_row = (const float*)(data + (size_t)idsweep * sweep_samples);
 
-    float pos_x = pos[idsweep * 3 + 0];
-    float pos_y = pos[idsweep * 3 + 1];
-    float pos_z = pos[idsweep * 3 + 2];
-    float px = (x - pos_x);
-    float py = (y - pos_y);
-    float pz = (z - pos_z);
+    for (int tb = 0; tb < Ntarget; tb += CHUNK) {
+        const int nchunk = std::min(CHUNK, Ntarget - tb);
 
-    const float d = sqrtf(px * px + py * py + pz * pz);
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            const float px = tx[tb + q] - pos_x;
+            const float py = ty[tb + q] - pos_y;
+            const float pz = tz[tb + q] - pos_z;
+            const float d = sqrtf(px * px + py * py + pz * pz);
 
-    float sx = delta_r * (d + d0);
+            const float sx = delta_r * (d + d0);
+            const int id0 = (int)sx;
+            // Float-domain check: (int)sx truncates toward zero, so
+            // sx in (-1, 0) would pass an id0 >= 0 check and
+            // extrapolate with a negative weight.
+            const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
+            idx_buf[q] = ok ? id0 : -1;
+            frac_buf[q] = sx - id0;
 
-    int id0 = sx;
-    int id1 = id0 + 1;
-    if (sx < 0.0f || id1 >= sweep_samples) {
-        data_out[idtarget * nsweeps + idsweep] = {0.0f, 0.0f};
-    } else {
-        complex64_t s0 = data[idsweep * sweep_samples + id0];
-        complex64_t s1 = data[idsweep * sweep_samples + id1];
-        float interp_idx = sx - id0;
-        complex64_t s = (1.0f - interp_idx) * s0 + interp_idx * s1;
+            float ref_sin, ref_cos;
+            sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+            cs_buf[q] = ref_cos;
+            sn_buf[q] = ref_sin;
+        }
 
-        float ref_sin, ref_cos;
-        sincospi<float>(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
-        complex64_t ref = {ref_cos, ref_sin};
-        data_out[idtarget * nsweeps + idsweep] = s * ref;
+        // Scalar pass: data gather (linear interpolation), multiply by
+        // reference and store.
+        for (int q = 0; q < nchunk; q++) {
+            const int id0 = idx_buf[q];
+            complex64_t out = {0.0f, 0.0f};
+            if (id0 >= 0) {
+                const float f = frac_buf[q];
+                const float sr = (1.0f - f) * data_row[2*id0]     + f * data_row[2*id0 + 2];
+                const float si = (1.0f - f) * data_row[2*id0 + 1] + f * data_row[2*id0 + 3];
+                out = {sr * cs_buf[q] - si * sn_buf[q],
+                       sr * sn_buf[q] + si * cs_buf[q]};
+            }
+            data_out[(size_t)(tb + q) * nsweeps + idsweep] = out;
+        }
     }
 }
 
@@ -1868,17 +1892,23 @@ at::Tensor gpga_backprojection_2d_cpu(
     const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
 
+    // Unit-stride target coordinates for the vectorized geometry pass.
+    std::vector<float> tx(Ntarget), ty(Ntarget), tz(Ntarget);
+    for (int t = 0; t < Ntarget; t++) {
+        tx[t] = target_pos_ptr[t * 3 + 0];
+        ty[t] = target_pos_ptr[t * 3 + 1];
+        tz[t] = target_pos_ptr[t * 3 + 2];
+    }
+
     // See backprojection_cart_2d_cpu for why the team size is set explicitly.
     omp_set_num_threads(omp_get_num_procs());
 
-#pragma omp parallel for collapse(2)
-    for (int idtarget = 0; idtarget < Ntarget; idtarget++) {
-        for (int idsweep = 0; idsweep < nsweeps; idsweep++) {
-            gpga_backprojection_2d_kernel_cpu(
-                    target_pos_ptr, data_ptr, pos_ptr, data_out_ptr,
-                    sweep_samples, nsweeps, ref_phase, delta_r, Ntarget, d0,
-                    data_fmod / kPI, idtarget, idsweep);
-        }
+#pragma omp parallel for
+    for (int idsweep = 0; idsweep < nsweeps; idsweep++) {
+        gpga_backprojection_2d_sweep_cpu(
+                tx.data(), ty.data(), tz.data(), data_ptr, pos_ptr,
+                data_out_ptr, sweep_samples, nsweeps, ref_phase, delta_r,
+                Ntarget, d0, data_fmod / kPI, idsweep);
     }
     return data_out;
 }
