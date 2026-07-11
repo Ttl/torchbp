@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     from ..grid import PolarGrid, CartesianGrid
 
 cart_2d_nargs = 16
-polar_2d_nargs = 27
+polar_2d_nargs = 28
 
 def _prepare_backprojection_polar_2d_args(
     data: Tensor,
@@ -22,7 +22,8 @@ def _prepare_backprojection_polar_2d_args(
     g_extent: list | None = None,
     data_fmod: float = 0,
     alias_fmod: float = 0,
-    normalize: bool = True
+    normalize: bool = True,
+    dem: Tensor | None = None
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d operator.
 
@@ -32,6 +33,14 @@ def _prepare_backprojection_polar_2d_args(
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
     nbatch, nsweeps, sweep_samples = get_batch_dims(data, pos)
     antenna = AntennaPattern(g, g_extent)
+
+    if dem is not None:
+        if dem.ndim != 2:
+            raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
+        if dem.dtype != torch.float32:
+            raise ValueError(f"dem must be float32, got {dem.dtype}")
+        if dem.device != data.device:
+            raise ValueError(f"dem must be on the same device as data ({data.device}), got {dem.device}")
 
     # Validate and normalize att shape when antenna pattern is used
     if g is not None:
@@ -53,7 +62,7 @@ def _prepare_backprojection_polar_2d_args(
     return (data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
             r0, dr, theta0, dtheta, nr, ntheta, d0, dealias, z0,
             *antenna.to_cpp_args(),
-            data_fmod, alias_fmod, normalize)
+            data_fmod, alias_fmod, normalize, dem)
 
 
 def _prepare_backprojection_polar_2d_lanczos_args(
@@ -70,7 +79,8 @@ def _prepare_backprojection_polar_2d_lanczos_args(
     g_extent: list | None = None,
     data_fmod: float = 0,
     alias_fmod: float = 0,
-    normalize: bool = True
+    normalize: bool = True,
+    dem: Tensor | None = None
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d_lanczos operator.
 
@@ -79,7 +89,7 @@ def _prepare_backprojection_polar_2d_lanczos_args(
     """
     # Reuse linear preparation and insert order parameter
     base_args = _prepare_backprojection_polar_2d_args(
-        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod, normalize
+        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod, normalize, dem
     )
     # Insert order after z0 (index 17)
     return base_args[:17] + (order,) + base_args[17:]
@@ -100,7 +110,8 @@ def _prepare_backprojection_polar_2d_knab_args(
     g_extent: list | None = None,
     data_fmod: float = 0,
     alias_fmod: float = 0,
-    normalize: bool = True
+    normalize: bool = True,
+    dem: Tensor | None = None
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d_knab operator.
 
@@ -109,7 +120,7 @@ def _prepare_backprojection_polar_2d_knab_args(
     """
     # Reuse linear preparation and insert order and oversample parameters
     base_args = _prepare_backprojection_polar_2d_args(
-        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod, normalize
+        data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent, data_fmod, alias_fmod, normalize, dem
     )
     # Insert order and oversample after z0 (index 17)
     return base_args[:17] + (order, oversample) + base_args[17:]
@@ -128,12 +139,14 @@ def backprojection_polar_2d(
     g_extent: list | None = None,
     data_fmod: float = 0,
     alias_fmod: float = 0,
-    normalize: bool = True
+    normalize: bool = True,
+    dem: Tensor | None = None
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
 
-    Gradient can be calculated with respect to data and pos.
+    Gradient can be calculated with respect to data and pos (not supported
+    with dem).
 
     Parameters
     ----------
@@ -186,6 +199,14 @@ def backprojection_polar_2d(
         The antenna pattern should be nonzero everywhere to avoid noise
         amplification at pixels illuminated only near pattern nulls.
         Set to False for FFBP to output unnormalized accumulation.
+    dem : Tensor or None
+        Digital elevation model sampled on the image polar grid. Shape
+        [dem_nr, dem_ntheta], covering the same r and theta extent as `grid`.
+        The DEM resolution can be coarser than the image grid; heights are
+        bilinearly interpolated at each pixel. Values are pixel z coordinates
+        in the same frame as `pos`. If None (default) pixels are assumed to
+        lie on the z=0 plane. See `torchbp.util.dem_to_polar` for resampling
+        a Cartesian DEM onto the polar grid.
 
     Returns
     -------
@@ -194,7 +215,7 @@ def backprojection_polar_2d(
     """
     cpp_args = _prepare_backprojection_polar_2d_args(
         data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent,
-        data_fmod, alias_fmod, normalize
+        data_fmod, alias_fmod, normalize, dem
     )
     return torch.ops.torchbp.backprojection_polar_2d.default(*cpp_args)
 
@@ -212,7 +233,8 @@ def backprojection_polar_2d_lanczos(
     g: Tensor = None,
     g_extent: list | None = None,
     data_fmod: float = 0,
-    alias_fmod: float = 0
+    alias_fmod: float = 0,
+    dem: Tensor | None = None
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
@@ -268,6 +290,10 @@ def backprojection_polar_2d_lanczos(
         Range modulation frequency applied to input data.
     alias_fmod : float
         Range modulation frequency applied to SAR image.
+    dem : Tensor or None
+        Digital elevation model sampled on the image polar grid. Shape
+        [dem_nr, dem_ntheta], covering the same r and theta extent as `grid`.
+        May be coarser than the image grid. See `backprojection_polar_2d`.
 
     Returns
     -------
@@ -276,7 +302,7 @@ def backprojection_polar_2d_lanczos(
     """
     cpp_args = _prepare_backprojection_polar_2d_lanczos_args(
         data, grid, fc, r_res, pos, d0, dealias, order, att, g, g_extent,
-        data_fmod, alias_fmod
+        data_fmod, alias_fmod, dem=dem
     )
     return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(*cpp_args)
 
@@ -295,7 +321,8 @@ def backprojection_polar_2d_knab(
     g: Tensor = None,
     g_extent: list | None = None,
     data_fmod: float = 0,
-    alias_fmod: float = 0
+    alias_fmod: float = 0,
+    dem: Tensor | None = None
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
@@ -354,6 +381,10 @@ def backprojection_polar_2d_knab(
         Range modulation frequency applied to input data.
     alias_fmod : float
         Range modulation frequency applied to SAR image.
+    dem : Tensor or None
+        Digital elevation model sampled on the image polar grid. Shape
+        [dem_nr, dem_ntheta], covering the same r and theta extent as `grid`.
+        May be coarser than the image grid. See `backprojection_polar_2d`.
 
     Returns
     -------
@@ -362,7 +393,7 @@ def backprojection_polar_2d_knab(
     """
     cpp_args = _prepare_backprojection_polar_2d_knab_args(
         data, grid, fc, r_res, pos, d0, dealias, order, oversample, att, g, g_extent,
-        data_fmod, alias_fmod
+        data_fmod, alias_fmod, dem=dem
     )
     return torch.ops.torchbp.backprojection_polar_2d_knab.default(*cpp_args)
 
@@ -1463,6 +1494,7 @@ def _fake_polar_2d(
     data_fmod: float,
     alias_fmod: float,
     normalize: bool,
+    dem: Tensor,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
@@ -1525,6 +1557,7 @@ def _fake_polar_2d_grad(
     data_fmod: float,
     alias_fmod: float,
     normalize: bool,
+    dem: Tensor,
 ):
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
@@ -1687,6 +1720,8 @@ def _backward_polar_2d(ctx, grad):
         raise ValueError("dealias gradient not supported")
     if ctx.saved[15] is not None:
         raise ValueError("gradient with antenna pattern g not supported")
+    if ctx.saved[25] is not None:
+        raise ValueError("gradient with dem not supported")
     if data.dtype == torch.complex32:
         raise NotImplementedError("complex32 gradient not supported, use complex64 data")
     ret = torch.ops.torchbp.backprojection_polar_2d_grad.default(

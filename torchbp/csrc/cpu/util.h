@@ -259,6 +259,25 @@ static inline T interp_row_cpu(const T *row, const float *w, int count) {
     }
 }
 
+// 1D windowed-sinc resampler tap. Reads the input signal at continuous
+// position ``src`` (in input samples) with a Lanczos kernel. ``cutoff`` <= 1
+// lowpasses to ``cutoff`` * input-Nyquist for anti-aliased decimation; it is 1
+// for up/equal-rate sampling, giving the plain Lanczos kernel. Mirrors
+// lanczos_resample_1d in cuda/util.h.
+template<class T>
+static T lanczos_resample_1d_cpu(const T *img, int n, float src, int order, float cutoff) {
+    float a = 0.5f * order;
+    float half = a / cutoff;
+    int start = std::max(0, (int)ceilf(src - half));
+    int end = std::min(n-1, (int)floorf(src + half));
+    int count = std::min(end - start + 1, INTERP_MAX_TAPS);
+    float w[INTERP_MAX_TAPS];
+    for (int j = 0; j < count; j++) {
+        w[j] = cutoff * lanczos_kernel_cpu(cutoff * (src - (start + j)), a);
+    }
+    return interp_row_cpu<T>(img + start, w, count);
+}
+
 template<class T>
 static T lanczos_interp_2d_cpu(const T *img, int nx, int ny, float x, float y, int order) {
     float a = 0.5f * order;
@@ -297,6 +316,23 @@ static inline float knab_kernel_cpu(float x, float a, float v, float norm) {
     float xa = x / a;
     float n = expf(kPI * a * v * (sqrtf(1.0f - xa*xa) - 1.0f));
     return (sinpi_f(x) / (kPI * x)) * (norm/(n*(norm + 1.0f)) + n/(norm + 1.0f));
+}
+
+// 1D windowed-sinc resampler tap using the Knab kernel. See
+// lanczos_resample_1d_cpu for the ``cutoff`` semantics. Mirrors
+// knab_resample_1d in cuda/util.h.
+template<class T>
+static T knab_resample_1d_cpu(const T *img, int n, float src, int order, float v, float norm, float cutoff) {
+    float a = 0.5f * order;
+    float half = a / cutoff;
+    int start = std::max(0, (int)ceilf(src - half));
+    int end = std::min(n-1, (int)floorf(src + half));
+    int count = std::min(end - start + 1, INTERP_MAX_TAPS);
+    float w[INTERP_MAX_TAPS];
+    for (int j = 0; j < count; j++) {
+        w[j] = cutoff * knab_kernel_cpu(cutoff * (src - (start + j)), a, v, norm);
+    }
+    return interp_row_cpu<T>(img + start, w, count);
 }
 
 template<class T>

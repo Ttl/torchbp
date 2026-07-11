@@ -13,7 +13,7 @@ enum class InterpMethod {
     KNAB
 };
 
-template<typename T, bool HasAntennaPattern, bool Normalize = true, InterpMethod Method = InterpMethod::LINEAR>
+template<typename T, bool HasAntennaPattern, bool Normalize = true, InterpMethod Method = InterpMethod::LINEAR, bool HasDem = false>
 __global__ void backprojection_polar_2d_kernel(
           const T* __restrict__ data,
           const float* __restrict__ pos,
@@ -42,6 +42,11 @@ __global__ void backprojection_polar_2d_kernel(
           float g_del,
           int g_naz,
           int g_nel,
+          const float* __restrict__ dem,
+          float dem_r_scale,
+          float dem_theta_scale,
+          int dem_nr,
+          int dem_ntheta,
           int interp_order = 2,
           float knab_v = 0.0f) {
 
@@ -67,10 +72,24 @@ __global__ void backprojection_polar_2d_kernel(
     float r2[PIXELS_PER_THREAD];
     float x[PIXELS_PER_THREAD];
     float y[PIXELS_PER_THREAD];
+    float z[PIXELS_PER_THREAD];
+    float rz2[PIXELS_PER_THREAD];
     float pixel_re[PIXELS_PER_THREAD] = {0};
     float pixel_im[PIXELS_PER_THREAD] = {0};
     float w_sum2[PIXELS_PER_THREAD] = {0};
     float w_sum1[PIXELS_PER_THREAD] = {0};
+
+    // DEM shares the grid extent, so pixel index maps to DEM index by a
+    // constant ratio. Theta side is fixed for the whole thread. Indices are
+    // edge-clamped: guard band pixels |theta| > 1 get the DEM edge value.
+    int dem_it0, dem_it1;
+    float dem_wt;
+    if constexpr (HasDem) {
+        const float ft = idtheta * dem_theta_scale;
+        dem_it0 = min((int)ft, dem_ntheta - 1);
+        dem_it1 = min(dem_it0 + 1, dem_ntheta - 1);
+        dem_wt = ft - dem_it0;
+    }
 
     #pragma unroll
     for(int k=0; k<PIXELS_PER_THREAD; ++k) {
@@ -79,6 +98,20 @@ __global__ void backprojection_polar_2d_kernel(
             r2[k] = r[k] * r[k];
             x[k] = r[k] * cos_theta;
             y[k] = r[k] * sin_theta;
+            if constexpr (HasDem) {
+                const float fr = (idr_base + k) * dem_r_scale;
+                const int ir0 = min((int)fr, dem_nr - 1);
+                const int ir1 = min(ir0 + 1, dem_nr - 1);
+                const float wr = fr - ir0;
+                const float z00 = __ldg(&dem[ir0 * dem_ntheta + dem_it0]);
+                const float z01 = __ldg(&dem[ir0 * dem_ntheta + dem_it1]);
+                const float z10 = __ldg(&dem[ir1 * dem_ntheta + dem_it0]);
+                const float z11 = __ldg(&dem[ir1 * dem_ntheta + dem_it1]);
+                const float za = fmaf(dem_wt, z01 - z00, z00);
+                const float zb = fmaf(dem_wt, z11 - z10, z10);
+                z[k] = fmaf(wr, zb - za, za);
+                rz2[k] = fmaf(z[k], z[k], r2[k]);
+            }
         }
     }
 
@@ -123,7 +156,14 @@ __global__ void backprojection_polar_2d_kernel(
             // merge interpolation valid support at the grid edge. Distance
             // from a virtual Cartesian point would instead jump the phase
             // rate to ~2k*r at the fold.
-            float d_sq = fmaf(-2.0f * x[k], pos_x, fmaf(-2.0f * y[k], pos_y, r2[k] + pn2));
+            // With a DEM the pixel is at (x, y, z): d^2 gains z^2 - 2*z*p_z.
+            float d_sq;
+            if constexpr (HasDem) {
+                d_sq = fmaf(-2.0f * x[k], pos_x, fmaf(-2.0f * y[k], pos_y,
+                            fmaf(-2.0f * z[k], pos_z, rz2[k] + pn2)));
+            } else {
+                d_sq = fmaf(-2.0f * x[k], pos_x, fmaf(-2.0f * y[k], pos_y, r2[k] + pn2));
+            }
             float d = sqrtf(fmaxf(d_sq, 0.0f));
 
             // Compute d_eff once, use for both sx and phase
@@ -186,7 +226,12 @@ __global__ void backprojection_polar_2d_kernel(
                 __sincosf(fmaf(phase_coef, d_eff, phase_offset2), &ref_sin, &ref_cos);
 
                 if constexpr (HasAntennaPattern) {
-                    const float look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+                    float look_angle;
+                    if constexpr (HasDem) {
+                        look_angle = asinf(fminf(fmaxf((z[k] - pos_z) / d, -1.0f), 1.0f));
+                    } else {
+                        look_angle = asinf(fmaxf(-pos_z / d, -1.0f));
+                    }
                     const float el_deg = look_angle - att_el;
                     const float az_deg = atan2f(py, px) - att_az;
 
@@ -1873,7 +1918,8 @@ at::Tensor backprojection_polar_2d_cuda(
           int64_t g_nel,
           double data_fmod,
           double alias_fmod,
-          bool normalize) {
+          bool normalize,
+          const at::Tensor &dem) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
@@ -1910,6 +1956,23 @@ at::Tensor backprojection_polar_2d_cuda(
         g_ptr = g_contig.data_ptr<float>();
     }
 
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
+
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -1928,37 +1991,47 @@ at::Tensor backprojection_polar_2d_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Use template specialization to eliminate antenna pattern and normalize branches
-    #define LAUNCH_KERNEL(T, has_antenna, do_normalize) \
-        backprojection_polar_2d_kernel<T, has_antenna, do_normalize> \
+    // Use template specialization to eliminate antenna pattern, normalize and DEM branches
+    #define LAUNCH_KERNEL(T, has_antenna, do_normalize, use_dem) \
+        backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::LINEAR, use_dem> \
               <<<block_count, thread_per_block, 0, stream>>>( \
                       (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
                       sweep_samples, nsweeps, \
                       phase_coef, phase_offset, delta_r, \
                       r0, dr, theta0, dtheta, Nr, Ntheta, \
                       d0, dealias, z0, dealias_coef, dealias_fmod, \
-                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel)
+                      g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta)
+    #define LAUNCH_KERNEL_DEM(T, has_antenna, do_normalize) \
+        do { \
+            if (has_dem) { \
+                LAUNCH_KERNEL(T, has_antenna, do_normalize, true); \
+            } else { \
+                LAUNCH_KERNEL(T, has_antenna, do_normalize, false); \
+            } \
+        } while (0)
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         if (antenna_pattern && normalize) {
-            LAUNCH_KERNEL(complex64_t, true, true);
+            LAUNCH_KERNEL_DEM(complex64_t, true, true);
         } else if (antenna_pattern && !normalize) {
-            LAUNCH_KERNEL(complex64_t, true, false);
+            LAUNCH_KERNEL_DEM(complex64_t, true, false);
         } else {
-            LAUNCH_KERNEL(complex64_t, false, true);
+            LAUNCH_KERNEL_DEM(complex64_t, false, true);
         }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         if (antenna_pattern && normalize) {
-            LAUNCH_KERNEL(half2, true, true);
+            LAUNCH_KERNEL_DEM(half2, true, true);
         } else if (antenna_pattern && !normalize) {
-            LAUNCH_KERNEL(half2, true, false);
+            LAUNCH_KERNEL_DEM(half2, true, false);
         } else {
-            LAUNCH_KERNEL(half2, false, true);
+            LAUNCH_KERNEL_DEM(half2, false, true);
         }
     }
 
+    #undef LAUNCH_KERNEL_DEM
     #undef LAUNCH_KERNEL
 
 	return img;
@@ -1992,10 +2065,12 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cuda(
           int64_t g_nel,
           double data_fmod,
           double alias_fmod,
-          bool normalize) {
+          bool normalize,
+          const at::Tensor &dem) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
+	TORCH_CHECK(!dem.defined(), "backprojection_polar_2d gradient with dem is not supported");
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CUDA);
@@ -2213,7 +2288,8 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
           int64_t g_nel,
           double data_fmod,
           double alias_fmod,
-          bool normalize) {
+          bool normalize,
+          const at::Tensor &dem) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
@@ -2250,6 +2326,23 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
         g_ptr = g_contig.data_ptr<float>();
     }
 
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
+
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
 
@@ -2268,9 +2361,9 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Use template specialization to eliminate antenna pattern and normalize branches
-    #define LAUNCH_KERNEL(T, has_antenna, do_normalize) \
-        backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::LANCZOS> \
+    // Use template specialization to eliminate antenna pattern, normalize and DEM branches
+    #define LAUNCH_KERNEL(T, has_antenna, do_normalize, use_dem) \
+        backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::LANCZOS, use_dem> \
               <<<block_count, thread_per_block, 0, stream>>>( \
                       (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
                       sweep_samples, nsweeps, \
@@ -2278,28 +2371,38 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
                       r0, dr, theta0, dtheta, Nr, Ntheta, \
                       d0, dealias, z0, dealias_coef, dealias_fmod, \
                       g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta, \
                       order)
+    #define LAUNCH_KERNEL_DEM(T, has_antenna, do_normalize) \
+        do { \
+            if (has_dem) { \
+                LAUNCH_KERNEL(T, has_antenna, do_normalize, true); \
+            } else { \
+                LAUNCH_KERNEL(T, has_antenna, do_normalize, false); \
+            } \
+        } while (0)
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         if (antenna_pattern && normalize) {
-            LAUNCH_KERNEL(complex64_t, true, true);
+            LAUNCH_KERNEL_DEM(complex64_t, true, true);
         } else if (antenna_pattern && !normalize) {
-            LAUNCH_KERNEL(complex64_t, true, false);
+            LAUNCH_KERNEL_DEM(complex64_t, true, false);
         } else {
-            LAUNCH_KERNEL(complex64_t, false, true);
+            LAUNCH_KERNEL_DEM(complex64_t, false, true);
         }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         if (antenna_pattern && normalize) {
-            LAUNCH_KERNEL(half2, true, true);
+            LAUNCH_KERNEL_DEM(half2, true, true);
         } else if (antenna_pattern && !normalize) {
-            LAUNCH_KERNEL(half2, true, false);
+            LAUNCH_KERNEL_DEM(half2, true, false);
         } else {
-            LAUNCH_KERNEL(half2, false, true);
+            LAUNCH_KERNEL_DEM(half2, false, true);
         }
     }
 
+    #undef LAUNCH_KERNEL_DEM
     #undef LAUNCH_KERNEL
 
 	return img;
@@ -2334,7 +2437,8 @@ at::Tensor backprojection_polar_2d_knab_cuda(
           int64_t g_nel,
           double data_fmod,
           double alias_fmod,
-          bool normalize) {
+          bool normalize,
+          const at::Tensor &dem) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat || data.dtype() == at::kComplexHalf);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
@@ -2371,6 +2475,23 @@ at::Tensor backprojection_polar_2d_knab_cuda(
         g_ptr = g_contig.data_ptr<float>();
     }
 
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
+
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
     const float v = 1.0f - 1.0f / oversample;
@@ -2390,9 +2511,9 @@ at::Tensor backprojection_polar_2d_knab_cuda(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Use template specialization to eliminate antenna pattern and normalize branches
-    #define LAUNCH_KERNEL(T, has_antenna, do_normalize) \
-        backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::KNAB> \
+    // Use template specialization to eliminate antenna pattern, normalize and DEM branches
+    #define LAUNCH_KERNEL(T, has_antenna, do_normalize, use_dem) \
+        backprojection_polar_2d_kernel<T, has_antenna, do_normalize, InterpMethod::KNAB, use_dem> \
               <<<block_count, thread_per_block, 0, stream>>>( \
                       (T*)data_ptr, pos_ptr, att_ptr, (complex64_t*)img_ptr, \
                       sweep_samples, nsweeps, \
@@ -2400,28 +2521,38 @@ at::Tensor backprojection_polar_2d_knab_cuda(
                       r0, dr, theta0, dtheta, Nr, Ntheta, \
                       d0, dealias, z0, dealias_coef, dealias_fmod, \
                       g_ptr, g_az0, g_el0, g_daz, g_del, g_naz, g_nel, \
+                      dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta, \
                       order, v)
+    #define LAUNCH_KERNEL_DEM(T, has_antenna, do_normalize) \
+        do { \
+            if (has_dem) { \
+                LAUNCH_KERNEL(T, has_antenna, do_normalize, true); \
+            } else { \
+                LAUNCH_KERNEL(T, has_antenna, do_normalize, false); \
+            } \
+        } while (0)
 
 	if (data.dtype() == at::kComplexFloat) {
         const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
         if (antenna_pattern && normalize) {
-            LAUNCH_KERNEL(complex64_t, true, true);
+            LAUNCH_KERNEL_DEM(complex64_t, true, true);
         } else if (antenna_pattern && !normalize) {
-            LAUNCH_KERNEL(complex64_t, true, false);
+            LAUNCH_KERNEL_DEM(complex64_t, true, false);
         } else {
-            LAUNCH_KERNEL(complex64_t, false, true);
+            LAUNCH_KERNEL_DEM(complex64_t, false, true);
         }
     } else if (data.dtype() == at::kComplexHalf) {
         const c10::complex<at::Half>* data_ptr = data_contig.data_ptr<c10::complex<at::Half>>();
         if (antenna_pattern && normalize) {
-            LAUNCH_KERNEL(half2, true, true);
+            LAUNCH_KERNEL_DEM(half2, true, true);
         } else if (antenna_pattern && !normalize) {
-            LAUNCH_KERNEL(half2, true, false);
+            LAUNCH_KERNEL_DEM(half2, true, false);
         } else {
-            LAUNCH_KERNEL(half2, false, true);
+            LAUNCH_KERNEL_DEM(half2, false, true);
         }
     }
 
+    #undef LAUNCH_KERNEL_DEM
     #undef LAUNCH_KERNEL
 
 	return img;

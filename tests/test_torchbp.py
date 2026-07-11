@@ -676,6 +676,255 @@ class TestBackprojectionPolar(TestCase):
         self._opcheck("cuda")
 
 
+class TestBackprojectionPolarDem(TestCase):
+    """Tests for the optional polar-grid DEM input of backprojection_polar_2d."""
+
+    def _random_inputs(self, device, nr=32, ntheta=16):
+        torch.manual_seed(42)
+        nbatch = 1
+        nsweeps = 8
+        sweep_samples = 512
+        grid = {"r": (30, 60), "theta": (-0.5, 0.5), "nr": nr, "ntheta": ntheta}
+        data = torch.randn(nbatch, nsweeps, sweep_samples, device=device,
+                           dtype=torch.complex64)
+        pos = torch.zeros(nbatch, nsweeps, 3, device=device)
+        pos[..., 1] = torch.linspace(-1, 1, nsweeps, device=device)
+        pos[..., 2] = 25.0
+        return data, grid, pos
+
+    def _test_zero_dem_matches_no_dem(self, device):
+        data, grid, pos = self._random_inputs(device)
+        dem = torch.zeros(grid["nr"], grid["ntheta"], device=device)
+        ref = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos)
+        res = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos, dem=dem)
+        torch.testing.assert_close(res, ref)
+
+    def test_zero_dem_matches_no_dem_cpu(self):
+        self._test_zero_dem_matches_no_dem("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_zero_dem_matches_no_dem_cuda(self):
+        self._test_zero_dem_matches_no_dem("cuda")
+
+    def _test_constant_dem_equals_shifted_pos(self, device):
+        # Pixels at a constant height h see exactly the same distances as
+        # z=0 pixels with the platform lowered by h.
+        data, grid, pos = self._random_inputs(device)
+        h = 7.0
+        dem = torch.full((grid["nr"], grid["ntheta"]), h, device=device)
+        res = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos, dem=dem)
+        pos_shift = pos.clone()
+        pos_shift[..., 2] -= h
+        ref = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos_shift)
+        torch.testing.assert_close(res, ref, atol=1e-2, rtol=1e-2)
+
+    def test_constant_dem_equals_shifted_pos_cpu(self):
+        self._test_constant_dem_equals_shifted_pos("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_constant_dem_equals_shifted_pos_cuda(self):
+        self._test_constant_dem_equals_shifted_pos("cuda")
+
+    def _make_ramp_dem(self, grid, dem_nr, dem_ntheta, device):
+        # Bilinear in (r, theta), so bilinear interpolation between DEM
+        # samples reproduces it exactly on aligned grids.
+        r0, r1 = grid["r"]
+        t0, t1 = grid["theta"]
+        r = r0 + (r1 - r0) / dem_nr * torch.arange(dem_nr, device=device)
+        t = t0 + (t1 - t0) / dem_ntheta * torch.arange(dem_ntheta, device=device)
+        return 0.2 * r[:, None] + 3.0 * t[None, :] + 2.0
+
+    def _test_downsampled_dem(self, device):
+        data, grid, pos = self._random_inputs(device, nr=32, ntheta=16)
+        # Constant DEM: downsampling changes nothing anywhere.
+        h = 5.0
+        dem_fine = torch.full((32, 16), h, device=device)
+        dem_coarse = torch.full((8, 4), h, device=device)
+        res_f = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos, dem=dem_fine)
+        res_c = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos, dem=dem_coarse)
+        torch.testing.assert_close(res_c, res_f)
+
+        # Ramp DEM: exact away from the edge-clamped last coarse cell.
+        # fr = idr * dem_nr / nr is within the coarse grid for
+        # idr <= (dem_nr - 1) * nr / dem_nr.
+        dem_fine = self._make_ramp_dem(grid, 32, 16, device)
+        dem_coarse = self._make_ramp_dem(grid, 8, 4, device)
+        res_f = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos, dem=dem_fine)
+        res_c = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos, dem=dem_coarse)
+        torch.testing.assert_close(res_c[:, :29, :13], res_f[:, :29, :13],
+                                   atol=1e-2, rtol=1e-2)
+
+    def test_downsampled_dem_cpu(self):
+        self._test_downsampled_dem("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_downsampled_dem_cuda(self):
+        self._test_downsampled_dem("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_and_gpu_dem(self):
+        data, grid, pos = self._random_inputs("cuda")
+        torch.manual_seed(123)
+        dem = 5.0 + 2.0 * torch.randn(grid["nr"] // 4, grid["ntheta"] // 4,
+                                      device="cuda")
+        res_gpu = torchbp.ops.backprojection_polar_2d(
+            data, grid, 6e9, 0.15, pos, dem=dem).cpu()
+        res_cpu = torchbp.ops.backprojection_polar_2d(
+            data.cpu(), grid, 6e9, 0.15, pos.cpu(), dem=dem.cpu())
+        torch.testing.assert_close(res_cpu, res_gpu, atol=1e-3, rtol=1e-2)
+
+    def _test_dem_grad_raises(self, device):
+        data, grid, pos = self._random_inputs(device)
+        pos.requires_grad = True
+        dem = torch.zeros(grid["nr"], grid["ntheta"], device=device)
+        res = torchbp.ops.backprojection_polar_2d(data, grid, 6e9, 0.15, pos, dem=dem)
+        with self.assertRaises(ValueError):
+            torch.mean(torch.abs(res)).backward()
+
+    def test_dem_grad_raises_cpu(self):
+        self._test_dem_grad_raises("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_dem_grad_raises_cuda(self):
+        self._test_dem_grad_raises("cuda")
+
+    def _opcheck_dem(self, device):
+        from torchbp.ops.backproj import _prepare_backprojection_polar_2d_args
+
+        data, grid, pos = self._random_inputs(device)
+        dem = torch.zeros(grid["nr"], grid["ntheta"], device=device)
+        cpp_args = _prepare_backprojection_polar_2d_args(
+            data, grid, 6e9, 0.15, pos, dem=dem)
+        opcheck(
+            torch.ops.torchbp.backprojection_polar_2d,
+            cpp_args,
+            test_utils=["test_schema", "test_faketensor"]
+        )
+
+    def test_opcheck_dem_cpu(self):
+        self._opcheck_dem("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_dem_cuda(self):
+        self._opcheck_dem("cuda")
+
+    def _test_dem_point_target(self, device):
+        # A target above the ground plane focuses at the wrong ground range
+        # with the flat-earth assumption and at the true ground range with a
+        # DEM at the target height.
+        c0 = 299792458.0
+        fc = 6e9
+        bw = 200e6
+        tsweep = 100e-6
+        fs = 10e6
+        nsamples = int(fs * tsweep)
+        oversample = 2
+        r_res = c0 / (2 * bw * oversample)
+        nsweeps = 128
+        alt = 30.0
+        h = 12.0
+        target_r = 80.0
+
+        pos = torch.zeros(nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-10, 10, nsweeps, device=device)
+        pos[:, 2] = alt
+        target_pos = torch.tensor([[target_r, 0.0, h]], device=device)
+        target_rcs = torch.ones((1, 1), device=device)
+
+        raw = torchbp.util.generate_fmcw_data(
+            target_pos, target_rcs, pos, fc, bw, tsweep, fs, rvp=False)
+        w = torch.hamming_window(nsamples, periodic=False, device=device)
+        data = torch.fft.ifft(raw * w[None, :], dim=-1, n=nsamples * oversample)
+
+        grid = {"r": (60.0, 100.0), "theta": (-0.3, 0.3), "nr": 320, "ntheta": 128}
+        dr = (grid["r"][1] - grid["r"][0]) / grid["nr"]
+
+        img_flat = torchbp.ops.backprojection_polar_2d(
+            data, grid, fc, r_res, pos)[0]
+        dem = torch.full((grid["nr"], grid["ntheta"]), h, device=device)
+        img_dem = torchbp.ops.backprojection_polar_2d(
+            data, grid, fc, r_res, pos, dem=dem)[0]
+
+        idr_dem = torch.argmax(torch.abs(img_dem)).item() // grid["ntheta"]
+        idr_flat = torch.argmax(torch.abs(img_flat)).item() // grid["ntheta"]
+
+        r_dem = grid["r"][0] + dr * idr_dem
+        r_flat = grid["r"][0] + dr * idr_flat
+        # Flat-earth image focuses where sqrt(r^2 + alt^2) equals the true
+        # slant range sqrt(target_r^2 + (alt - h)^2).
+        d_true = np.sqrt(target_r**2 + (alt - h) ** 2)
+        r_flat_expected = np.sqrt(d_true**2 - alt**2)
+
+        self.assertLess(abs(r_dem - target_r), 2 * dr)
+        self.assertLess(abs(r_flat - r_flat_expected), 2 * dr)
+
+    def test_dem_point_target_cpu(self):
+        self._test_dem_point_target("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_dem_point_target_cuda(self):
+        self._test_dem_point_target("cuda")
+
+
+class TestDemToPolar(TestCase):
+    def test_planar_dem(self):
+        # Bilinear sampling of a planar surface is exact in the interior.
+        cart_grid = {"x": (0.0, 100.0), "y": (-50.0, 50.0), "nx": 100, "ny": 100}
+        polar_grid = {"r": (20.0, 80.0), "theta": (-0.5, 0.5), "nr": 64, "ntheta": 32}
+
+        nx, ny = cart_grid["nx"], cart_grid["ny"]
+        dx = (cart_grid["x"][1] - cart_grid["x"][0]) / nx
+        dy = (cart_grid["y"][1] - cart_grid["y"][0]) / ny
+        xc = cart_grid["x"][0] + dx * torch.arange(nx)
+        yc = cart_grid["y"][0] + dy * torch.arange(ny)
+        dem_cart = 0.1 * xc[:, None] + 0.05 * yc[None, :] + 3.0
+
+        dem_polar = torchbp.util.dem_to_polar(dem_cart, cart_grid, polar_grid)
+
+        r0, r1 = polar_grid["r"]
+        t0, t1 = polar_grid["theta"]
+        nr, ntheta = polar_grid["nr"], polar_grid["ntheta"]
+        r = r0 + (r1 - r0) / nr * torch.arange(nr)
+        sin_t = t0 + (t1 - t0) / ntheta * torch.arange(ntheta)
+        cos_t = torch.sqrt(torch.clamp(1 - sin_t**2, min=0))
+        x = r[:, None] * cos_t[None, :]
+        y = r[:, None] * sin_t[None, :]
+        expected = 0.1 * x + 0.05 * y + 3.0
+
+        self.assertEqual(dem_polar.shape, (nr, ntheta))
+        torch.testing.assert_close(dem_polar, expected, atol=1e-3, rtol=1e-5)
+
+    def test_origin_rotation(self):
+        # With a rotation of pi/2 the grid x axis points along +y in the DEM
+        # frame; heights are returned relative to the origin z.
+        cart_grid = {"x": (-100.0, 100.0), "y": (-100.0, 100.0), "nx": 200, "ny": 200}
+        polar_grid = {"r": (20.0, 50.0), "theta": (-0.3, 0.3), "nr": 16, "ntheta": 8}
+
+        nx, ny = cart_grid["nx"], cart_grid["ny"]
+        dx = (cart_grid["x"][1] - cart_grid["x"][0]) / nx
+        dy = (cart_grid["y"][1] - cart_grid["y"][0]) / ny
+        xc = cart_grid["x"][0] + dx * torch.arange(nx)
+        yc = cart_grid["y"][0] + dy * torch.arange(ny)
+        dem_cart = 0.1 * yc[None, :].expand(nx, ny).clone()
+
+        origin = torch.tensor([5.0, -10.0, 2.0])
+        rotation = np.pi / 2
+        dem_polar = torchbp.util.dem_to_polar(
+            dem_cart, cart_grid, polar_grid, origin=origin, rotation=rotation)
+
+        r0, r1 = polar_grid["r"]
+        t0, t1 = polar_grid["theta"]
+        nr, ntheta = polar_grid["nr"], polar_grid["ntheta"]
+        r = r0 + (r1 - r0) / nr * torch.arange(nr)
+        sin_t = t0 + (t1 - t0) / ntheta * torch.arange(ntheta)
+        cos_t = torch.sqrt(torch.clamp(1 - sin_t**2, min=0))
+        # Rotated by pi/2: x_dem = origin_x - r*sin, y_dem = origin_y + r*cos
+        y_dem = origin[1] + r[:, None] * cos_t[None, :]
+        expected = 0.1 * y_dem - origin[2]
+
+        torch.testing.assert_close(dem_polar, expected, atol=1e-3, rtol=1e-5)
+
+
 class TestBackprojectionPolarAntennaPattern(TestCase):
     """Test that antenna pattern weighting is correctly normalized."""
 
@@ -3799,6 +4048,262 @@ class TestResample2DKnab(TestCase):
             )
             opcheck(
                 torch.ops.torchbp.resample_2d_knab,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestResample1DLanczos(TestCase):
+    """Test generic 1D signal rate change with Lanczos interpolation."""
+
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            return torch.randn(size, device=device, requires_grad=requires_grad, dtype=dtype)
+
+        args = {
+            "img": make_tensor((2, 32), dtype=dtype),
+            "N": 32,
+            "M": 64,
+            "order": 6,
+        }
+        return [args]
+
+    def _test_identity(self, device, dtype):
+        """num == N must reproduce the input exactly (within kernel boundary effects)."""
+        N = 64
+        x = torch.randn(3, N, device=device, dtype=dtype)
+        out = torchbp.ops.resample_1d_lanczos(x, N, order=6)
+        self.assertEqual(out.shape, x.shape)
+        margin = 4
+        err = torch.max(torch.abs(out[:, margin:-margin] - x[:, margin:-margin]))
+        self.assertLess(err.item(), 1e-5)
+
+    def _test_smooth_upsample(self, device, dtype):
+        """Upsample a band-limited signal and compare against the analytical values."""
+        N = 128
+        M = 256
+        t = torch.arange(N, device=device, dtype=torch.float32)
+        freq = 0.1
+        if dtype == torch.complex64:
+            x = torch.exp(1j * freq * t).to(dtype=dtype)
+        else:
+            x = torch.cos(freq * t).to(dtype=dtype)
+
+        out = torchbp.ops.resample_1d_lanczos(x, M, order=8)
+        self.assertEqual(out.shape[0], M)
+
+        # Output sample k maps to input position k * N / M.
+        tk = torch.arange(M, device=device, dtype=torch.float32) * (N / M)
+        if dtype == torch.complex64:
+            expected = torch.exp(1j * freq * tk).to(dtype=dtype)
+        else:
+            expected = torch.cos(freq * tk).to(dtype=dtype)
+
+        margin = 8
+        err = torch.abs(out[margin:-margin] - expected[margin:-margin])
+        max_err = err.max().item()
+        self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for upsampling")
+
+    def _test_axis(self, device, dtype):
+        """Resampling along an arbitrary axis matches moving that axis to the end."""
+        x = torch.randn(4, 40, 5, device=device, dtype=dtype)
+        for axis in [0, 1, 2, -1, -2]:
+            num = 2 * x.shape[axis]
+            out = torchbp.ops.resample_1d_lanczos(x, num, axis=axis, order=6)
+            exp_shape = list(x.shape)
+            exp_shape[axis] = num
+            self.assertEqual(list(out.shape), exp_shape)
+            ref = torchbp.ops.resample_1d_lanczos(
+                x.movedim(axis, -1), num, axis=-1, order=6).movedim(-1, axis)
+            torch.testing.assert_close(out, ref)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_identity_complex(self):
+        self._test_identity("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_identity_float(self):
+        self._test_identity("cuda", torch.float32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_complex(self):
+        self._test_smooth_upsample("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_float(self):
+        self._test_smooth_upsample("cuda", torch.float32)
+
+    def test_identity_complex_cpu(self):
+        self._test_identity("cpu", torch.complex64)
+
+    def test_identity_float_cpu(self):
+        self._test_identity("cpu", torch.float32)
+
+    def test_smooth_complex_cpu(self):
+        self._test_smooth_upsample("cpu", torch.complex64)
+
+    def test_smooth_float_cpu(self):
+        self._test_smooth_upsample("cpu", torch.float32)
+
+    def test_axis_complex_cpu(self):
+        self._test_axis("cpu", torch.complex64)
+
+    def test_axis_float_cpu(self):
+        self._test_axis("cpu", torch.float32)
+
+    def _test_cpu_cuda(self, dtype):
+        x = torch.randn(3, 33, 5, dtype=dtype)
+        for num in [33, 66, 116, 16]:
+            out_cpu = torchbp.ops.resample_1d_lanczos(x, num, axis=1, order=6)
+            out_gpu = torchbp.ops.resample_1d_lanczos(
+                x.cuda(), num, axis=1, order=6).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_complex(self):
+        self._test_cpu_cuda(torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_float(self):
+        self._test_cpu_cuda(torch.float32)
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = (
+                args["img"],
+                args["img"].shape[0],  # nbatch
+                args["N"],
+                args["M"],
+                args["order"],
+            )
+            opcheck(
+                torch.ops.torchbp.resample_1d_lanczos,
+                cpp_args,
+                test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
+            )
+
+    def test_opcheck_cpu(self):
+        self._opcheck("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_opcheck_cuda(self):
+        self._opcheck("cuda")
+
+
+class TestResample1DKnab(TestCase):
+    """Test generic 1D signal rate change with Knab interpolation."""
+
+    def sample_inputs(self, device, *, requires_grad=False, dtype=torch.complex64):
+        def make_tensor(size, dtype=dtype):
+            return torch.randn(size, device=device, requires_grad=requires_grad, dtype=dtype)
+
+        args = {
+            "img": make_tensor((2, 32), dtype=dtype),
+            "N": 32,
+            "M": 64,
+            "order": 6,
+            "oversample": 1.5,
+        }
+        return [args]
+
+    def _test_identity(self, device, dtype):
+        N = 64
+        x = torch.randn(3, N, device=device, dtype=dtype)
+        out = torchbp.ops.resample_1d_knab(x, N, order=6, oversample=1.5)
+        self.assertEqual(out.shape, x.shape)
+        margin = 4
+        err = torch.max(torch.abs(out[:, margin:-margin] - x[:, margin:-margin]))
+        self.assertLess(err.item(), 1e-5)
+
+    def _test_smooth_upsample(self, device, dtype):
+        N = 128
+        M = 256
+        t = torch.arange(N, device=device, dtype=torch.float32)
+        freq = 0.1
+        if dtype == torch.complex64:
+            x = torch.exp(1j * freq * t).to(dtype=dtype)
+        else:
+            x = torch.cos(freq * t).to(dtype=dtype)
+
+        out = torchbp.ops.resample_1d_knab(x, M, order=8, oversample=2.0)
+        self.assertEqual(out.shape[0], M)
+
+        tk = torch.arange(M, device=device, dtype=torch.float32) * (N / M)
+        if dtype == torch.complex64:
+            expected = torch.exp(1j * freq * tk).to(dtype=dtype)
+        else:
+            expected = torch.cos(freq * tk).to(dtype=dtype)
+
+        margin = 8
+        err = torch.abs(out[margin:-margin] - expected[margin:-margin])
+        max_err = err.max().item()
+        self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for upsampling")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_identity_complex(self):
+        self._test_identity("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_identity_float(self):
+        self._test_identity("cuda", torch.float32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_complex(self):
+        self._test_smooth_upsample("cuda", torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_smooth_float(self):
+        self._test_smooth_upsample("cuda", torch.float32)
+
+    def test_identity_complex_cpu(self):
+        self._test_identity("cpu", torch.complex64)
+
+    def test_identity_float_cpu(self):
+        self._test_identity("cpu", torch.float32)
+
+    def test_smooth_complex_cpu(self):
+        self._test_smooth_upsample("cpu", torch.complex64)
+
+    def test_smooth_float_cpu(self):
+        self._test_smooth_upsample("cpu", torch.float32)
+
+    def _test_cpu_cuda(self, dtype):
+        x = torch.randn(3, 33, 5, dtype=dtype)
+        for num in [33, 66, 116, 16]:
+            out_cpu = torchbp.ops.resample_1d_knab(x, num, axis=1, order=6, oversample=1.5)
+            out_gpu = torchbp.ops.resample_1d_knab(
+                x.cuda(), num, axis=1, order=6, oversample=1.5).cpu()
+            torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_complex(self):
+        self._test_cpu_cuda(torch.complex64)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_cuda_float(self):
+        self._test_cpu_cuda(torch.float32)
+
+    def _opcheck(self, device):
+        samples = self.sample_inputs(device, requires_grad=False)
+        for args in samples:
+            cpp_args = (
+                args["img"],
+                args["img"].shape[0],
+                args["N"],
+                args["M"],
+                args["order"],
+                args["oversample"],
+            )
+            opcheck(
+                torch.ops.torchbp.resample_1d_knab,
                 cpp_args,
                 test_utils=["test_schema", "test_autograd_registration", "test_faketensor"]
             )

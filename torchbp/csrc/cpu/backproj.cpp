@@ -11,6 +11,7 @@ namespace torchbp {
 // data-dependent sample gather and accumulates. The antenna gain path adds a
 // vectorizable angle pass (asinf_fast/atan2f_fast, a few ulp from libm) and
 // folds the bilinear gain gather into the scalar pass.
+template<bool HasDem>
 static void backprojection_polar_2d_row_cpu(
           const complex64_t* data,
           const float* pos,
@@ -36,6 +37,11 @@ static void backprojection_polar_2d_row_cpu(
           float g_del,
           int g_naz,
           int g_nel,
+          const float* dem,
+          float dem_r_scale,
+          float dem_theta_scale,
+          int dem_nr,
+          int dem_ntheta,
           float data_fmod,
           float alias_fmod,
           bool normalize,
@@ -50,6 +56,7 @@ static void backprojection_polar_2d_row_cpu(
     float d_buf[CHUNK];
     float ef_buf[CHUNK], af_buf[CHUNK];
     int gi_buf[CHUNK];
+    float z_buf[CHUNK], z2_buf[CHUNK];
 
     const float r = r0 + idr * dr;
     const float r2 = r * r;
@@ -75,6 +82,32 @@ static void backprojection_polar_2d_row_cpu(
             wsum2_buf[q] = 0.0f;
         }
 
+        // DEM shares the grid extent, so pixel index maps to DEM index by a
+        // constant ratio. The r side is fixed for the whole row. Indices are
+        // edge-clamped: guard band pixels |theta| > 1 get the DEM edge value.
+        if constexpr (HasDem) {
+            const float fr = idr * dem_r_scale;
+            int ir0 = (int)fr;
+            ir0 = ir0 < dem_nr - 1 ? ir0 : dem_nr - 1;
+            const int ir1 = ir0 + 1 < dem_nr ? ir0 + 1 : dem_nr - 1;
+            const float wr = fr - ir0;
+            const float* dem_row0 = dem + (size_t)ir0 * dem_ntheta;
+            const float* dem_row1 = dem + (size_t)ir1 * dem_ntheta;
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float ft = (tb + q) * dem_theta_scale;
+                int it0 = (int)ft;
+                it0 = it0 < dem_ntheta - 1 ? it0 : dem_ntheta - 1;
+                const int it1 = it0 + 1 < dem_ntheta ? it0 + 1 : dem_ntheta - 1;
+                const float wt = ft - it0;
+                const float za = dem_row0[it0] + wt * (dem_row0[it1] - dem_row0[it0]);
+                const float zb = dem_row1[it0] + wt * (dem_row1[it1] - dem_row1[it0]);
+                const float zq = za + wr * (zb - za);
+                z_buf[q] = zq;
+                z2_buf[q] = zq * zq;
+            }
+        }
+
         for(int i = 0; i < nsweeps; i++) {
             // Sweep reference position.
             const float pos_x = pos_b[i * 3 + 0];
@@ -97,7 +130,15 @@ static void backprojection_polar_2d_row_cpu(
                 // give the merge interpolation valid support at the grid
                 // edge. Distance from a virtual Cartesian point would instead
                 // jump the phase rate to ~2k*r at the fold.
-                const float d2 = r2pn2 - 2.0f * (x_buf[q] * pos_x + y_buf[q] * pos_y);
+                // With a DEM the pixel is at (x, y, z): d^2 gains
+                // z^2 - 2*z*pos_z.
+                float d2;
+                if constexpr (HasDem) {
+                    d2 = r2pn2 + z2_buf[q] - 2.0f * (x_buf[q] * pos_x
+                            + y_buf[q] * pos_y + z_buf[q] * pos_z);
+                } else {
+                    d2 = r2pn2 - 2.0f * (x_buf[q] * pos_x + y_buf[q] * pos_y);
+                }
                 const float d = sqrtf(d2 > 0.0f ? d2 : 0.0f);
                 d_buf[q] = d;
 
@@ -126,7 +167,13 @@ static void backprojection_polar_2d_row_cpu(
                     const float px = x_buf[q] - pos_x;
                     const float py = y_buf[q] - pos_y;
                     const float d = d_buf[q];
-                    const float sin_l = -pos_z / d;
+                    float sin_l;
+                    if constexpr (HasDem) {
+                        sin_l = (z_buf[q] - pos_z) / d;
+                        sin_l = sin_l > 1.0f ? 1.0f : sin_l;
+                    } else {
+                        sin_l = -pos_z / d;
+                    }
                     const float look_angle = asinf_fast(sin_l < -1.0f ? -1.0f : sin_l);
                     const float el_deg = look_angle - att0;
                     const float az_deg = atan2f_fast(py, px) - att2;
@@ -248,7 +295,8 @@ at::Tensor backprojection_polar_2d_cpu(
           int64_t g_nel,
           double data_fmod,
           double alias_fmod,
-          bool normalize) {
+          bool normalize,
+          const at::Tensor &dem) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
@@ -286,6 +334,23 @@ at::Tensor backprojection_polar_2d_cpu(
         g_ptr = g_contig.data_ptr<float>();
     }
 
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
+
 	const float delta_r = 1.0f / r_res;
     const float ref_phase = 4.0f * fc / kC0;
     const c10::complex<float>* data_ptr = data_contig.data_ptr<c10::complex<float>>();
@@ -296,10 +361,12 @@ at::Tensor backprojection_polar_2d_cpu(
     // logical processor count (incl. SMT/hyperthreads).
     omp_set_num_threads(omp_get_num_procs());
 
+    auto row = has_dem ? &backprojection_polar_2d_row_cpu<true>
+                       : &backprojection_polar_2d_row_cpu<false>;
 #pragma omp parallel for collapse(2)
     for(int idbatch = 0; idbatch < nbatch; idbatch++) {
         for(int idr = 0; idr < Nr; idr++) {
-            backprojection_polar_2d_row_cpu(
+            row(
                           data_ptr,
                           pos_ptr,
                           att_ptr,
@@ -320,6 +387,11 @@ at::Tensor backprojection_polar_2d_cpu(
                           g_del,
                           g_naz,
                           g_nel,
+                          dem_ptr,
+                          dem_r_scale,
+                          dem_theta_scale,
+                          dem_nr,
+                          dem_ntheta,
                           data_fmod/kPI,
                           alias_fmod/kPI,
                           normalize,
@@ -499,10 +571,12 @@ std::vector<at::Tensor> backprojection_polar_2d_grad_cpu(
           int64_t g_nel,
           double data_fmod,
           double alias_fmod,
-          bool normalize) {
+          bool normalize,
+          const at::Tensor &dem) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_CHECK(grad.dtype() == at::kComplexFloat);
+	TORCH_CHECK(!dem.defined(), "backprojection_polar_2d gradient with dem is not supported");
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
 	TORCH_INTERNAL_ASSERT(grad.device().type() == at::DeviceType::CPU);

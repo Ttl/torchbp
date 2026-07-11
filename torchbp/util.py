@@ -776,6 +776,75 @@ def make_polar_grid(
 make_polar_grid_obj = make_polar_grid
 
 
+def dem_to_polar(
+    dem: Tensor,
+    dem_grid: "CartesianGrid | dict",
+    polar_grid: "PolarGrid | dict",
+    origin: Tensor | None = None,
+    rotation: float = 0.0,
+) -> Tensor:
+    """
+    Resample a Cartesian DEM onto a polar grid for use as the `dem` input of
+    `torchbp.ops.backprojection_polar_2d`.
+
+    Parameters
+    ----------
+    dem : Tensor
+        Cartesian DEM heights, shape [nx, ny] on `dem_grid`. Same x/y
+        coordinate frame and z datum as the platform positions before
+        subtracting `origin`.
+    dem_grid : CartesianGrid or dict
+        Cartesian grid of `dem`.
+    polar_grid : PolarGrid or dict
+        Polar grid to sample to. Should have the same r and theta extent as
+        the imaging grid; nr and ntheta can be smaller for a downsampled DEM.
+    origin : Tensor or None
+        Polar grid origin [x, y, z] in the DEM frame (the origin subtracted
+        from the platform positions). Default is zeros.
+    rotation : float
+        Polar grid rotation in radians, same convention as
+        `torchbp.ops.polar_to_cart`.
+
+    Returns
+    -------
+    dem_polar : Tensor
+        DEM heights at the polar grid points relative to the origin z,
+        shape [nr, ntheta] float32. Points outside the DEM extent take the
+        nearest border value. Guard band points |theta| > 1 sample at the
+        clamped angle.
+    """
+    from .grid import unpack_cartesian_grid, unpack_polar_grid
+
+    x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(dem_grid)
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(polar_grid)
+
+    device = dem.device
+    if origin is None:
+        origin = torch.zeros(3, device=device)
+
+    r = r0 + dr * torch.arange(nr, device=device, dtype=torch.float32)
+    sin_t = theta0 + dtheta * torch.arange(ntheta, device=device, dtype=torch.float32)
+    cos_t = torch.sqrt(torch.clamp(1.0 - sin_t * sin_t, min=0.0))
+    # Angle in the DEM frame is the grid angle plus the grid rotation.
+    cos_rot = float(np.cos(rotation))
+    sin_rot = float(np.sin(rotation))
+    cos_a = cos_t * cos_rot - sin_t * sin_rot
+    sin_a = sin_t * cos_rot + cos_t * sin_rot
+    x = origin[0] + r[:, None] * cos_a[None, :]
+    y = origin[1] + r[:, None] * sin_a[None, :]
+
+    # grid_sample with align_corners=True: -1 maps to index 0 and +1 to the
+    # last sample. Grid samples are at x0 + i*dx (cell start convention).
+    gx = 2.0 * (x - x0) / (dx * (nx - 1)) - 1.0
+    gy = 2.0 * (y - y0) / (dy * (ny - 1)) - 1.0
+    # Input is [1, 1, nx, ny]: y is the innermost (W) axis.
+    coords = torch.stack([gy, gx], dim=-1)[None]
+    dem_polar = F.grid_sample(
+        dem[None, None].to(torch.float32), coords, mode="bilinear",
+        padding_mode="border", align_corners=True)[0, 0]
+    return dem_polar - origin[2]
+
+
 def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     """
     Convert radar reflection phase shift to distance.

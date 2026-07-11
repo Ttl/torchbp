@@ -116,10 +116,104 @@ at::Tensor resample_2d_knab_cpu(
     }
 }
 
+// Generic 1D signal rate change. Resamples N input samples to M output samples
+// along the last axis; everything else is folded into nbatch. Output element
+// id1 reads the input at continuous position id1 * (N / M) with a windowed-sinc
+// kernel, lowpassed to the output rate when M < N (decimation). Mirrors
+// resample_1d_*_kernel in cuda/resample.cu. interp_1d is a callable
+// (row_base, src) -> T.
+template<typename T, typename Interp>
+static void resample_1d_kernel_cpu(
+        const T* img, T* out,
+        int N, int M, float step, Interp interp_1d, int id1, int idbatch) {
+    if (id1 >= M) return;
+
+    const float src = id1 * step;
+    out[idbatch * M + id1] = interp_1d(&img[idbatch * N], src);
+}
+
+template<typename T, typename Interp>
+static at::Tensor resample_1d_cpu_impl(
+          const at::Tensor &img,
+          int64_t nbatch, int64_t N, int64_t M,
+          Interp interp_1d) {
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor out = torch::empty({nbatch, M}, img_contig.options());
+
+    const T* img_ptr = (const T*)img_contig.template data_ptr<T>();
+    T* out_ptr = (T*)out.template data_ptr<T>();
+
+    const float step = (float)N / (float)M;
+
+    // See backprojection_cart_2d_cpu for why the team size is set explicitly.
+    omp_set_num_threads(omp_get_num_procs());
+
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int id1 = 0; id1 < M; id1++) {
+            resample_1d_kernel_cpu<T>(
+                    img_ptr, out_ptr, N, M, step, interp_1d, id1, idbatch);
+        }
+    }
+    return out;
+}
+
+at::Tensor resample_1d_lanczos_cpu(
+          const at::Tensor &img,
+          int64_t nbatch, int64_t N, int64_t M, int64_t order) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat,
+                "resample_1d_lanczos: img must be complex64 or float32");
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+
+    // Anti-alias cutoff: input Nyquist when up/equal-rate, output Nyquist when
+    // decimating.
+    const float cutoff = M >= N ? 1.0f : (float)M / (float)N;
+
+    if (img.dtype() == at::kComplexFloat) {
+        auto interp = [N, order, cutoff](const complex64_t* base, float src) {
+            return lanczos_resample_1d_cpu<complex64_t>(base, N, src, order, cutoff);
+        };
+        return resample_1d_cpu_impl<complex64_t>(img, nbatch, N, M, interp);
+    } else {
+        auto interp = [N, order, cutoff](const float* base, float src) {
+            return lanczos_resample_1d_cpu<float>(base, N, src, order, cutoff);
+        };
+        return resample_1d_cpu_impl<float>(img, nbatch, N, M, interp);
+    }
+}
+
+at::Tensor resample_1d_knab_cpu(
+          const at::Tensor &img,
+          int64_t nbatch, int64_t N, int64_t M, int64_t order,
+          double oversample) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat || img.dtype() == at::kFloat,
+                "resample_1d_knab: img must be complex64 or float32");
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+
+    // Knab window parameter: v = 1 - 1/oversample
+    const float v = 1.0f - 1.0f / static_cast<float>(oversample);
+    const float norm = knab_kernel_norm_cpu(order, v);
+    const float cutoff = M >= N ? 1.0f : (float)M / (float)N;
+
+    if (img.dtype() == at::kComplexFloat) {
+        auto interp = [N, order, v, norm, cutoff](const complex64_t* base, float src) {
+            return knab_resample_1d_cpu<complex64_t>(base, N, src, order, v, norm, cutoff);
+        };
+        return resample_1d_cpu_impl<complex64_t>(img, nbatch, N, M, interp);
+    } else {
+        auto interp = [N, order, v, norm, cutoff](const float* base, float src) {
+            return knab_resample_1d_cpu<float>(base, N, src, order, v, norm, cutoff);
+        };
+        return resample_1d_cpu_impl<float>(img, nbatch, N, M, interp);
+    }
+}
+
 // Registers CPU implementations
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("resample_2d_lanczos", &resample_2d_lanczos_cpu);
   m.impl("resample_2d_knab", &resample_2d_knab_cpu);
+  m.impl("resample_1d_lanczos", &resample_1d_lanczos_cpu);
+  m.impl("resample_1d_knab", &resample_1d_knab_cpu);
 }
 
 }

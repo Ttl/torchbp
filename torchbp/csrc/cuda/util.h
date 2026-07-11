@@ -417,6 +417,40 @@ __device__ T knab_interp_2d(const T2 *img, int nx, int ny, float x, float y, int
     return sum;
 }
 
+// 1D windowed-sinc resampler tap. Reads the input signal at continuous
+// position ``src`` (in input samples) with a Lanczos kernel. ``cutoff`` <= 1
+// lowpasses to ``cutoff`` * input-Nyquist for anti-aliased decimation; it is 1
+// for up/equal-rate sampling, giving the plain Lanczos kernel.
+template<class T>
+__device__ T lanczos_resample_1d(const T *img, int n, float src, int order, float cutoff) {
+    float a = 0.5f * order;
+    float half = a / cutoff;
+    int start = max(0, (int)ceilf(src - half));
+    int end = min(n-1, (int)floorf(src + half));
+    T sum{};
+    for (int i = start; i <= end; i++) {
+        float w = cutoff * lanczos_kernel(cutoff * (src - i), a);
+        sum += w * img[i];
+    }
+    return sum;
+}
+
+// 1D windowed-sinc resampler tap using the Knab kernel. See
+// lanczos_resample_1d for the ``cutoff`` semantics.
+template<class T>
+__device__ T knab_resample_1d(const T *img, int n, float src, int order, float v, float norm, float cutoff) {
+    float a = 0.5f * order;
+    float half = a / cutoff;
+    int start = max(0, (int)ceilf(src - half));
+    int end = min(n-1, (int)floorf(src + half));
+    T sum{};
+    for (int i = start; i <= end; i++) {
+        float w = cutoff * knab_kernel(cutoff * (src - i), a, v, norm);
+        sum += w * img[i];
+    }
+    return sum;
+}
+
 // Template-specialized polynomial evaluation for full compile-time unrolling
 // Evaluates 1 + c1*x + c2*x^2 + ... + cn*x^n using Horner's method
 // N_COEFS is the number of coefficients (c1..cn, excluding implicit c0=1)
