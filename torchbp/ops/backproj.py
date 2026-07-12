@@ -525,7 +525,7 @@ def _prepare_projection_cart_2d_args(
         if list(pos.shape) != [nbatch, nsweeps, 3]:
             raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nbatch, nsweeps, 3]}")
 
-    if normalization == "sigma":
+    if normalization in ("beta", "sigma", None):
         norm = 0
     elif normalization == "gamma":
         norm = 1
@@ -610,8 +610,9 @@ def projection_cart_2d(
     use_rvp : bool
         True to add residual video phase term.
     normalization : str
-        Surface reflectivity definition to use. Valid choices are "sigma" or "gamma".
-        "sigma": No look angle dependency (unphysical).
+        Surface reflectivity definition to use. Valid choices are "beta"
+        (default), "sigma" or "gamma".
+        "beta" (or "sigma" or None): No look angle dependency.
         "gamma": Multiply the reflectivity be cross-sectional area of the patch
         (more realistic).
     vel : Tensor or None
@@ -667,7 +668,7 @@ def _prepare_projection_cart_2d_nufft_args(
         if list(pos.shape) != [nbatch, nsweeps, 3]:
             raise ValueError(f"Invalid pos shape {pos.shape}, expected {[nbatch, nsweeps, 3]}")
 
-    if normalization == "sigma":
+    if normalization in ("beta", "sigma", None):
         norm = 0
     elif normalization == "gamma":
         norm = 1

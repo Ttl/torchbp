@@ -654,7 +654,9 @@ def generate_fmcw_data(
     target_pos : Tensor
         [ntargets, 3] tensor of target XYZ positions.
     target_rcs : Tensor
-        [ntargets, 1] tensor of target reflectivity.
+        [ntargets, 1] tensor of complex target reflectivity, used directly
+        as the signal amplitude (same convention as the image input of
+        `torchbp.ops.projection_cart_2d`).
     pos : Tensor
         [nsweeps, 3] tensor of platform positions. When `vel` is provided,
         `pos[s]` is the platform position at the midpoint of sweep `s`.
@@ -731,22 +733,19 @@ def generate_fmcw_data(
     t_rel = (t - 0.5 * tsweep) if vel is not None else None
 
     for e, target in enumerate(target_pos):
-        rcs_phase = torch.angle(target_rcs[e])
-        rcs_abs = torch.sqrt(torch.abs(target_rcs[e]))
-
         dpos = pos - target[None, :]                               # [nsweeps, 3]
         if vel is None:
-            d = torch.linalg.vector_norm(dpos, dim=-1)[:, None] + d0  # [nsweeps, 1]
+            d = torch.linalg.vector_norm(dpos, dim=-1)[:, None]    # [nsweeps, 1]
         else:
             # |dpos + vel * t_rel|^2 = |dpos|^2 + 2<dpos,vel> t_rel + |vel|^2 t_rel^2
             dp_sq = (dpos * dpos).sum(dim=-1, keepdim=True)        # [nsweeps, 1]
             dp_v = (dpos * vel).sum(dim=-1, keepdim=True)          # [nsweeps, 1]
             v_sq = (vel * vel).sum(dim=-1, keepdim=True)           # [nsweeps, 1]
-            d = torch.sqrt(dp_sq + 2.0 * dp_v * t_rel + v_sq * t_rel**2) + d0  # [nsweeps, nsamples]
-        tau = 2 * d / c0
+            d = torch.sqrt(dp_sq + 2.0 * dp_v * t_rel + v_sq * t_rel**2)  # [nsweeps, nsamples]
+        tau = 2 * (d + d0) / c0
         if antenna_gain:
             # Antenna gain evaluated at sweep midpoint (slow-varying across chirp).
-            d_mid = torch.linalg.vector_norm(dpos, dim=-1)[:, None] + d0
+            d_mid = torch.linalg.vector_norm(dpos, dim=-1)[:, None]
             look_angle = torch.asin(pos[:, 2] / d_mid[:, 0])
             el_deg = -look_angle - att[:, 0]
             az_deg = (
@@ -773,9 +772,8 @@ def generate_fmcw_data(
         else:
             g_a = 1
 
-        data += (g_a * rcs_abs / d**2) * torch.exp(
+        data += (g_a * target_rcs[e] / d**2) * torch.exp(
             1j * 2 * pi * (-fc * tau - k * tau * t + use_rvp * 0.5 * k * tau**2)
-            + 1j * rcs_phase
         )
     return data
 
