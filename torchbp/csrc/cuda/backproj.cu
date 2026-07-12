@@ -3430,6 +3430,12 @@ __global__ void compute_illumination_kernel(
           float r0, float dr, float theta0, float dtheta, int nr, int ntheta,
           // Antenna pattern parameters
           float g_el0, float g_del, float g_az0, float g_daz, int g_nel, int g_naz,
+          // Optional DEM sampled on the (full resolution) grid extent, or
+          // nullptr. With a DEM the elevation look angle and distance
+          // reference the pixel at the DEM height, matching the gains that
+          // backprojection with the same DEM applies.
+          const float* __restrict__ dem,
+          float dem_r_scale, float dem_theta_scale, int dem_nr, int dem_ntheta,
           // Decimation factor (1 = no decimation)
           int decimation) {
 
@@ -3457,6 +3463,28 @@ __global__ void compute_illumination_kernel(
     const float x = r * cost;
     const float y = r * t;
 
+    // Bilinear DEM lookup, edge-clamped: the DEM shares the grid extent so
+    // the full-resolution pixel index maps to a DEM index by a constant
+    // ratio.
+    float z = 0.0f;
+    if (dem != nullptr) {
+        const float fr = full_idr * dem_r_scale;
+        int ir0 = (int)fr;
+        ir0 = min(ir0, dem_nr - 1);
+        const int ir1 = min(ir0 + 1, dem_nr - 1);
+        const float wr = fr - ir0;
+        const float ft = full_idtheta * dem_theta_scale;
+        int it0 = (int)ft;
+        it0 = min(it0, dem_ntheta - 1);
+        const int it1 = min(it0 + 1, dem_ntheta - 1);
+        const float wt = ft - it0;
+        const float* row0 = dem + (size_t)ir0 * dem_ntheta;
+        const float* row1 = dem + (size_t)ir1 * dem_ntheta;
+        const float za = row0[it0] + wt * (row0[it1] - row0[it0]);
+        const float zb = row1[it0] + wt * (row1[it1] - row1[it0]);
+        z = za + wr * (zb - za);
+    }
+
     float w1 = 0.0f;
     float w2 = 0.0f;
 
@@ -3467,11 +3495,11 @@ __global__ void compute_illumination_kernel(
 
         const float px = x - pos_x;
         const float py = y - pos_y;
-        const float d_sq = r*r + pos_x*pos_x + pos_y*pos_y + pos_z*pos_z
-                         - 2.0f * (x * pos_x + y * pos_y);
+        const float d_sq = r*r + pos_x*pos_x + pos_y*pos_y + pos_z*pos_z + z*z
+                         - 2.0f * (x * pos_x + y * pos_y + z * pos_z);
         const float d = sqrtf(fmaxf(d_sq, 0.0f));
 
-        const float look_angle = asinf(fmaxf(-1.0f, fminf(1.0f, -pos_z / d)));
+        const float look_angle = asinf(fmaxf(-1.0f, fminf(1.0f, (z - pos_z) / d)));
 
         float att_el = 0.0f;
         float att_az = 0.0f;
@@ -3521,7 +3549,8 @@ std::vector<at::Tensor> compute_illumination_cuda(
           double dtheta,
           int64_t nr,
           int64_t ntheta,
-          int64_t decimation) {
+          int64_t decimation,
+          const at::Tensor &dem) {
     TORCH_CHECK(pos.dtype() == at::kFloat);
     TORCH_CHECK(g.dtype() == at::kFloat);
     TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
@@ -3543,6 +3572,22 @@ std::vector<at::Tensor> compute_illumination_cuda(
 
     at::Tensor pos_contig = pos.contiguous();
     at::Tensor g_contig = g.contiguous();
+
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / nr;
+        dem_theta_scale = (float)dem_ntheta / ntheta;
+    }
 
     // Compute decimated output dimensions
     const int64_t dec = decimation > 0 ? decimation : 1;
@@ -3571,6 +3616,7 @@ std::vector<at::Tensor> compute_illumination_cuda(
         nsweeps,
         r0, dr, theta0, dtheta, nr, ntheta,
         g_el0, g_del, g_az0, g_daz, g_nel, g_naz,
+        dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta,
         dec
     );
 

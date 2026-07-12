@@ -1086,6 +1086,12 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cpu(
 // gain and accumulates the moments. Out-of-pattern pixels get gvld = 0 and
 // contribute exactly zero: the merge gating and the Wiener normalization
 // rely on W counting exactly the gains that weight A.
+// With HasDem the elevation look angle and distance reference the pixel at
+// the DEM height instead of the z = 0 plane, matching the gains that
+// backprojection_polar_2d applies with the same DEM: flat-earth maps would
+// sample the elevation pattern at the wrong angle over terrain and bias
+// the weighted normalization by a pattern-dependent factor.
+template<bool HasDem>
 static void compute_illumination_row_cpu(
           const float* pos,
           const float* att,
@@ -1095,6 +1101,8 @@ static void compute_illumination_row_cpu(
           int nsweeps,
           float r0, float dr, float theta0, float dtheta,
           float g_el0, float g_del, float g_az0, float g_daz, int g_nel, int g_naz,
+          const float* dem, float dem_r_scale, float dem_theta_scale,
+          int dem_nr, int dem_ntheta,
           int decimation, int out_ntheta, int out_idr) {
     constexpr int CHUNK = 256;
     float x_buf[CHUNK], y_buf[CHUNK];
@@ -1107,6 +1115,7 @@ static void compute_illumination_row_cpu(
     // float copies compile to vgatherdps, which is slower than scalar moves
     // on AVX2.
     double g0_buf[CHUNK], g1_buf[CHUNK];
+    float z_buf[CHUNK], z2_buf[CHUNK];
 
     const float r = r0 + dr * (out_idr * decimation);
     const float r2 = r * r;
@@ -1129,6 +1138,33 @@ static void compute_illumination_row_cpu(
             w2_buf[q] = 0.0f;
         }
 
+        // DEM shares the grid extent, so the full-resolution pixel index
+        // maps to a DEM index by a constant ratio; the decimated output
+        // samples the same full-grid pixel centers as the CUDA kernel.
+        // Indices are edge-clamped like the backprojection kernel.
+        if constexpr (HasDem) {
+            const float fr = (out_idr * decimation) * dem_r_scale;
+            int ir0 = (int)fr;
+            ir0 = ir0 < dem_nr - 1 ? ir0 : dem_nr - 1;
+            const int ir1 = ir0 + 1 < dem_nr ? ir0 + 1 : dem_nr - 1;
+            const float wr = fr - ir0;
+            const float* dem_row0 = dem + (size_t)ir0 * dem_ntheta;
+            const float* dem_row1 = dem + (size_t)ir1 * dem_ntheta;
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float ft = ((tb + q) * decimation) * dem_theta_scale;
+                int it0 = (int)ft;
+                it0 = it0 < dem_ntheta - 1 ? it0 : dem_ntheta - 1;
+                const int it1 = it0 + 1 < dem_ntheta ? it0 + 1 : dem_ntheta - 1;
+                const float wt = ft - it0;
+                const float za = dem_row0[it0] + wt * (dem_row0[it1] - dem_row0[it0]);
+                const float zb = dem_row1[it0] + wt * (dem_row1[it1] - dem_row1[it0]);
+                const float zq = za + wr * (zb - za);
+                z_buf[q] = zq;
+                z2_buf[q] = zq * zq;
+            }
+        }
+
         for (int i = 0; i < nsweeps; i++) {
             const float pos_x = pos[i * 3 + 0];
             const float pos_y = pos[i * 3 + 1];
@@ -1146,9 +1182,20 @@ static void compute_illumination_row_cpu(
             for (int q = 0; q < nchunk; q++) {
                 const float px = x_buf[q] - pos_x;
                 const float py = y_buf[q] - pos_y;
-                const float d2 = r2pn2 - 2.0f * (x_buf[q] * pos_x + y_buf[q] * pos_y);
+                float d2, sin_l;
+                if constexpr (HasDem) {
+                    d2 = r2pn2 + z2_buf[q] - 2.0f * (x_buf[q] * pos_x
+                            + y_buf[q] * pos_y + z_buf[q] * pos_z);
+                } else {
+                    d2 = r2pn2 - 2.0f * (x_buf[q] * pos_x + y_buf[q] * pos_y);
+                }
                 const float d = sqrtf(d2 > 0.0f ? d2 : 0.0f);
-                const float sin_l = -pos_z / d;
+                if constexpr (HasDem) {
+                    sin_l = (z_buf[q] - pos_z) / d;
+                    sin_l = sin_l > 1.0f ? 1.0f : sin_l;
+                } else {
+                    sin_l = -pos_z / d;
+                }
                 const float look_angle = asinf_fast(sin_l < -1.0f ? -1.0f : sin_l);
                 const float el = look_angle - att_el;
                 const float az = atan2f_fast(py, px) - att_az;
@@ -1211,7 +1258,8 @@ std::vector<at::Tensor> compute_illumination_cpu(
           double dtheta,
           int64_t nr,
           int64_t ntheta,
-          int64_t decimation) {
+          int64_t decimation,
+          const at::Tensor &dem) {
     TORCH_CHECK(pos.dtype() == at::kFloat);
     TORCH_CHECK(g.dtype() == at::kFloat);
     TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
@@ -1233,6 +1281,23 @@ std::vector<at::Tensor> compute_illumination_cpu(
     at::Tensor pos_contig = pos.contiguous();
     at::Tensor g_contig = g.contiguous();
 
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / nr;
+        dem_theta_scale = (float)dem_ntheta / ntheta;
+    }
+
     const int64_t dec = decimation > 0 ? decimation : 1;
     const int64_t out_nr = (nr + dec - 1) / dec;
     const int64_t out_ntheta = (ntheta + dec - 1) / dec;
@@ -1249,12 +1314,16 @@ std::vector<at::Tensor> compute_illumination_cpu(
 
     omp_set_num_threads(omp_get_num_procs());
 
+    auto row = has_dem ? &compute_illumination_row_cpu<true>
+                       : &compute_illumination_row_cpu<false>;
 #pragma omp parallel for
     for (int idr = 0; idr < out_nr; idr++) {
-        compute_illumination_row_cpu(
+        row(
                 pos_ptr, att_ptr, g_ptr, w1_out_ptr, w2_out_ptr, nsweeps,
                 r0, dr, theta0, dtheta,
-                g_el0, g_del, g_az0, g_daz, g_nel, g_naz, dec, out_ntheta, idr);
+                g_el0, g_del, g_az0, g_daz, g_nel, g_naz,
+                dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta,
+                dec, out_ntheta, idr);
     }
 
     std::vector<at::Tensor> ret;

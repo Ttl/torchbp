@@ -67,7 +67,7 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("backprojection_cart_2d_tx_power_accum(Tensor wa, Tensor pos, Tensor att, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, int g_naz, int g_nel, int nsweeps, float x0, float dx, float y0, float dy, int Nx, int Ny, int normalization, float dx_ref, float h_ref) -> Tensor");
   m.def("cart_tx_power_merge2(Tensor acc0, Tensor acc1, float x0_0, float dx_0, float y0_0, float dy_0, int Nx_0, int Ny_0, float x0_1, float dx_1, float y0_1, float dy_1, int Nx_1, int Ny_1, float x1, float dx1, float y1, float dy1, int Nx1, int Ny1) -> Tensor");
   m.def("ffbp_tx_power_merge2(Tensor acc0, Tensor acc1, Tensor dorigin, Tensor r0, Tensor dr0, Tensor theta0, Tensor dtheta0, Tensor Nr0, Tensor Ntheta0, float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1, float altitude, int in_psi, int out_psi) -> Tensor");
-  m.def("compute_illumination(Tensor pos, Tensor att, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, float r0, float dr, float theta0, float dtheta, int nr, int ntheta, int decimation) -> Tensor[]");
+  m.def("compute_illumination(Tensor pos, Tensor att, Tensor g, float g_az0, float g_el0, float g_daz, float g_del, float r0, float dr, float theta0, float dtheta, int nr, int ntheta, int decimation, Tensor dem) -> Tensor[]");
   m.def("entropy(Tensor data, Tensor norm, int nbatch) -> Tensor");
   m.def("entropy_grad(Tensor data, Tensor norm, Tensor grad, int nbatch) -> Tensor[]");
   m.def("abs_sum(Tensor data, int nbatch) -> Tensor");

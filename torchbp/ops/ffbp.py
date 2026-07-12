@@ -29,6 +29,7 @@ def compute_subaperture_illumination(
     g_extent: list,
     grid: "PolarGrid | dict",
     decimation: int = 1,
+    dem: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Compute illumination weight maps (sum of gains and sum of squared gains) for a subaperture.
@@ -52,6 +53,11 @@ def compute_subaperture_illumination(
         Polar grid for output weight map.
     decimation : int
         Decimation factor for output (1 = full resolution, 4 = 1/16 size).
+    dem : Tensor or None
+        Digital elevation model sampled on the output polar grid extent,
+        shape [dem_nr, dem_ntheta]; may be coarser than the grid. The
+        elevation look angle then references the pixel at the DEM height,
+        matching ``backprojection_polar_2d`` with the same ``dem``.
 
     Returns
     -------
@@ -67,7 +73,7 @@ def compute_subaperture_illumination(
     return torch.ops.torchbp.compute_illumination.default(
         pos, att, *args,
         r0, dr, theta0, dtheta,
-        nr, ntheta, decimation
+        nr, ntheta, decimation, dem
     )
 
 
@@ -79,6 +85,7 @@ def _illumination_pulse_decimated(
     grid: dict,
     decimation: int,
     pulse_decimation: int,
+    dem: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Illumination moment maps from a ``1/pulse_decimation`` subset of the
     pulses, scaled back to the full pulse count.
@@ -105,7 +112,7 @@ def _illumination_pulse_decimated(
         pos = pos[idx]
         att = att[idx] if att is not None else None
     w1, w2 = compute_subaperture_illumination(
-        pos, att, g, g_extent, grid, decimation=decimation)
+        pos, att, g, g_extent, grid, decimation=decimation, dem=dem)
     if m < n:
         w1 = w1 * (n / m)
         w2 = w2 * (n / m)
@@ -351,9 +358,8 @@ def ffbp(
         ``backprojection_polar_2d(..., dem=dem)`` with the same ``dealias``
         (with a DEM the dealias carrier is always DEM-referenced). Not
         supported together with ``afbp_nsub > 1``. With an antenna pattern
-        the per-pulse gain weighting is DEM-aware but the W1/W2
-        illumination normalization maps still use flat-earth look angles
-        (a small amplitude approximation over terrain).
+        both the per-pulse gain weighting and the W1/W2 illumination
+        normalization maps reference the DEM look angles.
 
     Returns
     -------
@@ -757,6 +763,7 @@ def _ffbp_impl(
         else:
             # When using antenna pattern, request unnormalized output
             normalize = not use_antenna_pattern
+            dem_local = None
             if afbp_nsub > 1:
                 img = afbp(
                     data_local, grid_local, fc, r_res, pos_local,
@@ -766,7 +773,6 @@ def _ffbp_impl(
                     normalize=normalize
                 )[None]
             else:
-                dem_local = None
                 if dem is not None:
                     dem_local = _dem_on_node_grid(dem, dem_grid, grid_local,
                                                   dem_off_local)
@@ -795,7 +801,7 @@ def _ffbp_impl(
                 # resolution directly.
                 w1_map, w2_map = _illumination_pulse_decimated(
                     pos_local, att_local, g, g_extent, grid_local,
-                    weight_map_downsample, afbp_nsub
+                    weight_map_downsample, afbp_nsub, dem=dem_local
                 )
                 # Create weight grid matching output dimensions
                 dec = weight_map_downsample
