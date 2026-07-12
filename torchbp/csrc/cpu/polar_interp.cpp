@@ -1199,10 +1199,12 @@ static void ffbp_merge2_geom_pass_cpu(float d, float dz, float theta1,
 // TAPS is the interpolation order rounded up to even (window capacity).
 // For each pixel it stores the TAPS-wide window start, clamped into
 // [0, N - TAPS] so the tap gather never reads out of bounds, and the tap
-// weights: range weights wr_buf[tap][pixel] and theta weights duplicated
-// into interleaved (re, im) pairs wt2_buf[pixel][2j] = wt2_buf[pixel][2j+1],
-// so the gather reduces to fixed-length contiguous dot products over the
-// interleaved image rows. Taps outside the exact kernel support |dx| < a
+// weights, both in [tap][pixel] layout: range weights wr_buf and theta
+// weights wt_buf. The gather applies the range weights while accumulating
+// rows and the theta weights once in its final reduction, so neither needs
+// a per-pixel layout (an earlier interleaved-pair transpose of the theta
+// weights for the row loop cost more than the rest of this pass).
+// Taps outside the exact kernel support |dx| < a
 // (window clamping at the image edges, off-center clamped windows, odd
 // order in an even-capacity window) get exactly zero weight instead of a
 // variable tap count. This matches the exact kernel, which vanishes at
@@ -1216,13 +1218,12 @@ static void ffbp_merge2_poly_weights_pass_cpu(const float *coefs, int order,
         int Nr, int Ntheta, int nchunk,
         const float *dri_buf, const float *dti_buf,
         int *ir_buf, int *it_buf,
-        float wr_buf[][MERGE_CHUNK], float wt2_buf[][2*TAPS]) {
+        float wr_buf[][MERGE_CHUNK], float wt_buf[][MERGE_CHUNK]) {
     const float a = 0.5f * order;
     const float inv_a2 = 1.0f / (a * a);
     // Weights are computed in [tap][pixel] layout so the Horner recurrences
-    // vectorize across pixels; the per-pixel layout the gather wants would
-    // scalarize this pass, which then dominates the whole kernel.
-    float wt_tmp[TAPS][MERGE_CHUNK];
+    // vectorize across pixels; a per-pixel layout would scalarize this
+    // pass, which then dominates the whole kernel.
 #pragma omp simd
     for (int q = 0; q < nchunk; q++) {
         const float x = dri_buf[q];
@@ -1246,49 +1247,41 @@ static void ffbp_merge2_poly_weights_pass_cpu(const float *coefs, int order,
             const float dy = y - (float)(sy + j);
             const float ty = dy * dy * inv_a2;
             const float my = ty < 1.0f ? 1.0f : 0.0f;
-            wt_tmp[j][q] = my * polyval_c0_one_cpu<N_COEFS>(coefs, ty);
-        }
-    }
-    // Transpose the theta weights to per-pixel interleaved pairs for the
-    // gather. The range weights stay in [tap][pixel]: the gather reads them
-    // once per row, so their layout does not matter there.
-    for (int j = 0; j < TAPS; j++) {
-        for (int q = 0; q < nchunk; q++) {
-            const float w = wt_tmp[j][q];
-            wt2_buf[q][2*j] = w;
-            wt2_buf[q][2*j+1] = w;
+            wt_buf[j][q] = my * polyval_c0_one_cpu<N_COEFS>(coefs, ty);
         }
     }
 }
 
 // Per-pixel interpolation tap gather of the polynomial merge kernels:
 // TAPS x TAPS window accumulated as contiguous dot products of the
-// interleaved (re, im) image rows with the zero-padded per-pixel weights
-// from the weight pass. The fixed trip counts and contiguous weights keep
-// the whole accumulation vectorized; a [tap][pixel] weight layout with
-// variable tap counts compiles to a scalar gather instead (about 2x
-// slower). Accumulates in plain floats: gcc optimizes this much better
-// than the c10::complex operator chain.
+// interleaved (re, im) image rows. The fixed trip counts and row-uniform
+// weights keep the accumulation vectorized (variable tap counts compile to
+// a scalar gather instead, about 2x slower). The theta weights are
+// constant across the range taps, so the rows are accumulated with the
+// range weight only and the theta weight is applied once per column in the
+// final reduction; the reduction reads the [tap][pixel] weight layout
+// directly, its handful of strided scalar loads is much cheaper than
+// transposing the weights per pixel. Accumulates in plain floats: gcc
+// optimizes this much better than the c10::complex operator chain.
 template<int TAPS>
 static inline complex64_t ffbp_merge2_poly_taps_cpu(const complex64_t *img,
         int Ntheta, int q, const int *ir_buf, const int *it_buf,
-        const float wr_buf[][MERGE_CHUNK], const float wt2_buf[][2*TAPS]) {
+        const float wr_buf[][MERGE_CHUNK], const float wt_buf[][MERGE_CHUNK]) {
     float acc2[2*TAPS] = {0.0f};
-    const float *wt2 = wt2_buf[q];
     const float *row = (const float*)(img + (size_t)ir_buf[q] * Ntheta + it_buf[q]);
     for (int i = 0; i < TAPS; i++) {
         const float wxi = wr_buf[i][q];
 #pragma omp simd
         for (int k = 0; k < 2*TAPS; k++) {
-            acc2[k] += row[k] * (wxi * wt2[k]);
+            acc2[k] += row[k] * wxi;
         }
         row += 2 * Ntheta;
     }
     float sr = 0.0f, si = 0.0f;
-#pragma omp simd reduction(+:sr,si)
     for (int k = 0; k < TAPS; k++) {
-        sr += acc2[2*k];
-        si += acc2[2*k+1];
+        const float wyk = wt_buf[k][q];
+        sr += acc2[2*k] * wyk;
+        si += acc2[2*k+1] * wyk;
     }
     return {sr, si};
 }
@@ -1474,7 +1467,7 @@ static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64
     float rp_buf[MERGE_CHUNK], tp_buf[MERGE_CHUNK];
     float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
     float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
-    float wr_buf[TAPS][MERGE_CHUNK], wt2_buf[MERGE_CHUNK][2*TAPS];
+    float wr_buf[TAPS][MERGE_CHUNK], wt_buf[TAPS][MERGE_CHUNK];
     int ir_buf[MERGE_CHUNK], it_buf[MERGE_CHUNK];
 
     const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
@@ -1510,14 +1503,14 @@ static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64
         }
         ffbp_merge2_poly_weights_pass_cpu<N_COEFS, TAPS>(coefs, order,
                 Nr[id], Ntheta[id], nchunk, dri_buf, dti_buf,
-                ir_buf, it_buf, wr_buf, wt2_buf);
+                ir_buf, it_buf, wr_buf, wt_buf);
         // Per-pixel pass: data-dependent interpolation gather.
         for (int q = 0; q < nchunk; q++) {
             if (dri_buf[q] < 0.0f) {
                 continue;
             }
             complex64_t v = ffbp_merge2_poly_taps_cpu<TAPS>(img, Ntheta[id], q,
-                    ir_buf, it_buf, wr_buf, wt2_buf);
+                    ir_buf, it_buf, wr_buf, wt_buf);
             accr[q] += v.real() * cs_buf[q] - v.imag() * sn_buf[q];
             acci[q] += v.real() * sn_buf[q] + v.imag() * cs_buf[q];
         }
@@ -1860,7 +1853,7 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
     float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
     float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
     float accw1[MERGE_CHUNK], accw2[MERGE_CHUNK];
-    float wr_buf[TAPS][MERGE_CHUNK], wt2_buf[MERGE_CHUNK][2*TAPS];
+    float wr_buf[TAPS][MERGE_CHUNK], wt_buf[TAPS][MERGE_CHUNK];
     int ir_buf[MERGE_CHUNK], it_buf[MERGE_CHUNK];
 
     const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
@@ -1907,14 +1900,14 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
         }
         ffbp_merge2_poly_weights_pass_cpu<N_COEFS, TAPS>(coefs, order,
                 Nr[id], Ntheta[id], nchunk, dri_buf, dti_buf,
-                ir_buf, it_buf, wr_buf, wt2_buf);
+                ir_buf, it_buf, wr_buf, wt_buf);
         // Per-pixel pass: data-dependent interpolation and weight map gathers.
         for (int q = 0; q < nchunk; q++) {
             if (dri_buf[q] < 0.0f) {
                 continue;
             }
             complex64_t v = ffbp_merge2_poly_taps_cpu<TAPS>(img, Ntheta[id], q,
-                    ir_buf, it_buf, wr_buf, wt2_buf);
+                    ir_buf, it_buf, wr_buf, wt_buf);
 
             const float vr = v.real() * cs_buf[q] - v.imag() * sn_buf[q];
             const float vi = v.real() * sn_buf[q] + v.imag() * cs_buf[q];
