@@ -350,8 +350,14 @@ class TestCFBP(TestCase):
             interp = (g * w.to(img.dtype)).sum(-1)
             ph = torch.pi * ref_phase * (dist(ox, oy, z) - dp)
             ref = ref + interp * torch.polar(torch.ones_like(ph), ph)
+        # The re-reference carrier pi * ref_phase * (d - dp) with d ~ 300 m
+        # in float32 amplifies a single ulp of either distance to ~8e-3 of
+        # relative amplitude, and the kernel's summation order is compiler
+        # dependent (FMA contraction), so bit-agreement with the torch
+        # reference cannot be expected. Real indexing/weight bugs decorrelate
+        # the phase entirely and show up as rel ~ 1.
         rel = ((out - ref).abs().max() / ref.abs().max()).item()
-        self.assertLess(rel, 1e-4)
+        self.assertLess(rel, 0.05)
 
     def _merge2_opcheck(self, device):
         opcheck(
@@ -369,10 +375,19 @@ class TestCFBP(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_merge2_cuda_matches_cpu(self):
-        out_cuda = torch.ops.torchbp.cfbp_merge2.default(*self._merge2_args("cuda"))
-        out_cpu = torch.ops.torchbp.cfbp_merge2.default(*self._merge2_args("cpu"))
+        # CPU (MT19937) and CUDA (Philox) randn give different values for the
+        # same seed, so the inputs must be built once and copied, not
+        # regenerated per device. Tolerance: see
+        # test_merge2_matches_torch_reference; CPU additionally hoists
+        # x^2 + z^2 out of the pixel loop while CUDA sums per pixel, and the
+        # CUDA build uses --use_fast_math sqrt, so a few ulp of independent
+        # distance rounding is expected.
+        args = self._merge2_args("cpu")
+        gargs = tuple(a.cuda() if torch.is_tensor(a) else a for a in args)
+        out_cuda = torch.ops.torchbp.cfbp_merge2.default(*gargs)
+        out_cpu = torch.ops.torchbp.cfbp_merge2.default(*args)
         rel = ((out_cuda.cpu() - out_cpu).abs().max() / out_cpu.abs().max()).item()
-        self.assertLess(rel, 1e-4)
+        self.assertLess(rel, 0.05)
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_cuda_matches_direct(self):

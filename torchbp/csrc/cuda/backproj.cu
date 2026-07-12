@@ -289,15 +289,20 @@ __global__ void backprojection_polar_2d_kernel(
                 // the image spectrum on any significant topography.
                 // bp_polar_range_dealias/alias with the same dem apply/remove
                 // the identical carrier.
+                // Same expression shapes as polar_range_dealias_kernel, and
+                // exactly-reduced half-cycle sincospif instead of __sincosf:
+                // the carrier argument is ~1e4 rad, where the fast intrinsic
+                // loses several mrad. Once per pixel, off the per-sweep hot
+                // path, so the accurate version costs nothing.
                 float dd;
                 if constexpr (HasDem) {
                     const float zz = z0 - z[k];
-                    dd = sqrtf(fmaf(zz, zz, r2[k]));
+                    dd = sqrtf(r2[k] + zz * zz);
                 } else {
                     dd = sqrtf(r2[k] + z0*z0);
                 }
                 float ref_sin, ref_cos;
-                __sincosf(fmaf(dealias_coef, dd, dealias_fmod * (idr_base + k)), &ref_sin, &ref_cos);
+                sincospif(dealias_coef * dd + dealias_fmod * (idr_base + k), &ref_sin, &ref_cos);
                 complex64_t ref = {ref_cos, ref_sin};
                 pixel *= ref;
             }
@@ -2036,8 +2041,10 @@ at::Tensor backprojection_polar_2d_cuda(
     // Precompute phase coefficients with PI multiplied in
     const float phase_coef = (ref_phase - (data_fmod / kPI) * delta_r) * kPI;
     const float phase_offset = -(data_fmod / kPI) * delta_r * d0 * kPI;
-    const float dealias_coef = -ref_phase * kPI;
-    const float dealias_fmod = alias_fmod;  // already divided by kPI in caller
+    // Half-cycle units for the exactly-reduced sincospif in the dealias
+    // epilogue (matches the CPU kernel and polar_range_dealias).
+    const float dealias_coef = -ref_phase;
+    const float dealias_fmod = alias_fmod / kPI;
 
 	dim3 thread_per_block = {256, 1};
     constexpr int pixels_per_thread = 4;
@@ -2406,8 +2413,10 @@ at::Tensor backprojection_polar_2d_lanczos_cuda(
     // Precompute phase coefficients with PI multiplied in
     const float phase_coef = (ref_phase - (data_fmod / kPI) * delta_r) * kPI;
     const float phase_offset = -(data_fmod / kPI) * delta_r * d0 * kPI;
-    const float dealias_coef = -ref_phase * kPI;
-    const float dealias_fmod = alias_fmod;  // already divided by kPI in caller
+    // Half-cycle units for the exactly-reduced sincospif in the dealias
+    // epilogue (matches the CPU kernel and polar_range_dealias).
+    const float dealias_coef = -ref_phase;
+    const float dealias_fmod = alias_fmod / kPI;
 
 	dim3 thread_per_block = {256, 1};
     constexpr int pixels_per_thread = 4;
@@ -2556,8 +2565,10 @@ at::Tensor backprojection_polar_2d_knab_cuda(
     // Precompute phase coefficients with PI multiplied in
     const float phase_coef = (ref_phase - (data_fmod / kPI) * delta_r) * kPI;
     const float phase_offset = -(data_fmod / kPI) * delta_r * d0 * kPI;
-    const float dealias_coef = -ref_phase * kPI;
-    const float dealias_fmod = alias_fmod;  // already divided by kPI in caller
+    // Half-cycle units for the exactly-reduced sincospif in the dealias
+    // epilogue (matches the CPU kernel and polar_range_dealias).
+    const float dealias_coef = -ref_phase;
+    const float dealias_fmod = alias_fmod / kPI;
 
 	dim3 thread_per_block = {256, 1};
     constexpr int pixels_per_thread = 4;

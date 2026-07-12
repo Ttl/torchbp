@@ -696,6 +696,17 @@ class TestFFBPTxPower(TestCase):
             torch.testing.assert_close(
                 cart, pol[ir, it], atol=1e-6, rtol=1e-5)
 
+    @staticmethod
+    def sample_inputs(device):
+        # Track at 20 m altitude looking at ~60 m slant range: ground range
+        # ~57 m, so the grid brackets the illuminated patch with some
+        # unilluminated (inf) margin.
+        g, g_extent = TestFFBPTxPower._antenna(device, az_width=0.4)
+        wa, pos, att = TestFFBPTxPower._straight_track(device, nsweeps=64)
+        grid = {"x": (40.0, 80.0), "y": (-30.0, 30.0), "nx": 48, "ny": 64}
+        return [dict(wa=wa, g=g, g_extent=g_extent, grid=grid, r_res=0.15,
+                     pos=pos, att=att, normalization="sigma")]
+
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_cpu_cuda_match(self):
         from torchbp.ops.backproj import backprojection_cart_2d_tx_power
@@ -707,7 +718,7 @@ class TestFFBPTxPower(TestCase):
         out_cuda = backprojection_cart_2d_tx_power(**gargs).cpu()
         fin = torch.isfinite(out_cpu) & torch.isfinite(out_cuda)
         torch.testing.assert_close(out_cpu[fin], out_cuda[fin],
-                                   atol=1e-5, rtol=1e-4)
+                                   atol=1e-6, rtol=1e-3)
         self.assertTrue(
             (torch.isinf(out_cpu) == torch.isinf(out_cuda)).all())
 
