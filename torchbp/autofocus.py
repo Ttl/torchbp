@@ -301,15 +301,49 @@ def _grid_is_polar(grid: "PolarGrid | CartesianGrid | dict") -> bool:
     )
 
 
+def _dem_at_pixels(
+    dem: Tensor,
+    grid: "PolarGrid | CartesianGrid | dict",
+    i_idx: Tensor,
+    j_idx: Tensor,
+) -> Tensor:
+    """Sample DEM heights at (fractional) image pixel indices.
+
+    Matches the backprojection kernels' convention: the DEM shares the grid
+    extent, so pixel index maps to DEM index by the constant ratio
+    ``dem_n / grid_n`` per axis, sampled bilinearly with edge clamping.
+    """
+    if _grid_is_polar(grid):
+        _, _, _, _, n0, n1, _, _ = unpack_polar_grid(grid)
+    else:
+        _, _, _, _, n0, n1, _, _ = unpack_cartesian_grid(grid)
+    dem_n0, dem_n1 = dem.shape
+    f0 = i_idx * (dem_n0 / n0)
+    f1 = j_idx * (dem_n1 / n1)
+    i0 = torch.clamp(torch.floor(f0).long(), 0, dem_n0 - 1)
+    j0 = torch.clamp(torch.floor(f1).long(), 0, dem_n1 - 1)
+    i1 = torch.clamp(i0 + 1, max=dem_n0 - 1)
+    j1 = torch.clamp(j0 + 1, max=dem_n1 - 1)
+    wi = f0 - i0
+    wj = f1 - j0
+    za = dem[i0, j0] + wj * (dem[i0, j1] - dem[i0, j0])
+    zb = dem[i1, j0] + wj * (dem[i1, j1] - dem[i1, j0])
+    return za + wi * (zb - za)
+
+
 def _pixel_to_world(
-    grid: "PolarGrid | CartesianGrid | dict", i_idx: Tensor, j_idx: Tensor
+    grid: "PolarGrid | CartesianGrid | dict",
+    i_idx: Tensor,
+    j_idx: Tensor,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """Map image pixel indices to Cartesian world coordinates.
 
     ``i_idx`` indexes the first image axis (range for polar, x for Cartesian),
     ``j_idx`` the second (azimuth/theta for polar, y for Cartesian). Indices may
     be fractional (float tensors) so block centers work too. Returns a
-    ``[N, 3]`` tensor of ``(x, y, z)`` with ``z = 0``.
+    ``[N, 3]`` tensor of ``(x, y, z)`` with ``z`` sampled from ``dem`` if
+    given, else ``z = 0``.
     """
     if _grid_is_polar(grid):
         r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
@@ -321,7 +355,10 @@ def _pixel_to_world(
         x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
         x = x0 + dx * i_idx
         y = y0 + dy * j_idx
-    z = torch.zeros_like(x)
+    if dem is not None:
+        z = _dem_at_pixels(dem, grid, i_idx, j_idx)
+    else:
+        z = torch.zeros_like(x)
     return torch.stack([x, y, z], dim=1)
 
 
@@ -441,17 +478,17 @@ def _select_targets(
 
 
 # Image formation algorithm registry for GPGA. Maps algorithm name to
-# (function, grid kind, accepts antenna pattern, default image_opts). "bp"
+# (function, accepts antenna pattern, accepts dem, default image_opts). "bp"
 # resolves to the polar or Cartesian direct backprojection by grid type.
 _GPGA_POLAR_ALGOS = {
-    "bp": (backprojection_polar_2d, True, {}),
-    "ffbp": (ffbp, True, {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}),
-    "afbp": (afbp, True, {}),
+    "bp": (backprojection_polar_2d, True, True, {}),
+    "ffbp": (ffbp, True, True, {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}),
+    "afbp": (afbp, True, False, {}),
 }
 _GPGA_CART_ALGOS = {
-    "bp": (backprojection_cart_2d, False, {}),
-    "cfbp": (cfbp, False, {"stages": 4}),
-    "cfbp_adaptive": (cfbp_adaptive, False, {"stages": 4}),
+    "bp": (backprojection_cart_2d, False, False, {}),
+    "cfbp": (cfbp, False, False, {"stages": 4}),
+    "cfbp_adaptive": (cfbp_adaptive, False, False, {"stages": 4}),
 }
 
 
@@ -467,13 +504,14 @@ def _make_image_former(
     g: Tensor | None,
     g_extent: list | None,
     image_opts: dict | None,
+    dem: Tensor | None = None,
 ):
     """Build a ``form_image(pos) -> 2D image`` closure for GPGA.
 
     Selects the image formation algorithm by name and grid type, merges
     ``image_opts`` over the algorithm's defaults, forwards antenna pattern
-    arguments only to algorithms that accept them, and normalizes the output to
-    a bare 2D tensor.
+    and DEM arguments only to algorithms that accept them, and normalizes the
+    output to a bare 2D tensor.
     """
     is_polar = _grid_is_polar(grid)
     table = _GPGA_POLAR_ALGOS if is_polar else _GPGA_CART_ALGOS
@@ -483,13 +521,19 @@ def _make_image_former(
             f"algorithm {algorithm!r} is not available for a {kind} grid. "
             f"Choose one of {sorted(table)}."
         )
-    func, accepts_antenna, defaults = table[algorithm]
+    func, accepts_antenna, accepts_dem, defaults = table[algorithm]
 
     has_antenna = att is not None or g is not None or g_extent is not None
     if has_antenna and not accepts_antenna:
         raise ValueError(
             f"algorithm {algorithm!r} does not support antenna pattern "
             "arguments (att/g/g_extent)."
+        )
+    if dem is not None and not accepts_dem:
+        kind = "polar" if is_polar else "Cartesian"
+        raise ValueError(
+            f"algorithm {algorithm!r} ({kind} grid) does not support dem. "
+            "Use algorithm 'bp' or 'ffbp' with a polar grid."
         )
 
     opts = dict(defaults)
@@ -507,6 +551,8 @@ def _make_image_former(
         kwargs.update(d0=d0, data_fmod=data_fmod)
         if accepts_antenna:
             kwargs.update(att=att, g=g, g_extent=g_extent)
+        if dem is not None:
+            kwargs.update(dem=dem)
         img = func(data, grid, fc, r_res, p, **kwargs)
         if img.dim() == 3:
             img = img[0]
@@ -542,7 +588,8 @@ def gpga(
     att: Tensor | None = None,
     g: Tensor | None = None,
     g_extent: list | None = None,
-    data_fmod: float = 0
+    data_fmod: float = 0,
+    dem: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus. [1]_
@@ -658,6 +705,16 @@ def gpga(
         Antenna pattern arguments are only supported by the polar algorithms.
     data_fmod : float
         Range modulation frequency applied to input data.
+    dem : Tensor or None
+        Digital elevation model sampled on the image grid. Shape
+        [dem_nr, dem_ntheta], covering the same extent as `grid`; can be
+        coarser than the image grid (bilinearly interpolated). Values are
+        pixel z coordinates in the same frame as `pos`. Used both for the
+        image formation and for the autofocus target positions. Only
+        supported with a polar grid and algorithm "bp" or "ffbp". See
+        :func:`torchbp.util.dem_to_polar` for resampling a Cartesian DEM
+        onto the polar grid. If None (default) targets are assumed to lie
+        on the z=0 plane.
 
     References
     ----------
@@ -680,7 +737,7 @@ def gpga(
 
     form_image = _make_image_former(
         algorithm, grid, data, fc, r_res, d0, data_fmod,
-        att, g, g_extent, image_opts,
+        att, g, g_extent, image_opts, dem,
     )
 
     phi_sum = torch.zeros(data.shape[0], dtype=torch.float32, device=data.device)
@@ -706,7 +763,7 @@ def gpga(
             isolation_window,
         )
         target_pos = _pixel_to_world(
-            grid, rows.to(torch.float32), cols.to(torch.float32)
+            grid, rows.to(torch.float32), cols.to(torch.float32), dem
         )
 
         # Get range profile samples for each target
@@ -784,6 +841,7 @@ def gpga_tde(
     g_extent: list | None = None,
     verbose: bool = False,
     data_fmod: float = 0,
+    dem: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Generalized phase gradient autofocus [1]_ with time-domain error (TDE) 3D
@@ -909,6 +967,16 @@ def gpga_tde(
         Print progress stats.
     data_fmod : float
         Range modulation frequency applied to input data.
+    dem : Tensor or None
+        Digital elevation model sampled on the image grid. Shape
+        [dem_nr, dem_ntheta], covering the same extent as `grid`; can be
+        coarser than the image grid (bilinearly interpolated). Values are
+        pixel z coordinates in the same frame as `pos`. Used for the image
+        formation, the autofocus target positions and the block-center
+        geometry of the position solve. Only supported with a polar grid
+        and algorithm "bp" or "ffbp". See :func:`torchbp.util.dem_to_polar`
+        for resampling a Cartesian DEM onto the polar grid. If None
+        (default) targets are assumed to lie on the z=0 plane.
 
 
     References
@@ -936,7 +1004,7 @@ def gpga_tde(
 
     form_image = _make_image_former(
         algorithm, grid, data, fc, r_res, d0, data_fmod,
-        att, g, g_extent, image_opts,
+        att, g, g_extent, image_opts, dem,
     )
 
     pos_new = pos.clone()
@@ -960,7 +1028,7 @@ def gpga_tde(
         device=data.device,
     )
     local_centers = torch.zeros(
-        (range_divisions * azimuth_divisions, 2),
+        (range_divisions * azimuth_divisions, 3),
         dtype=torch.float32,
         device=data.device,
     )
@@ -1013,14 +1081,14 @@ def gpga_tde(
                             [jr * azdiv + local_img.shape[1] / 2],
                             device=data.device,
                         ),
+                        dem,
                     )[0]
-                    local_centers[ir * azimuth_divisions + jr, 0] = mid[0]
-                    local_centers[ir * azimuth_divisions + jr, 1] = mid[1]
+                    local_centers[ir * azimuth_divisions + jr] = mid
                     continue
                 # Absolute image indices of the targets in this block.
                 i_idx = ir * rdiv + rows.to(torch.float32)
                 j_idx = jr * azdiv + cols.to(torch.float32)
-                target_pos = _pixel_to_world(grid, i_idx, j_idx)
+                target_pos = _pixel_to_world(grid, i_idx, j_idx, dem)
 
                 # Get range profile samples for each target
                 target_data = gpga_backprojection_2d_core(
@@ -1076,16 +1144,14 @@ def gpga_tde(
                 # Average the target world coordinates directly so the block
                 # center is grid-agnostic (polar or Cartesian).
                 wn = w[:, 0] / torch.max(w)
-                local_centers[ir * azimuth_divisions + jr, 0] = torch.sum(
-                    wn * target_pos[:, 0]
-                ) / torch.sum(wn)
-                local_centers[ir * azimuth_divisions + jr, 1] = torch.sum(
-                    wn * target_pos[:, 1]
+                local_centers[ir * azimuth_divisions + jr] = torch.sum(
+                    wn[:, None] * target_pos, dim=0
                 ) / torch.sum(wn)
 
         # Local image centers in Cartesian world coordinates
         local_x = local_centers[:, 0]
         local_y = local_centers[:, 1]
+        local_z = local_centers[:, 2]
         # Ground range from each position to local image centers
         local_r = torch.sqrt(
             (pos_new[:, 0][:, None] - local_x[None, :]) ** 2
@@ -1093,7 +1159,9 @@ def gpga_tde(
         )
 
         # Local image center azimuth and elevation angles from each data position
-        target_el = torch.arctan2(-pos_new[:, 2][:, None], local_r)
+        target_el = torch.arctan2(
+            local_z[None, :] - pos_new[:, 2][:, None], local_r
+        )
         target_az = torch.arctan2(
             local_y[None, :] - pos_new[:, 1][:, None],
             local_x[None, :] - pos_new[:, 0][:, None],

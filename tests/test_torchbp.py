@@ -5064,6 +5064,167 @@ class TestGpgaCartesian(TestGpgaBpPolar):
             )
 
 
+class TestGpgaDem(TestGpgaBpPolar):
+    """GPGA with a DEM: scatterers on a sloped plane instead of z=0.
+
+    Reuses the polar scene/data helpers; the parent's z=0 tests are
+    disabled. The DEM is coarser than the image grid to also exercise the
+    bilinear target-height interpolation.
+    """
+
+    dem_nr = 32
+    dem_ntheta = 32
+
+    # Disable the inherited z=0 tests.
+    def test_focuses_range_motion_error(self):
+        pass
+
+    def test_ffbp_image_formation(self):
+        pass
+
+    @staticmethod
+    def _plane_z(x, y):
+        return 4.0 + 0.08 * (x - 80.0) + 0.05 * y
+
+    def _dem(self):
+        # DEM sample [i, j] corresponds to image pixel (i * nr / dem_nr,
+        # j * ntheta / dem_ntheta), i.e. r/theta at fraction i/dem_nr of
+        # the grid extent (the backprojection kernel convention).
+        r0, r1 = self.grid_polar["r"]
+        t0, t1 = self.grid_polar["theta"]
+        r = r0 + (r1 - r0) * torch.arange(self.dem_nr) / self.dem_nr
+        t = t0 + (t1 - t0) * torch.arange(self.dem_ntheta) / self.dem_ntheta
+        x = r[:, None] * torch.sqrt(1 - t[None, :] ** 2)
+        y = r[:, None] * t[None, :]
+        return self._plane_z(x, y).to(torch.float32)
+
+    def _dem_scene_with_error(self):
+        targets, amps, pos = self._scene()
+        targets[:, 2] = self._plane_z(targets[:, 0], targets[:, 1])
+        dx = 4e-3 * torch.sin(
+            2 * torch.pi * 2 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+        return data, pos, dx
+
+    def test_zero_dem_matches_no_dem(self):
+        # A zero DEM must reproduce the z=0 solution.
+        targets, amps, pos = self._scene()
+        dx = 4e-3 * torch.sin(
+            2 * torch.pi * 2 * torch.arange(self.nsweeps) / self.nsweeps
+        )
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+
+        common = dict(max_iters=4, target_threshold_db=15)
+        _, phi = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_polar, **common
+        )
+        _, phi_dem = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            dem=torch.zeros(self.dem_nr, self.dem_ntheta), **common
+        )
+        self.assertLess((phi - phi_dem).abs().max().item(), 1e-2)
+
+    def test_gpga_dem_focuses(self):
+        data, pos, dx = self._dem_scene_with_error()
+        dem = self._dem()
+
+        img_blur = torchbp.ops.backprojection_polar_2d(
+            data, self.grid_polar, self.fc, self.r_res, pos, dem=dem
+        )[0]
+        img_focus, phi = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            max_iters=8, target_threshold_db=15, dem=dem,
+        )
+
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(phi).all())
+        self.assertGreater(
+            self._sharpness(img_focus).item(),
+            1.3 * self._sharpness(img_blur).item(),
+        )
+
+        from torchbp.util import detrend
+        c0 = 299792458.0
+        d = phi * c0 / (4 * torch.pi * self.fc)
+        resid = min(
+            detrend(dx - d).pow(2).mean().sqrt().item(),
+            detrend(dx + d).pow(2).mean().sqrt().item(),
+        )
+        self.assertLess(resid, 0.4 * dx.pow(2).mean().sqrt().item())
+
+    def test_gpga_ffbp_dem(self):
+        # algorithm="ffbp" with a DEM should drive the same autofocus
+        # solution as exact backprojection with the DEM.
+        data, pos, dx = self._dem_scene_with_error()
+        dem = self._dem()
+
+        common = dict(max_iters=8, target_threshold_db=15, dem=dem)
+        _, phi_bp = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_polar, **common
+        )
+        _, phi_ff = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            algorithm="ffbp", image_opts={"stages": 4}, **common
+        )
+        self.assertTrue(torch.isfinite(phi_ff).all())
+        corr = torch.corrcoef(torch.stack([phi_bp, phi_ff]))[0, 1]
+        self.assertGreater(corr.item(), 0.9)
+
+    def test_tde_dem_focuses_and_recovers(self):
+        data, pos, dx = self._dem_scene_with_error()
+        dem = self._dem()
+
+        img_blur = torchbp.ops.backprojection_polar_2d(
+            data, self.grid_polar, self.fc, self.r_res, pos, dem=dem
+        )[0]
+        img_focus, pos_new = torchbp.autofocus.gpga_tde(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            azimuth_divisions=2, range_divisions=2, estimate_z=False,
+            max_iters=8, target_threshold_db=15, dem=dem,
+        )
+
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(pos_new).all())
+        self.assertGreater(
+            self._sharpness(img_focus).item(),
+            1.3 * self._sharpness(img_blur).item(),
+        )
+
+        from torchbp.util import detrend
+        d = pos_new[:, 0] - pos[:, 0]
+        resid = detrend(dx - d).pow(2).mean().sqrt().item()
+        self.assertLess(resid, 0.5 * dx.pow(2).mean().sqrt().item())
+
+    def test_dem_rejected_for_unsupported_algorithms(self):
+        targets, amps, pos = self._scene()
+        data = self._make_data(targets, amps, pos)
+        dem = torch.zeros(self.dem_nr, self.dem_ntheta)
+        with self.assertRaises(ValueError):
+            torchbp.autofocus.gpga(
+                None, data, pos, self.fc, self.r_res, self.grid_polar,
+                algorithm="afbp", image_opts={"nsub": 4}, dem=dem,
+                max_iters=1,
+            )
+        grid_cart = {"x": (85.0, 115.0), "y": (-20.0, 20.0),
+                     "nx": 64, "ny": 64}
+        with self.assertRaises(ValueError):
+            torchbp.autofocus.gpga(
+                None, data, pos, self.fc, self.r_res, grid_cart,
+                algorithm="bp", dem=dem, max_iters=1,
+            )
+        with self.assertRaises(ValueError):
+            torchbp.autofocus.gpga_tde(
+                None, data, pos, self.fc, self.r_res, grid_cart,
+                azimuth_divisions=2, range_divisions=2,
+                algorithm="cfbp", dem=dem, max_iters=1,
+            )
+
+
 class TestCFBP(TestCase):
     """Cartesian factorized backprojection against direct backprojection."""
 
