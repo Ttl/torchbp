@@ -33,6 +33,17 @@ isolated environment with a different (freshly downloaded) torch, producing
 a `.so` that fails to import with an `undefined symbol` error. For the same
 reason, rebuild torchbp whenever you change your torch version.
 
+## Tests
+
+Install test dependencies, then run pytest:
+
+```bash
+pip install --no-build-isolation -e .[test]
+pytest tests/
+```
+
+On a CPU-only machine the CUDA tests are skipped rather than failing.
+
 ## Documentation
 
 Latest documentation can be viewed at: https://ttl.github.io/torchbp/
