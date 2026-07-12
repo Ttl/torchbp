@@ -62,7 +62,8 @@ static void backprojection_polar_2d_row_cpu(
     float d_buf[CHUNK];
     float ef_buf[CHUNK], af_buf[CHUNK];
     int gi_buf[CHUNK];
-    float g00_buf[CHUNK], g01_buf[CHUNK], g10_buf[CHUNK], g11_buf[CHUNK];
+    // Adjacent gain pattern pairs, 8-byte moves like the sample pairs.
+    double g0_buf[CHUNK], g1_buf[CHUNK];
     float gvld_buf[CHUNK];
     float z_buf[CHUNK], z2_buf[CHUNK];
 
@@ -210,10 +211,8 @@ static void backprojection_polar_2d_row_cpu(
                 // stay scalar; everything else moves to the vector pass.
                 for (int q = 0; q < nchunk; q++) {
                     const int gi = gi_buf[q];
-                    g00_buf[q] = g[gi];
-                    g01_buf[q] = g[gi + 1];
-                    g10_buf[q] = g[gi + g_naz];
-                    g11_buf[q] = g[gi + g_naz + 1];
+                    memcpy(&g0_buf[q], g + gi, 8);
+                    memcpy(&g1_buf[q], g + gi + g_naz, 8);
                     const float *s = data_row + 2 * idx_buf[q];
                     memcpy(&v0_buf[q], s, 8);
                     memcpy(&v1_buf[q], s + 2, 8);
@@ -224,8 +223,10 @@ static void backprojection_polar_2d_row_cpu(
 #pragma omp simd
                 for (int q = 0; q < nchunk; q++) {
                     const float ef = ef_buf[q], af = af_buf[q];
-                    const float w0 = g00_buf[q] + af * (g01_buf[q] - g00_buf[q]);
-                    const float w1 = g10_buf[q] + af * (g11_buf[q] - g10_buf[q]);
+                    const float *g0 = (const float*)g0_buf;
+                    const float *g1 = (const float*)g1_buf;
+                    const float w0 = g0[2*q] + af * (g0[2*q+1] - g0[2*q]);
+                    const float w1 = g1[2*q] + af * (g1[2*q+1] - g1[2*q]);
                     const float w = (w0 + ef * (w1 - w0)) * vld_buf[q] * gvld_buf[q];
 
                     const float f = frac_buf[q];
@@ -1082,9 +1083,9 @@ std::vector<at::Tensor> backprojection_cart_2d_grad_cpu(
 // vectorizable angle pass (asinf_fast/atan2f_fast, matching the
 // backprojection kernel's gain-lookup conventions) writes the bilinear
 // pattern coordinates to small buffers, then a scalar pass gathers the
-// gain and accumulates the moments. gi = -1 marks out-of-pattern pixels,
-// which contribute exactly zero: the merge gating and the Wiener
-// normalization rely on W counting exactly the gains that weight A.
+// gain and accumulates the moments. Out-of-pattern pixels get gvld = 0 and
+// contribute exactly zero: the merge gating and the Wiener normalization
+// rely on W counting exactly the gains that weight A.
 static void compute_illumination_row_cpu(
           const float* pos,
           const float* att,
@@ -1100,6 +1101,12 @@ static void compute_illumination_row_cpu(
     float w1_buf[CHUNK], w2_buf[CHUNK];
     float ef_buf[CHUNK], af_buf[CHUNK];
     int gi_buf[CHUNK];
+    float gvld_buf[CHUNK];
+    // Adjacent gain pattern pairs copied as single 8-byte moves; the vector
+    // pass deinterleaves them with in-register shuffles. Plain per-corner
+    // float copies compile to vgatherdps, which is slower than scalar moves
+    // on AVX2.
+    double g0_buf[CHUNK], g1_buf[CHUNK];
 
     const float r = r0 + dr * (out_idr * decimation);
     const float r2 = r * r;
@@ -1152,23 +1159,31 @@ static void compute_illumination_row_cpu(
                 const int az_int = (int)az_idx;
                 const bool ok = (el_idx >= 0.0f) & (el_int + 1 < g_nel) &
                                 (az_idx >= 0.0f) & (az_int + 1 < g_naz);
-                ef_buf[q] = el_idx - el_int;
-                af_buf[q] = az_idx - az_int;
-                gi_buf[q] = ok ? el_int * g_naz + az_int : -1;
+                // Zero the fractions of invalid pixels: an unbounded
+                // fraction could overflow the masked bilinear to inf and
+                // the 0 * inf mask multiply to NaN.
+                ef_buf[q] = ok ? el_idx - el_int : 0.0f;
+                af_buf[q] = ok ? az_idx - az_int : 0.0f;
+                gi_buf[q] = ok ? el_int * g_naz + az_int : 0;
+                gvld_buf[q] = ok ? 1.0f : 0.0f;
             }
-            // Scalar pass: gain gather, accumulate the moments.
+            // Copy pass: only the data-dependent gain loads stay scalar.
             for (int q = 0; q < nchunk; q++) {
                 const int gi = gi_buf[q];
-                if (gi < 0) {
-                    continue;
-                }
+                memcpy(&g0_buf[q], g + gi, 8);
+                memcpy(&g1_buf[q], g + gi + g_naz, 8);
+            }
+            // Vector pass: gain bilinear and moment accumulation, masked by
+            // the 0/1 validity so out-of-pattern pixels contribute exactly
+            // zero to both moments.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
                 const float ef = ef_buf[q], af = af_buf[q];
-                const float v00 = g[gi],         v01 = g[gi + 1];
-                const float v10 = g[gi + g_naz], v11 = g[gi + g_naz + 1];
-                const float w = v00 * (1.0f - ef) * (1.0f - af)
-                              + v01 * (1.0f - ef) * af
-                              + v10 * ef * (1.0f - af)
-                              + v11 * ef * af;
+                const float *g0 = (const float*)g0_buf;
+                const float *g1 = (const float*)g1_buf;
+                const float w0 = g0[2*q] + af * (g0[2*q+1] - g0[2*q]);
+                const float w1 = g1[2*q] + af * (g1[2*q+1] - g1[2*q]);
+                const float w = (w0 + ef * (w1 - w0)) * gvld_buf[q];
                 w1_buf[q] += w;
                 w2_buf[q] += w * w;
             }
@@ -1925,60 +1940,93 @@ at::Tensor projection_cart_2d_cpu(
 // sequential), where a target-outer order would touch a different
 // ~100 KB-distant row on every iteration and be DRAM latency bound.
 // Structured like backprojection_polar_2d_row_cpu: a vectorizable geometry
-// + phase pass into small buffers, then a scalar gather pass.
+// + phase pass into small buffers, a scalar sample copy pass and a
+// vectorizable interpolate + phasor pass.
+//
+// Processes a tile of GPGA_SWEEP_TILE sweeps per call: the [target, sweep]
+// output is transposed relative to the sweep-major compute order, so
+// per-sweep stores would touch a new output cache line every store and be
+// write-allocate bound once the output exceeds the caches. Buffering the
+// tile and storing GPGA_SWEEP_TILE consecutive sweeps of one target
+// together fills whole cache lines instead.
+constexpr int GPGA_SWEEP_TILE = 8;
 static void gpga_backprojection_2d_sweep_cpu(
           const float* tx, const float* ty, const float* tz,
           const complex64_t* data, const float* pos,
           complex64_t* data_out, int sweep_samples, int nsweeps,
           float ref_phase, float delta_r, int Ntarget, float d0, float data_fmod,
-          int idsweep) {
+          int idsweep0, int nsweep_tile) {
     constexpr int CHUNK = 256;
     float frac_buf[CHUNK], cs_buf[CHUNK], sn_buf[CHUNK];
     int idx_buf[CHUNK];
-
-    const float pos_x = pos[idsweep * 3 + 0];
-    const float pos_y = pos[idsweep * 3 + 1];
-    const float pos_z = pos[idsweep * 3 + 2];
-    const float* data_row = (const float*)(data + (size_t)idsweep * sweep_samples);
+    float vld_buf[CHUNK];
+    // (re, im) sample pairs copied as single 8-byte moves; the vector pass
+    // deinterleaves them with in-register shuffles.
+    double v0_buf[CHUNK], v1_buf[CHUNK];
+    float or_buf[GPGA_SWEEP_TILE][CHUNK], oi_buf[GPGA_SWEEP_TILE][CHUNK];
 
     for (int tb = 0; tb < Ntarget; tb += CHUNK) {
         const int nchunk = std::min(CHUNK, Ntarget - tb);
 
+        for (int s = 0; s < nsweep_tile; s++) {
+            const int idsweep = idsweep0 + s;
+            const float pos_x = pos[idsweep * 3 + 0];
+            const float pos_y = pos[idsweep * 3 + 1];
+            const float pos_z = pos[idsweep * 3 + 2];
+            const float* data_row = (const float*)(data + (size_t)idsweep * sweep_samples);
+
 #pragma omp simd
-        for (int q = 0; q < nchunk; q++) {
-            const float px = tx[tb + q] - pos_x;
-            const float py = ty[tb + q] - pos_y;
-            const float pz = tz[tb + q] - pos_z;
-            const float d = sqrtf(px * px + py * py + pz * pz);
+            for (int q = 0; q < nchunk; q++) {
+                const float px = tx[tb + q] - pos_x;
+                const float py = ty[tb + q] - pos_y;
+                const float pz = tz[tb + q] - pos_z;
+                const float d = sqrtf(px * px + py * py + pz * pz);
 
-            const float sx = delta_r * (d + d0);
-            const int id0 = (int)sx;
-            // Float-domain check: (int)sx truncates toward zero, so
-            // sx in (-1, 0) would pass an id0 >= 0 check and
-            // extrapolate with a negative weight.
-            const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
-            idx_buf[q] = ok ? id0 : -1;
-            frac_buf[q] = sx - id0;
+                const float sx = delta_r * (d + d0);
+                const int id0 = (int)sx;
+                // Float-domain check: (int)sx truncates toward zero, so
+                // sx in (-1, 0) would pass an id0 >= 0 check and
+                // extrapolate with a negative weight.
+                // Out-of-window targets read sample 0 and are zeroed by the
+                // 0/1 mask in the vector pass.
+                const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
+                idx_buf[q] = ok ? id0 : 0;
+                vld_buf[q] = ok ? 1.0f : 0.0f;
+                frac_buf[q] = sx - id0;
 
-            float ref_sin, ref_cos;
-            sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
-            cs_buf[q] = ref_cos;
-            sn_buf[q] = ref_sin;
-        }
-
-        // Scalar pass: data gather (linear interpolation), multiply by
-        // reference and store.
-        for (int q = 0; q < nchunk; q++) {
-            const int id0 = idx_buf[q];
-            complex64_t out = {0.0f, 0.0f};
-            if (id0 >= 0) {
-                const float f = frac_buf[q];
-                const float sr = (1.0f - f) * data_row[2*id0]     + f * data_row[2*id0 + 2];
-                const float si = (1.0f - f) * data_row[2*id0 + 1] + f * data_row[2*id0 + 3];
-                out = {sr * cs_buf[q] - si * sn_buf[q],
-                       sr * sn_buf[q] + si * cs_buf[q]};
+                float ref_sin, ref_cos;
+                sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+                cs_buf[q] = ref_cos;
+                sn_buf[q] = ref_sin;
             }
-            data_out[(size_t)(tb + q) * nsweeps + idsweep] = out;
+
+            // Copy pass: only the data-dependent sample load stays scalar.
+            for (int q = 0; q < nchunk; q++) {
+                const float *sp = data_row + 2 * idx_buf[q];
+                memcpy(&v0_buf[q], sp, 8);
+                memcpy(&v1_buf[q], sp + 2, 8);
+            }
+            // Vector pass: sample interpolation and phasor multiply, masked
+            // by the 0/1 validity instead of a branch.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float f = frac_buf[q];
+                const float *v0 = (const float*)v0_buf;
+                const float *v1 = (const float*)v1_buf;
+                const float sr = v0[2*q] + f * (v1[2*q] - v0[2*q]);
+                const float si = v0[2*q+1] + f * (v1[2*q+1] - v0[2*q+1]);
+                const float m = vld_buf[q];
+                or_buf[s][q] = m * (sr * cs_buf[q] - si * sn_buf[q]);
+                oi_buf[s][q] = m * (sr * sn_buf[q] + si * cs_buf[q]);
+            }
+        }
+        // Store pass: consecutive sweeps of one target are contiguous in
+        // the output, so the tile fills whole cache lines.
+        for (int q = 0; q < nchunk; q++) {
+            complex64_t *out = data_out + (size_t)(tb + q) * nsweeps + idsweep0;
+            for (int s = 0; s < nsweep_tile; s++) {
+                out[s] = complex64_t(or_buf[s][q], oi_buf[s][q]);
+            }
         }
     }
 }
@@ -2031,11 +2079,12 @@ at::Tensor gpga_backprojection_2d_cpu(
     omp_set_num_threads(omp_get_num_procs());
 
 #pragma omp parallel for
-    for (int idsweep = 0; idsweep < nsweeps; idsweep++) {
+    for (int idsweep = 0; idsweep < nsweeps; idsweep += GPGA_SWEEP_TILE) {
         gpga_backprojection_2d_sweep_cpu(
                 tx.data(), ty.data(), tz.data(), data_ptr, pos_ptr,
                 data_out_ptr, sweep_samples, nsweeps, ref_phase, delta_r,
-                Ntarget, d0, data_fmod / kPI, idsweep);
+                Ntarget, d0, data_fmod / kPI, idsweep,
+                std::min((int64_t)GPGA_SWEEP_TILE, nsweeps - idsweep));
     }
     return data_out;
 }
@@ -2048,7 +2097,7 @@ at::Tensor gpga_backprojection_2d_cpu(
 // weighting so the [npix, nsweeps] footprint matrix is never materialized.
 // Mirrors blocksvd_alpha_kernel in cuda/backproj.cu; structured like
 // backprojection_polar_2d_row_cpu (SIMD geometry + phase pass into chunk
-// buffers, scalar gather + accumulate pass).
+// buffers, scalar copy pass, SIMD interpolate + accumulate pass).
 static void blocksvd_alpha_kernel_cpu(
           const complex64_t* img, const complex64_t* data, const float* pos,
           const int32_t* blocks, complex64_t* alpha, int sweep_samples,
@@ -2058,6 +2107,10 @@ static void blocksvd_alpha_kernel_cpu(
     constexpr int CHUNK = 256;
     float cs_buf[CHUNK], sn_buf[CHUNK], frac_buf[CHUNK];
     int idx_buf[CHUNK];
+    float vld_buf[CHUNK];
+    // (re, im) pairs copied as single 8-byte moves; the vector pass
+    // deinterleaves them with in-register shuffles.
+    double v0_buf[CHUNK], v1_buf[CHUNK], w_buf[CHUNK];
 
     const int ri0 = blocks[idblock * 6 + 0];
     const int ri1 = blocks[idblock * 6 + 1];
@@ -2102,8 +2155,11 @@ static void blocksvd_alpha_kernel_cpu(
                 // Float-domain check: (int)sx truncates toward zero, so
                 // sx in (-1, 0) would pass an id0 >= 0 check and
                 // extrapolate with a negative weight.
+                // Out-of-window pixels read sample 0 and are zeroed by the
+                // 0/1 mask in the vector pass.
                 const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
-                idx_buf[q] = ok ? id0 : -1;
+                idx_buf[q] = ok ? id0 : 0;
+                vld_buf[q] = ok ? 1.0f : 0.0f;
                 frac_buf[q] = sx - id0;
 
                 float ref_sin, ref_cos;
@@ -2112,23 +2168,31 @@ static void blocksvd_alpha_kernel_cpu(
                 sn_buf[q] = ref_sin;
             }
 
-            // Scalar pass: data gather (linear interpolation), multiply by
-            // reference, accumulate against the conjugated image pixel.
-            // The image patch is small enough to stay cached despite the
-            // Ntheta-strided access.
+            // Copy pass: only the data-dependent sample loads and the
+            // Ntheta-strided image column stay scalar. The image patch is
+            // small enough to stay cached despite the strided access.
             const float* img_col = (const float*)(img + (size_t)rb * Ntheta + j);
             for (int q = 0; q < nchunk; q++) {
-                const int id0 = idx_buf[q];
-                if (id0 < 0) {
-                    continue;
-                }
+                const float *s = data_row + 2 * idx_buf[q];
+                memcpy(&v0_buf[q], s, 8);
+                memcpy(&v1_buf[q], s + 2, 8);
+                memcpy(&w_buf[q], img_col + 2*(size_t)q*Ntheta, 8);
+            }
+            // Vector pass: interpolate, phasor multiply, accumulate against
+            // the conjugated image pixel, masked by the 0/1 validity.
+#pragma omp simd reduction(+:acc_r,acc_i)
+            for (int q = 0; q < nchunk; q++) {
                 const float f = frac_buf[q];
-                const float sr = (1.0f - f) * data_row[2*id0]     + f * data_row[2*id0 + 2];
-                const float si = (1.0f - f) * data_row[2*id0 + 1] + f * data_row[2*id0 + 3];
-                const float vr = sr * cs_buf[q] - si * sn_buf[q];
-                const float vi = sr * sn_buf[q] + si * cs_buf[q];
-                const float wr = img_col[2*(size_t)q*Ntheta];
-                const float wi = img_col[2*(size_t)q*Ntheta + 1];
+                const float *v0 = (const float*)v0_buf;
+                const float *v1 = (const float*)v1_buf;
+                const float *w = (const float*)w_buf;
+                const float sr = v0[2*q] + f * (v1[2*q] - v0[2*q]);
+                const float si = v0[2*q+1] + f * (v1[2*q+1] - v0[2*q+1]);
+                const float m = vld_buf[q];
+                const float vr = m * (sr * cs_buf[q] - si * sn_buf[q]);
+                const float vi = m * (sr * sn_buf[q] + si * cs_buf[q]);
+                const float wr = w[2*q];
+                const float wi = w[2*q+1];
                 // conj(w) * v
                 acc_r += wr * vr + wi * vi;
                 acc_i += wr * vi - wi * vr;
