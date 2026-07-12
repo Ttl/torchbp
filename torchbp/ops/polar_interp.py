@@ -378,7 +378,8 @@ def ffbp_merge2_lanczos(
     order: int = 6,
     alias: bool = False,
     alias_fmod: float = 0,
-    output_alias: bool = True
+    output_alias: bool = True,
+    dem: Tensor | None = None
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -421,6 +422,13 @@ def ffbp_merge2_lanczos(
         Range modulation frequency applied to input.
     output_alias : bool
         If True and `alias` is True apply `alias_fmod` to output.
+    dem : Tensor or None
+        Digital elevation model sampled on the output polar grid
+        (``grid_polar_new``), shape [dem_nr, dem_ntheta] covering the same r
+        and theta extent; may be coarser. The merge carriers then reference
+        the 3D distance from the origins to the pixel at the DEM height.
+        Input images must be dealiased with the matching DEM-referenced
+        carrier (``backprojection_polar_2d`` with ``dealias=2``).
 
     Returns
     -------
@@ -500,6 +508,7 @@ def ffbp_merge2_lanczos(
         order,
         alias_mode,
         alias_fmod,
+        dem,
     )
 
 
@@ -516,7 +525,8 @@ def ffbp_merge2_knab(
     oversample: float = 1.5,
     alias: bool = False,
     alias_fmod: float = 0,
-    output_alias: bool = True
+    output_alias: bool = True,
+    dem: Tensor | None = None
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -562,6 +572,13 @@ def ffbp_merge2_knab(
         Range modulation frequency applied to input.
     output_alias : bool
         If True and `alias` is True apply `alias_fmod` to output.
+    dem : Tensor or None
+        Digital elevation model sampled on the output polar grid
+        (``grid_polar_new``), shape [dem_nr, dem_ntheta] covering the same r
+        and theta extent; may be coarser. The merge carriers then reference
+        the 3D distance from the origins to the pixel at the DEM height.
+        Input images must be dealiased with the matching DEM-referenced
+        carrier (``backprojection_polar_2d`` with ``dealias=2``).
 
     References
     ----------
@@ -647,6 +664,7 @@ def ffbp_merge2_knab(
         oversample,
         alias_mode,
         alias_fmod,
+        dem,
     )
 
 
@@ -665,7 +683,8 @@ def ffbp_merge2_poly(
     alias_fmod: float = 0,
     output_alias: bool = True,
     poly_degree: int = None,
-    poly_coefs: Tensor = None
+    poly_coefs: Tensor = None,
+    dem: Tensor | None = None
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -726,6 +745,13 @@ def ffbp_merge2_poly(
         Use compute_knab_poly_coefs_full() to compute these coefficients.
         Precomputing is useful when calling this function multiple times with
         the same order and oversample parameters.
+    dem : Tensor or None
+        Digital elevation model sampled on the output polar grid
+        (``grid_polar_new``), shape [dem_nr, dem_ntheta] covering the same r
+        and theta extent; may be coarser. The merge carriers then reference
+        the 3D distance from the origins to the pixel at the DEM height.
+        Input images must be dealiased with the matching DEM-referenced
+        carrier (``backprojection_polar_2d`` with ``dealias=2``).
 
     Returns
     -------
@@ -821,6 +847,7 @@ def ffbp_merge2_poly(
         poly_coefs,
         alias_mode,
         alias_fmod,
+        dem,
     )
 
 
@@ -847,6 +874,7 @@ def ffbp_merge2_poly_weighted(
     weight_grid1: "PolarGrid | dict" = None,
     output_weight_map: bool = False,
     output_weight_decimation: int = 1,
+    dem: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None, Tensor | None, "dict | None"]:
     """
     Interpolate two pseudo-polar radar images to new grid with antenna pattern weighting.
@@ -1043,6 +1071,7 @@ def ffbp_merge2_poly_weighted(
         w_ntheta1,
         1 if output_weight_map else 0,
         output_weight_decimation,
+        dem,
     )
 
     if output_weight_map:
@@ -1076,7 +1105,8 @@ def ffbp_merge2(
     alias_fmod: float = 0,
     output_alias: bool = True,
     use_poly: bool = True,
-    poly_coefs: Tensor = None
+    poly_coefs: Tensor = None,
+    dem: Tensor | None = None
 ) -> Tensor:
     """
     Interpolate two pseudo-polar radar images to new grid and change origin
@@ -1144,6 +1174,7 @@ def ffbp_merge2(
         use_poly = use_poly and order <= 8
         knab_func = ffbp_merge2_poly if use_poly else ffbp_merge2_knab
         kwargs = dict(
+            dem=dem,
             order=order,
             oversample=method_params[1],
             alias=alias,

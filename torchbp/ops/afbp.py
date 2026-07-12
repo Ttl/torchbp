@@ -85,6 +85,7 @@ def afbp(
     weight_map_downsample: int = 4,
     weight_eps: float | None = None,
     _batched_fusion: bool | None = None,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """
     Accelerated factorized backprojection. [1]_
@@ -225,6 +226,10 @@ def afbp(
     """
     if hasattr(grid, "to_dict"):
         grid = grid.to_dict()
+    if dem is not None:
+        raise NotImplementedError(
+            "afbp does not support dem; use ffbp (with afbp_nsub=1) or "
+            "backprojection_polar_2d")
     if data.dim() != 2:
         raise ValueError("data shape should be [nsweeps, samples]")
     if pos.dim() != 2 or pos.shape[0] != data.shape[0]:

@@ -1330,11 +1330,36 @@ at::Tensor polar_interp_linear_cuda(
 	return out;
 }
 
+// Bilinear DEM lookup on the merge output grid, edge-clamped. The DEM shares
+// the output grid extent so the pixel index maps to the DEM index by a
+// constant ratio. Guard band pixels |theta| > 1 get the DEM edge value (the
+// same convention as the backprojection kernel).
+static __device__ __forceinline__ float ffbp_merge2_dem_z(const float *dem,
+        int idr, int idtheta, float dem_r_scale, float dem_theta_scale,
+        int dem_nr, int dem_ntheta) {
+    const float fr = idr * dem_r_scale;
+    const float ft = idtheta * dem_theta_scale;
+    const int ir0 = min((int)fr, dem_nr - 1);
+    const int ir1 = min(ir0 + 1, dem_nr - 1);
+    const int it0 = min((int)ft, dem_ntheta - 1);
+    const int it1 = min(it0 + 1, dem_ntheta - 1);
+    const float wr = fr - ir0;
+    const float wt = ft - it0;
+    const float z00 = __ldg(&dem[ir0 * dem_ntheta + it0]);
+    const float z01 = __ldg(&dem[ir0 * dem_ntheta + it1]);
+    const float z10 = __ldg(&dem[ir1 * dem_ntheta + it0]);
+    const float z11 = __ldg(&dem[ir1 * dem_ntheta + it1]);
+    const float za = fmaf(wt, z01 - z00, z00);
+    const float zb = fmaf(wt, z11 - z10, z10);
+    return fmaf(wr, zb - za, za);
+}
+
 __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const complex64_t *img1,
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod) {
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod,
+        const float *dem, float dem_r_scale, float dem_theta_scale, int dem_nr, int dem_ntheta) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -1350,7 +1375,16 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
     // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
     const float cost = sqrtf(fmaxf(0.0f, 1.0f - t*t));
-    const float dz = sqrtf(z1*z1 + d*d);
+    // With a DEM the pixel sits at height zp: both carriers reference the 3D
+    // distance from the origins to the pixel so the topographic phase cancels
+    // through the merge. zp = 0 reproduces the flat-earth carriers exactly.
+    float zp = 0.0f;
+    if (dem != nullptr) {
+        zp = ffbp_merge2_dem_z(dem, idr, idtheta, dem_r_scale,
+                               dem_theta_scale, dem_nr, dem_ntheta);
+    }
+    const float z1p = z1 - zp;
+    const float dz = sqrtf(z1p*z1p + d*d);
 
     complex64_t pixel{};
 
@@ -1374,7 +1408,7 @@ __global__ void ffbp_merge2_kernel_lanczos(const complex64_t *img0, const comple
                     img, Nr[id], Ntheta[id], dri, dti, order);
 
             float ref_sin, ref_cos;
-            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float z0 = z1 + dorigin[id * 3 + 2] - zp;
             const float rpz = sqrtf(z0*z0 + rp*rp);
             sincospif(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
@@ -1401,7 +1435,8 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v, int alias, float alias_fmod) {
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, float knab_v, int alias, float alias_fmod,
+        const float *dem, float dem_r_scale, float dem_theta_scale, int dem_nr, int dem_ntheta) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -1417,7 +1452,16 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
     // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
     const float cost = sqrtf(fmaxf(0.0f, 1.0f - t*t));
-    const float dz = sqrtf(z1*z1 + d*d);
+    // With a DEM the pixel sits at height zp: both carriers reference the 3D
+    // distance from the origins to the pixel so the topographic phase cancels
+    // through the merge. zp = 0 reproduces the flat-earth carriers exactly.
+    float zp = 0.0f;
+    if (dem != nullptr) {
+        zp = ffbp_merge2_dem_z(dem, idr, idtheta, dem_r_scale,
+                               dem_theta_scale, dem_nr, dem_ntheta);
+    }
+    const float z1p = z1 - zp;
+    const float dz = sqrtf(z1p*z1p + d*d);
 
     complex64_t pixel{};
     const float knab_norm = knab_kernel_norm(order, knab_v);
@@ -1442,7 +1486,7 @@ __global__ void ffbp_merge2_kernel_knab(const complex64_t *img0, const complex64
                     img, Nr[id], Ntheta[id], dri, dti, order, knab_v, knab_norm);
 
             float ref_sin, ref_cos;
-            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float z0 = z1 + dorigin[id * 3 + 2] - zp;
             const float rpz = sqrtf(z0*z0 + rp*rp);
             sincospif(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
@@ -1472,7 +1516,8 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod) {
+        float dtheta1, int Nr1, int Ntheta1, float z1, int order, int alias, float alias_fmod,
+        const float *dem, float dem_r_scale, float dem_theta_scale, int dem_nr, int dem_ntheta) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
     const int idr = idx / Ntheta1;
@@ -1488,7 +1533,16 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
     // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
     const float cost = sqrtf(fmaxf(0.0f, 1.0f - t*t));
-    const float dz = sqrtf(z1*z1 + d*d);
+    // With a DEM the pixel sits at height zp: both carriers reference the 3D
+    // distance from the origins to the pixel so the topographic phase cancels
+    // through the merge. zp = 0 reproduces the flat-earth carriers exactly.
+    float zp = 0.0f;
+    if (dem != nullptr) {
+        zp = ffbp_merge2_dem_z(dem, idr, idtheta, dem_r_scale,
+                               dem_theta_scale, dem_nr, dem_ntheta);
+    }
+    const float z1p = z1 - zp;
+    const float dz = sqrtf(z1p*z1p + d*d);
 
     complex64_t pixel{};
 
@@ -1512,7 +1566,7 @@ __global__ void ffbp_merge2_kernel_poly(const complex64_t *img0, const complex64
                     img, Nr[id], Ntheta[id], dri, dti, order);
 
             float ref_sin, ref_cos;
-            const float z0 = z1 + dorigin[id * 3 + 2];
+            const float z0 = z1 + dorigin[id * 3 + 2] - zp;
             const float rpz = sqrtf(z0*z0 + rp*rp);
             sincospif(ref_phase * (rpz - dz) - alias_fmod*(dri - idr), &ref_sin, &ref_cos);
             complex64_t ref = {ref_cos, ref_sin};
@@ -1563,7 +1617,8 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
         float w_r0_1, float w_dr1, float w_theta0_1, float w_dtheta1,
         int w_nr1, int w_ntheta1,
         // Output weight map decimation (1 = no decimation, 4 = write every 4th pixel)
-        int output_weight_decimation) {
+        int output_weight_decimation,
+        const float *dem, float dem_r_scale, float dem_theta_scale, int dem_nr, int dem_ntheta) {
 
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta1;
@@ -1589,7 +1644,15 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
     // of rp (the same continuation the backprojection kernel produces).
     const float sint = t;
     const float cost = sqrtf(fmaxf(0.0f, fmaf(-t, t, 1.0f)));
-    const float dz = hypotf(z1, d);
+    // With a DEM the pixel sits at height zp: both carriers reference the 3D
+    // distance from the origins to the pixel so the topographic phase cancels
+    // through the merge. zp = 0 reproduces the flat-earth carriers exactly.
+    float zp = 0.0f;
+    if (dem != nullptr) {
+        zp = ffbp_merge2_dem_z(dem, idr, idtheta, dem_r_scale,
+                               dem_theta_scale, dem_nr, dem_ntheta);
+    }
+    const float dz = hypotf(z1 - zp, d);
 
     // Accumulate unnormalized A values and total W1, W2
     complex64_t A_total{};
@@ -1636,7 +1699,7 @@ __global__ void ffbp_merge2_kernel_poly_weighted(
                     img, Nr_val, Ntheta_val, dri, dti, order);
 
             float ref_sin, ref_cos;
-            const float z0 = z1 + dorig2;
+            const float z0 = z1 + dorig2 - zp;
             const float rpz = hypotf(z0, rp);
             const float phase_angle = fmaf(ref_phase, rpz - dz, -alias_fmod * (dri - idr)) * M_PI;
             __sincosf(phase_angle, &ref_sin, &ref_cos);
@@ -1885,7 +1948,8 @@ at::Tensor ffbp_merge2_lanczos_cuda(
           double z1,
           int64_t order,
           int64_t alias,
-          double alias_fmod) {
+          double alias_fmod,
+          const at::Tensor &dem) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -1932,6 +1996,22 @@ at::Tensor ffbp_merge2_lanczos_cuda(
 	dim3 block_count = {block_x, 1, 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    const float* dem_ptr = nullptr;
+    at::Tensor dem_contig;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr1;
+        dem_theta_scale = (float)dem_ntheta / Ntheta1;
+    }
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     ffbp_merge2_kernel_lanczos
@@ -1956,7 +2036,8 @@ at::Tensor ffbp_merge2_lanczos_cuda(
                   z1,
                   order,
                   alias,
-                  alias_fmod/kPI
+                  alias_fmod/kPI,
+                  dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta
                   );
 	return out;
 }
@@ -1982,7 +2063,8 @@ at::Tensor ffbp_merge2_knab_cuda(
           int64_t order,
           double oversample,
           int64_t alias,
-          double alias_fmod) {
+          double alias_fmod,
+          const at::Tensor &dem) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2029,6 +2111,22 @@ at::Tensor ffbp_merge2_knab_cuda(
 	dim3 block_count = {block_x, 1, 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    const float* dem_ptr = nullptr;
+    at::Tensor dem_contig;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr1;
+        dem_theta_scale = (float)dem_ntheta / Ntheta1;
+    }
+
     const float v = 1.0f - 1.0f / oversample;
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -2055,7 +2153,8 @@ at::Tensor ffbp_merge2_knab_cuda(
                   order,
                   v,
                   alias,
-                  alias_fmod/kPI
+                  alias_fmod/kPI,
+                  dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta
                   );
 	return out;
 }
@@ -2081,7 +2180,8 @@ at::Tensor ffbp_merge2_poly_cuda(
           int64_t order,
           const at::Tensor &poly_coefs,
           int64_t alias,
-          double alias_fmod) {
+          double alias_fmod,
+          const at::Tensor &dem) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2141,6 +2241,22 @@ at::Tensor ffbp_merge2_poly_cuda(
 	dim3 block_count = {block_x, 1, 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    const float* dem_ptr = nullptr;
+    at::Tensor dem_contig;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr1;
+        dem_theta_scale = (float)dem_ntheta / Ntheta1;
+    }
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Dispatch to template-specialized kernel based on n_coefs
@@ -2150,7 +2266,8 @@ at::Tensor ffbp_merge2_poly_cuda(
             (const complex64_t*)img0_ptr, (const complex64_t*)img1_ptr, \
             (complex64_t*)out_ptr, dorigin_ptr, ref_phase, \
             r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
-            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI)
+            r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI, \
+            dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta)
 
     switch (n_coefs) {
         case 4: LAUNCH_KERNEL(4); break;
@@ -2205,7 +2322,8 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
           double w_r0_1, double w_dr1, double w_theta0_1, double w_dtheta1,
           int64_t w_nr1, int64_t w_ntheta1,
           int64_t output_weight_map,
-          int64_t output_weight_decimation) {
+          int64_t output_weight_decimation,
+          const at::Tensor &dem) {
 	TORCH_CHECK(img0.dtype() == at::kComplexFloat);
 	TORCH_CHECK(img1.dtype() == at::kComplexFloat);
 	TORCH_CHECK(dorigin.dtype() == at::kFloat);
@@ -2315,6 +2433,22 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
 	dim3 block_count = {block_x, 1, 1};
 
     const float ref_phase = 4.0f * fc / kC0;
+    const float* dem_ptr = nullptr;
+    at::Tensor dem_contig;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (dem.defined()) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr1;
+        dem_theta_scale = (float)dem_ntheta / Ntheta1;
+    }
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     int dec = output_weight_decimation > 0 ? output_weight_decimation : 1;
@@ -2326,7 +2460,8 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cuda(
             r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, alias, alias_fmod/kPI, \
             w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0, \
             w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1, \
-            dec)
+            dec, \
+            dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta)
 
     switch (n_coefs) {
         case 4: LAUNCH_WEIGHTED_KERNEL(4); break;

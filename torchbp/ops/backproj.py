@@ -54,6 +54,8 @@ def _prepare_backprojection_polar_2d_args(
             raise ValueError(f"att must have shape {expected_shape} when g is provided, got {att.shape}")
 
     z0 = 0
+    if dealias == 2 and dem is None:
+        raise ValueError("dealias=2 (DEM-referenced carrier) requires dem")
     if dealias:
         if nbatch != 1:
             raise ValueError("Only nbatch=1 supported with dealias")
@@ -172,9 +174,13 @@ def backprojection_polar_2d(
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
     d0 : float
         Zero range correction.
-    dealias : bool
+    dealias : bool or int
         If True removes the range spectrum aliasing. Equivalent to applying
         `torchbp.util.bp_polar_range_dealias` on the SAR image.
+        The integer value 2 references the dealias carrier to the DEM height
+        instead of the z=0 plane (requires `dem`); used internally by `ffbp`
+        so that the stored image residual stays terrain-free for the merge
+        interpolation.
         Default is False.
     att : Tensor
         Antenna rotation tensor.

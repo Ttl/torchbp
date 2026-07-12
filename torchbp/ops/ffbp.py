@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from typing import Union, TYPE_CHECKING
 from warnings import warn
@@ -219,6 +220,7 @@ def ffbp(
     weight_eps: float | None = None,
     afbp_nsub: int = 1,
     guard_max_ratio: float = 0.125,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -338,6 +340,20 @@ def ffbp(
         range degrades gracefully instead of exhausting memory. Increase
         for full edge accuracy at more memory, decrease (0 gives the
         minimum window support) for less memory. Default is 0.125.
+    dem : Tensor or None
+        Digital elevation model sampled on the scene polar grid. Shape
+        [dem_nr, dem_ntheta], covering the same r and theta extent as
+        `grid`; may be coarser than the image grid. Values are pixel z
+        coordinates in the same frame as `pos`. Resampled internally onto
+        every subaperture and merge grid; base images use the DEM-referenced
+        dealias carrier (``dealias=2``) so the merge interpolation sees a
+        terrain-free residual. With ``dealias=False`` the output matches
+        ``backprojection_polar_2d(..., dem=dem)``; with ``dealias=True`` the
+        output carrier is DEM-referenced (``dealias=2`` convention). Not
+        supported together with ``afbp_nsub > 1``. With an antenna pattern
+        the per-pulse gain weighting is DEM-aware but the W1/W2
+        illumination normalization maps still use flat-earth look angles
+        (a small amplitude approximation over terrain).
 
     Returns
     -------
@@ -381,13 +397,24 @@ def ffbp(
         if att.shape[0] != nsweeps:
             raise ValueError(f"att must have {nsweeps} sweeps, got {att.shape[0]}")
 
+    if dem is not None:
+        if afbp_nsub > 1:
+            raise NotImplementedError("afbp base level (afbp_nsub > 1) is not implemented with dem")
+        if dem.ndim != 2:
+            raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
+        if dem.dtype != torch.float32:
+            raise ValueError(f"dem must be float32, got {dem.dtype}")
+        if dem.device != data.device:
+            raise ValueError(f"dem must be on the same device as data ({data.device}), got {dem.device}")
+
     if nsweeps < divisions:
         # Too few sweeps to split into subapertures
         return backprojection_polar_2d(
-            data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
+            data, grid, fc, r_res, pos, d0=d0,
+            dealias=(2 if (dealias and dem is not None) else dealias),
             data_fmod=data_fmod,
             alias_fmod=alias_fmod if (output_alias and dealias) else 0.0,
-            att=att, g=g, g_extent=g_extent,
+            att=att, g=g, g_extent=g_extent, dem=dem,
         )[0]
 
     # Worst (needed / cap) guard shortfall over the whole merge tree,
@@ -403,6 +430,8 @@ def ffbp(
         afbp_nsub=afbp_nsub,
         guard_max_ratio=guard_max_ratio,
         guard_shortfall=guard_shortfall,
+        dem=dem,
+        dem_grid=grid,
     )
     # A small shortfall only truncates the window support of guard bins,
     # whose error reaches the scene attenuated by the interpolation kernel
@@ -420,6 +449,55 @@ def ffbp(
     if use_antenna_pattern:
         img = _weighted_normalize(img, result[1], result[2], eps=weight_eps)
     return img
+
+
+def _dem_on_node_grid(
+    dem: Tensor,
+    dem_grid: dict,
+    node_grid: dict,
+    off_xy: Tensor,
+) -> Tensor:
+    """Resample the top-level polar-grid DEM onto a tree node's polar grid.
+
+    The node grid is centered at an origin offset by ``off_xy`` (cumulative
+    over the recursion) from the top-level frame that ``dem`` is defined in
+    (extent from ``dem_grid``). The output resolution keeps the top DEM's
+    cell size, so a downsampled input stays downsampled. Points outside the
+    top DEM extent take the border value; guard band points |theta| > 1
+    sample at the clamped-cosine ground position like the kernels.
+    """
+    device = dem.device
+    dem_nr, dem_ntheta = dem.shape
+    top_r0, top_r1 = dem_grid["r"]
+    top_t0, top_t1 = dem_grid["theta"]
+    dem_dr = (top_r1 - top_r0) / dem_nr
+    dem_dt = (top_t1 - top_t0) / dem_ntheta
+
+    node_r0, node_r1 = node_grid["r"]
+    node_t0, node_t1 = node_grid["theta"]
+    out_nr = max(2, round((node_r1 - node_r0) / dem_dr))
+    out_nt = max(2, round((node_t1 - node_t0) / dem_dt))
+
+    r = node_r0 + (node_r1 - node_r0) / out_nr * torch.arange(
+        out_nr, device=device, dtype=torch.float32)
+    sin_t = node_t0 + (node_t1 - node_t0) / out_nt * torch.arange(
+        out_nt, device=device, dtype=torch.float32)
+    cos_t = torch.sqrt(torch.clamp(1.0 - sin_t * sin_t, min=0.0))
+    x = r[:, None] * cos_t[None, :] + off_xy[0]
+    y = r[:, None] * sin_t[None, :] + off_xy[1]
+    rt = torch.sqrt(x * x + y * y)
+    tt = y / torch.clamp(rt, min=1e-9)
+
+    # Fractional index into the top DEM (cell start convention), normalized
+    # for grid_sample with align_corners=True.
+    fi = (rt - top_r0) / dem_dr
+    fj = (tt - top_t0) / dem_dt
+    gy = 2.0 * fi / (dem_nr - 1) - 1.0
+    gx = 2.0 * fj / (dem_ntheta - 1) - 1.0
+    coords = torch.stack([gx, gy], dim=-1)[None]
+    return F.grid_sample(
+        dem[None, None], coords, mode="bilinear",
+        padding_mode="border", align_corners=True)[0, 0].contiguous()
 
 
 def _ffbp_impl(
@@ -451,8 +529,16 @@ def _ffbp_impl(
     guard_max_ratio: float = 0.125,
     pos_xy: list | None = None,
     guard_shortfall: list | None = None,
+    dem: Tensor | None = None,
+    dem_grid: dict | None = None,
+    dem_off: Tensor | None = None,
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients.
+
+    ``dem`` is the top-level polar-grid DEM (extent from ``dem_grid``) and
+    ``dem_off`` the cumulative xy offset of this node's frame from the
+    top-level frame; each node resamples the DEM onto its own grid with
+    :func:`_dem_on_node_grid`.
 
     ``core_theta`` is the scene theta extent, constant down the recursion;
     the node grid covers it plus a guard band (possibly asymmetric) whose
@@ -466,6 +552,9 @@ def _ffbp_impl(
     """
     nsweeps = data.shape[0]
     use_antenna_pattern = g is not None
+
+    if dem is not None and dem_off is None:
+        dem_off = torch.zeros(2, device=data.device, dtype=torch.float32)
 
     if pos_z is None:
         # Sweep coordinates as Python floats: the z0/new_z and guard sizing
@@ -627,6 +716,10 @@ def _ffbp_impl(
         # guard above _GUARD_STOP_FRAC of the subaperture image.
         min_core = int(4 * (a_bins + 1) * (1.0 / _GUARD_STOP_FRAC - 1.0))
         next_core = (core_nt_child + divisions - 1) // divisions
+        dem_off_local = None
+        if dem is not None:
+            dem_off_local = dem_off + origin_local[0][:2]
+
         if stages > 1 and len(data_local) >= 2 * divisions and next_core >= min_core:
             img, w1_map, w2_map, weight_grid = _ffbp_impl(
                 data_local,
@@ -657,6 +750,9 @@ def _ffbp_impl(
                 guard_max_ratio=guard_max_ratio,
                 pos_xy=pos_xy_local,
                 guard_shortfall=guard_shortfall,
+                dem=dem,
+                dem_grid=dem_grid,
+                dem_off=dem_off_local,
             )
         else:
             # When using antenna pattern, request unnormalized output
@@ -670,10 +766,16 @@ def _ffbp_impl(
                     normalize=normalize
                 )[None]
             else:
+                dem_local = None
+                if dem is not None:
+                    dem_local = _dem_on_node_grid(dem, dem_grid, grid_local,
+                                                  dem_off_local)
                 img = backprojection_polar_2d(
-                    data_local, grid_local, fc, r_res, pos_local, d0=d0, dealias=True,
+                    data_local, grid_local, fc, r_res, pos_local, d0=d0,
+                    dealias=(2 if dem_local is not None else True),
                     data_fmod=data_fmod, alias_fmod=alias_fmod,
-                    att=att_local, g=g, g_extent=g_extent, normalize=normalize
+                    att=att_local, g=g, g_extent=g_extent, normalize=normalize,
+                    dem=dem_local
                 )
 
             # Compute weight maps at base level for antenna pattern weighting
@@ -755,6 +857,14 @@ def _ffbp_impl(
         dorigin2 = new_origin - img2[0]
         dorigin2[2] = -(new_z - img2[3])
 
+        # DEM on the merge output grid: the merge carriers reference the 3D
+        # distance to the pixel at the DEM height, matching the dealias=2
+        # carrier of the base images.
+        dem_merge = None
+        if dem is not None:
+            dem_merge = _dem_on_node_grid(dem, dem_grid, grid_polar_new,
+                                          dem_off + new_origin[:2])
+
         # Get weight maps and grids
         # Tuple structure: (origin, grid, img, z0, w1_map, w2_map, weight_grid)
         w1_map1, w2_map1, wgrid1 = img1[4], img1[5], img1[6]
@@ -791,6 +901,7 @@ def _ffbp_impl(
                 weight_grid1=wgrid2,
                 output_weight_map=True,
                 output_weight_decimation=out_dec,
+                dem=dem_merge,
             )
         else:
             # Standard merge (no antenna pattern)
@@ -808,7 +919,8 @@ def _ffbp_impl(
                 alias_fmod=alias_fmod,
                 output_alias=out_alias,
                 use_poly=use_poly,
-                poly_coefs=poly_coefs
+                poly_coefs=poly_coefs,
+                dem=dem_merge
             )
             w1_out = None
             w2_out = None

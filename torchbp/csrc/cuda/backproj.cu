@@ -31,7 +31,7 @@ __global__ void backprojection_polar_2d_kernel(
           int Nr,
           int Ntheta,
           float d0,
-          bool dealias,
+          int dealias,
           float z0,
           float dealias_coef,
           float dealias_fmod,
@@ -282,8 +282,18 @@ __global__ void backprojection_polar_2d_kernel(
 
             if (dealias) {
                 // Range-row-only carrier (also for guard band pixels
-                // |theta| > 1 where x^2 + y^2 != r^2).
-                const float dd = sqrtf(r2[k] + z0*z0);
+                // |theta| > 1 where x^2 + y^2 != r^2). dealias == 2
+                // references the carrier to the DEM height instead of the
+                // z = 0 plane; ffbp uses it internally so that the stored
+                // image residual stays terrain-free for the merge
+                // interpolation.
+                float dd;
+                if (HasDem && dealias == 2) {
+                    const float zz = z0 - z[k];
+                    dd = sqrtf(fmaf(zz, zz, r2[k]));
+                } else {
+                    dd = sqrtf(r2[k] + z0*z0);
+                }
                 float ref_sin, ref_cos;
                 __sincosf(fmaf(dealias_coef, dd, dealias_fmod * (idr_base + k)), &ref_sin, &ref_cos);
                 complex64_t ref = {ref_cos, ref_sin};

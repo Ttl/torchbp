@@ -28,7 +28,7 @@ static void backprojection_polar_2d_row_cpu(
           int Nr,
           int Ntheta,
           float d0,
-          bool dealias,
+          int dealias,
           float z0,
           const float *g,
           float g_az0,
@@ -248,16 +248,33 @@ static void backprojection_polar_2d_row_cpu(
         }
         if (dealias) {
             // The carrier depends only on the range row (also for guard band
-            // pixels |theta| > 1 where x^2 + y^2 != r^2).
-            const float d = sqrtf(r2 + z0*z0);
-            float ref_sin, ref_cos;
-            sincospi(-ref_phase * d + alias_fmod * idr, &ref_sin, &ref_cos);
+            // pixels |theta| > 1 where x^2 + y^2 != r^2). dealias == 2
+            // references the carrier to the DEM height instead of the z = 0
+            // plane; ffbp uses it internally so that the stored image
+            // residual stays terrain-free for the merge interpolation. The
+            // carrier then varies with theta, so the phasor is per pixel.
+            if (HasDem && dealias == 2) {
+                for (int q = 0; q < nchunk; q++) {
+                    const float zz = z0 - z_buf[q];
+                    const float dq = sqrtf(r2 + zz*zz);
+                    float ref_sin, ref_cos;
+                    sincospi(-ref_phase * dq + alias_fmod * idr, &ref_sin, &ref_cos);
+                    const float pr = accr[q] * ref_cos - acci[q] * ref_sin;
+                    const float pi = accr[q] * ref_sin + acci[q] * ref_cos;
+                    accr[q] = pr;
+                    acci[q] = pi;
+                }
+            } else {
+                const float d = sqrtf(r2 + z0*z0);
+                float ref_sin, ref_cos;
+                sincospi(-ref_phase * d + alias_fmod * idr, &ref_sin, &ref_cos);
 #pragma omp simd
-            for (int q = 0; q < nchunk; q++) {
-                const float pr = accr[q] * ref_cos - acci[q] * ref_sin;
-                const float pi = accr[q] * ref_sin + acci[q] * ref_cos;
-                accr[q] = pr;
-                acci[q] = pi;
+                for (int q = 0; q < nchunk; q++) {
+                    const float pr = accr[q] * ref_cos - acci[q] * ref_sin;
+                    const float pi = accr[q] * ref_sin + acci[q] * ref_cos;
+                    accr[q] = pr;
+                    acci[q] = pi;
+                }
             }
         }
 #pragma omp simd

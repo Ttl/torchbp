@@ -773,6 +773,34 @@ class TestBackprojectionPolarDem(TestCase):
             data.cpu(), grid, 6e9, 0.15, pos.cpu(), dem=dem.cpu())
         torch.testing.assert_close(res_cpu, res_gpu, atol=1e-3, rtol=1e-2)
 
+    def _test_dealias2_constant_dem_equals_shifted_pos(self, device):
+        # DEM-referenced dealias carrier sqrt(r^2 + (z0 - h)^2) with a
+        # constant DEM h equals the flat r-only carrier with the platform
+        # lowered by h.
+        data, grid, pos = self._random_inputs(device)
+        h = 7.0
+        dem = torch.full((grid["nr"], grid["ntheta"]), h, device=device)
+        res = torchbp.ops.backprojection_polar_2d(
+            data[0], grid, 6e9, 0.15, pos[0], dealias=2, dem=dem)
+        pos_shift = pos[0].clone()
+        pos_shift[:, 2] -= h
+        ref = torchbp.ops.backprojection_polar_2d(
+            data[0], grid, 6e9, 0.15, pos_shift, dealias=True)
+        torch.testing.assert_close(res, ref, atol=1e-2, rtol=1e-2)
+
+    def test_dealias2_constant_dem_cpu(self):
+        self._test_dealias2_constant_dem_equals_shifted_pos("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_dealias2_constant_dem_cuda(self):
+        self._test_dealias2_constant_dem_equals_shifted_pos("cuda")
+
+    def test_dealias2_requires_dem(self):
+        data, grid, pos = self._random_inputs("cpu")
+        with self.assertRaises(ValueError):
+            torchbp.ops.backprojection_polar_2d(
+                data, grid, 6e9, 0.15, pos, dealias=2)
+
     def _test_dem_grad_raises(self, device):
         data, grid, pos = self._random_inputs(device)
         pos.requires_grad = True
@@ -923,6 +951,143 @@ class TestDemToPolar(TestCase):
         expected = 0.1 * y_dem - origin[2]
 
         torch.testing.assert_close(dem_polar, expected, atol=1e-3, rtol=1e-5)
+
+
+class TestFfbpDem(TestCase):
+    """DEM support through the full ffbp merge tree."""
+
+    def _random_scene(self, device):
+        torch.manual_seed(11)
+        nsweeps = 64
+        sweep_samples = 512
+        grid = {"r": (30.0, 60.0), "theta": (-0.4, 0.4), "nr": 96, "ntheta": 128}
+        data = torch.randn(nsweeps, sweep_samples, device=device,
+                           dtype=torch.complex64)
+        pos = torch.zeros(nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-2, 2, nsweeps, device=device)
+        pos[:, 2] = 25.0
+        return data, grid, pos
+
+    def _test_constant_dem_equals_shifted_pos(self, device):
+        # A constant DEM h through the whole merge tree (base dealias=2,
+        # DEM-referenced merge carriers, per-node resampling) must equal flat
+        # ffbp with the platform lowered by h: every distance and carrier is
+        # identical.
+        data, grid, pos = self._random_scene(device)
+        h = 9.0
+        dem = torch.full((grid["nr"], grid["ntheta"]), h, device=device)
+        res = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=3, dem=dem)
+        pos_shift = pos.clone()
+        pos_shift[:, 2] -= h
+        ref = torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos_shift, stages=3)
+        self.assertLess(
+            (torch.linalg.norm(res - ref) / torch.linalg.norm(ref)).item(),
+            1e-3)
+
+    def test_constant_dem_equals_shifted_pos_cpu(self):
+        self._test_constant_dem_equals_shifted_pos("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_constant_dem_equals_shifted_pos_cuda(self):
+        self._test_constant_dem_equals_shifted_pos("cuda")
+
+    def _terrain_scene(self, device):
+        # Point targets on a smooth terrain surface. The theta grid must
+        # oversample the aperture azimuth bandwidth lambda / (2 * L) for the
+        # ffbp merges: L = 10 m at 6 GHz gives 2.5e-3 in sin(theta), the
+        # grid steps 1.17e-3.
+        c0 = 299792458.0
+        fc = 6e9
+        bw = 200e6
+        tsweep = 100e-6
+        fs = 10e6
+        nsamples = int(fs * tsweep)
+        oversample = 2
+        r_res = c0 / (2 * bw * oversample)
+        nsweeps = 384
+        alt = 30.0
+
+        grid = {"r": (60.0, 100.0), "theta": (-0.3, 0.3), "nr": 320, "ntheta": 512}
+
+        def terrain(r, t):
+            return 8.0 + 5.0 * torch.sin(2 * torch.pi * (r - 60.0) / 45.0) \
+                + 3.0 * t
+
+        r0, r1 = grid["r"]
+        t0, t1 = grid["theta"]
+        nr, ntheta = grid["nr"], grid["ntheta"]
+        rr = r0 + (r1 - r0) / nr * torch.arange(nr, device=device)
+        tt = t0 + (t1 - t0) / ntheta * torch.arange(ntheta, device=device)
+        dem = terrain(rr[:, None], tt[None, :]).float()
+
+        tr = torch.tensor([70.0, 80.0, 90.0], device=device)
+        tth = torch.tensor([-0.15, 0.0, 0.12], device=device)
+        tz = terrain(tr, tth)
+        targets = torch.stack(
+            [tr * torch.sqrt(1 - tth**2), tr * tth, tz], dim=-1)
+
+        pos = torch.zeros(nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-5, 5, nsweeps, device=device)
+        pos[:, 2] = alt
+
+        rcs = torch.ones((targets.shape[0], 1), device=device)
+        raw = torchbp.util.generate_fmcw_data(
+            targets, rcs, pos, fc, bw, tsweep, fs, rvp=False)
+        w = torch.hamming_window(nsamples, periodic=False, device=device)
+        data = torch.fft.ifft(raw * w[None, :], dim=-1, n=nsamples * oversample)
+        return data, grid, fc, r_res, pos, dem, tr, tth
+
+    def _test_ffbp_dem_matches_direct_bp(self, device):
+        data, grid, fc, r_res, pos, dem, tr, tth = self._terrain_scene(device)
+        img_bp = torchbp.ops.backprojection_polar_2d(
+            data, grid, fc, r_res, pos, dem=dem)[0]
+        img_ffbp = torchbp.ops.ffbp(
+            data, grid, fc, r_res, pos, stages=3, dem=dem)
+        rel = (torch.linalg.norm(img_ffbp - img_bp)
+               / torch.linalg.norm(img_bp)).item()
+        # The merge interpolation error on a sparse point scene dominates
+        # the relative L2, so the meaningful check is that the DEM does not
+        # degrade the ffbp accuracy relative to the flat-earth case.
+        img_bp_flat = torchbp.ops.backprojection_polar_2d(
+            data, grid, fc, r_res, pos)[0]
+        img_ffbp_flat = torchbp.ops.ffbp(
+            data, grid, fc, r_res, pos, stages=3)
+        rel_flat = (torch.linalg.norm(img_ffbp_flat - img_bp_flat)
+                    / torch.linalg.norm(img_bp_flat)).item()
+        self.assertLess(rel, 0.25)
+        self.assertLess(rel, rel_flat + 0.02)
+
+        # Peaks land on the true target ground positions.
+        r0, r1 = grid["r"]
+        t0, t1 = grid["theta"]
+        dr = (r1 - r0) / grid["nr"]
+        dt = (t1 - t0) / grid["ntheta"]
+        a = torch.abs(img_ffbp)
+        for k in range(tr.shape[0]):
+            ir = int(round(((tr[k].item() - r0) / dr)))
+            it = int(round(((tth[k].item() - t0) / dt)))
+            win = a[max(0, ir - 8):ir + 9, max(0, it - 8):it + 9]
+            peak = torch.argmax(win)
+            pr = peak.item() // win.shape[1] + max(0, ir - 8)
+            pt = peak.item() % win.shape[1] + max(0, it - 8)
+            self.assertLessEqual(abs(pr - ir), 2)
+            self.assertLessEqual(abs(pt - it), 2)
+
+    def test_ffbp_dem_matches_direct_bp_cpu(self):
+        self._test_ffbp_dem_matches_direct_bp("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_ffbp_dem_matches_direct_bp_cuda(self):
+        self._test_ffbp_dem_matches_direct_bp("cuda")
+
+    def test_afbp_dem_raises(self):
+        data, grid, pos = self._random_scene("cpu")
+        dem = torch.zeros(grid["nr"], grid["ntheta"])
+        with self.assertRaises(NotImplementedError):
+            torchbp.ops.afbp(data, grid, 6e9, 0.15, pos, nsub=2, dem=dem)
+        with self.assertRaises(NotImplementedError):
+            torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=2,
+                             afbp_nsub=2, dem=dem)
 
 
 class TestBackprojectionPolarAntennaPattern(TestCase):
@@ -3661,7 +3826,7 @@ class TestFFBPMerge2Lanczos(TestCase):
             cpp_args = (img0, img1, dorigin, fc,
                        r0, dr0, theta0, dtheta0, Nr0, Ntheta0,
                        r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3,
-                       z0, order, alias_mode, alias_fmod)
+                       z0, order, alias_mode, alias_fmod, None)
 
             opcheck(
                 torch.ops.torchbp.ffbp_merge2_lanczos,
