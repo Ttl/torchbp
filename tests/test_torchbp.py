@@ -3125,7 +3125,7 @@ class TestFFBPTxPower(TestCase):
         opcheck(
             torch.ops.torchbp.backprojection_polar_2d_tx_power_accum,
             (wa, pos, att, g, -1.0, -0.5, 2.0 / 8, 1.0 / 8, 8, 8, 4,
-             1.0, 0.5, -0.9, 0.2, 8, 8, 1, 0.5, 10.0, 0.0, 0),
+             1.0, 0.5, -0.9, 0.2, 8, 8, 1, 0.5, 10.0, 0.0, 0, None),
             test_utils=["test_schema"],
         )
         acc0 = torch.rand(4, 8, 8, device=device)

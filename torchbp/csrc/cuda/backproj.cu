@@ -668,6 +668,7 @@ __global__ void gpga_backprojection_2d_lanczos_kernel(
 }
 
 
+template <bool HasDem>
 __global__ void backprojection_polar_2d_tx_power_kernel(
           const float* wa,
           const float* pos,
@@ -690,7 +691,12 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
           int Ntheta,
           int normalization,
           int azimuth_resolution,
-          float altitude) {
+          float altitude,
+          const float* dem,
+          float dem_r_scale,
+          float dem_theta_scale,
+          int dem_nr,
+          int dem_ntheta) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
     const int idr = idx / Ntheta;
@@ -725,17 +731,31 @@ __global__ void backprojection_polar_2d_tx_power_kernel(
         z_eff = 0.0f;  // will use per-sweep pos_z
     }
 
+    // Pixel height and terrain slopes. The DEM shares the grid extent, so
+    // pixel index maps to DEM index by a constant ratio (edge-clamped, same
+    // convention as the coherent kernels). DEM with a slant grid is rejected
+    // by the dispatcher, so HasDem implies altitude == 0.
+    float z_pix = 0.0f, dzdx = 0.0f, dzdy = 0.0f;
+    if constexpr (HasDem) {
+        tx_power_dem_sample(dem, dem_nr, dem_ntheta,
+                idr * dem_r_scale, idtheta * dem_theta_scale,
+                &z_pix, &dzdx, &dzdy);
+    }
+
     // Squared sine of the angle subtended by one range cell at nadir, used
-    // as a floor on sin^2 of the look angle.
+    // as a floor on sin^2 of the look angle. With a DEM the reference height
+    // is above the pixel, so constant DEM == shifted platform holds exactly.
     float h_ref = (altitude > 0.0f) ? altitude
                   : pos[idbatch * nsweeps * 3 + (nsweeps/2) * 3 + 2];
+    if constexpr (HasDem) h_ref = fmaxf(h_ref - z_pix, 1e-3f);
     const float min_sin2_look = 2.0f * dr / h_ref;
 
     // Per-sweep accumulation (shared helper). nbatch is handled by offsetting
     // the pointers. Slant grids use a fixed reference height (z_eff = altitude),
     // ground grids the per-sweep platform z.
     float pixel, m_w, m_mean, m_s;
-    tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/altitude > 0.0f, z_eff,
+    tx_power_pixel_moments<HasDem>(px_base, py_base,
+            /*use_h_fixed=*/altitude > 0.0f, z_eff, z_pix, dzdx, dzdy,
             pos + (size_t)idbatch * nsweeps * 3, att + (size_t)idbatch * nsweeps * 3,
             nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
             wa + (size_t)idbatch * nsweeps, normalization, min_sin2_look,
@@ -803,6 +823,7 @@ __global__ void backprojection_cart_2d_tx_power_kernel(
     // the pointers. Cartesian ground grid: per-sweep height is the platform z.
     float pixel, m_w, m_mean, m_s;
     tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/false, 0.0f,
+            0.0f, 0.0f, 0.0f,
             pos + (size_t)idbatch * nsweeps * 3, att + (size_t)idbatch * nsweeps * 3,
             nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
             wa + (size_t)idbatch * nsweeps, normalization, min_sin2_look,
@@ -822,6 +843,7 @@ __global__ void backprojection_cart_2d_tx_power_kernel(
     img[idbatch * Nx * Ny + idx_x * Ny + idy] = sqrtf(pixel);
 }
 
+template <bool HasDem>
 __global__ void backprojection_polar_2d_tx_power_accum_kernel(
           const float* wa,
           const float* pos,
@@ -845,7 +867,12 @@ __global__ void backprojection_polar_2d_tx_power_accum_kernel(
           float dr_ref,
           float h_ref,
           float altitude,
-          int theta_psi) {
+          int theta_psi,
+          const float* dem,
+          float dem_r_scale,
+          float dem_theta_scale,
+          int dem_nr,
+          int dem_ntheta) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int idtheta = idx % Ntheta;
     const int idr = idx / Ntheta;
@@ -888,16 +915,33 @@ __global__ void backprojection_polar_2d_tx_power_accum_kernel(
         z_eff = 0.0f;  // will use per-sweep pos_z
     }
 
-    // Angular size of resolution cell at nadir. dr_ref and h_ref refer to the
-    // final output grid so that subaperture grids use the same clamp floor.
-    const float min_look_angle = sqrtf(2.0f * dr_ref / h_ref);
+    // Pixel height and terrain slopes. The DEM is resampled onto this node
+    // grid's own axis parameterization (uniform psi for theta_psi grids) on
+    // the Python side, so the index mapping is the same constant ratio as the
+    // direct kernel. DEM with a slant grid is rejected by the dispatcher.
+    float z_pix = 0.0f, dzdx = 0.0f, dzdy = 0.0f;
+    if constexpr (HasDem) {
+        tx_power_dem_sample(dem, dem_nr, dem_ntheta,
+                idr * dem_r_scale, idtheta * dem_theta_scale,
+                &z_pix, &dzdx, &dzdy);
+    }
+
+    // Squared sine of the angle subtended by one range cell at nadir, used
+    // as a floor on sin^2 of the look angle. dr_ref and h_ref refer to the
+    // final output grid so that subaperture grids use the same clamp floor
+    // as the direct kernel. With a DEM the reference height is above the
+    // pixel.
+    float h_ref_pix = h_ref;
+    if constexpr (HasDem) h_ref_pix = fmaxf(h_ref - z_pix, 1e-3f);
+    const float min_sin2_look = 2.0f * dr_ref / h_ref_pix;
 
     // Polar grid: slant grids use a fixed reference height (z_eff = altitude),
     // ground grids the per-sweep platform z.
     float pixel, m_w, m_mean, m_s;
-    tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/altitude > 0.0f, z_eff,
+    tx_power_pixel_moments<HasDem>(px_base, py_base,
+            /*use_h_fixed=*/altitude > 0.0f, z_eff, z_pix, dzdx, dzdy,
             pos, att, nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
-            wa, normalization, min_look_angle,
+            wa, normalization, min_sin2_look,
             &pixel, &m_w, &m_mean, &m_s);
 
     // Unfinished accumulators for factorized (ffbp style) processing:
@@ -954,6 +998,7 @@ __global__ void backprojection_cart_2d_tx_power_accum_kernel(
     // Cartesian ground grid: per-sweep height is the platform z.
     float pixel, m_w, m_mean, m_s;
     tx_power_pixel_moments(px_base, py_base, /*use_h_fixed=*/false, 0.0f,
+            0.0f, 0.0f, 0.0f,
             pos, att, nsweeps, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
             wa, normalization, min_sin2_look,
             &pixel, &m_w, &m_mean, &m_s);
@@ -2818,7 +2863,8 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
           int64_t Nr,
           int64_t Ntheta,
           int64_t normalization,
-          int64_t azimuth_resolution) {
+          int64_t azimuth_resolution,
+          const at::Tensor &dem) {
 	TORCH_CHECK(wa.dtype() == at::kFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
@@ -2827,6 +2873,24 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    int dem_nr = 0, dem_ntheta = 0;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 3 && dem.size(0) == 3,
+                "dem must be [3, dem_nr, dem_ntheta] (z, dz/dx, dz/dy)");
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(1);
+        dem_ntheta = dem_contig.size(2);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
 
 	at::Tensor wa_contig = wa.contiguous();
 	at::Tensor pos_contig = pos.contiguous();
@@ -2853,7 +2917,9 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    backprojection_polar_2d_tx_power_kernel
+    auto kern = has_dem ? &backprojection_polar_2d_tx_power_kernel<true>
+                        : &backprojection_polar_2d_tx_power_kernel<false>;
+    kern
           <<<block_count, thread_per_block, 0, stream>>>(
                   wa_ptr,
                   pos_ptr,
@@ -2873,7 +2939,9 @@ at::Tensor backprojection_polar_2d_tx_power_cuda(
                   Nr, Ntheta,
                   normalization,
                   azimuth_resolution,
-                  0.0f);
+                  0.0f,
+                  dem_ptr, dem_r_scale, dem_theta_scale,
+                  dem_nr, dem_ntheta);
 	return img;
 }
 
@@ -2933,7 +3001,7 @@ at::Tensor backprojection_polar_2d_tx_power_slant_cuda(
 	dim3 block_count = {block_x, static_cast<unsigned int>(nbatch)};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    backprojection_polar_2d_tx_power_kernel
+    backprojection_polar_2d_tx_power_kernel<false>
           <<<block_count, thread_per_block, 0, stream>>>(
                   wa_ptr,
                   pos_ptr,
@@ -2953,7 +3021,8 @@ at::Tensor backprojection_polar_2d_tx_power_slant_cuda(
                   Nr, Ntheta,
                   normalization,
                   azimuth_resolution,
-                  static_cast<float>(altitude));
+                  static_cast<float>(altitude),
+                  nullptr, 0.0f, 0.0f, 0, 0);
 	return img;
 }
 
@@ -3057,7 +3126,8 @@ at::Tensor backprojection_polar_2d_tx_power_accum_cuda(
           double dr_ref,
           double h_ref,
           double altitude,
-          int64_t theta_psi) {
+          int64_t theta_psi,
+          const at::Tensor &dem) {
 	TORCH_CHECK(wa.dtype() == at::kFloat);
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(att.dtype() == at::kFloat);
@@ -3066,6 +3136,26 @@ at::Tensor backprojection_polar_2d_tx_power_accum_cuda(
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CUDA);
 	TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CUDA);
+
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    int dem_nr = 0, dem_ntheta = 0;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 3 && dem.size(0) == 3,
+                "dem must be [3, dem_nr, dem_ntheta] (z, dz/dx, dz/dy)");
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CUDA);
+        TORCH_CHECK(altitude == 0.0,
+                "dem with a slant-range grid is not supported");
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(1);
+        dem_ntheta = dem_contig.size(2);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
 
 	at::Tensor wa_contig = wa.contiguous();
 	at::Tensor pos_contig = pos.contiguous();
@@ -3090,7 +3180,9 @@ at::Tensor backprojection_polar_2d_tx_power_accum_cuda(
 	dim3 block_count = {block_x, 1};
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    backprojection_polar_2d_tx_power_accum_kernel
+    auto kern = has_dem ? &backprojection_polar_2d_tx_power_accum_kernel<true>
+                        : &backprojection_polar_2d_tx_power_accum_kernel<false>;
+    kern
           <<<block_count, thread_per_block, 0, stream>>>(
                   wa_ptr,
                   pos_ptr,
@@ -3111,7 +3203,9 @@ at::Tensor backprojection_polar_2d_tx_power_accum_cuda(
                   static_cast<float>(dr_ref),
                   static_cast<float>(h_ref),
                   static_cast<float>(altitude),
-                  static_cast<int>(theta_psi));
+                  static_cast<int>(theta_psi),
+                  dem_ptr, dem_r_scale, dem_theta_scale,
+                  dem_nr, dem_ntheta);
 	return img;
 }
 

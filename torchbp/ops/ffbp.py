@@ -462,6 +462,7 @@ def _dem_on_node_grid(
     dem_grid: dict,
     node_grid: dict,
     off_xy: Tensor,
+    theta_psi_out: bool = False,
 ) -> Tensor:
     """Resample the top-level polar-grid DEM onto a tree node's polar grid.
 
@@ -471,9 +472,16 @@ def _dem_on_node_grid(
     cell size, so a downsampled input stays downsampled. Points outside the
     top DEM extent take the border value; guard band points |theta| > 1
     sample at the clamped-cosine ground position like the kernels.
+
+    ``dem`` can be [dem_nr, dem_ntheta] or a multi-channel
+    [C, dem_nr, dem_ntheta] stack (the tx_power (z, dz/dx, dz/dy) stack;
+    the slope channels are Cartesian and translation invariant, so plain
+    offset resampling is exact up to interpolation). With ``theta_psi_out``
+    the node grid theta extents are in psi radians (tx_power subaperture
+    grids) and the output is sampled uniformly in psi.
     """
     device = dem.device
-    dem_nr, dem_ntheta = dem.shape
+    dem_nr, dem_ntheta = dem.shape[-2:]
     top_r0, top_r1 = dem_grid["r"]
     top_t0, top_t1 = dem_grid["theta"]
     dem_dr = (top_r1 - top_r0) / dem_nr
@@ -486,9 +494,14 @@ def _dem_on_node_grid(
 
     r = node_r0 + (node_r1 - node_r0) / out_nr * torch.arange(
         out_nr, device=device, dtype=torch.float32)
-    sin_t = node_t0 + (node_t1 - node_t0) / out_nt * torch.arange(
+    t = node_t0 + (node_t1 - node_t0) / out_nt * torch.arange(
         out_nt, device=device, dtype=torch.float32)
-    cos_t = torch.sqrt(torch.clamp(1.0 - sin_t * sin_t, min=0.0))
+    if theta_psi_out:
+        sin_t = torch.sin(t)
+        cos_t = torch.cos(t)
+    else:
+        sin_t = t
+        cos_t = torch.sqrt(torch.clamp(1.0 - sin_t * sin_t, min=0.0))
     x = r[:, None] * cos_t[None, :] + off_xy[0]
     y = r[:, None] * sin_t[None, :] + off_xy[1]
     rt = torch.sqrt(x * x + y * y)
@@ -501,9 +514,11 @@ def _dem_on_node_grid(
     gy = 2.0 * fi / (dem_nr - 1) - 1.0
     gx = 2.0 * fj / (dem_ntheta - 1) - 1.0
     coords = torch.stack([gx, gy], dim=-1)[None]
-    return F.grid_sample(
-        dem[None, None], coords, mode="bilinear",
-        padding_mode="border", align_corners=True)[0, 0].contiguous()
+    inp = dem[None, None] if dem.dim() == 2 else dem[None]
+    out = F.grid_sample(
+        inp, coords, mode="bilinear",
+        padding_mode="border", align_corners=True)[0]
+    return (out[0] if dem.dim() == 2 else out).contiguous()
 
 
 def _ffbp_impl(
@@ -1059,12 +1074,20 @@ def _ffbp_tx_power_impl(
     altitude: float,
     grid_out: dict | None = None,
     is_top_level: bool = True,
+    dem: Tensor | None = None,
+    dem_grid: dict | None = None,
+    dem_off: Tensor | None = None,
 ) -> tuple[Tensor, dict, Tensor] | None:
     """Recursive tx_power accumulator map computation.
 
     Returns (acc, grid, frame_offset) where frame_offset is the origin of the
     accumulator map frame relative to this node's frame, or None if no pulse
     of this node illuminates the output grid.
+
+    dem is the top-level [3, dem_nr, dem_ntheta] (z, dz/dx, dz/dy) stack on
+    dem_grid; dem_off is the cumulative xy offset of this node's frame from
+    the top-level frame. The accumulators are phase-free, so the DEM only
+    enters the leaf kernels; the merges are untouched.
     """
     nsweeps = wa.shape[0]
     device = wa.device
@@ -1088,13 +1111,15 @@ def _ffbp_tx_power_impl(
         boundary_local = boundary - o[None, :2]
         wa_local = wa[i0:i1]
         att_local = att[i0:i1]
+        dem_off_local = dem_off + o[:2] if dem is not None else None
 
         if stages > 1 and i1 - i0 > min_nsweeps:
             child = _ffbp_tx_power_impl(
                 wa_local, pos_local, att_local, boundary_local,
                 stages - 1, divisions, g, g_extent, g_daz, normalization,
                 sub_dr, sub_dpsi, margin, min_nr, min_ntheta, min_nsweeps,
-                dr_ref, h_ref, altitude, grid_out=None, is_top_level=False)
+                dr_ref, h_ref, altitude, grid_out=None, is_top_level=False,
+                dem=dem, dem_grid=dem_grid, dem_off=dem_off_local)
             if child is None:
                 continue
             acc, grid_local, child_offset = child
@@ -1105,9 +1130,15 @@ def _ffbp_tx_power_impl(
                 sub_dr, sub_dpsi, margin, min_nr, min_ntheta, altitude)
             if grid_local is None:
                 continue
+            dem_local = None
+            if dem is not None:
+                dem_local = _dem_on_node_grid(
+                    dem, dem_grid, grid_local, dem_off_local,
+                    theta_psi_out=True)
             acc = _backprojection_polar_2d_tx_power_accum(
                 wa_local, g, g_extent, grid_local, pos_local, att_local,
-                normalization, dr_ref, h_ref, altitude, theta_psi=True)
+                normalization, dr_ref, h_ref, altitude, theta_psi=True,
+                dem=dem_local)
             offset = o
         nodes.append((acc, grid_local, offset))
 
@@ -1152,6 +1183,7 @@ def backprojection_polar_2d_tx_power_ffbp(
     margin: int = 4,
     altitude: float = 0.0,
     beam_theta_samples: float = 32.0,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """
     Fast factorized version of :func:`backprojection_polar_2d_tx_power`.
@@ -1250,6 +1282,16 @@ def backprojection_polar_2d_tx_power_ffbp(
         A quarter of the same sample density is applied to the range step
         relative to the elevation beamwidth, which matters only when the
         near edge of the grid approaches nadir.
+    dem : Tensor or None
+        Digital elevation model heights on the output polar grid, same
+        convention as :func:`backprojection_polar_2d_tx_power` (shape
+        [dem_nr, dem_ntheta] covering the grid extent, resolution can be
+        lower). Resampled onto each subaperture node grid; the phase-free
+        accumulator merges need no DEM. Not supported with ``altitude > 0``.
+        With ``normalization="gamma"`` the illumination goes to zero where
+        the terrain approaches grazing local incidence; inside those
+        near-null bands the interpolated maps are approximate like the
+        illumination edges.
 
     Returns
     -------
@@ -1266,6 +1308,25 @@ def backprojection_polar_2d_tx_power_ffbp(
     assert pos.shape == (nsweeps, 3)
     assert att.shape == (nsweeps, 3)
     device = wa.device
+
+    dem3 = None
+    dem_grid = None
+    dem_off0 = None
+    if dem is not None:
+        if altitude > 0.0:
+            raise NotImplementedError(
+                "dem is not supported with a slant-range grid (altitude > 0)")
+        if dem.ndim != 2:
+            raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
+        if dem.dtype != torch.float32:
+            raise ValueError(f"dem must be float32, got {dem.dtype}")
+        if dem.device != device:
+            raise ValueError(f"dem must be on the same device as wa ({device}), got {dem.device}")
+        from ..util import polar_dem_slopes
+        dem3 = polar_dem_slopes(dem, grid)
+        dem_grid = {"r": grid["r"], "theta": grid["theta"],
+                    "nr": dem.shape[0], "ntheta": dem.shape[1]}
+        dem_off0 = torch.zeros(2, device=device, dtype=torch.float32)
 
     g_el0, g_az0, g_el1, g_az1 = g_extent
     g_daz = (g_az1 - g_az0) / g.shape[1]
@@ -1323,7 +1384,8 @@ def backprojection_polar_2d_tx_power_ffbp(
     node = _ffbp_tx_power_impl(
         wa, pos, att, boundary, stages, divisions, g, g_extent, g_daz,
         normalization, sub_dr, sub_dpsi, margin, min_nr, min_ntheta,
-        min_nsweeps, dr, h_ref, altitude, grid_out=grid, is_top_level=True)
+        min_nsweeps, dr, h_ref, altitude, grid_out=grid, is_top_level=True,
+        dem=dem3, dem_grid=dem_grid, dem_off=dem_off0)
 
     if node is None:
         acc = torch.zeros((4, nr, ntheta), dtype=torch.float32, device=device)

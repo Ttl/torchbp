@@ -918,6 +918,7 @@ def _backprojection_polar_2d_tx_power_accum(
     h_ref: float,
     altitude: float = 0.0,
     theta_psi: bool = False,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """Unfinished tx_power accumulator maps for factorized processing.
 
@@ -929,6 +930,12 @@ def _backprojection_polar_2d_tx_power_accum(
     reference altitude so that all subapertures use the same minimum look
     angle clamp as the direct kernel. With theta_psi the grid theta extents
     are in psi = asin(theta) radians and the map is sampled uniformly in psi.
+
+    dem is an already stacked [3, dem_nr, dem_ntheta] (z, dz/dx, dz/dy)
+    tensor (see :func:`torchbp.util.polar_dem_slopes`), already resampled
+    onto this grid's extent and axis parameterization (uniform psi when
+    theta_psi is set). Slopes are in the top-level Cartesian frame; z is in
+    the frame of ``pos``.
     """
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
 
@@ -948,7 +955,7 @@ def _backprojection_polar_2d_tx_power_accum(
     return torch.ops.torchbp.backprojection_polar_2d_tx_power_accum.default(
         wa, pos, att, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
         nsweeps, r0, dr, theta0, dtheta, nr, ntheta, norm,
-        dr_ref, h_ref, altitude, int(theta_psi))
+        dr_ref, h_ref, altitude, int(theta_psi), dem)
 
 
 def _prepare_backprojection_polar_2d_tx_power_args(
@@ -961,10 +968,12 @@ def _prepare_backprojection_polar_2d_tx_power_args(
     att: Tensor,
     normalization: str | None = None,
     azimuth_resolution: bool = True,
+    dem: Tensor | None = None,
 ) -> tuple:
     """Prepare arguments for C++ backprojection_polar_2d_tx_power operator.
 
-    Returns tuple of arguments matching C++ operator signature.
+    Returns tuple of arguments matching C++ operator signature; ``dem`` is
+    stacked with its Cartesian slopes and appended last.
     Used internally by backprojection_polar_2d_tx_power and for testing.
     """
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
@@ -988,9 +997,20 @@ def _prepare_backprojection_polar_2d_tx_power_args(
 
     norm = _tx_power_norm_int(normalization)
 
+    dem3 = None
+    if dem is not None:
+        if dem.ndim != 2:
+            raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
+        if dem.dtype != torch.float32:
+            raise ValueError(f"dem must be float32, got {dem.dtype}")
+        if dem.device != wa.device:
+            raise ValueError(f"dem must be on the same device as wa ({wa.device}), got {dem.device}")
+        from ..util import polar_dem_slopes
+        dem3 = polar_dem_slopes(dem, grid)
+
     return (wa, pos, att, g, nbatch, g_az0, g_el0, g_daz, g_del,
             g_naz, g_nel, nsweeps, r_res, r0, dr, theta0, dtheta,
-            nr, ntheta, norm, int(azimuth_resolution))
+            nr, ntheta, norm, int(azimuth_resolution), dem3)
 
 
 def backprojection_polar_2d_tx_power(
@@ -1003,6 +1023,7 @@ def backprojection_polar_2d_tx_power(
     att: Tensor,
     normalization: str | None = None,
     azimuth_resolution: bool = True,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """
     Calculate square root of transmitted power to image plane. Can be used to
@@ -1063,6 +1084,23 @@ def backprojection_polar_2d_tx_power(
         Pixels with fewer than two contributing sweeps have no measurable
         azimuth aperture and are set to inf.
         Set to False to get the pure antenna/range illumination.
+    dem : Tensor or None
+        Digital elevation model heights, shape [dem_nr, dem_ntheta], sampled
+        on the image polar grid: same r and theta extent as `grid`. The
+        resolution can be lower than the image grid, in which case heights
+        are interpolated bilinearly for each pixel. Values are pixel z
+        coordinates in the same coordinate system as `pos`.
+        `torchbp.util.dem_to_polar` can be used to resample a Cartesian DEM
+        to the polar grid. Default is None: pixels lie on the z=0 plane.
+        The DEM height fixes the range and the antenna pattern elevation
+        angle, and the "sigma" and "gamma" normalizations use the local
+        terrain slope: "sigma" divides by the projected-area factor
+        (sin(inc) - u*cos(inc))/N with up-range slope u and surface normal
+        magnitude N (terrain surface area normalization), "gamma"
+        additionally divides by the cosine of the local incidence angle
+        (terrain-flattened gamma). Layover folds clamp at the nadir
+        resolution floor; facets past grazing (shadow) contribute nearly
+        zero to the gamma illumination.
 
     Returns
     -------
@@ -1071,7 +1109,8 @@ def backprojection_polar_2d_tx_power(
         pixel assuming constant reflectivity.
     """
     cpp_args = _prepare_backprojection_polar_2d_tx_power_args(
-        wa, g, g_extent, grid, r_res, pos, att, normalization, azimuth_resolution
+        wa, g, g_extent, grid, r_res, pos, att, normalization,
+        azimuth_resolution, dem
     )
     return torch.ops.torchbp.backprojection_polar_2d_tx_power.default(*cpp_args)
 
@@ -1087,6 +1126,7 @@ def backprojection_polar_2d_tx_power_slant(
     altitude: float,
     normalization: str | None = None,
     azimuth_resolution: bool = True,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """
     Slant-range variant of :func:`backprojection_polar_2d_tx_power`.
@@ -1103,17 +1143,23 @@ def backprojection_polar_2d_tx_power_slant(
         Same as :func:`backprojection_polar_2d_tx_power`.
     altitude : float
         Sensor altitude above ground (metres).  Must be > 0.
+    dem : Tensor or None
+        Not supported for the slant variant; must be None.
 
     Returns
     -------
     tx_power : Tensor
         Same as :func:`backprojection_polar_2d_tx_power`.
     """
+    if dem is not None:
+        raise NotImplementedError(
+            "dem is not supported with the slant tx_power variant")
     cpp_args = _prepare_backprojection_polar_2d_tx_power_args(
         wa, g, g_extent, grid, r_res, pos, att, normalization, azimuth_resolution
     )
+    # The slant schema has no dem argument; drop the trailing None.
     return torch.ops.torchbp.backprojection_polar_2d_tx_power_slant.default(
-        *cpp_args, altitude
+        *cpp_args[:-1], altitude
     )
 
 

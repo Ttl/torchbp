@@ -59,6 +59,32 @@ static T interp2d_grady(const T *img, int nx, int ny,
 
 // Shared tx_power helpers (CPU). Mirrored in cuda/util.h.
 //
+// Edge-clamped bilinear sample of the 3 tx_power DEM channels (z, dz/dx,
+// dz/dy) at fractional cell (fr, ft). Same cell-start index convention as the
+// image->DEM mapping fr = idr * dem_nr / nr used by the coherent kernels.
+static inline void tx_power_dem_sample(const float* dem, int dem_nr,
+        int dem_ntheta, float fr, float ft,
+        float* z, float* dzdx, float* dzdy) {
+    int ir0 = (int)fr;
+    ir0 = ir0 < dem_nr - 1 ? ir0 : dem_nr - 1;
+    const int ir1 = ir0 + 1 < dem_nr ? ir0 + 1 : dem_nr - 1;
+    const float wr = fr - ir0;
+    int it0 = (int)ft;
+    it0 = it0 < dem_ntheta - 1 ? it0 : dem_ntheta - 1;
+    const int it1 = it0 + 1 < dem_ntheta ? it0 + 1 : dem_ntheta - 1;
+    const float wt = ft - it0;
+    const size_t np = (size_t)dem_nr * dem_ntheta;
+    float out[3];
+    for (int c = 0; c < 3; c++) {
+        const float* row0 = dem + c * np + (size_t)ir0 * dem_ntheta;
+        const float* row1 = dem + c * np + (size_t)ir1 * dem_ntheta;
+        const float a = row0[it0] + wt * (row0[it1] - row0[it0]);
+        const float b = row1[it0] + wt * (row1[it1] - row1[it0]);
+        out[c] = a + wr * (b - a);
+    }
+    *z = out[0]; *dzdx = out[1]; *dzdy = out[2];
+}
+
 // Accumulate the transmit-power moments for one ground pixel over all sweeps.
 // px_base, py_base: pixel ground position. Per sweep the platform height is
 // h_fixed (slant grid) or the sweep pos z (ground grid). min_sin2 is the floor
@@ -66,18 +92,41 @@ static T interp2d_grady(const T *img, int nx, int ny,
 // pixel = sum wi/sinl and the Welford weighted moments (m_w, m_mean, m_s) of
 // the ground-frame line-of-sight azimuth. Shared by the direct and factorized
 // (accum) polar and Cartesian tx_power kernels.
+//
+// With HasDem the pixel sits at height z_base with Cartesian terrain slopes
+// (dzdx, dzdy): the platform height over the pixel becomes pos_z - z_base
+// (also fixing the antenna elevation lookup), and sigma/gamma use the local
+// patch orientation instead of the flat-ground incidence. With up-range slope
+// u = s/Rg along the ground LOS and normal magnitude N = sqrt(1+|grad z|^2):
+//   sigma_0: projected-area factor (Ulander) (sin(inc) - u*cos(inc))/N;
+//            the azimuth slope enters only through N.
+//   gamma_0: additionally divided by cos(local incidence) = (s+h)/(d*N)
+//            (terrain-flattened gamma).
+// Both clamp at the flat-formula floor (max(sqrt(f), x) == sqrt(max(f, x^2))
+// for x >= 0, so zero slopes reproduce the flat expressions exactly). Layover
+// folds clamp at the floor since tx_power is a divisor; shadowed patches
+// (gamma) roll continuously to near-zero contribution via the clamped
+// cos(local incidence).
+template<bool HasDem = false>
 static inline void tx_power_pixel_moments(
         float px_base, float py_base, bool use_h_fixed, float h_fixed,
+        float z_base, float dzdx, float dzdy,
         const float* pos, const float* att, int nsweeps,
         const float* g, float g_az0, float g_el0, float g_daz, float g_del,
         int g_naz, int g_nel, const float* wa, int normalization,
         float min_sin2,
         float* pixel, float* m_w, float* m_mean, float* m_s) {
     float acc = 0.0f, mw = 0.0f, mmean = 0.0f, ms = 0.0f;
+    float inv_N = 1.0f, sin_floor = 0.0f;
+    if constexpr (HasDem) {
+        inv_N = 1.0f / sqrtf(1.0f + dzdx*dzdx + dzdy*dzdy);
+        sin_floor = sqrtf(min_sin2);
+    }
     for (int i = 0; i < nsweeps; i++) {
         const float px = px_base - pos[i*3 + 0];
         const float py = py_base - pos[i*3 + 1];
-        const float h = use_h_fixed ? h_fixed : pos[i*3 + 2];
+        float h = use_h_fixed ? h_fixed : pos[i*3 + 2];
+        if constexpr (HasDem) h -= z_base;
         const float d = sqrtf(px*px + py*py + h*h);
         const float look_angle = asinf(fmaxf(-h / d, -1.0f));
         const float psi = atan2f(py, px);  // ground-frame LOS azimuth
@@ -92,12 +141,35 @@ static inline void tx_power_pixel_moments(
         const float g_i = interp2d<float>(g, g_nel, g_naz,
                 el_int, el_idx - el_int, az_int, az_idx - az_int);
         float sinl = 1.0f;
-        if (normalization == 1) {           // sigma_0
-            sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d)));
-        } else if (normalization == 2) {    // gamma_0
-            sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d))) * d / h;
-        } else if (normalization == 3) {    // point (d^4)
-            sinl = d;
+        if constexpr (HasDem) {
+            if (normalization == 1 || normalization == 2) {
+                const float Rg2 = px*px + py*py;
+                const float Rg = fmaxf(sqrtf(Rg2), 1e-6f);
+                const float s = px*dzdx + py*dzdy;
+                if (normalization == 1) {           // sigma_0
+                    sinl = fmaxf(sin_floor, (Rg2 - s*h) * inv_N / (Rg * d));
+                } else {                            // gamma_0
+                    // cos(local incidence) = (s + h) / (d * N) goes to zero
+                    // at grazing and negative in shadow. Clamp it at a small
+                    // positive value so the shadowed contribution rolls
+                    // continuously to (nearly) zero instead of jumping; the
+                    // discontinuity would break the factorized (ffbp)
+                    // interpolation at the shadow boundary.
+                    const float floor_g = sin_floor * d / fmaxf(h, 1e-3f);
+                    const float den = Rg * fmaxf(s + h, 1e-3f * d);
+                    sinl = fmaxf(floor_g, (Rg2 - s*h) / den);
+                }
+            } else if (normalization == 3) {        // point (d^4)
+                sinl = d;
+            }
+        } else {
+            if (normalization == 1) {           // sigma_0
+                sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d)));
+            } else if (normalization == 2) {    // gamma_0
+                sinl = sqrtf(fmaxf(min_sin2, 1.0f - (h*h)/(d*d))) * d / h;
+            } else if (normalization == 3) {    // point (d^4)
+                sinl = d;
+            }
         }
         const float w = wa[i];
         const float wi = g_i * g_i * w * w / (d*d*d);

@@ -888,6 +888,65 @@ def dem_to_polar(
     return dem_polar - origin[2]
 
 
+def polar_dem_slopes(
+    dem: Tensor,
+    grid: "PolarGrid | dict",
+    theta_psi: bool = False,
+) -> Tensor:
+    """
+    Stack a polar-grid DEM with its Cartesian terrain slopes for the `dem`
+    input of the tx_power kernels.
+
+    Parameters
+    ----------
+    dem : Tensor
+        DEM heights on the polar grid, shape [dem_nr, dem_ntheta]. Covers the
+        same r and theta extent as `grid`; the resolution can differ.
+    grid : PolarGrid or dict
+        Polar grid giving the r and theta extents (nr and ntheta are taken
+        from `dem`).
+    theta_psi : bool
+        If True the theta axis is uniform in the angle psi (radians) instead
+        of sin(psi). Used for the ffbp subaperture node grids.
+
+    Returns
+    -------
+    dem3 : Tensor
+        [3, dem_nr, dem_ntheta] float32 stack (z, dz/dx, dz/dy). The slopes
+        are in the Cartesian frame of the grid origin and are translation
+        invariant, so the same values apply in shifted subaperture frames.
+    """
+    from .grid import unpack_polar_grid
+
+    r0, r1, theta0, theta1, _, _, _, _ = unpack_polar_grid(grid)
+    dem = dem.to(torch.float32)
+    dem_nr, dem_ntheta = dem.shape
+    device = dem.device
+
+    dr = (r1 - r0) / dem_nr
+    dt = (theta1 - theta0) / dem_ntheta
+    r = r0 + dr * torch.arange(dem_nr, device=device, dtype=torch.float32)
+    t = theta0 + dt * torch.arange(dem_ntheta, device=device, dtype=torch.float32)
+    z_r, z_t = torch.gradient(dem, spacing=(float(dr), float(dt)), dim=(0, 1))
+    if theta_psi:
+        sin_p = torch.sin(t)
+        cos_p = torch.cos(t)
+        z_psi = z_t
+    else:
+        sin_p = torch.clamp(t, -1.0, 1.0)
+        cos_p = torch.sqrt(torch.clamp(1.0 - sin_p * sin_p, min=0.0))
+        # d(theta)/d(psi) = cos(psi); zero in the |theta| > 1 guard band where
+        # the azimuth slope is not defined.
+        z_psi = z_t * cos_p[None, :]
+    # Chain rule from (r, psi) to the Cartesian frame at (r, psi):
+    # dz/dx = cos(psi) dz/dr - sin(psi)/r dz/dpsi,
+    # dz/dy = sin(psi) dz/dr + cos(psi)/r dz/dpsi.
+    inv_r = 1.0 / torch.clamp(r, min=1e-6)
+    dzdx = cos_p[None, :] * z_r - sin_p[None, :] * z_psi * inv_r[:, None]
+    dzdy = sin_p[None, :] * z_r + cos_p[None, :] * z_psi * inv_r[:, None]
+    return torch.stack([dem, dzdx, dzdy]).contiguous()
+
+
 def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     """
     Convert radar reflection phase shift to distance.
