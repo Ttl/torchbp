@@ -773,33 +773,27 @@ class TestBackprojectionPolarDem(TestCase):
             data.cpu(), grid, 6e9, 0.15, pos.cpu(), dem=dem.cpu())
         torch.testing.assert_close(res_cpu, res_gpu, atol=1e-3, rtol=1e-2)
 
-    def _test_dealias2_constant_dem_equals_shifted_pos(self, device):
-        # DEM-referenced dealias carrier sqrt(r^2 + (z0 - h)^2) with a
-        # constant DEM h equals the flat r-only carrier with the platform
-        # lowered by h.
+    def _test_dealias_constant_dem_equals_shifted_pos(self, device):
+        # With a DEM the dealias carrier is DEM-referenced:
+        # sqrt(r^2 + (z0 - h)^2) with a constant DEM h equals the flat r-only
+        # carrier with the platform lowered by h.
         data, grid, pos = self._random_inputs(device)
         h = 7.0
         dem = torch.full((grid["nr"], grid["ntheta"]), h, device=device)
         res = torchbp.ops.backprojection_polar_2d(
-            data[0], grid, 6e9, 0.15, pos[0], dealias=2, dem=dem)
+            data[0], grid, 6e9, 0.15, pos[0], dealias=True, dem=dem)
         pos_shift = pos[0].clone()
         pos_shift[:, 2] -= h
         ref = torchbp.ops.backprojection_polar_2d(
             data[0], grid, 6e9, 0.15, pos_shift, dealias=True)
         torch.testing.assert_close(res, ref, atol=1e-2, rtol=1e-2)
 
-    def test_dealias2_constant_dem_cpu(self):
-        self._test_dealias2_constant_dem_equals_shifted_pos("cpu")
+    def test_dealias_constant_dem_cpu(self):
+        self._test_dealias_constant_dem_equals_shifted_pos("cpu")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
-    def test_dealias2_constant_dem_cuda(self):
-        self._test_dealias2_constant_dem_equals_shifted_pos("cuda")
-
-    def test_dealias2_requires_dem(self):
-        data, grid, pos = self._random_inputs("cpu")
-        with self.assertRaises(ValueError):
-            torchbp.ops.backprojection_polar_2d(
-                data, grid, 6e9, 0.15, pos, dealias=2)
+    def test_dealias_constant_dem_cuda(self):
+        self._test_dealias_constant_dem_equals_shifted_pos("cuda")
 
     def _test_dem_grad_raises(self, device):
         data, grid, pos = self._random_inputs(device)
@@ -894,6 +888,137 @@ class TestBackprojectionPolarDem(TestCase):
         self._test_dem_point_target("cuda")
 
 
+class TestBpPolarRangeDealias(TestCase):
+    """bp_polar_range_dealias/alias custom op: flat and DEM-referenced carriers."""
+
+    grid = {"r": (30.0, 60.0), "theta": (-0.5, 0.5), "nr": 32, "ntheta": 16}
+    fc = 6e9
+
+    def _img(self, device, batch=False):
+        torch.manual_seed(7)
+        shape = (32, 16) if not batch else (2, 32, 16)
+        return torch.randn(shape, dtype=torch.complex64, device=device)
+
+    def _dealias_ref(self, img, origin, fc, grid, alias_fmod=0):
+        # The previous pure-PyTorch implementation, as reference.
+        r0, r1 = grid["r"]
+        theta0, theta1 = grid["theta"]
+        nr, ntheta = grid["nr"], grid["ntheta"]
+        dr = (r1 - r0) / nr
+        dtheta = (theta1 - theta0) / ntheta
+        er = torch.arange(nr, device=img.device)
+        r = r0 + dr * er
+        theta = theta0 + dtheta * torch.arange(ntheta, device=img.device)
+        x = r[:, None] * torch.sqrt(1 - torch.square(theta))[None, :]
+        y = r[:, None] * theta[None, :]
+        d = torch.sqrt((x - origin[0])**2 + (y - origin[1])**2 + origin[2]**2)
+        c0 = 299792458
+        phase = torch.exp(-1j * 4 * torch.pi * fc * d / c0
+                          + 1j * alias_fmod * er[:, None])
+        if img.dim() == 3:
+            phase = phase.unsqueeze(0)
+        return phase * img
+
+    def _test_flat_matches_reference(self, device):
+        img = self._img(device)
+        origin = torch.tensor([1.5, -2.0, 25.0], device=device)
+        res = torchbp.util.bp_polar_range_dealias(
+            img, origin, self.fc, self.grid, alias_fmod=0.3)
+        ref = self._dealias_ref(img, origin, self.fc, self.grid, alias_fmod=0.3)
+        # Both evaluate a ~25e3 rad carrier in float32 with different but
+        # equivalent distance expressions; a few mrad of independent
+        # rounding is expected.
+        torch.testing.assert_close(res, ref, atol=2e-2, rtol=2e-2)
+        # Batched input
+        imgb = self._img(device, batch=True)
+        res = torchbp.util.bp_polar_range_dealias(
+            imgb, origin, self.fc, self.grid)
+        ref = self._dealias_ref(imgb, origin, self.fc, self.grid)
+        torch.testing.assert_close(res, ref, atol=2e-2, rtol=2e-2)
+
+    def test_flat_matches_reference_cpu(self):
+        self._test_flat_matches_reference("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_flat_matches_reference_cuda(self):
+        self._test_flat_matches_reference("cuda")
+
+    def _test_zero_dem_matches_no_dem(self, device):
+        img = self._img(device)
+        origin = torch.tensor([0.0, 0.0, 25.0], device=device)
+        dem = torch.zeros(8, 4, device=device)
+        res = torchbp.util.bp_polar_range_dealias(
+            img, origin, self.fc, self.grid, dem=dem)
+        ref = torchbp.util.bp_polar_range_dealias(
+            img, origin, self.fc, self.grid)
+        torch.testing.assert_close(res, ref)
+
+    def test_zero_dem_matches_no_dem_cpu(self):
+        self._test_zero_dem_matches_no_dem("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_zero_dem_matches_no_dem_cuda(self):
+        self._test_zero_dem_matches_no_dem("cuda")
+
+    def _test_alias_dealias_roundtrip(self, device):
+        img = self._img(device)
+        origin = torch.tensor([0.0, 0.0, 25.0], device=device)
+        torch.manual_seed(8)
+        dem = 5.0 + 2.0 * torch.randn(8, 4, device=device)
+        res = torchbp.util.bp_polar_range_dealias(
+            img, origin, self.fc, self.grid, alias_fmod=0.3, dem=dem)
+        back = torchbp.util.bp_polar_range_alias(
+            res, origin, self.fc, self.grid, alias_fmod=0.3, dem=dem)
+        torch.testing.assert_close(back, img, atol=1e-5, rtol=1e-5)
+
+    def test_alias_dealias_roundtrip_cpu(self):
+        self._test_alias_dealias_roundtrip("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_alias_dealias_roundtrip_cuda(self):
+        self._test_alias_dealias_roundtrip("cuda")
+
+    def _test_matches_bp_dealias_dem(self, device):
+        # bp(dem, dealias=True) must equal bp_polar_range_dealias with the
+        # same dem applied on the non-dealiased image, with origin
+        # [0, 0, mean platform z] (the carrier reference the kernel uses).
+        torch.manual_seed(42)
+        nsweeps = 8
+        data = torch.randn(nsweeps, 512, device=device, dtype=torch.complex64)
+        pos = torch.zeros(nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-1, 1, nsweeps, device=device)
+        pos[:, 2] = 25.0
+        torch.manual_seed(9)
+        dem = 5.0 + 2.0 * torch.randn(8, 4, device=device)
+
+        ref = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fc, 0.15, pos, dealias=True,
+            alias_fmod=0.3, dem=dem)[0]
+        img = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fc, 0.15, pos, dem=dem)[0]
+        origin = torch.tensor([0.0, 0.0, 25.0], device=device)
+        res = torchbp.util.bp_polar_range_dealias(
+            img, origin, self.fc, self.grid, alias_fmod=0.3, dem=dem)
+        torch.testing.assert_close(res, ref, atol=1e-3, rtol=1e-3)
+
+    def test_matches_bp_dealias_dem_cpu(self):
+        self._test_matches_bp_dealias_dem("cpu")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_matches_bp_dealias_dem_cuda(self):
+        self._test_matches_bp_dealias_dem("cuda")
+
+    def test_opcheck(self):
+        img = self._img("cpu")
+        dem = torch.zeros(8, 4)
+        opcheck(
+            torch.ops.torchbp.polar_range_dealias,
+            (img, dem, 1, 32, 16, self.fc, 30.0, 30.0/32, -0.5, 1.0/16,
+             0.0, 0.0, 25.0, 0.0),
+            test_utils=["test_schema", "test_faketensor"],
+        )
+
+
 class TestDemToPolar(TestCase):
     def test_planar_dem(self):
         # Bilinear sampling of a planar surface is exact in the interior.
@@ -969,8 +1094,8 @@ class TestFfbpDem(TestCase):
         return data, grid, pos
 
     def _test_constant_dem_equals_shifted_pos(self, device):
-        # A constant DEM h through the whole merge tree (base dealias=2,
-        # DEM-referenced merge carriers, per-node resampling) must equal flat
+        # A constant DEM h through the whole merge tree (DEM-referenced base
+        # dealias and merge carriers, per-node resampling) must equal flat
         # ffbp with the platform lowered by h: every distance and carrier is
         # identical.
         data, grid, pos = self._random_scene(device)

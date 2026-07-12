@@ -11,15 +11,22 @@ if TYPE_CHECKING:
 
 
 def bp_polar_range_dealias(
-    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict", alias_fmod: float = 0
+    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict",
+    alias_fmod: float = 0, dem: Tensor | None = None
 ) -> Tensor:
     """
     De-alias range-axis spectrum of polar SAR image processed with backprojection. [1]_
 
+    Equivalent to the ``dealias`` option of
+    :func:`torchbp.ops.backprojection_polar_2d` when ``origin`` is the center
+    of the platform positions used for backprojection (``[0, 0, z0]`` when
+    the positions were centered) and the same ``dem`` is given.
+
     Parameters
     ----------
     img : Tensor
-        Complex input image. Shape should be: [Range, azimuth].
+        Complex input image. Shape should be: [Range, azimuth] or
+        [nbatch, Range, azimuth].
     origin : Tensor
         Center of the platform position.
     fc : float
@@ -31,6 +38,15 @@ def bp_polar_range_dealias(
         - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
     alias_fmod : float
         Range modulation frequency applied to input.
+    dem : Tensor or None
+        Digital elevation model sampled on the image polar grid, same
+        convention as the `dem` input of
+        :func:`torchbp.ops.backprojection_polar_2d`: float32
+        [dem_nr, dem_ntheta] covering the grid extent, can be coarser than
+        the image grid (bilinearly interpolated). When given, the carrier is
+        referenced to the pixel at the DEM height, matching the dealias
+        carrier of a backprojection with the same `dem`. If None the carrier
+        is referenced to the z=0 plane.
 
     References
     ----------
@@ -43,12 +59,35 @@ def bp_polar_range_dealias(
     img : Tensor
         SAR image without range spectrum aliasing.
     """
-    r0, r1 = grid_polar["r"]
-    theta0, theta1 = grid_polar["theta"]
-    ntheta = grid_polar["ntheta"]
-    nr = grid_polar["nr"]
-    dtheta = (theta1 - theta0) / ntheta
-    dr = (r1 - r0) / nr
+    from .grid import unpack_polar_grid
+
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
+
+    if origin.dim() == 2:
+        origin = origin[0]
+
+    if img.dtype == torch.complex64:
+        # Custom op: one pass over the image with a per-pixel bilinear DEM
+        # lookup, no full-size temporaries beyond the output.
+        nbatch = img.shape[0] if img.dim() == 3 else 1
+        if dem is not None:
+            if dem.dtype != torch.float32:
+                raise ValueError(f"dem must be float32, got {dem.dtype}")
+            if dem.device != img.device:
+                raise ValueError(
+                    f"dem must be on the same device as img ({img.device}), "
+                    f"got {dem.device}"
+                )
+        out = torch.ops.torchbp.polar_range_dealias(
+            img, dem, nbatch, nr, ntheta, fc, r0, dr, theta0, dtheta,
+            float(origin[0]), float(origin[1]), float(origin[2]), alias_fmod
+        )
+        return out.reshape(img.shape)
+
+    if dem is not None:
+        raise NotImplementedError(
+            "dem is only supported for complex64 images"
+        )
 
     er = torch.arange(nr, device=img.device)
     r = r0 + dr * er
@@ -57,8 +96,6 @@ def bp_polar_range_dealias(
     x = r[:, None] * torch.sqrt(1 - torch.square(theta))[None, :]
     y = r[:, None] * theta[None, :]
 
-    if origin.dim() == 2:
-        origin = origin[0]
     d = torch.sqrt((x - origin[0]) ** 2 + (y - origin[1]) ** 2 + origin[2] ** 2)
     c0 = 299792458
     phase = torch.exp(-1j * 4 * pi * fc * d / c0 + 1j*alias_fmod*er[:,None])
@@ -68,7 +105,8 @@ def bp_polar_range_dealias(
 
 
 def bp_polar_range_alias(
-    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict", alias_fmod: float=0
+    img: Tensor, origin: Tensor, fc: float, grid_polar: "PolarGrid | dict",
+    alias_fmod: float = 0, dem: Tensor | None = None
 ) -> Tensor:
     """
     Inverse of bp_polar_range_dealias.
@@ -76,7 +114,8 @@ def bp_polar_range_alias(
     Parameters
     ----------
     img : Tensor
-        Complex input image. Shape should be: [Range, azimuth].
+        Complex input image. Shape should be: [Range, azimuth] or
+        [nbatch, Range, azimuth].
     origin : Tensor
         Center of the platform position.
     fc : float
@@ -88,13 +127,17 @@ def bp_polar_range_alias(
         - dict: {"r": (r0, r1), "theta": (theta0, theta1), "nr": nr, "ntheta": ntheta}
     alias_fmod : float
         Range modulation frequency applied to output.
+    dem : Tensor or None
+        Digital elevation model sampled on the image polar grid. See
+        :func:`bp_polar_range_dealias`. Must be the same `dem` the image was
+        dealiased with.
 
     Returns
     -------
     img : Tensor
         SAR image with range spectrum aliasing.
     """
-    return bp_polar_range_dealias(img, origin, -fc, grid_polar, -alias_fmod)
+    return bp_polar_range_dealias(img, origin, -fc, grid_polar, -alias_fmod, dem=dem)
 
 
 def diff(x: Tensor, dim: int = -1, same_size: bool = False) -> Tensor:

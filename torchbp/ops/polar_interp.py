@@ -428,7 +428,8 @@ def ffbp_merge2_lanczos(
         and theta extent; may be coarser. The merge carriers then reference
         the 3D distance from the origins to the pixel at the DEM height.
         Input images must be dealiased with the matching DEM-referenced
-        carrier (``backprojection_polar_2d`` with ``dealias=2``).
+        carrier (``backprojection_polar_2d`` with ``dealias=True`` and the
+        same DEM).
 
     Returns
     -------
@@ -578,7 +579,8 @@ def ffbp_merge2_knab(
         and theta extent; may be coarser. The merge carriers then reference
         the 3D distance from the origins to the pixel at the DEM height.
         Input images must be dealiased with the matching DEM-referenced
-        carrier (``backprojection_polar_2d`` with ``dealias=2``).
+        carrier (``backprojection_polar_2d`` with ``dealias=True`` and the
+        same DEM).
 
     References
     ----------
@@ -751,7 +753,8 @@ def ffbp_merge2_poly(
         and theta extent; may be coarser. The merge carriers then reference
         the 3D distance from the origins to the pixel at the DEM height.
         Input images must be dealiased with the matching DEM-referenced
-        carrier (``backprojection_polar_2d`` with ``dealias=2``).
+        carrier (``backprojection_polar_2d`` with ``dealias=True`` and the
+        same DEM).
 
     Returns
     -------

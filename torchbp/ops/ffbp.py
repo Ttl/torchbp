@@ -346,10 +346,10 @@ def ffbp(
         `grid`; may be coarser than the image grid. Values are pixel z
         coordinates in the same frame as `pos`. Resampled internally onto
         every subaperture and merge grid; base images use the DEM-referenced
-        dealias carrier (``dealias=2``) so the merge interpolation sees a
-        terrain-free residual. With ``dealias=False`` the output matches
-        ``backprojection_polar_2d(..., dem=dem)``; with ``dealias=True`` the
-        output carrier is DEM-referenced (``dealias=2`` convention). Not
+        dealias carrier so the merge interpolation sees a terrain-free
+        residual. The output matches
+        ``backprojection_polar_2d(..., dem=dem)`` with the same ``dealias``
+        (with a DEM the dealias carrier is always DEM-referenced). Not
         supported together with ``afbp_nsub > 1``. With an antenna pattern
         the per-pulse gain weighting is DEM-aware but the W1/W2
         illumination normalization maps still use flat-earth look angles
@@ -411,7 +411,7 @@ def ffbp(
         # Too few sweeps to split into subapertures
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0,
-            dealias=(2 if (dealias and dem is not None) else dealias),
+            dealias=dealias,
             data_fmod=data_fmod,
             alias_fmod=alias_fmod if (output_alias and dealias) else 0.0,
             att=att, g=g, g_extent=g_extent, dem=dem,
@@ -770,9 +770,12 @@ def _ffbp_impl(
                 if dem is not None:
                     dem_local = _dem_on_node_grid(dem, dem_grid, grid_local,
                                                   dem_off_local)
+                # With a DEM the dealias carrier is DEM-referenced, so the
+                # stored image residual stays terrain-free for the merge
+                # interpolation.
                 img = backprojection_polar_2d(
                     data_local, grid_local, fc, r_res, pos_local, d0=d0,
-                    dealias=(2 if dem_local is not None else True),
+                    dealias=True,
                     data_fmod=data_fmod, alias_fmod=alias_fmod,
                     att=att_local, g=g, g_extent=g_extent, normalize=normalize,
                     dem=dem_local
@@ -858,8 +861,8 @@ def _ffbp_impl(
         dorigin2[2] = -(new_z - img2[3])
 
         # DEM on the merge output grid: the merge carriers reference the 3D
-        # distance to the pixel at the DEM height, matching the dealias=2
-        # carrier of the base images.
+        # distance to the pixel at the DEM height, matching the
+        # DEM-referenced dealias carrier of the base images.
         dem_merge = None
         if dem is not None:
             dem_merge = _dem_on_node_grid(dem, dem_grid, grid_polar_new,

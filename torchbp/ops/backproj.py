@@ -54,8 +54,6 @@ def _prepare_backprojection_polar_2d_args(
             raise ValueError(f"att must have shape {expected_shape} when g is provided, got {att.shape}")
 
     z0 = 0
-    if dealias == 2 and dem is None:
-        raise ValueError("dealias=2 (DEM-referenced carrier) requires dem")
     if dealias:
         if nbatch != 1:
             raise ValueError("Only nbatch=1 supported with dealias")
@@ -174,13 +172,13 @@ def backprojection_polar_2d(
         Position of the platform at each data point. Shape should be [nsweeps, 3] or [nbatch, nsweeps, 3].
     d0 : float
         Zero range correction.
-    dealias : bool or int
+    dealias : bool
         If True removes the range spectrum aliasing. Equivalent to applying
-        `torchbp.util.bp_polar_range_dealias` on the SAR image.
-        The integer value 2 references the dealias carrier to the DEM height
-        instead of the z=0 plane (requires `dem`); used internally by `ffbp`
-        so that the stored image residual stays terrain-free for the merge
-        interpolation.
+        `torchbp.util.bp_polar_range_dealias` (with the same `dem`) on the
+        SAR image. When `dem` is given, the carrier is always referenced to
+        the DEM height instead of the z=0 plane: a flat-plane carrier would
+        leave a terrain-dependent residual whose local frequency aliases the
+        image spectrum on any significant topography.
         Default is False.
     att : Tensor
         Antenna rotation tensor.
@@ -274,7 +272,9 @@ def backprojection_polar_2d_lanczos(
         Zero range correction.
     dealias : bool
         If True removes the range spectrum aliasing. Equivalent to applying
-        `torchbp.util.bp_polar_range_dealias` on the SAR image.
+        `torchbp.util.bp_polar_range_dealias` (with the same `dem`) on the
+        SAR image. When `dem` is given the carrier is referenced to the DEM
+        height instead of the z=0 plane.
         Default is False.
     order : int
         Number of nearby samples to use for interpolation of one new sample.
@@ -362,7 +362,9 @@ def backprojection_polar_2d_knab(
         Zero range correction.
     dealias : bool
         If True removes the range spectrum aliasing. Equivalent to applying
-        `torchbp.util.bp_polar_range_dealias` on the SAR image.
+        `torchbp.util.bp_polar_range_dealias` (with the same `dem`) on the
+        SAR image. When `dem` is given the carrier is referenced to the DEM
+        height instead of the z=0 plane.
         Default is False.
     order : int
         Number of nearby samples to use for interpolation of one new sample.
@@ -1505,6 +1507,27 @@ def _fake_polar_2d(
     torch._check(pos.dtype == torch.float32)
     torch._check(data.dtype == torch.complex64 or data.dtype == torch.complex32)
     return torch.empty((nbatch, Nr, Ntheta), dtype=torch.complex64, device=data.device)
+
+
+@torch.library.register_fake("torchbp::polar_range_dealias")
+def _fake_polar_range_dealias(
+    img: Tensor,
+    dem: Tensor,
+    nbatch: int,
+    Nr: int,
+    Ntheta: int,
+    fc: float,
+    r0: float,
+    dr: float,
+    theta0: float,
+    dtheta: float,
+    ox: float,
+    oy: float,
+    oz: float,
+    alias_fmod: float,
+):
+    torch._check(img.dtype == torch.complex64)
+    return torch.empty_like(img)
 
 
 @torch.library.register_fake("torchbp::blocksvd_alpha")

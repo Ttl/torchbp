@@ -247,13 +247,16 @@ static void backprojection_polar_2d_row_cpu(
             }
         }
         if (dealias) {
-            // The carrier depends only on the range row (also for guard band
-            // pixels |theta| > 1 where x^2 + y^2 != r^2). dealias == 2
-            // references the carrier to the DEM height instead of the z = 0
-            // plane; ffbp uses it internally so that the stored image
-            // residual stays terrain-free for the merge interpolation. The
-            // carrier then varies with theta, so the phasor is per pixel.
-            if (HasDem && dealias == 2) {
+            // Without a DEM the carrier depends only on the range row (also
+            // for guard band pixels |theta| > 1 where x^2 + y^2 != r^2).
+            // With a DEM the carrier is always referenced to the DEM height
+            // instead of the z = 0 plane: a flat-plane carrier would leave a
+            // terrain-dependent residual whose local frequency aliases the
+            // image spectrum on any significant topography. The carrier then
+            // varies with theta, so the phasor is per pixel.
+            // bp_polar_range_dealias/alias with the same dem apply/remove
+            // the identical carrier.
+            if constexpr (HasDem) {
                 for (int q = 0; q < nchunk; q++) {
                     const float zz = z0 - z_buf[q];
                     const float dq = sqrtf(r2 + zz*zz);
@@ -2944,6 +2947,148 @@ at::Tensor cart_tx_power_merge2_cpu(
 }
 
 
+// Multiply one range row of a polar SAR image by the range-dealias carrier.
+// Same carrier as the dealias option of backprojection_polar_2d: distance
+// from origin to the pixel at the DEM height (z=0 without a DEM), in the
+// polar form that matches the backprojection kernels also on guard band
+// pixels |theta| > 1. fc < 0 applies the conjugate carrier (re-alias).
+// Single pass over the image, per-pixel bilinear DEM lookup: no full-size
+// temporaries beyond the output.
+template<bool HasDem>
+static void polar_range_dealias_row_cpu(
+          const complex64_t* img,
+          complex64_t* out,
+          float ref_phase,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          int Nr,
+          int Ntheta,
+          float ox,
+          float oy,
+          float oz,
+          const float* dem,
+          float dem_r_scale,
+          float dem_theta_scale,
+          int dem_nr,
+          int dem_ntheta,
+          float alias_fmod,
+          int idr,
+          int idbatch) {
+    const float r = r0 + idr * dr;
+    const complex64_t* img_row = img + ((size_t)idbatch * Nr + idr) * Ntheta;
+    complex64_t* out_row = out + ((size_t)idbatch * Nr + idr) * Ntheta;
+
+    // DEM row interpolation setup, same pixel-index-ratio convention as the
+    // backprojection kernels.
+    float wr = 0.0f;
+    const float* dem_row0 = nullptr;
+    const float* dem_row1 = nullptr;
+    if constexpr (HasDem) {
+        const float fr = idr * dem_r_scale;
+        int ir0 = (int)fr;
+        ir0 = ir0 < dem_nr - 1 ? ir0 : dem_nr - 1;
+        const int ir1 = ir0 + 1 < dem_nr ? ir0 + 1 : dem_nr - 1;
+        wr = fr - ir0;
+        dem_row0 = dem + (size_t)ir0 * dem_ntheta;
+        dem_row1 = dem + (size_t)ir1 * dem_ntheta;
+    }
+
+    const float oxy2 = ox * ox + oy * oy;
+#pragma omp simd
+    for (int q = 0; q < Ntheta; q++) {
+        const float theta = theta0 + q * dtheta;
+        const float ct2 = 1.0f - theta * theta;
+        const float x = r * (ct2 > 0.0f ? sqrtf(ct2) : 0.0f);
+        const float y = r * theta;
+        float z = 0.0f;
+        if constexpr (HasDem) {
+            const float ft = q * dem_theta_scale;
+            int it0 = (int)ft;
+            it0 = it0 < dem_ntheta - 1 ? it0 : dem_ntheta - 1;
+            const int it1 = it0 + 1 < dem_ntheta ? it0 + 1 : dem_ntheta - 1;
+            const float wt = ft - it0;
+            const float za = dem_row0[it0] + wt * (dem_row0[it1] - dem_row0[it0]);
+            const float zb = dem_row1[it0] + wt * (dem_row1[it1] - dem_row1[it0]);
+            z = za + wr * (zb - za);
+        }
+        // Polar-form distance r^2 - 2*(x*ox + y*oy) + |o_xy|^2 + (oz-z)^2:
+        // equals the Cartesian distance to the origin for |theta| <= 1 and
+        // continues the backprojection kernels' clamped-cosine convention
+        // past |theta| = 1.
+        const float zz = oz - z;
+        const float d2 = r * r - 2.0f * (x * ox + y * oy) + oxy2 + zz * zz;
+        const float d = sqrtf(d2 > 0.0f ? d2 : 0.0f);
+        float ref_sin, ref_cos;
+        sincospi(-ref_phase * d + alias_fmod * idr, &ref_sin, &ref_cos);
+        const float vr = img_row[q].real();
+        const float vi = img_row[q].imag();
+        out_row[q] = complex64_t(vr * ref_cos - vi * ref_sin,
+                                 vr * ref_sin + vi * ref_cos);
+    }
+}
+
+at::Tensor polar_range_dealias_cpu(
+          const at::Tensor &img,
+          const at::Tensor &dem,
+          int64_t nbatch,
+          int64_t Nr,
+          int64_t Ntheta,
+          double fc,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          double ox,
+          double oy,
+          double oz,
+          double alias_fmod) {
+    TORCH_CHECK(img.dtype() == at::kComplexFloat,
+                "polar_range_dealias: img must be complex64");
+    TORCH_INTERNAL_ASSERT(img.device().type() == at::DeviceType::CPU);
+
+    at::Tensor img_contig = img.contiguous();
+    at::Tensor out = torch::empty_like(img_contig);
+    const complex64_t* img_ptr = img_contig.data_ptr<c10::complex<float>>();
+    complex64_t* out_ptr = out.data_ptr<c10::complex<float>>();
+
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat, "polar_range_dealias: dem must be float32");
+        TORCH_CHECK(dem.dim() == 2, "polar_range_dealias: dem must be 2D");
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
+
+    const float ref_phase = 4.0f * fc / kC0;
+
+    omp_set_num_threads(omp_get_num_procs());
+
+    auto row = has_dem ? &polar_range_dealias_row_cpu<true>
+                       : &polar_range_dealias_row_cpu<false>;
+#pragma omp parallel for collapse(2)
+    for (int idbatch = 0; idbatch < nbatch; idbatch++) {
+        for (int idr = 0; idr < Nr; idr++) {
+            row(img_ptr, out_ptr, ref_phase, r0, dr, theta0, dtheta,
+                Nr, Ntheta, ox, oy, oz,
+                dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta,
+                alias_fmod / kPI, idr, idbatch);
+        }
+    }
+    return out;
+}
+
+
 // Registers CPU implementations
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
@@ -2961,6 +3106,7 @@ TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("projection_cart_2d_nufft", &projection_cart_2d_nufft_cpu);
   m.impl("gpga_backprojection_2d", &gpga_backprojection_2d_cpu);
   m.impl("blocksvd_alpha", &blocksvd_alpha_cpu);
+  m.impl("polar_range_dealias", &polar_range_dealias_cpu);
 }
 
 }
