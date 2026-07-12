@@ -5954,5 +5954,116 @@ class TestFFBPLongBaseline(TestCase):
                         f"{ratio:.3f} vs divisions=2 {base_ratio:.3f}")
 
 
+class TestTxPowerPitch(TestCase):
+    """Pitch in the tx_power kernels: the along-track attitude angle rotates
+    the antenna pattern about its boresight (side-looking case). Per-sweep
+    kernel pitch must be equivalent to zero pitch with the pattern
+    pre-rotated about [1, 0, 0] (the rotate_antenna_pattern compensation the
+    processing pipeline applies with the mean pitch)."""
+
+    el_width = 0.8
+    az_width = 0.25
+    # Fine pattern sampling: both paths bilinearly interpolate the pattern at
+    # different coordinates (rotated lookup vs pre-rotated table), so the
+    # comparison error is the pattern interpolation error, quadratic in the
+    # step-to-beamwidth ratio.
+    nel, naz = 128, 512
+
+    @classmethod
+    def _gauss(cls, el, az):
+        return np.exp(-((el / cls.el_width) ** 2) - (az / cls.az_width) ** 2)
+
+    @classmethod
+    def _patterns(cls, pitch):
+        """Anisotropic Gaussian pattern and the same pattern rotated by
+        `pitch` about the boresight, both sampled on the same grid. The
+        rotated pattern is evaluated analytically: for each grid direction
+        u(el, az) (x = cos(el)cos(az), y = cos(el)sin(az), z = sin(el)) take
+        the original gain at the angles of R_x(pitch) @ u, which is what
+        rotate_antenna_pattern computes without its interpolation error.
+
+        The tables are sampled on the kernel's cell-start convention
+        (sample k at angle0 + k * (angle1 - angle0) / n): the two paths
+        rotate in different places (lookup coordinates vs table values), so
+        any angle-to-index misregistration would not cancel between them."""
+        el0, el1 = -1.2, 1.2
+        az0, az1 = -2.0, 2.0
+        el = el0 + (el1 - el0) / cls.nel * np.arange(cls.nel)
+        az = az0 + (az1 - az0) / cls.naz * np.arange(cls.naz)
+        EL, AZ = np.meshgrid(el, az, indexing="ij")
+        g = cls._gauss(EL, AZ)
+        ux = np.cos(EL) * np.cos(AZ)
+        uy = np.cos(EL) * np.sin(AZ)
+        uz = np.sin(EL)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        uyr = cp * uy - sp * uz
+        uzr = sp * uy + cp * uz
+        el_r = np.arcsin(np.clip(uzr, -1.0, 1.0))
+        az_r = np.arctan2(uyr, ux)
+        g_rot = cls._gauss(el_r, az_r)
+        g_extent = [el0, az0, el1, az1]
+        to_t = lambda a: torch.tensor(a, dtype=torch.float32)
+        return to_t(g), to_t(g_rot), g_extent
+
+    @staticmethod
+    def _track(pitch, nsweeps=128, alt=20.0, r_center=60.0, span=32.0):
+        pos = torch.zeros([nsweeps, 3], dtype=torch.float32)
+        pos[:, 1] = torch.linspace(-span / 2, span / 2, nsweeps)
+        pos[:, 2] = alt
+        att = torch.zeros([nsweeps, 3], dtype=torch.float32)
+        d = float(np.sqrt(r_center**2 + alt**2))
+        att[:, 0] = -float(np.arcsin(alt / d))
+        att[:, 1] = pitch
+        wa = (torch.hann_window(nsweeps) + 0.1).to(torch.float32)
+        return wa, pos, att
+
+    def _rel_err(self, out, ref, margin=4):
+        out_c = out[margin:-margin, margin:-margin]
+        ref_c = ref[margin:-margin, margin:-margin]
+        finite = torch.isfinite(out_c) & torch.isfinite(ref_c)
+        mask = finite & (ref_c > 1e-3 * float(ref_c[finite].max()))
+        self.assertGreater(int(mask.sum()), 1000)
+        return (out_c[mask] / ref_c[mask] - 1).abs()
+
+    def test_constant_pitch_equals_rotated_pattern(self):
+        pitch = 0.2
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
+        g, g_rot, g_extent = self._patterns(pitch)
+        wa, pos, att = self._track(pitch)
+        att0 = att.clone()
+        att0[:, 1] = 0.0
+        for norm in [None, "sigma"]:
+            out = torchbp.ops.backprojection_polar_2d_tx_power(
+                wa, g, g_extent, grid, 0.15, pos, att,
+                normalization=norm)[0]
+            ref = torchbp.ops.backprojection_polar_2d_tx_power(
+                wa, g_rot, g_extent, grid, 0.15, pos, att0,
+                normalization=norm)[0]
+            err = self._rel_err(out, ref)
+            self.assertLess(float(torch.quantile(err, 0.95)), 5e-3)
+            self.assertLess(float(err.max()), 2e-2)
+            # Sanity: the pitch must actually matter for the anisotropic
+            # pattern, or the equivalence above is vacuous.
+            ignored = torchbp.ops.backprojection_polar_2d_tx_power(
+                wa, g, g_extent, grid, 0.15, pos, att0,
+                normalization=norm)[0]
+            diff = self._rel_err(ignored, ref)
+            self.assertGreater(float(torch.quantile(diff, 0.95)), 0.05)
+
+    def test_ffbp_matches_direct_with_pitch(self):
+        pitch = 0.2
+        grid = {"r": (40, 80), "theta": (-0.6, 0.6), "nr": 96, "ntheta": 192}
+        g, _, g_extent = self._patterns(pitch)
+        wa, pos, att = self._track(pitch)
+        ref = torchbp.ops.backprojection_polar_2d_tx_power(
+            wa, g, g_extent, grid, 0.15, pos, att, normalization="sigma")[0]
+        out = torchbp.ops.backprojection_polar_2d_tx_power_ffbp(
+            wa, g, g_extent, grid, 0.15, pos, att, stages=3,
+            downsample_r=1.0, downsample_theta=1.0, min_nsweeps=16,
+            normalization="sigma")
+        err = self._rel_err(out, ref)
+        self.assertLess(float(torch.quantile(err, 0.95)), 0.03)
+
+
 if __name__ == "__main__":
     unittest.main()

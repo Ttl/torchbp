@@ -1234,7 +1234,9 @@ def backprojection_polar_2d_tx_power_ffbp(
         Position of the platform at each data point. Shape should be [nsweeps, 3].
     att : Tensor
         Euler angles of the radar antenna at each data point. Shape should be
-        [nsweeps, 3]. [Roll, pitch, yaw]. Only roll and yaw are used at the moment.
+        [nsweeps, 3]. [Roll, pitch, yaw]. Pitch rotates the antenna pattern about its
+        boresight (the along-track attitude angle for a side-looking
+        antenna).
     stages : int
         Number of recursions.
     divisions : int

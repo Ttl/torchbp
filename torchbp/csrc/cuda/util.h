@@ -147,8 +147,29 @@ __device__ static inline void tx_power_pixel_moments(
         const float d = sqrtf(px*px + py*py + h*h);
         const float look_angle = asinf(fmaxf(-h / d, -1.0f));
         const float psi = atan2f(py, px);  // ground-frame LOS azimuth
-        const float el_idx = (look_angle - att[3*i + 0] - g_el0) / g_del;
-        const float az_idx = (psi - att[3*i + 2] - g_az0) / g_daz;
+        float el_a = look_angle - att[3*i + 0];
+        float az_a = psi - att[3*i + 2];
+        const float pitch = att[3*i + 1];
+        if (pitch != 0.0f) {
+            // Pitch rotates the antenna about its boresight (the along-track
+            // attitude angle for a side-looking antenna). Rotate the
+            // roll/yaw-compensated LOS about the pattern x axis with the full
+            // spherical rotation (x = cos(el)cos(az), y = cos(el)sin(az),
+            // z = sin(el)), matching a pattern rotated by the same angle
+            // about [1, 0, 0]. Zero pitch takes the exact legacy path.
+            const float ce = cosf(el_a);
+            const float ux = ce * cosf(az_a);
+            const float uy = ce * sinf(az_a);
+            const float uz = sinf(el_a);
+            const float cp = cosf(pitch);
+            const float sp = sinf(pitch);
+            const float uyp = cp * uy - sp * uz;
+            const float uzp = sp * uy + cp * uz;
+            el_a = asinf(fmaxf(-1.0f, fminf(1.0f, uzp)));
+            az_a = atan2f(uyp, ux);
+        }
+        const float el_idx = (el_a - g_el0) / g_del;
+        const float az_idx = (az_a - g_az0) / g_daz;
         const int el_int = el_idx;
         const int az_int = az_idx;
         // Reject samples below the pattern's first row/column (negative

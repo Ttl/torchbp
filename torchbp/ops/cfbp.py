@@ -933,7 +933,8 @@ def backprojection_cart_2d_tx_power_cfbp(
         Platform position at each pulse, shape [nsweeps, 3].
     att : Tensor
         Euler angles [roll, pitch, yaw] at each pulse, shape [nsweeps, 3].
-        Only roll and yaw are used.
+        Pitch rotates the antenna pattern about its boresight
+        (the along-track attitude angle for a side-looking antenna).
     stages : int
         Number of recursions.
     divisions : int
