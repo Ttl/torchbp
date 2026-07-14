@@ -162,6 +162,8 @@ def pga(
     eps: float = 1e-6,
     spectrum_support: bool = True,
     support_gate: float = 0.01,
+    max_targets: int | None = None,
+    truncate: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """
     Phase gradient autofocus
@@ -172,6 +174,9 @@ def pga(
         Complex input image. Shape should be: [Range, azimuth].
     window_width : int
         Initial window width. Default is None which uses full image size.
+        With a large image, setting this to a bound on the initial blur
+        width avoids the expensive full-length estimate of the first
+        iteration.
     max_iter : int
         Maximum number of iterations.
     window_exp : float
@@ -200,6 +205,21 @@ def pga(
     support_gate : float
         Azimuth spectrum bins with mean power below this fraction of the
         maximum are considered unoccupied.
+    max_targets : int or None
+        Estimate the phase error only from this many range rows with the
+        highest peak-to-mean amplitude ratio. None (default) uses every
+        row. Rows without a strong target get a near-zero weight from the
+        "wls" estimator but still cost a windowed FFT and estimator pass,
+        so on large images a few hundred rows gives nearly the same
+        estimate much faster.
+    truncate : bool
+        When the window is much smaller than the image, estimate the
+        phase error from a zero-padded FFT of only the windowed samples
+        instead of a full-length FFT and interpolate the estimate back
+        onto the full azimuth spectrum. The windowed signal supports only
+        about ``window`` independent estimate values, so a 4x oversampled
+        short FFT loses almost nothing. Only affects speed; disable to
+        reproduce the exact full-length estimates.
 
     Returns
     -------
@@ -221,15 +241,19 @@ def pga(
         window_width = ntheta
     dev = img.device
 
+    # The image spectrum is the loop state: the correction multiplies it in
+    # place and the image domain is materialized once per iteration for the
+    # peak search, instead of a separate fft+ifft round trip per correction.
+    F = torch.fft.fft(img, axis=-1)
+
     # Spectrum magnitude is invariant over the iterations since only phase
     # corrections are applied, so the support is solved only once.
     est_weight = None
     det_weight = None
+    mask = None
     k_gap = 0
     if spectrum_support:
-        spec_pwr = torch.mean(
-            torch.abs(torch.fft.fft(img, axis=-1)) ** 2, dim=0
-        )
+        spec_pwr = torch.mean(torch.abs(F) ** 2, dim=0)
         support = spec_pwr / torch.clamp(torch.max(spec_pwr), min=1e-30)
         mask = support > support_gate
         # Start the phase integration and unwrapping from the least occupied
@@ -243,42 +267,117 @@ def pga(
         est_weight = torch.roll(mask, -k_gap).to(img.real.dtype)[None, :]
         det_weight = torch.roll(support * mask, -k_gap)
 
+    corrected = False
     for i in range(max_iters):
         window = int(window_width * window_exp**i)
         if window < min_window:
             break
+        if corrected:
+            img = torch.fft.ifft(F, axis=-1)
         # Peak for each range bin
-        rpeaks = torch.argmax(torch.abs(img), axis=1)
-        # Roll theta axis so that peak is at 0 bin. Batched gather instead
-        # of a per-row roll: one kernel instead of nr launches and syncs.
-        idx = (
-            torch.arange(ntheta, device=img.device)[None, :] + rpeaks[:, None]
-        ) % ntheta
-        g = torch.gather(img, 1, idx)
+        a_img = torch.abs(img)
+        rpeaks = torch.argmax(a_img, axis=1)
+        if max_targets is not None and max_targets < nr:
+            # Rows with the highest peak-to-mean ratio carry nearly all of
+            # the "wls" weight; skip the rest.
+            peak = a_img[torch.arange(nr, device=dev), rpeaks]
+            score = peak / (torch.mean(a_img, dim=1) + 1e-30)
+            rows = torch.topk(score, max_targets).indices
+            rpeaks = rpeaks[rows]
+            img_est = img[rows]
+        else:
+            img_est = img
+        del a_img
+        w2 = window // 2
+        m_len = ntheta
+        if truncate:
+            m_len = 1 << max(4, (4 * (window + 1) - 1).bit_length())
+        if truncate and m_len <= ntheta // 2:
+            # The windowed rows are zero outside `window` samples around
+            # the peak, so an oversampled short FFT of just those samples
+            # carries the same information as the full-length FFT. Keep
+            # the circular sample layout (tail at negative indices) so a
+            # peak shift stays a linear phase.
+            offs = torch.cat(
+                [
+                    torch.arange(0, w2 + 1, device=dev),
+                    torch.arange(ntheta - w2, ntheta, device=dev),
+                ]
+            )
+            idx = (rpeaks[:, None] + offs[None, :]) % ntheta
+            gs = torch.gather(img_est, 1, idx)
+            g = torch.zeros(
+                gs.shape[0], m_len, dtype=img.dtype, device=dev
+            )
+            g[:, : w2 + 1] = gs[:, : w2 + 1]
+            if w2 > 0:
+                g[:, m_len - w2 :] = gs[:, w2 + 1 :]
+            del gs
+        else:
+            m_len = ntheta
+            # Roll theta axis so that peak is at 0 bin. Batched gather
+            # instead of a per-row roll: one kernel instead of nr launches
+            # and syncs.
+            idx = (
+                torch.arange(ntheta, device=dev)[None, :] + rpeaks[:, None]
+            ) % ntheta
+            g = torch.gather(img_est, 1, idx)
+            # Apply window
+            g[:, 1 + w2 : ntheta - w2] = 0
+        del img_est, idx
         if offload:
-            img = img.to(device="cpu")
-        # Apply window
-        g[:, 1 + window // 2 : ntheta - window // 2] = 0
+            F = F.to(device="cpu")
         # IFFT across theta
         g = torch.fft.fft(g, axis=-1)
+        k_gap_m = 0
+        est_w = est_weight
         if spectrum_support:
-            g = torch.roll(g, -k_gap, dims=-1)
-        phi = pga_estimator(g, estimator, eps, weight=est_weight)
+            if m_len == ntheta:
+                k_gap_m = k_gap
+            else:
+                # The short FFT samples the same spectrum on a coarser
+                # grid; resample the support mask and gap onto it.
+                k_gap_m = int(round(k_gap * m_len / ntheta))
+                pos = torch.round(
+                    torch.arange(m_len, device=dev) * (ntheta / m_len)
+                ).long() % ntheta
+                est_w = torch.roll(mask[pos], -k_gap_m).to(
+                    img.real.dtype
+                )[None, :]
+            g = torch.roll(g, -k_gap_m, dims=-1)
+        phi = pga_estimator(g, estimator, eps, weight=est_w)
         del g
+        # Unwrap in the rolled frame where the occupied band is contiguous
+        # and the estimate is smooth.
+        phi = unwrap(phi)
+        if m_len != ntheta:
+            # Interpolate the estimate onto the full spectrum, still in
+            # the rolled frame (sub-bin offset from the gap rounding
+            # included).
+            xq = torch.remainder(
+                (torch.arange(ntheta, device=dev, dtype=phi.dtype) + k_gap)
+                * (m_len / ntheta)
+                - k_gap_m,
+                m_len,
+            )
+            phi = _interp1_linear(
+                xq,
+                torch.arange(m_len, device=dev, dtype=phi.dtype),
+                phi,
+            )
         if remove_trend:
-            # Unwrap and fit the trend in the rolled frame where the
-            # occupied band is contiguous and the estimate is smooth.
-            phi = weighted_detrend(unwrap(phi), det_weight)
+            phi = weighted_detrend(phi, det_weight)
         if spectrum_support:
             phi = torch.roll(phi, k_gap, dims=-1)
         phi_sum += phi
 
         if offload:
-            img = img.to(device=dev)
-        img_ifft = torch.fft.fft(img, axis=-1)
-        img_ifft *= torch.exp(-1j * phi[None, :])
-        img = torch.fft.ifft(img_ifft, axis=-1)
+            F = F.to(device=dev)
+        F *= torch.exp(-1j * phi[None, :])
+        corrected = True
 
+    if corrected:
+        img = torch.fft.ifft(F, axis=-1)
     return img, phi_sum
 
 
@@ -298,6 +397,7 @@ def pga_xz(
     eps: float = 1e-6,
     spectrum_support: bool = True,
     support_gate: float = 0.01,
+    truncate: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """
     Phase gradient autofocus with range-direction and vertical (x, z)
@@ -351,6 +451,12 @@ def pga_xz(
         block estimate.
     window_width : int
         Initial window width. Default is None which uses full image size.
+        With a large image, set this to a bound on the initial blur
+        width: an unwindowed estimate over tens of thousands of bins is
+        dominated by phase-difference random-walk noise, which the x/z
+        solve amplifies (the unwindowed first pass therefore solves the
+        range-direction component only, see below), and it is also the
+        expensive iteration the truncated estimation cannot shorten.
     max_iters : int
         Maximum number of iterations.
     window_exp : float
@@ -377,6 +483,14 @@ def pga_xz(
     support_gate : float
         Azimuth spectrum bins with mean power below this fraction of the
         maximum are considered unoccupied.
+    truncate : bool
+        When the window is much smaller than the image, estimate the
+        block phases from a zero-padded FFT of only the windowed samples
+        instead of a full-length FFT, as in :func:`pga`. The short-grid
+        estimate is interpolated onto the common spectral axis by the
+        same resampling step that handles the per-block ``cos(el)``
+        scaling. Only affects speed; disable to reproduce the exact
+        full-length estimates.
 
     Returns
     -------
@@ -433,44 +547,106 @@ def pga_xz(
     nb = range_divisions
     rdiv = nr // nb
 
+    # The fftshifted image spectrum is the loop state: the correction
+    # multiplies it in place and the image domain is materialized once per
+    # iteration for the peak search, instead of a separate fft+ifft round
+    # trip per correction.
+    F = torch.fft.fftshift(torch.fft.fft(img, axis=-1), dim=-1)
+
     # Spectrum magnitude is invariant over the iterations since only
     # phase corrections are applied, so the support is solved only once.
     est_weight = None
     det_weight = None
     if spectrum_support:
-        spec_pwr = torch.fft.fftshift(
-            torch.mean(torch.abs(torch.fft.fft(img, axis=-1)) ** 2, dim=0)
-        )
+        spec_pwr = torch.mean(torch.abs(F) ** 2, dim=0)
         support = spec_pwr / torch.clamp(torch.max(spec_pwr), min=1e-30)
         mask = support > support_gate
         est_weight = mask.to(rdtype)[None, :]
         det_weight = support * mask
 
-    ncomp = 2 if estimate_z else 1
+    # The correction resamples the solved profiles onto each row's spectral
+    # scale on a uniform grid whose geometry does not change over the
+    # iterations; precompute the per-pixel interpolation indices.
+    gamma_rows = torch.clamp(cos_el / cos_el_ref, min=1e-6)
+    qi = (f_axis[None, :] / gamma_rows[:, None] - f_axis[0]).clamp(
+        0, ntheta - 1.001
+    )
+    qi0 = qi.floor().long()
+    qt = (qi - qi0).to(rdtype)
+    del qi
+
     d_sum = torch.zeros(2, ntheta, device=dev, dtype=rdtype)
     local_d = torch.zeros(nb, ntheta, device=dev, dtype=rdtype)
     local_w = torch.zeros(nb, device=dev, dtype=rdtype)
     local_m = torch.zeros(nb, 2, device=dev, dtype=rdtype)
 
+    corrected = False
     for i in range(max_iters):
         window = int(window_width * window_exp**i)
         if window < min_window:
             break
+        if corrected:
+            img = torch.fft.ifft(torch.fft.ifftshift(F, dim=-1), axis=-1)
+        w2 = window // 2
+        # The windowed rows are zero outside `window` samples around the
+        # peak, so an oversampled short FFT of just those samples carries
+        # the same information as the full-length FFT (see pga). The
+        # short-grid estimate lands on the common axis through the same
+        # interpolation that handles the per-block cos(el) scaling.
+        m_len = ntheta
+        if truncate:
+            m_len = 1 << max(4, (4 * (window + 1) - 1).bit_length())
+        use_trunc = truncate and m_len <= ntheta // 2
+        if use_trunc:
+            f_m = torch.arange(m_len, device=dev, dtype=rdtype) - m_len // 2
+            est_w = None
+            if spectrum_support:
+                # Sample the support mask onto the short grid.
+                pos = torch.clamp(
+                    torch.round(f_m * (ntheta / m_len)).long() + ntheta // 2,
+                    0,
+                    ntheta - 1,
+                )
+                est_w = est_weight[:, pos]
+            offs = torch.cat(
+                [
+                    torch.arange(0, w2 + 1, device=dev),
+                    torch.arange(ntheta - w2, ntheta, device=dev),
+                ]
+            )
+        else:
+            m_len = ntheta
+            f_m = f_axis
+            est_w = est_weight
         for b in range(nb):
             b1 = (b + 1) * rdiv if b < nb - 1 else nr
             sub = img[b * rdiv : b1]
             # Peak for each range bin, rolled to bin 0 with a batched
             # gather as in pga.
             rpeaks = torch.argmax(torch.abs(sub), axis=1)
-            idx = (
-                torch.arange(ntheta, device=dev)[None, :] + rpeaks[:, None]
-            ) % ntheta
-            g = torch.gather(sub, 1, idx)
-            # Apply window
-            g[:, 1 + window // 2 : ntheta - window // 2] = 0
+            if use_trunc:
+                # Keep the circular sample layout (tail at negative
+                # indices) so a peak shift stays a linear phase.
+                idx = (rpeaks[:, None] + offs[None, :]) % ntheta
+                gs = torch.gather(sub, 1, idx)
+                g = torch.zeros(
+                    gs.shape[0], m_len, dtype=img.dtype, device=dev
+                )
+                g[:, : w2 + 1] = gs[:, : w2 + 1]
+                if w2 > 0:
+                    g[:, m_len - w2 :] = gs[:, w2 + 1 :]
+                del gs
+            else:
+                idx = (
+                    torch.arange(ntheta, device=dev)[None, :]
+                    + rpeaks[:, None]
+                ) % ntheta
+                g = torch.gather(sub, 1, idx)
+                # Apply window
+                g[:, 1 + w2 : ntheta - w2] = 0
             g = torch.fft.fftshift(torch.fft.fft(g, axis=-1), dim=-1)
             phi, w = pga_estimator(
-                g, "wls", eps, return_weight=True, weight=est_weight
+                g, "wls", eps, return_weight=True, weight=est_w
             )
             phi = unwrap(phi)
             # SCR-weighted block geometry: where the strong targets are.
@@ -478,8 +654,11 @@ def pga_xz(
             r_b = torch.sum(wn * r_rows[b * rdiv : b1]) / torch.sum(wn)
             slant_b = torch.sqrt(r_b**2 + h**2)
             gamma_b = (r_b / slant_b) / cos_el_ref
-            # Resample the block estimate onto the common spectral axis.
-            phi = _interp1_linear(f_axis * gamma_b, f_axis, phi)
+            # Resample the block estimate onto the common spectral axis
+            # (common bin s maps to short-grid bin s*gamma_b*m_len/ntheta).
+            phi = _interp1_linear(
+                f_axis * (gamma_b * m_len / ntheta), f_m, phi
+            )
             local_d[b] = phi / k_wave
             local_w[b] = 1 / torch.sum(1 / w)
             local_m[b, 0] = cos_az_c * r_b / slant_b
@@ -491,6 +670,12 @@ def pga_xz(
         # gpga_tde) is a single small solve applied to all bins: if the
         # elevation angle spread is too small to separate z from x, the
         # weak eigen-direction gets zero update instead of noise.
+        # On the unwindowed first pass the targets are not isolated at all
+        # and the block estimates are at their noisiest; the weakly
+        # observed z direction amplifies that noise into a correction that
+        # can defocus a large image. Solve only the range-direction
+        # component there and let the windowed iterations separate z.
+        ncomp = 2 if (estimate_z and window < ntheta) else 1
         ws = torch.sqrt(
             local_w / torch.clamp(torch.max(local_w), min=1e-30)
         )[:, None]
@@ -509,21 +694,18 @@ def pga_xz(
         d_sum[:ncomp] += p
 
         # Apply the correction with per-row spectrum multiplies,
-        # resampling the profiles back to each row's spectral scale.
-        q = f_axis[None, :] / torch.clamp(
-            (cos_el / cos_el_ref)[:, None], min=1e-6
-        )
-        phi_corr = k_wave * mx_rows[:, None] * _interp1_linear(
-            q, f_axis, p[0]
-        )
-        if estimate_z:
-            phi_corr = phi_corr + k_wave * sin_el[:, None] * _interp1_linear(
-                q, f_axis, p[1]
-            )
-        img_fft = torch.fft.fftshift(torch.fft.fft(img, axis=-1), dim=-1)
-        img_fft *= torch.exp(-1j * phi_corr)
-        img = torch.fft.ifft(torch.fft.ifftshift(img_fft, dim=-1), axis=-1)
+        # resampling the profiles back to each row's spectral scale with
+        # the precomputed uniform-grid interpolation.
+        px = p[0][qi0] * (1 - qt) + p[0][qi0 + 1] * qt
+        phi_corr = k_wave * mx_rows[:, None] * px
+        if ncomp == 2:
+            pz = p[1][qi0] * (1 - qt) + p[1][qi0 + 1] * qt
+            phi_corr = phi_corr + k_wave * sin_el[:, None] * pz
+        F *= torch.exp(-1j * phi_corr)
+        corrected = True
 
+    if corrected:
+        img = torch.fft.ifft(torch.fft.ifftshift(F, dim=-1), axis=-1)
     return img, d_sum
 
 
