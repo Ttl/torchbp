@@ -252,7 +252,11 @@ def ffbp(
         and oversample is FFT oversampling factor.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
-        Batched input is not supported.
+        Batched input is not supported. The output grid is referenced to the
+        coordinate frame origin like :func:`backprojection_polar_2d`: a
+        nonzero mean of the positions is honored, not re-centered away
+        (internal subaperture frames are centered, but the final merge lands
+        back on the input frame).
     stages : int
         Number of recursions. This is an upper bound: the recursion also
         stops early where a further split would make the subaperture grids
@@ -626,8 +630,11 @@ def _ffbp_impl(
     div_xy = [pos_xy[bounds[i]:bounds[i + 1]] for i in range(divisions)]
     means = [(sum(x for x, _ in s) / len(s), sum(y for _, y in s) / len(s))
              for s in div_xy]
-    # True centroid over all node pulses. The final merge lands on this same
-    # centroid via pulse-count-weighted origins in the merge chain below.
+    # True centroid over all node pulses: the intermediate merges track it
+    # via pulse-count-weighted origins in the merge chain below. The final
+    # merge lands on the node frame origin, which for a center_pos-centered
+    # input (every recursive call) coincides with the centroid; at the top
+    # level the input positions may have a nonzero mean and the two differ.
     n_all = len(pos_xy)
     cx = sum(x for x, _ in pos_xy) / n_all
     cy = sum(y for _, y in pos_xy) / n_all
@@ -675,9 +682,15 @@ def _ffbp_impl(
         # swath and over the merge-chain origin variation (dy = 0 covers
         # the no-shift window; the 0.5/1.5 factors bound the intermediate
         # pairwise-mean origins of unbalanced in-node merge chains).
-        dy = cy - means[d_idx][1]
-        dx = cx - means[d_idx][0]
-        cand = [(sy * dy, sx * dx, d)
+        offs = [(cy - means[d_idx][1], cx - means[d_idx][0])]
+        if is_top_level:
+            # The top-level final merge lands on the input frame origin
+            # (0, 0), not the pulse centroid; with a nonzero input position
+            # mean the guard must also cover the lookup shifts relative to
+            # it. pos_xy at the top level is in input frame coordinates.
+            offs.append((-means[d_idx][1], -means[d_idx][0]))
+        cand = [(sy * dy_o, sx * dx_o, d)
+                for dy_o, dx_o in offs
                 for sy in (0.0, 0.5, 1.5) for sx in (-1.5, 1.5)
                 for d in (r0_min, r1_max)]
         s_hi = max(_tp_shift(theta1_g, *c) for c in cand)
@@ -856,11 +869,18 @@ def _ffbp_impl(
     def _merge_pair(img1, img2, is_final_merge):
         # Pulse-count-weighted origin so the running frame tracks the true phase
         # center of the combined pulses. Plain 0.5/0.5 averaging only reaches
-        # the node centroid for balanced trees. Weighting makes the final merge
-        # land exactly on the node centroid, the frame the parent expects.
+        # the node centroid for balanced trees. The final merge lands on the
+        # node frame origin: the frame the parent expects (center_pos-centered
+        # input, where it equals the pulse centroid) and, at the top level, the
+        # frame the grid and positions are defined in — like
+        # backprojection_polar_2d, a nonzero input position mean is honored
+        # instead of silently re-centering the output grid on the centroid.
         n1, n2 = img1[7], img2[7]
         nsum = n1 + n2
-        new_origin = (n1 * img1[0] + n2 * img2[0]) / nsum
+        if is_final_merge:
+            new_origin = torch.zeros_like(img1[0])
+        else:
+            new_origin = (n1 * img1[0] + n2 * img2[0]) / nsum
         new_z = (n1 * img1[3] + n2 * img2[3]) / nsum
         alias = False
         # output_alias only applies to final merge

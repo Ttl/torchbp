@@ -382,6 +382,75 @@ class TestFFBPRemainderSweeps(TestCase):
         self.assertGreater(self._last_sweep_energy(1000, 2, divisions=3), 0.0)
 
 
+class TestFfbpFrameOrigin(TestCase):
+    """ffbp must reference the output grid to the coordinate frame origin
+    like backprojection_polar_2d, not to the mean of the input positions.
+    """
+
+    def _scene(self, device):
+        c0 = 299792458.0
+        fc = 6e9
+        bw = 200e6
+        tsweep = 100e-6
+        fs = 10e6
+        oversample = 2
+        r_res = c0 / (2 * bw * oversample)
+        nsweeps = 192
+        pos = torch.zeros(nsweeps, 3, device=device)
+        pos[:, 1] = torch.linspace(-4, 4, nsweeps, device=device)
+        pos[:, 2] = 25.0
+        targets = torch.tensor([[80.0, 0.0, 0.0], [70.0, -8.0, 0.0],
+                                [95.0, 10.0, 0.0]], device=device)
+        rcs = torch.ones((targets.shape[0], 1), device=device,
+                         dtype=torch.complex64)
+        raw = torchbp.util.generate_fmcw_data(
+            targets, rcs, pos, fc, bw, tsweep, fs, rvp=False)
+        nsamples = raw.shape[-1]
+        w = torch.hamming_window(nsamples, periodic=False, device=device)
+        data = torch.fft.ifft(raw * w[None, :], dim=-1,
+                              n=nsamples * oversample)
+        grid = {"r": (60.0, 110.0), "theta": (-0.3, 0.3),
+                "nr": 256, "ntheta": 256}
+        return data, grid, fc, r_res, pos
+
+    def _test_nonzero_mean_pos_matches_bp(self, device, divisions):
+        data, grid, fc, r_res, pos = self._scene(device)
+        # In-plane baseline-scale offset, like the InSAR reform case.
+        off = torch.tensor([0.13, 0.585, 0.0], device=device)
+
+        def rel(a, b):
+            return (torch.linalg.norm(a - b) / torch.linalg.norm(b)).item()
+
+        def run(p):
+            ref = torchbp.ops.backprojection_polar_2d(
+                data, grid, fc, r_res, p, dealias=True)[0]
+            out = torchbp.ops.ffbp(
+                data, grid, fc, r_res, p, stages=4, divisions=divisions,
+                dealias=True, grid_oversample=2.0)
+            return out, ref
+
+        out0, ref0 = run(pos)
+        out_off, ref_off = run(pos + off)
+        # Offset accuracy must match the zero-mean accuracy (merge
+        # interpolation error only).
+        self.assertLess(rel(out_off, ref_off), rel(out0, ref0) + 0.01)
+        # And ffbp must not be translation invariant: the offset displaces
+        # the scene and changes the phase reference.
+        self.assertGreater(rel(out_off, out0), 0.5)
+
+    def test_nonzero_mean_pos_matches_bp_cpu(self):
+        self._test_nonzero_mean_pos_matches_bp("cpu", divisions=2)
+
+    def test_nonzero_mean_pos_matches_bp_divisions3_cpu(self):
+        # Odd image count exercises the trailing-image reduction path with
+        # the frame-origin final merge.
+        self._test_nonzero_mean_pos_matches_bp("cpu", divisions=3)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_nonzero_mean_pos_matches_bp_cuda(self):
+        self._test_nonzero_mean_pos_matches_bp("cuda", divisions=2)
+
+
 class TestComputeIllumination(TestCase):
     """Test antenna pattern illumination map computation (compute_illumination op)."""
 
