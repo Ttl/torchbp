@@ -171,6 +171,154 @@ class TestPga(TestCase):
         )
 
 
+class TestPgaXz(TestCase):
+    """Image-domain range/elevation (x, z) PGA on a polar image."""
+
+    fc = 6e9
+    h = 60.0
+    r_res = 0.3
+    grid = {"r": (60.0, 140.0), "theta": (-0.25, 0.25), "nr": 128,
+            "ntheta": 256}
+    nsweeps = 128
+    sweep_samples = 512
+
+    @staticmethod
+    def _sharpness(img):
+        p = img.abs() ** 2
+        return ((p**2).sum() / (p.sum() ** 2)).item()
+
+    def _geometry(self):
+        """Per-row cos/sin elevation angle, platform above scene at z=0."""
+        r0, r1 = self.grid["r"]
+        nr = self.grid["nr"]
+        r = r0 + (r1 - r0) / nr * torch.arange(nr)
+        slant = torch.sqrt(r**2 + self.h**2)
+        return r / slant, -self.h / slant
+
+    def test_recovers_xz_error(self):
+        # Corrupt a sparse point-target image through the physical model
+        # pga_xz inverts: phase (4*pi*fc/c) * (cos_el*dx + sin_el*dz) at
+        # spectrum bin f, with the per-row cos(el) scaling of the
+        # spectral axis. Both profiles must be recovered on the common
+        # axis, verifying the per-bin x/z separation and the axis
+        # rescaling (dz is at a frequency where ignoring the scaling
+        # would misalign the blocks by about a cycle).
+        torch.manual_seed(3)
+        nr, ntheta = self.grid["nr"], self.grid["ntheta"]
+        img = 0.01 * torch.randn(nr, ntheta, dtype=torch.complex64)
+        r_idx = torch.randint(0, nr, (64,))
+        t_idx = torch.randint(0, ntheta, (64,))
+        img[r_idx, t_idx] += (1.0 + torch.rand(64)) * torch.exp(
+            2j * torch.pi * torch.rand(64)
+        )
+
+        cos_el, sin_el = self._geometry()
+        f = (torch.arange(ntheta) - ntheta // 2).to(torch.float32)
+
+        def dx_fun(q):
+            return 4e-3 * torch.sin(2 * torch.pi * 2 * q / ntheta)
+
+        def dz_fun(q):
+            return 8e-3 * torch.sin(2 * torch.pi * 4 * q / ntheta + 1.0)
+
+        k_wave = 4 * torch.pi * self.fc / 299792458.0
+        # Row's bin f sees the common-axis profile at f / gamma(r).
+        q = f[None, :] / (cos_el / cos_el.max())[:, None]
+        phi_true = k_wave * (
+            cos_el[:, None] * dx_fun(q) + sin_el[:, None] * dz_fun(q)
+        )
+        img_bad = torch.fft.ifft(
+            torch.fft.ifftshift(
+                torch.fft.fftshift(torch.fft.fft(img, axis=-1), dim=-1)
+                * torch.exp(1j * phi_true),
+                dim=-1,
+            ),
+            axis=-1,
+        )
+
+        img_focus, d = torchbp.autofocus.pga_xz(
+            img_bad.clone(), self.grid, self.fc, self.h, range_divisions=4
+        )
+
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(d).all())
+        self.assertGreater(
+            self._sharpness(img_focus), 2.0 * self._sharpness(img_bad)
+        )
+        # Recovered profiles must match the injected ones up to the
+        # unobservable linear trend, without x/z cross-leakage.
+        from torchbp.util import detrend
+        for comp, true in ((0, dx_fun(f)), (1, dz_fun(f))):
+            resid = detrend(true - d[comp])
+            self.assertLess(
+                resid.pow(2).mean().sqrt().item(),
+                0.4 * true.pow(2).mean().sqrt().item(),
+            )
+
+    def _make_data(self, targets, amps, pos):
+        """Point responses consistent with the backprojection phase model."""
+        c0 = 299792458.0
+        data = torch.zeros(
+            pos.shape[0], self.sweep_samples, dtype=torch.complex64
+        )
+        m_idx = torch.arange(pos.shape[0])
+        for t, a in zip(targets, amps):
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = d / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += a * w[valid] * phase[valid]
+        return data
+
+    def test_focuses_backprojected_motion_error(self):
+        # End-to-end: data simulated with true x and z platform motion
+        # errors, backprojected at the nominal positions. This validates
+        # the geometry conventions against the real kernel (a sign error
+        # in the correction would make the image worse, not better).
+        torch.manual_seed(5)
+        ntargets = 24
+        r = 70.0 + 60.0 * torch.rand(ntargets)
+        t = -0.2 + 0.4 * torch.rand(ntargets)
+        targets = torch.stack(
+            [r * torch.sqrt(1 - t**2), r * t, torch.zeros_like(r)], dim=1
+        )
+        amps = (1.0 + torch.rand(ntargets)).to(torch.complex64)
+        pos = torch.zeros(self.nsweeps, 3)
+        pos[:, 1] = torch.linspace(-3.0, 3.0, self.nsweeps)
+        pos[:, 2] = self.h
+
+        n = torch.arange(self.nsweeps)
+        dx = 4e-3 * torch.sin(2 * torch.pi * 2 * n / self.nsweeps)
+        dz = 15e-3 * torch.sin(2 * torch.pi * 3 * n / self.nsweeps + 1.0)
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        pos_true[:, 2] += dz
+        data = self._make_data(targets, amps, pos_true)
+
+        img_blur = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fc, self.r_res, pos
+        )[0]
+        img_focus, d = torchbp.autofocus.pga_xz(
+            img_blur.clone(), self.grid, self.fc, self.h,
+            range_divisions=4,
+        )
+
+        self.assertTrue(torch.isfinite(img_focus).all())
+        self.assertTrue(torch.isfinite(d).all())
+        self.assertGreater(
+            self._sharpness(img_focus), 1.3 * self._sharpness(img_blur)
+        )
+        # The range-variant z correction must add focus over plain
+        # (space-invariant) pga on the same image.
+        img_pga, _ = torchbp.autofocus.pga(img_blur.clone())
+        self.assertGreater(
+            self._sharpness(img_focus), 1.2 * self._sharpness(img_pga)
+        )
+
+
 class TestGpgaBpPolar(TestCase):
     """End-to-end GPGA polar autofocus on synthetic point-scatterer data."""
 

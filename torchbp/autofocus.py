@@ -282,6 +282,251 @@ def pga(
     return img, phi_sum
 
 
+def pga_xz(
+    img: Tensor,
+    grid: "PolarGrid | dict",
+    fc: float,
+    h: float,
+    range_divisions: int = 4,
+    window_width: int | None = None,
+    max_iters: int = 10,
+    window_exp: float = 0.5,
+    min_window: int = 5,
+    remove_trend: bool = True,
+    estimate_z: bool = True,
+    solve_threshold: float = 3e-3,
+    eps: float = 1e-6,
+    spectrum_support: bool = True,
+    support_gate: float = 0.01,
+) -> tuple[Tensor, Tensor]:
+    """
+    Phase gradient autofocus with range-direction and vertical (x, z)
+    position error estimation.
+
+    Image-domain variant of :func:`gpga_tde` restricted to the
+    range-direction (x) and vertical (z) platform position error
+    components. For these two components the phase error of a pixel
+    depends on the pixel direction only through the elevation angle,
+    which on a polar grid is a function of the range row alone (scene
+    assumed at ``z = 0``), so the error decomposes over the image: at
+    range row ``r`` and azimuth spectrum bin ``k``
+
+    ``phi(k, r) = (4 pi fc / c) * (cos(az_c) * cos(el(r)) * dx(k) + sin(el(r)) * dz(k))``
+
+    where ``az_c`` is the grid center azimuth. The profiles ``dx`` and
+    ``dz`` are estimated by running the PGA estimator on blocks of range
+    rows and solving the two components per spectrum bin from the block
+    phases, and the correction is applied with per-row multiplies in the
+    azimuth spectrum domain. Unlike :func:`gpga` / :func:`gpga_tde` no
+    raw data is needed and no image re-formation is done; the whole
+    algorithm runs on the image with FFTs.
+
+    The azimuth spectral variable of a target scales with ``cos(el)``:
+    the same along-track platform offset lands on different spectrum
+    bins at different range rows. Block estimates are resampled onto a
+    common spectral axis referenced to the row with the largest
+    ``cos(el)`` before the per-bin solve, and the correction is
+    resampled back per row.
+
+    The along-track (y) error component is not modeled: its phase error
+    is proportional to the theta coordinate within the image, which does
+    not decompose over range rows. At broadside it is also the component
+    that defocuses least.
+
+    Parameters
+    ----------
+    img : Tensor
+        Complex input image on a polar grid. Shape: [range, azimuth].
+    grid : PolarGrid or dict
+        Polar grid definition of the image.
+    fc : float
+        RF center frequency in Hz.
+    h : float
+        Mean platform altitude above the scene plane in meters
+        (e.g. ``torch.mean(pos[:, 2])``).
+    range_divisions : int
+        Number of range blocks the phase error is estimated from. Must
+        be at least 2 when `estimate_z` is True. More blocks improve the
+        conditioning of the x/z separation at the cost of fewer rows per
+        block estimate.
+    window_width : int
+        Initial window width. Default is None which uses full image size.
+    max_iters : int
+        Maximum number of iterations.
+    window_exp : float
+        Exponent for decreasing the window size for each iteration.
+    min_window : int
+        Minimum window size.
+    remove_trend : bool
+        Remove linear trend of the solved profiles that only shifts the
+        image.
+    estimate_z : bool
+        Estimate the vertical error component. Requires elevation angle
+        variation over the range swath. Automatically disabled when
+        ``h == 0``.
+    solve_threshold : float
+        Relative eigenvalue threshold of the per-bin (x, z) solve. If
+        the elevation angle spread over the range swath is too small to
+        separate z from x, the weakly observed direction gets zero
+        update instead of amplified noise.
+    eps : float
+        Minimum weight for weighted PGA.
+    spectrum_support : bool
+        Restrict the estimate to azimuth spectrum bins that have signal.
+        See :func:`pga`.
+    support_gate : float
+        Azimuth spectrum bins with mean power below this fraction of the
+        maximum are considered unoccupied.
+
+    Returns
+    -------
+    img : Tensor
+        Focused image.
+    d : Tensor
+        Solved position error profiles in meters, shape [2, ntheta].
+        ``d[0]`` is the range-direction (x) and ``d[1]`` the vertical
+        (z) error as a function of fftshifted azimuth spectrum bin on
+        the common spectral axis (bin ``ntheta // 2`` is zero azimuth
+        frequency, the bin is proportional to along-track position with
+        unknown scale and sign). Only meaningful over the occupied
+        spectrum bins. With `remove_trend` the unobservable linear
+        trends are removed.
+    """
+    if img.ndim != 2:
+        raise ValueError("Input image should be 2D.")
+    if not _grid_is_polar(grid):
+        raise ValueError("pga_xz requires a polar grid.")
+    if window_exp > 1 or window_exp < 0:
+        raise ValueError(f"Invalid window_exp {window_exp}")
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    if img.shape[0] != nr or img.shape[1] != ntheta:
+        raise ValueError(
+            f"Image shape {tuple(img.shape)} does not match the grid "
+            f"({nr}, {ntheta})."
+        )
+    if h == 0:
+        estimate_z = False
+    if estimate_z and range_divisions < 2:
+        raise ValueError("estimate_z requires range_divisions >= 2.")
+    dev = img.device
+    rdtype = img.real.dtype
+    c0 = 299792458.0
+    k_wave = 4 * torch.pi * fc / c0
+
+    # Per-row look geometry: grid r is ground range from the platform
+    # reference (origin), scene assumed at z=0.
+    r_rows = r0 + dr * torch.arange(nr, device=dev, dtype=rdtype)
+    slant = torch.sqrt(r_rows**2 + h**2)
+    cos_el = r_rows / slant
+    sin_el = -h / slant
+    theta_c = 0.5 * (theta0 + theta1)
+    cos_az_c = float(np.sqrt(max(1.0 - theta_c**2, 0.0)))
+    mx_rows = cos_az_c * cos_el
+    cos_el_ref = torch.max(cos_el)
+    # Signed spectral bin axis of the fftshifted azimuth spectrum.
+    f_axis = torch.arange(ntheta, device=dev, dtype=rdtype) - ntheta // 2
+
+    if window_width is None:
+        window_width = ntheta
+    if window_width > ntheta:
+        window_width = ntheta
+    nb = range_divisions
+    rdiv = nr // nb
+
+    # Spectrum magnitude is invariant over the iterations since only
+    # phase corrections are applied, so the support is solved only once.
+    est_weight = None
+    det_weight = None
+    if spectrum_support:
+        spec_pwr = torch.fft.fftshift(
+            torch.mean(torch.abs(torch.fft.fft(img, axis=-1)) ** 2, dim=0)
+        )
+        support = spec_pwr / torch.clamp(torch.max(spec_pwr), min=1e-30)
+        mask = support > support_gate
+        est_weight = mask.to(rdtype)[None, :]
+        det_weight = support * mask
+
+    ncomp = 2 if estimate_z else 1
+    d_sum = torch.zeros(2, ntheta, device=dev, dtype=rdtype)
+    local_d = torch.zeros(nb, ntheta, device=dev, dtype=rdtype)
+    local_w = torch.zeros(nb, device=dev, dtype=rdtype)
+    local_m = torch.zeros(nb, 2, device=dev, dtype=rdtype)
+
+    for i in range(max_iters):
+        window = int(window_width * window_exp**i)
+        if window < min_window:
+            break
+        for b in range(nb):
+            b1 = (b + 1) * rdiv if b < nb - 1 else nr
+            sub = img[b * rdiv : b1]
+            # Peak for each range bin, rolled to bin 0 with a batched
+            # gather as in pga.
+            rpeaks = torch.argmax(torch.abs(sub), axis=1)
+            idx = (
+                torch.arange(ntheta, device=dev)[None, :] + rpeaks[:, None]
+            ) % ntheta
+            g = torch.gather(sub, 1, idx)
+            # Apply window
+            g[:, 1 + window // 2 : ntheta - window // 2] = 0
+            g = torch.fft.fftshift(torch.fft.fft(g, axis=-1), dim=-1)
+            phi, w = pga_estimator(
+                g, "wls", eps, return_weight=True, weight=est_weight
+            )
+            phi = unwrap(phi)
+            # SCR-weighted block geometry: where the strong targets are.
+            wn = (w[:, 0] / torch.max(w)).to(rdtype)
+            r_b = torch.sum(wn * r_rows[b * rdiv : b1]) / torch.sum(wn)
+            slant_b = torch.sqrt(r_b**2 + h**2)
+            gamma_b = (r_b / slant_b) / cos_el_ref
+            # Resample the block estimate onto the common spectral axis.
+            phi = _interp1_linear(f_axis * gamma_b, f_axis, phi)
+            local_d[b] = phi / k_wave
+            local_w[b] = 1 / torch.sum(1 / w)
+            local_m[b, 0] = cos_az_c * r_b / slant_b
+            local_m[b, 1] = -h / slant_b
+
+        # Per-bin weighted solve of the (x, z) profiles from the block
+        # range errors. The model matrix is bin-independent so the
+        # truncated eigenvalue solve of the normal equations (as in
+        # gpga_tde) is a single small solve applied to all bins: if the
+        # elevation angle spread is too small to separate z from x, the
+        # weak eigen-direction gets zero update instead of noise.
+        ws = torch.sqrt(
+            local_w / torch.clamp(torch.max(local_w), min=1e-30)
+        )[:, None]
+        A = ws * local_m[:, :ncomp]
+        B = ws * local_d
+        AtA = A.T @ A
+        Atb = A.T @ B
+        evals, evecs = torch.linalg.eigh(AtA)
+        evinv = torch.where(
+            evals > solve_threshold * torch.max(evals), 1 / evals, 0.0
+        )
+        p = evecs @ (evinv[:, None] * (evecs.T @ Atb))
+        if remove_trend:
+            for c in range(ncomp):
+                p[c] = weighted_detrend(p[c], det_weight)
+        d_sum[:ncomp] += p
+
+        # Apply the correction with per-row spectrum multiplies,
+        # resampling the profiles back to each row's spectral scale.
+        q = f_axis[None, :] / torch.clamp(
+            (cos_el / cos_el_ref)[:, None], min=1e-6
+        )
+        phi_corr = k_wave * mx_rows[:, None] * _interp1_linear(
+            q, f_axis, p[0]
+        )
+        if estimate_z:
+            phi_corr = phi_corr + k_wave * sin_el[:, None] * _interp1_linear(
+                q, f_axis, p[1]
+            )
+        img_fft = torch.fft.fftshift(torch.fft.fft(img, axis=-1), dim=-1)
+        img_fft *= torch.exp(-1j * phi_corr)
+        img = torch.fft.ifft(torch.fft.ifftshift(img_fft, dim=-1), axis=-1)
+
+    return img, d_sum
+
+
 def _grid_is_polar(grid: "PolarGrid | CartesianGrid | dict") -> bool:
     """Return True for a polar grid, False for a Cartesian one.
 
