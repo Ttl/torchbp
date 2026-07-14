@@ -150,6 +150,94 @@ def pga_estimator(
     return phi
 
 
+def pga_window_estimate(
+    img: Tensor,
+    thr_db: float = 10.0,
+    margin: float = 2.0,
+    min_window: int = 8,
+) -> int:
+    """
+    Estimate the phase gradient autofocus window width from the image.
+
+    Measures the width of the average defocus kernel from the noncoherent
+    sum of the peak-centered image rows [1]_: with each row circularly
+    shifted so its strongest pixel is at bin 0, the phase of the blur
+    cancels in the intensity sum but its width survives, riding on a flat
+    clutter pedestal. Rows are weighted by a signal-to-clutter proxy
+    (peak-to-mean ratio squared) so target-free rows do not dilute the
+    kernel, the pedestal is estimated as the median of the summed profile,
+    and the width is measured at ``thr_db`` below the pedestal-subtracted
+    peak.
+
+    A sinusoidal phase error produces discrete paired echoes rather than
+    a continuous blur, and the dips between echoes would end the width
+    measurement early. The profile is therefore smoothed with a window
+    scaled to the current width estimate and re-measured until the
+    estimate is stable, so the smoothing bridges the echo spacing
+    whatever it is.
+
+    On a well focused image the estimate collapses to the target mainlobe
+    width, so it can also be used as a convergence indicator.
+
+    References
+    ----------
+    .. [1] D. E. Wahl, P. H. Eichel, D. C. Ghiglia and C. V. Jakowatz,
+        "Phase gradient autofocus - A robust tool for high resolution SAR
+        phase correction," in IEEE Transactions on Aerospace and
+        Electronic Systems, vol. 30, no. 3, pp. 827-835, July 1994.
+
+    Parameters
+    ----------
+    img : Tensor
+        Complex input image. Shape should be: [Range, azimuth].
+    thr_db : float
+        Width is measured where the pedestal-subtracted kernel profile
+        drops this many dB below its peak.
+    margin : float
+        Safety factor applied to the measured width.
+    min_window : int
+        Lower bound of the returned window width.
+
+    Returns
+    -------
+    window_width : int
+        Estimated window width in azimuth bins, at most the azimuth size.
+    """
+    if img.ndim != 2:
+        raise ValueError("Input image should be 2D.")
+    nr, ntheta = img.shape
+    a = torch.abs(img)
+    rpeaks = torch.argmax(a, dim=1)
+    pk = a[torch.arange(nr, device=img.device), rpeaks]
+    w = (pk / (torch.mean(a, dim=1) + 1e-30)) ** 2
+    w = w / torch.clamp(torch.sum(w), min=1e-30)
+    idx = (
+        torch.arange(ntheta, device=img.device)[None, :] + rpeaks[:, None]
+    ) % ntheta
+    s0 = torch.sum(w[:, None] * torch.gather(a, 1, idx) ** 2, dim=0)
+    ws = max(3, ntheta // 4096)
+    width = ntheta
+    for _ in range(6):
+        s = sum(
+            torch.roll(s0, j) for j in range(-(ws // 2), ws // 2 + 1)
+        ) / (2 * (ws // 2) + 1)
+        ped = torch.median(s)
+        thr = ped + (torch.max(s) - ped) * 10 ** (-thr_db / 10)
+        below = s <= thr
+        # First crossing walking outward from the centered peak at bin 0
+        # in both circular directions.
+        right = torch.nonzero(below[: ntheta // 2])
+        left = torch.nonzero(below[ntheta // 2 :].flip(0))
+        k_r = int(right[0]) if len(right) else ntheta // 2
+        k_l = int(left[0]) if len(left) else ntheta // 2
+        width = k_r + k_l
+        ws_new = max(3, width // 2)
+        if ws_new <= ws:
+            break
+        ws = ws_new
+    return max(min_window, min(ntheta, int(margin * width)))
+
+
 def pga(
     img: Tensor,
     window_width: int | None = None,
@@ -173,10 +261,10 @@ def pga(
     img : Tensor
         Complex input image. Shape should be: [Range, azimuth].
     window_width : int
-        Initial window width. Default is None which uses full image size.
-        With a large image, setting this to a bound on the initial blur
-        width avoids the expensive full-length estimate of the first
-        iteration.
+        Initial window width. Default is None which measures the blur
+        width from the image with :func:`pga_window_estimate`. Set
+        explicitly to override, e.g. to the image size for the previous
+        unwindowed first-iteration behavior.
     max_iter : int
         Maximum number of iterations.
     window_exp : float
@@ -236,7 +324,7 @@ def pga(
     nr, ntheta = img.shape
     phi_sum = torch.zeros(ntheta, device=img.device, dtype=img.real.dtype)
     if window_width is None:
-        window_width = ntheta
+        window_width = pga_window_estimate(img)
     if window_width > ntheta:
         window_width = ntheta
     dev = img.device
@@ -450,13 +538,13 @@ def pga_xz(
         conditioning of the x/z separation at the cost of fewer rows per
         block estimate.
     window_width : int
-        Initial window width. Default is None which uses full image size.
-        With a large image, set this to a bound on the initial blur
-        width: an unwindowed estimate over tens of thousands of bins is
+        Initial window width. Default is None which measures the blur
+        width from the image with :func:`pga_window_estimate`. Avoid an
+        unwindowed (image sized) estimate on a large image: it is
         dominated by phase-difference random-walk noise, which the x/z
-        solve amplifies (the unwindowed first pass therefore solves the
-        range-direction component only, see below), and it is also the
-        expensive iteration the truncated estimation cannot shorten.
+        solve amplifies (an unwindowed first pass therefore solves the
+        range-direction component only), and it is also the expensive
+        iteration the truncated estimation cannot shorten.
     max_iters : int
         Maximum number of iterations.
     window_exp : float
@@ -541,7 +629,7 @@ def pga_xz(
     f_axis = torch.arange(ntheta, device=dev, dtype=rdtype) - ntheta // 2
 
     if window_width is None:
-        window_width = ntheta
+        window_width = pga_window_estimate(img)
     if window_width > ntheta:
         window_width = ntheta
     nb = range_divisions

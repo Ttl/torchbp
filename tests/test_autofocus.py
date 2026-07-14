@@ -171,6 +171,43 @@ class TestPga(TestCase):
         )
 
 
+class TestPgaWindowEstimate(TestCase):
+    """Blur-width estimation from the peak-centered noncoherent sum."""
+
+    def test_tracks_blur_width(self):
+        torch.manual_seed(3)
+        nr, N = 256, 4096
+        img = 0.01 * torch.randn(nr, N, dtype=torch.complex64)
+        r_idx = torch.randint(0, nr, (500,))
+        t_idx = torch.randint(0, N, (500,))
+        img[r_idx, t_idx] += (1.0 + torch.rand(500)) * torch.exp(
+            2j * torch.pi * torch.rand(500)
+        )
+        k = torch.arange(N).float()
+        # Quadratic phase error: kernel extent ~ +-2*beta/pi bins.
+        phi = 20.0 * (2 * k / N - 1) ** 2
+
+        def corrupt(p):
+            return torch.fft.ifft(
+                torch.fft.fft(img, axis=-1) * torch.exp(1j * p)[None, :],
+                axis=-1,
+            )
+
+        w_focused = torchbp.autofocus.pga_window_estimate(img)
+        w_blur = torchbp.autofocus.pga_window_estimate(corrupt(phi))
+        w_blur3 = torchbp.autofocus.pga_window_estimate(corrupt(3 * phi))
+        # A focused image collapses to the mainlobe width.
+        self.assertLess(w_focused, 32)
+        # The window must cover the kernel (~26 and ~76 bins) with
+        # margin, without ballooning to the image size, and must grow
+        # with the blur.
+        self.assertGreater(w_blur, 26)
+        self.assertLess(w_blur, 300)
+        self.assertGreater(w_blur3, 76)
+        self.assertLess(w_blur3, 900)
+        self.assertGreater(w_blur3, w_blur)
+
+
 class TestPgaXz(TestCase):
     """Image-domain range/elevation (x, z) PGA on a polar image."""
 
