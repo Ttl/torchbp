@@ -133,6 +133,138 @@ class TestBackprojectionPolar(TestCase):
         self._opcheck("cuda")
 
 
+class TestBackprojectionPolarKnabCpu(TestCase):
+    """Tests for the CPU table-based backprojection_polar_2d_knab."""
+
+    fc = 1e9
+    c0 = 299792458.0
+
+    def _random_inputs(self, nsweeps=8, sweep_samples=64, nr=16, ntheta=8):
+        torch.manual_seed(7)
+        grid = {"r": (5, 15), "theta": (-0.5, 0.5), "nr": nr, "ntheta": ntheta}
+        data = torch.randn(nsweeps, sweep_samples, dtype=torch.complex64)
+        pos = torch.zeros(nsweeps, 3)
+        pos[:, 1] = torch.linspace(-1, 1, nsweeps)
+        pos[:, 2] = 2.0
+        return data, grid, pos
+
+    def _reference_knab(self, data, grid, fc, r_res, pos, d0, order,
+                        oversample, data_fmod=0.0):
+        """Brute-force knab backprojection with exact double weights.
+
+        Same geometry, pixel validity gating and per-tap edge masking as the
+        kernel; the kernel's nearest-table-row weights differ from the exact
+        weights by the fraction quantization only.
+        """
+        nsweeps, ns = data.shape
+        nr, ntheta = grid["nr"], grid["ntheta"]
+        r0, r1 = grid["r"]
+        t0, t1 = grid["theta"]
+        dr = (r1 - r0) / nr
+        dt = (t1 - t0) / ntheta
+        a = order / 2.0
+        v = 1.0 - 1.0 / oversample
+        ref_phase = 4.0 * fc / self.c0
+
+        def knab_w(x):
+            if abs(x) >= a or x == 0.0:
+                return float(x == 0.0)
+            w = np.sin(np.pi * x) / (np.pi * x)
+            if v > 0:
+                w *= np.cosh(np.pi * v * a * np.sqrt(1.0 - (x / a) ** 2))
+                w /= np.cosh(np.pi * v * a)
+            return w
+
+        d_np = data.numpy()
+        pos_np = pos.numpy().astype(np.float64)
+        img = np.zeros((nr, ntheta), np.complex128)
+        for i in range(nr):
+            r = r0 + dr * i
+            for j in range(ntheta):
+                th = t0 + dt * j
+                x = r * np.sqrt(max(0.0, 1.0 - th * th))
+                y = r * th
+                acc = 0.0
+                for m in range(nsweeps):
+                    px, py, pz = pos_np[m]
+                    d = np.sqrt(r * r + px * px + py * py + pz * pz
+                                - 2.0 * (x * px + y * py))
+                    sx = (d + d0) / r_res
+                    id0 = int(sx)
+                    if not (sx >= 0.0 and id0 + 1 < ns):
+                        continue
+                    frac = sx - id0
+                    base = id0 - (order // 2 - 1)
+                    s = 0.0
+                    for k in range(order):
+                        t = base + k
+                        if t < 0 or t >= ns:
+                            continue
+                        s += knab_w(frac + (order // 2 - 1) - k) * d_np[m, t]
+                    acc += s * np.exp(1j * (np.pi * ref_phase * d
+                                            - data_fmod * sx))
+                img[i, j] = acc
+        return torch.from_numpy(img).to(torch.complex64)
+
+    def test_matches_reference_cpu(self):
+        data, grid, pos = self._random_inputs()
+        # d0 and r_res chosen so sx spans past both data edges: covers
+        # invalid pixels and partial interpolation windows at the edges.
+        r_res = 8.0 / data.shape[1]
+        d0 = -6.0
+        for order, oversample in [(2, 1.0), (4, 1.25), (6, 1.5), (8, 2.0)]:
+            res = torchbp.ops.backprojection_polar_2d_knab(
+                data, grid, self.fc, r_res, pos, d0=d0, order=order,
+                oversample=oversample, data_fmod=0.7)[0]
+            ref = self._reference_knab(
+                data, grid, self.fc, r_res, pos, d0, order, oversample,
+                data_fmod=0.7)
+            rel = torch.norm(res - ref) / torch.norm(ref)
+            self.assertLess(rel.item(), 5e-3,
+                            f"order={order} oversample={oversample}")
+
+    def test_odd_order_rejected_cpu(self):
+        data, grid, pos = self._random_inputs()
+        with self.assertRaises(RuntimeError):
+            torchbp.ops.backprojection_polar_2d_knab(
+                data, grid, self.fc, 0.15, pos, order=5)
+
+    def test_constant_g_matches_no_g_cpu(self):
+        # A constant antenna pattern with normalization is a no-op.
+        data, grid, pos = self._random_inputs()
+        g = torch.ones(8, 16)
+        g_extent = [-torch.pi / 2, -torch.pi, torch.pi / 2, torch.pi]
+        att = torch.zeros(data.shape[0], 3)
+        ref = torchbp.ops.backprojection_polar_2d_knab(
+            data, grid, self.fc, 0.15, pos, order=6, oversample=1.5)
+        res = torchbp.ops.backprojection_polar_2d_knab(
+            data, grid, self.fc, 0.15, pos, order=6, oversample=1.5,
+            att=att, g=g, g_extent=g_extent)
+        torch.testing.assert_close(res, ref, atol=1e-5, rtol=1e-5)
+
+    def test_zero_dem_matches_no_dem_cpu(self):
+        data, grid, pos = self._random_inputs()
+        dem = torch.zeros(grid["nr"], grid["ntheta"])
+        ref = torchbp.ops.backprojection_polar_2d_knab(
+            data, grid, self.fc, 0.15, pos, order=6, oversample=1.5)
+        res = torchbp.ops.backprojection_polar_2d_knab(
+            data, grid, self.fc, 0.15, pos, order=6, oversample=1.5, dem=dem)
+        torch.testing.assert_close(res, ref)
+
+    def test_batched_cpu(self):
+        # Batched input matches per-batch processing.
+        data, grid, pos = self._random_inputs()
+        data2 = torch.stack([data, data.flip(0)])
+        pos2 = torch.stack([pos, pos.flip(0)])
+        res = torchbp.ops.backprojection_polar_2d_knab(
+            data2, grid, self.fc, 0.15, pos2, order=6, oversample=1.5)
+        for b in range(2):
+            ref = torchbp.ops.backprojection_polar_2d_knab(
+                data2[b], grid, self.fc, 0.15, pos2[b], order=6,
+                oversample=1.5)
+            torch.testing.assert_close(res[b], ref[0])
+
+
 class TestBackprojectionPolarDem(TestCase):
     """Tests for the optional polar-grid DEM input of backprojection_polar_2d."""
 
@@ -636,13 +768,26 @@ class TestBackprojectionPolarKnab(TestCase):
                 test_utils=["test_schema"]
             )
 
-    @unittest.skip("CPU implementation not available")
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    def test_cpu_and_gpu(self):
+        # CUDA evaluates the kernel transcendentally per tap, CPU through the
+        # precomputed table; the nearest-row quantization is ~1e-3 relative.
+        samples = self.sample_inputs("cuda")
+        for sample in samples:
+            res_gpu = torchbp.ops.backprojection_polar_2d_knab(**sample).cpu()
+            sample_cpu = {
+                k: sample[k].cpu() if isinstance(sample[k], torch.Tensor) else sample[k]
+                for k in sample.keys()
+            }
+            res_cpu = torchbp.ops.backprojection_polar_2d_knab(**sample_cpu)
+            torch.testing.assert_close(res_cpu, res_gpu, atol=1e-3, rtol=1e-2)
 
 
 class TestBackprojectionCart(TestCase):

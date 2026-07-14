@@ -336,6 +336,12 @@ def backprojection_polar_2d_knab(
 
     Gradient not supported.
 
+    The CPU implementation evaluates the kernel through a precomputed
+    polyphase weight table (nearest of 2048 fractional-position rows) instead
+    of transcendentally per tap; the quantization error is ~-70 dB, below the
+    kernel truncation error at practical orders. CPU requires an even
+    ``order`` <= 16.
+
     Parameters
     ----------
     data : Tensor

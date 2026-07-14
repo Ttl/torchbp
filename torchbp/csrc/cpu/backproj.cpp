@@ -322,6 +322,338 @@ static void backprojection_polar_2d_row_cpu(
 }
 
 
+// Maximum interpolation taps for the knab table backprojection kernel.
+#define BP_KNAB_MAX_TAPS 16
+// Fractional-position rows in the precomputed weight table.
+#define BP_KNAB_TABLE_PHASES 2048
+
+// Polyphase Knab interpolation weight table. Row p holds the ``taps`` tap
+// weights for fractional sample position p/nphase; tap j applies to sample
+// (int)sx - (taps/2 - 1) + j. Built in double; cost is negligible next to
+// the backprojection itself. Nearest-row lookup quantizes the fraction to
+// 1/(2*nphase), a ~-70 dB weight error, below the kernel truncation error
+// at practical orders.
+static std::vector<float> knab_interp_table(int taps, float v, int nphase) {
+    const double a = 0.5 * taps;
+    std::vector<float> table((size_t)(nphase + 1) * taps);
+    for (int p = 0; p <= nphase; p++) {
+        const double frac = (double)p / nphase;
+        for (int j = 0; j < taps; j++) {
+            const double x = frac + (taps / 2 - 1) - j;
+            double w;
+            if (std::fabs(x) >= a) {
+                w = 0.0;
+            } else if (x == 0.0) {
+                w = 1.0;
+            } else {
+                const double xa = x / a;
+                w = std::sin(M_PI * x) / (M_PI * x);
+                if (v > 0.0f)
+                    w *= std::cosh(M_PI * v * a * std::sqrt(1.0 - xa * xa))
+                       / std::cosh(M_PI * v * a);
+            }
+            table[(size_t)p * taps + j] = (float)w;
+        }
+    }
+    return table;
+}
+
+// Knab-interpolation variant of backprojection_polar_2d_row_cpu. Same pass
+// structure, with the 2-tap lerp replaced by a TAPS tap weighted sum using
+// nearest-row weights from the precomputed polyphase table: evaluating the
+// kernel transcendentally per tap (sinpi + expf) costs 5-10x the whole
+// linear kernel, the table row is one contiguous load next to the sample
+// gather. Pixel validity matches the linear kernel and the CUDA knab path
+// (sx >= 0 and sx < sweep_samples - 1). ``data`` points at the first real
+// sample of rows zero-padded by TAPS/2 on both sides (row stride
+// ``data_stride``): window taps past the data edges then read zeros, which
+// gives the same values as dropping them (the partial kernel near the range
+// edges of the CUDA knab path) with no per-tap bounds logic in the hot
+// loops. TAPS is a template parameter so the tap loop unrolls inside the
+// vector passes.
+template<bool HasDem, int TAPS>
+static void backprojection_polar_2d_knab_row_cpu(
+          const complex64_t* data,
+          const float* pos,
+          const float* att,
+          complex64_t* img,
+          int sweep_samples,
+          int nsweeps,
+          float ref_phase,
+          float delta_r,
+          float r0,
+          float dr,
+          float theta0,
+          float dtheta,
+          int Nr,
+          int Ntheta,
+          float d0,
+          int dealias,
+          float z0,
+          const float *g,
+          float g_az0,
+          float g_el0,
+          float g_daz,
+          float g_del,
+          int g_naz,
+          int g_nel,
+          const float* dem,
+          float dem_r_scale,
+          float dem_theta_scale,
+          int dem_nr,
+          int dem_ntheta,
+          float data_fmod,
+          float alias_fmod,
+          bool normalize,
+          const float* w_table,
+          int nphase,
+          int data_stride,
+          int idr,
+          int idbatch) {
+    constexpr int CHUNK = 256;
+    float x_buf[CHUNK], y_buf[CHUNK];
+    float accr[CHUNK], acci[CHUNK];
+    float cs_buf[CHUNK], sn_buf[CHUNK];
+    int idx_buf[CHUNK], p_buf[CHUNK];
+    float vld_buf[CHUNK];
+    // (re, im) sample pairs copied as single 8-byte moves; the vector pass
+    // deinterleaves them with in-register shuffles.
+    double v_buf[TAPS][CHUNK];
+    float w_buf[TAPS][CHUNK];
+    float wsum_buf[CHUNK], wsum2_buf[CHUNK];
+    float d_buf[CHUNK];
+    float ef_buf[CHUNK], af_buf[CHUNK];
+    int gi_buf[CHUNK];
+    // Adjacent gain pattern pairs, 8-byte moves like the sample pairs.
+    double g0_buf[CHUNK], g1_buf[CHUNK];
+    float gvld_buf[CHUNK];
+    float z_buf[CHUNK], z2_buf[CHUNK];
+
+    const float r = r0 + idr * dr;
+    const float r2 = r * r;
+    const complex64_t* data_b = data + (size_t)idbatch * nsweeps * data_stride;
+    const float* pos_b = pos + (size_t)idbatch * nsweeps * 3;
+    complex64_t* img_row = img + ((size_t)idbatch * Nr + idr) * Ntheta;
+
+    for (int tb = 0; tb < Ntheta; tb += CHUNK) {
+        const int nchunk = std::min(CHUNK, Ntheta - tb);
+
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            const float theta = theta0 + (tb + q) * dtheta;
+            // Guard band support past |theta| = 1, see
+            // backprojection_polar_2d_row_cpu.
+            const float ct2 = 1.0f - theta*theta;
+            x_buf[q] = r * (ct2 > 0.0f ? sqrtf(ct2) : 0.0f);
+            y_buf[q] = r * theta;
+            accr[q] = 0.0f;
+            acci[q] = 0.0f;
+            wsum_buf[q] = 0.0f;
+            wsum2_buf[q] = 0.0f;
+        }
+
+        if constexpr (HasDem) {
+            const float fr = idr * dem_r_scale;
+            int ir0 = (int)fr;
+            ir0 = ir0 < dem_nr - 1 ? ir0 : dem_nr - 1;
+            const int ir1 = ir0 + 1 < dem_nr ? ir0 + 1 : dem_nr - 1;
+            const float wr = fr - ir0;
+            const float* dem_row0 = dem + (size_t)ir0 * dem_ntheta;
+            const float* dem_row1 = dem + (size_t)ir1 * dem_ntheta;
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float ft = (tb + q) * dem_theta_scale;
+                int it0 = (int)ft;
+                it0 = it0 < dem_ntheta - 1 ? it0 : dem_ntheta - 1;
+                const int it1 = it0 + 1 < dem_ntheta ? it0 + 1 : dem_ntheta - 1;
+                const float wt = ft - it0;
+                const float za = dem_row0[it0] + wt * (dem_row0[it1] - dem_row0[it0]);
+                const float zb = dem_row1[it0] + wt * (dem_row1[it1] - dem_row1[it0]);
+                const float zq = za + wr * (zb - za);
+                z_buf[q] = zq;
+                z2_buf[q] = zq * zq;
+            }
+        }
+
+        for(int i = 0; i < nsweeps; i++) {
+            // Sweep reference position.
+            const float pos_x = pos_b[i * 3 + 0];
+            const float pos_y = pos_b[i * 3 + 1];
+            const float pos_z = pos_b[i * 3 + 2];
+            const float pz2 = pos_z * pos_z;
+            const float r2pn2 = r2 + pos_x * pos_x + pos_y * pos_y + pz2;
+            const float* data_row = (const float*)(data_b + (size_t)i * data_stride);
+
+            // Geometry + phase pass. Out-of-window pixels get idx = 0,
+            // table row 0 and are zeroed by the 0/1 mask in the combine
+            // pass, like the linear kernel.
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                // Distance in polar form, see
+                // backprojection_polar_2d_row_cpu.
+                float d2;
+                if constexpr (HasDem) {
+                    d2 = r2pn2 + z2_buf[q] - 2.0f * (x_buf[q] * pos_x
+                            + y_buf[q] * pos_y + z_buf[q] * pos_z);
+                } else {
+                    d2 = r2pn2 - 2.0f * (x_buf[q] * pos_x + y_buf[q] * pos_y);
+                }
+                const float d = sqrtf(d2 > 0.0f ? d2 : 0.0f);
+                d_buf[q] = d;
+
+                const float sx = delta_r * (d + d0);
+                const int id0 = (int)sx;
+                // Float-domain check as in the linear kernel: (int)sx
+                // truncates toward zero.
+                const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
+                // Window start; can be negative near the data start, the
+                // padding keeps the read in the row.
+                idx_buf[q] = ok ? id0 - (TAPS / 2 - 1) : 0;
+                p_buf[q] = ok ? (int)((sx - id0) * nphase + 0.5f) : 0;
+                vld_buf[q] = ok ? 1.0f : 0.0f;
+
+                float ref_sin, ref_cos;
+                sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
+                cs_buf[q] = ref_cos;
+                sn_buf[q] = ref_sin;
+            }
+
+            // Copy pass: the data-dependent sample and weight table loads
+            // stay scalar, everything else moves to the vector pass.
+            // (Gathering the weights from the table inside the vector pass
+            // instead measures slightly slower.)
+            for (int q = 0; q < nchunk; q++) {
+                const float *s = data_row + 2 * idx_buf[q];
+                const float *wrow = w_table + (size_t)p_buf[q] * TAPS;
+                for (int j = 0; j < TAPS; j++) {
+                    memcpy(&v_buf[j][q], s + 2 * j, 8);
+                    w_buf[j][q] = wrow[j];
+                }
+            }
+
+            if (g != nullptr) {
+                const float att0 = att[idbatch * nsweeps * 3 + 3 * i + 0];
+                const float att2 = att[idbatch * nsweeps * 3 + 3 * i + 2];
+                // Angle pass: bilinear antenna pattern coordinates, same as
+                // backprojection_polar_2d_row_cpu.
+#pragma omp simd
+                for (int q = 0; q < nchunk; q++) {
+                    const float px = x_buf[q] - pos_x;
+                    const float py = y_buf[q] - pos_y;
+                    const float d = d_buf[q];
+                    float sin_l;
+                    if constexpr (HasDem) {
+                        sin_l = (z_buf[q] - pos_z) / d;
+                        sin_l = sin_l > 1.0f ? 1.0f : sin_l;
+                    } else {
+                        sin_l = -pos_z / d;
+                    }
+                    const float look_angle = asinf_fast(sin_l < -1.0f ? -1.0f : sin_l);
+                    const float el_deg = look_angle - att0;
+                    const float az_deg = atan2f_fast(py, px) - att2;
+
+                    const float el_idx = (el_deg - g_el0) / g_del;
+                    const float az_idx = (az_deg - g_az0) / g_daz;
+
+                    const int el_int = (int)el_idx;
+                    const int az_int = (int)az_idx;
+                    const bool ok = (el_idx >= 0.0f) & (el_int + 1 < g_nel) &
+                                    (az_idx >= 0.0f) & (az_int + 1 < g_naz);
+                    ef_buf[q] = ok ? el_idx - el_int : 0.0f;
+                    af_buf[q] = ok ? az_idx - az_int : 0.0f;
+                    gi_buf[q] = ok ? el_int * g_naz + az_int : 0;
+                    gvld_buf[q] = ok ? 1.0f : 0.0f;
+                }
+                for (int q = 0; q < nchunk; q++) {
+                    const int gi = gi_buf[q];
+                    memcpy(&g0_buf[q], g + gi, 8);
+                    memcpy(&g1_buf[q], g + gi + g_naz, 8);
+                }
+                // Vector pass: gain bilinear, tap-unrolled interpolation,
+                // phasor multiply and accumulate, masked by the 0/1
+                // validity products instead of a skip branch.
+#pragma omp simd
+                for (int q = 0; q < nchunk; q++) {
+                    const float ef = ef_buf[q], af = af_buf[q];
+                    const float *g0 = (const float*)g0_buf;
+                    const float *g1 = (const float*)g1_buf;
+                    const float w0 = g0[2*q] + af * (g0[2*q+1] - g0[2*q]);
+                    const float w1 = g1[2*q] + af * (g1[2*q+1] - g1[2*q]);
+                    const float w = (w0 + ef * (w1 - w0)) * vld_buf[q] * gvld_buf[q];
+
+                    float sr = 0.0f, si = 0.0f;
+                    for (int j = 0; j < TAPS; j++) {
+                        const float *v = (const float*)v_buf[j];
+                        sr += w_buf[j][q] * v[2*q];
+                        si += w_buf[j][q] * v[2*q+1];
+                    }
+                    accr[q] += w * (sr * cs_buf[q] - si * sn_buf[q]);
+                    acci[q] += w * (sr * sn_buf[q] + si * cs_buf[q]);
+                    wsum_buf[q] += w;
+                    wsum2_buf[q] += w * w;
+                }
+            } else {
+                // Vector pass: tap-unrolled interpolation, phasor multiply
+                // and accumulate, masked by the 0/1 validity instead of a
+                // skip branch.
+#pragma omp simd
+                for (int q = 0; q < nchunk; q++) {
+                    float sr = 0.0f, si = 0.0f;
+                    for (int j = 0; j < TAPS; j++) {
+                        const float *v = (const float*)v_buf[j];
+                        sr += w_buf[j][q] * v[2*q];
+                        si += w_buf[j][q] * v[2*q+1];
+                    }
+                    const float m = vld_buf[q];
+                    accr[q] += m * (sr * cs_buf[q] - si * sn_buf[q]);
+                    acci[q] += m * (sr * sn_buf[q] + si * cs_buf[q]);
+                }
+            }
+        }
+        // Normalization and dealias epilogue, same as
+        // backprojection_polar_2d_row_cpu.
+        if (g != nullptr && normalize) {
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                const float scale = wsum2_buf[q] >= 1.17549435e-38f ?
+                    wsum_buf[q] / wsum2_buf[q] : 1.0f;
+                accr[q] *= scale;
+                acci[q] *= scale;
+            }
+        }
+        if (dealias) {
+            if constexpr (HasDem) {
+                for (int q = 0; q < nchunk; q++) {
+                    const float zz = z0 - z_buf[q];
+                    const float dq = sqrtf(r2 + zz*zz);
+                    float ref_sin, ref_cos;
+                    sincospi(-ref_phase * dq + alias_fmod * idr, &ref_sin, &ref_cos);
+                    const float pr = accr[q] * ref_cos - acci[q] * ref_sin;
+                    const float pi = accr[q] * ref_sin + acci[q] * ref_cos;
+                    accr[q] = pr;
+                    acci[q] = pi;
+                }
+            } else {
+                const float d = sqrtf(r2 + z0*z0);
+                float ref_sin, ref_cos;
+                sincospi(-ref_phase * d + alias_fmod * idr, &ref_sin, &ref_cos);
+#pragma omp simd
+                for (int q = 0; q < nchunk; q++) {
+                    const float pr = accr[q] * ref_cos - acci[q] * ref_sin;
+                    const float pi = accr[q] * ref_sin + acci[q] * ref_cos;
+                    accr[q] = pr;
+                    acci[q] = pi;
+                }
+            }
+        }
+#pragma omp simd
+        for (int q = 0; q < nchunk; q++) {
+            img_row[tb + q] = complex64_t(accr[q], acci[q]);
+        }
+    }
+}
+
+
 at::Tensor backprojection_polar_2d_cpu(
           const at::Tensor &data,
           const at::Tensor &pos,
@@ -451,6 +783,172 @@ at::Tensor backprojection_polar_2d_cpu(
                           normalize,
                           idr, idbatch);
         }
+    }
+	return img;
+}
+
+at::Tensor backprojection_polar_2d_knab_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          int64_t dealias,
+          double z0,
+          int64_t order,
+          double oversample,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          double data_fmod,
+          double alias_fmod,
+          bool normalize,
+          const at::Tensor &dem) {
+	TORCH_CHECK(pos.dtype() == at::kFloat);
+	TORCH_CHECK(data.dtype() == at::kComplexFloat);
+	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
+	TORCH_INTERNAL_ASSERT(data.device().type() == at::DeviceType::CPU);
+    // The fixed-window table formulation needs an even tap count; the CUDA
+    // transcendental path additionally supports odd and larger orders.
+    TORCH_CHECK(order >= 2 && order <= BP_KNAB_MAX_TAPS && order % 2 == 0,
+        "CPU backprojection_polar_2d_knab needs an even order in [2, ",
+        BP_KNAB_MAX_TAPS, "], got ", order);
+    TORCH_CHECK(oversample >= 1.0, "oversample should be >= 1, got ", oversample);
+
+    // Match CUDA: att alone (without a gain pattern) is ignored.
+    bool antenna_pattern = g.defined();
+    if (antenna_pattern) {
+        TORCH_CHECK(g.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(g.device().type() == at::DeviceType::CPU);
+        TORCH_CHECK(att.dtype() == at::kFloat);
+        TORCH_INTERNAL_ASSERT(att.device().type() == at::DeviceType::CPU);
+    }
+
+	at::Tensor pos_contig = pos.contiguous();
+	at::Tensor data_contig = data.contiguous();
+    auto options =
+      torch::TensorOptions()
+        .dtype(torch::kComplexFloat)
+        .layout(torch::kStrided)
+        .device(data.device());
+	at::Tensor img = torch::zeros({nbatch, Nr, Ntheta}, options);
+	const float* pos_ptr = pos_contig.data_ptr<float>();
+    c10::complex<float>* img_ptr = img.data_ptr<c10::complex<float>>();
+
+    // Keep contiguous copies alive until the kernel has run.
+    at::Tensor att_contig;
+    at::Tensor g_contig;
+    float* att_ptr = nullptr;
+    float* g_ptr = nullptr;
+    if (antenna_pattern) {
+        att_contig = att.contiguous();
+        g_contig = g.contiguous();
+        att_ptr = att_contig.data_ptr<float>();
+        g_ptr = g_contig.data_ptr<float>();
+    }
+
+    const bool has_dem = dem.defined();
+    at::Tensor dem_contig;
+    const float* dem_ptr = nullptr;
+    float dem_r_scale = 0.0f, dem_theta_scale = 0.0f;
+    int dem_nr = 0, dem_ntheta = 0;
+    if (has_dem) {
+        TORCH_CHECK(dem.dtype() == at::kFloat);
+        TORCH_CHECK(dem.dim() == 2);
+        TORCH_INTERNAL_ASSERT(dem.device().type() == at::DeviceType::CPU);
+        dem_contig = dem.contiguous();
+        dem_ptr = dem_contig.data_ptr<float>();
+        dem_nr = dem_contig.size(0);
+        dem_ntheta = dem_contig.size(1);
+        dem_r_scale = (float)dem_nr / Nr;
+        dem_theta_scale = (float)dem_ntheta / Ntheta;
+    }
+
+	const float delta_r = 1.0f / r_res;
+    const float ref_phase = 4.0f * fc / kC0;
+
+    const float knab_v = 1.0f - 1.0f / (float)oversample;
+    const std::vector<float> w_table =
+        knab_interp_table(order, knab_v, BP_KNAB_TABLE_PHASES);
+
+    // Zero-pad the range rows so the hot loops need no per-tap bounds
+    // logic; padded taps read zeros, which matches dropping them. The copy
+    // is negligible next to the backprojection.
+    const int64_t pad = order / 2;
+    at::Tensor data_padded = at::constant_pad_nd(data_contig, {pad, pad});
+    const int data_stride = sweep_samples + 2 * pad;
+    const c10::complex<float>* data_ptr =
+        data_padded.data_ptr<c10::complex<float>>() + pad;
+
+    // See backprojection_polar_2d_cpu for the omp_set_num_threads note.
+    omp_set_num_threads(omp_get_num_procs());
+
+    auto launch = [&](auto taps_c) {
+        constexpr int TAPS = decltype(taps_c)::value;
+        auto row = has_dem ? &backprojection_polar_2d_knab_row_cpu<true, TAPS>
+                           : &backprojection_polar_2d_knab_row_cpu<false, TAPS>;
+#pragma omp parallel for collapse(2)
+        for(int idbatch = 0; idbatch < nbatch; idbatch++) {
+            for(int idr = 0; idr < Nr; idr++) {
+                row(
+                              data_ptr,
+                              pos_ptr,
+                              att_ptr,
+                              img_ptr,
+                              sweep_samples,
+                              nsweeps,
+                              ref_phase,
+                              delta_r,
+                              r0, dr,
+                              theta0, dtheta,
+                              Nr, Ntheta,
+                              d0,
+                              dealias, z0,
+                              g_ptr,
+                              g_az0,
+                              g_el0,
+                              g_daz,
+                              g_del,
+                              g_naz,
+                              g_nel,
+                              dem_ptr,
+                              dem_r_scale,
+                              dem_theta_scale,
+                              dem_nr,
+                              dem_ntheta,
+                              data_fmod/kPI,
+                              alias_fmod/kPI,
+                              normalize,
+                              w_table.data(),
+                              BP_KNAB_TABLE_PHASES,
+                              data_stride,
+                              idr, idbatch);
+            }
+        }
+    };
+    switch (order) {
+    case 2:  launch(std::integral_constant<int, 2>{});  break;
+    case 4:  launch(std::integral_constant<int, 4>{});  break;
+    case 6:  launch(std::integral_constant<int, 6>{});  break;
+    case 8:  launch(std::integral_constant<int, 8>{});  break;
+    case 10: launch(std::integral_constant<int, 10>{}); break;
+    case 12: launch(std::integral_constant<int, 12>{}); break;
+    case 14: launch(std::integral_constant<int, 14>{}); break;
+    case 16: launch(std::integral_constant<int, 16>{}); break;
     }
 	return img;
 }
@@ -3357,6 +3855,7 @@ at::Tensor polar_range_dealias_cpu(
 // Registers CPU implementations
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
+  m.impl("backprojection_polar_2d_knab", &backprojection_polar_2d_knab_cpu);
   m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cpu);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cpu);
   m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cpu);
