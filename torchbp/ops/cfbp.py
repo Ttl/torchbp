@@ -8,7 +8,7 @@ from copy import deepcopy
 
 from .backproj import backprojection_cart_2d, _backprojection_cart_2d_tx_power_accum, _tx_power_finish
 from ..util import center_pos
-from ._utils import unpack_cartesian_grid
+from ._utils import unpack_cartesian_grid, parse_interp_method
 
 if TYPE_CHECKING:
     from ..grid import CartesianGrid
@@ -322,15 +322,9 @@ def cfbp(
         raise ValueError("data shape should be [nsweeps, samples]")
     if pos.dim() != 2 or pos.shape[0] != data.shape[0]:
         raise ValueError("pos shape should be [nsweeps, 3]")
-    if isinstance(interp_method, str):
-        interp_method = (interp_method,)
-    if interp_method[0] == "knab":
-        if len(interp_method) != 3:
-            raise ValueError("interp_method should be ('knab', order, oversample) or 'fft'")
-        if interp_method[2] <= 1:
-            raise ValueError("interp_method oversample should be > 1")
-    elif interp_method[0] != "fft":
-        raise ValueError("interp_method should be ('knab', order, oversample) or 'fft'")
+    interp_method = parse_interp_method(interp_method, allowed=("knab", "fft"))
+    if interp_method[0] == "knab" and interp_method[2] <= 1:
+        raise ValueError("interp_method oversample should be > 1")
 
     # Carrier spatial frequency of the image in units of pi. Includes the
     # data_fmod contribution to the range phase applied by the kernel.

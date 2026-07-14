@@ -4,6 +4,59 @@ from torch import Tensor
 from ..grid import unpack_polar_grid, unpack_cartesian_grid
 
 
+# Canonical parameter shapes of the interpolation method specs. The
+# descriptions double as the error message.
+_INTERP_METHOD_FORMS = {
+    "linear": '"linear"',
+    "fft": '"fft"',
+    "lanczos": '("lanczos", order)',
+    "knab": '("knab", order, oversample)',
+}
+_INTERP_METHOD_LENGTHS = {"linear": 1, "fft": 1, "lanczos": 2, "knab": 3}
+
+
+def parse_interp_method(
+    interp_method: "str | tuple | list",
+    allowed: tuple = ("linear", "lanczos", "knab"),
+    name: str = "interp_method",
+) -> tuple:
+    """Normalize an interpolation method spec to a canonical tuple.
+
+    Accepted forms are ``"linear"``, ``("lanczos", order)``,
+    ``("knab", order, oversample)`` and ``"fft"`` (cfbp merges); a bare
+    string is accepted for methods without parameters. Only structural
+    validation is done here, numeric constraints (order parity and limits,
+    oversample range) are checked by the callers and the ops.
+
+    Parameters
+    ----------
+    interp_method : str or tuple
+        Method spec to normalize.
+    allowed : tuple
+        Method names accepted by the caller.
+    name : str
+        Parameter name used in error messages.
+
+    Returns
+    -------
+    tuple
+        The method as a tuple ``(method, ...)``.
+    """
+    if isinstance(interp_method, str):
+        interp_method = (interp_method,)
+    else:
+        interp_method = tuple(interp_method)
+    method = interp_method[0] if len(interp_method) else None
+    if method not in allowed:
+        raise ValueError(
+            f"{name} should be one of {allowed}, got {method!r}")
+    if len(interp_method) != _INTERP_METHOD_LENGTHS[method]:
+        raise ValueError(
+            f"{name}: expected {_INTERP_METHOD_FORMS[method]}, "
+            f"got {interp_method!r}")
+    return interp_method
+
+
 def get_batch_dims(data: Tensor, pos: Tensor) -> Tuple[int, int, int]:
     """Extract (nbatch, nsweeps, sweep_samples) with validation.
 

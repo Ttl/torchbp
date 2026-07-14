@@ -133,6 +133,53 @@ class TestBackprojectionPolar(TestCase):
         self._opcheck("cuda")
 
 
+class TestBackprojectionPolarInterpMethod(TestCase):
+    """interp_method dispatch of backprojection_polar_2d."""
+
+    def _random_inputs(self):
+        torch.manual_seed(3)
+        nsweeps, sweep_samples = 8, 64
+        grid = {"r": (5, 15), "theta": (-0.5, 0.5), "nr": 16, "ntheta": 8}
+        data = torch.randn(nsweeps, sweep_samples, dtype=torch.complex64)
+        pos = torch.zeros(nsweeps, 3)
+        pos[:, 1] = torch.linspace(-1, 1, nsweeps)
+        pos[:, 2] = 2.0
+        return data, grid, pos
+
+    def test_knab_dispatch_matches_wrapper(self):
+        data, grid, pos = self._random_inputs()
+        res = torchbp.ops.backprojection_polar_2d(
+            data, grid, 1e9, 0.15, pos, interp_method=("knab", 6, 1.5))
+        ref = torchbp.ops.backprojection_polar_2d_knab(
+            data, grid, 1e9, 0.15, pos, order=6, oversample=1.5)
+        self.assertEqual((res - ref).abs().max().item(), 0.0)
+
+    def test_linear_default_matches_explicit(self):
+        data, grid, pos = self._random_inputs()
+        res = torchbp.ops.backprojection_polar_2d(
+            data, grid, 1e9, 0.15, pos, interp_method="linear")
+        ref = torchbp.ops.backprojection_polar_2d(data, grid, 1e9, 0.15, pos)
+        self.assertEqual((res - ref).abs().max().item(), 0.0)
+
+    def test_gradient_guard(self):
+        data, grid, pos = self._random_inputs()
+        data.requires_grad_(True)
+        with self.assertRaises(ValueError):
+            torchbp.ops.backprojection_polar_2d(
+                data, grid, 1e9, 0.15, pos, interp_method=("knab", 6, 1.5))
+        # Gradients through linear still work.
+        img = torchbp.ops.backprojection_polar_2d(data, grid, 1e9, 0.15, pos)
+        img.abs().mean().backward()
+        self.assertIsNotNone(data.grad)
+
+    def test_invalid_specs(self):
+        data, grid, pos = self._random_inputs()
+        for bad in [("knab", 6), ("lanczos",), "frob", ("linear", 2)]:
+            with self.assertRaises(ValueError):
+                torchbp.ops.backprojection_polar_2d(
+                    data, grid, 1e9, 0.15, pos, interp_method=bad)
+
+
 class TestBackprojectionPolarKnabCpu(TestCase):
     """Tests for the CPU table-based backprojection_polar_2d_knab."""
 

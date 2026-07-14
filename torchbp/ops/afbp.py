@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING
 from .backproj import (
     backprojection_polar_2d,
     _prepare_backprojection_polar_2d_args,
+    _prepare_backprojection_polar_2d_lanczos_args,
+    _prepare_backprojection_polar_2d_knab_args,
 )
-from ._utils import unpack_polar_grid
+from ._utils import unpack_polar_grid, parse_interp_method
 from ..util import next_fast_len
 
 if TYPE_CHECKING:
@@ -32,6 +34,7 @@ def _bp_polar_shared_dealias(
     g: Tensor | None,
     g_extent: list | None,
     normalize: bool,
+    interp_method: tuple = ("linear",),
 ) -> Tensor:
     """Dealiased polar backprojection with an explicit shared z0 reference.
 
@@ -40,13 +43,30 @@ def _bp_polar_shared_dealias(
     from the mean of ``pos``, and batched input is allowed. All afbp
     subapertures must be demodulated with the identical carrier or the
     wavenumber fusion would see spurious phase steps between them.
+    ``interp_method`` is a tuple from :func:`parse_interp_method`; the
+    lanczos and knab prepare functions insert their parameters after the
+    z0 argument, so the dealias/z0 indices patched here are the same for
+    every method.
     """
-    args = list(_prepare_backprojection_polar_2d_args(
-        data, grid, fc, r_res, pos, d0, False, att, g, g_extent,
-        data_fmod, alias_fmod, normalize))
+    if interp_method[0] == "lanczos":
+        args = list(_prepare_backprojection_polar_2d_lanczos_args(
+            data, grid, fc, r_res, pos, d0, False, interp_method[1],
+            att, g, g_extent, data_fmod, alias_fmod, normalize))
+        op = torch.ops.torchbp.backprojection_polar_2d_lanczos.default
+    elif interp_method[0] == "knab":
+        args = list(_prepare_backprojection_polar_2d_knab_args(
+            data, grid, fc, r_res, pos, d0, False, interp_method[1],
+            interp_method[2], att, g, g_extent, data_fmod, alias_fmod,
+            normalize))
+        op = torch.ops.torchbp.backprojection_polar_2d_knab.default
+    else:
+        args = list(_prepare_backprojection_polar_2d_args(
+            data, grid, fc, r_res, pos, d0, False, att, g, g_extent,
+            data_fmod, alias_fmod, normalize))
+        op = torch.ops.torchbp.backprojection_polar_2d.default
     args[15] = True  # dealias
     args[16] = z0
-    return torch.ops.torchbp.backprojection_polar_2d.default(*args)
+    return op(*args)
 
 
 def _dealias_carrier(
@@ -86,6 +106,7 @@ def afbp(
     weight_eps: float | None = None,
     _batched_fusion: bool | None = None,
     dem: Tensor | None = None,
+    data_interp_method: "str | tuple" = "linear",
 ) -> Tensor:
     """
     Accelerated factorized backprojection. [1]_
@@ -211,6 +232,10 @@ def afbp(
         itself.
     weight_eps : float or None
         Regularization of the antenna normalization, see :func:`ffbp`.
+    data_interp_method : str or tuple
+        Range interpolation method of the subaperture backprojections, see
+        :func:`backprojection_polar_2d`. Gradients are only supported with
+        the default "linear".
 
     Returns
     -------
@@ -236,6 +261,8 @@ def afbp(
         raise ValueError("pos shape should be [nsweeps, 3]")
     if guard_theta < 0:
         raise ValueError("guard_theta should be >= 0")
+    data_interp_method = parse_interp_method(
+        data_interp_method, name="data_interp_method")
     if g is not None and normalize:
         # The direct kernel's per-pixel sum(g)/sum(g^2) normalization is an
         # aperture-wide quantity that cannot be reassembled from
@@ -248,7 +275,8 @@ def afbp(
             data, grid, fc, r_res, pos, nsub, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             guard_theta=guard_theta, att=att, g=g, g_extent=g_extent,
-            normalize=False, _batched_fusion=_batched_fusion)
+            normalize=False, _batched_fusion=_batched_fusion,
+            data_interp_method=data_interp_method)
         from .ffbp import _illumination_pulse_decimated, _weighted_normalize
         # The per-pulse footprints move slowly along the aperture, so the
         # maps can be computed from a pulse subset (computed from every
@@ -269,7 +297,8 @@ def afbp(
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
-            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+            att=att, g=g, g_extent=g_extent, normalize=normalize,
+            interp_method=data_interp_method)[0]
 
     # Effective range wavenumber center of the image. data_fmod shifts the
     # matched filter phase the same way as in cfbp's keff.
@@ -318,7 +347,8 @@ def afbp(
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
-            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+            att=att, g=g, g_extent=g_extent, normalize=normalize,
+            interp_method=data_interp_method)[0]
     nsub = nsub_eff
 
     # Fall back to direct backprojection when the split cannot pay off: a
@@ -332,7 +362,8 @@ def afbp(
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
-            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+            att=att, g=g, g_extent=g_extent, normalize=normalize,
+            interp_method=data_interp_method)[0]
 
     # Split the track into nsub contiguous chunks.
     bounds = [round(i * nsweeps / nsub) for i in range(nsub + 1)]
@@ -353,7 +384,8 @@ def afbp(
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
-            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+            att=att, g=g, g_extent=g_extent, normalize=normalize,
+            interp_method=data_interp_method)[0]
     if kr_max * l_sub * fac * nsub * dtheta > 2.0 * math.pi:
         warn(f"afbp: subaperture spectrum patch does not fit the decimated "
              f"theta grid band; decrease nsub or the grid theta step "
@@ -382,7 +414,8 @@ def afbp(
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
-            att=att, g=g, g_extent=g_extent, normalize=normalize)[0]
+            att=att, g=g, g_extent=g_extent, normalize=normalize,
+            interp_method=data_interp_method)[0]
     n_fine = n_c * nsub
     guard_lo = (n_c - (-(-ntheta // nsub))) // 2
     theta0_i = theta0 - guard_lo * nsub * dtheta
@@ -418,6 +451,10 @@ def afbp(
     use_torch_dealias = torch.is_grad_enabled() and (
         data.requires_grad or pos.requires_grad)
     if use_torch_dealias:
+        if data_interp_method[0] != "linear":
+            raise ValueError(
+                f"data_interp_method={data_interp_method[0]!r} does not "
+                "support gradients, only \"linear\" does")
         args = _prepare_backprojection_polar_2d_args(
             data_b, grid_c, fc, r_res, pos_b, d0, False, att_b, g, g_extent,
             data_fmod, alias_fmod, normalize)
@@ -426,7 +463,8 @@ def afbp(
     else:
         imgs = _bp_polar_shared_dealias(
             data_b, grid_c, fc, r_res, pos_b, d0, z0, data_fmod, alias_fmod,
-            att_b, g, g_extent, normalize)
+            att_b, g, g_extent, normalize,
+            interp_method=data_interp_method)
 
     # The guard band and the ceil padding can push internal grid columns
     # past the polar domain |theta| <= 1. The backprojection kernel

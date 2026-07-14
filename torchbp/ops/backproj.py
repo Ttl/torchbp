@@ -1,7 +1,10 @@
 import torch
 from torch import Tensor
 from typing import Union, TYPE_CHECKING
-from ._utils import unpack_polar_grid, unpack_cartesian_grid, get_batch_dims, AntennaPattern
+from ._utils import (
+    unpack_polar_grid, unpack_cartesian_grid, get_batch_dims, AntennaPattern,
+    parse_interp_method,
+)
 
 if TYPE_CHECKING:
     from ..grid import PolarGrid, CartesianGrid
@@ -140,13 +143,14 @@ def backprojection_polar_2d(
     data_fmod: float = 0,
     alias_fmod: float = 0,
     normalize: bool = True,
-    dem: Tensor | None = None
+    dem: Tensor | None = None,
+    interp_method: "str | tuple" = "linear",
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates.
 
     Gradient can be calculated with respect to data and pos (not supported
-    with dem).
+    with dem, and only with ``interp_method="linear"``).
 
     Parameters
     ----------
@@ -211,12 +215,41 @@ def backprojection_polar_2d(
         in the same frame as `pos`. If None (default) pixels are assumed to
         lie on the z=0 plane. See `torchbp.util.dem_to_polar` for resampling
         a Cartesian DEM onto the polar grid.
+    interp_method : str or tuple
+        Range interpolation method of the input data:
+
+        - "linear" (default): linear interpolation. The only method that
+          supports gradients.
+        - ("lanczos", order): Lanczos interpolation with ``order`` taps.
+          CUDA only.
+        - ("knab", order, oversample): Knab interpolation with ``order``
+          taps, designed for data oversampled by ``oversample`` (>= 1).
+          Much lower range interpolation error than linear when the data
+          is oversampled. On CPU ``order`` must be even and <= 16.
 
     Returns
     -------
     img : Tensor
         Pseudo-polar format radar image.
     """
+    interp_method = parse_interp_method(interp_method)
+    if interp_method[0] != "linear":
+        if torch.is_grad_enabled() and (data.requires_grad or pos.requires_grad):
+            raise ValueError(
+                f"interp_method={interp_method[0]!r} does not support "
+                "gradients, only \"linear\" does")
+        if interp_method[0] == "lanczos":
+            cpp_args = _prepare_backprojection_polar_2d_lanczos_args(
+                data, grid, fc, r_res, pos, d0, dealias, interp_method[1],
+                att, g, g_extent, data_fmod, alias_fmod, normalize, dem
+            )
+            return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(*cpp_args)
+        cpp_args = _prepare_backprojection_polar_2d_knab_args(
+            data, grid, fc, r_res, pos, d0, dealias, interp_method[1],
+            interp_method[2], att, g, g_extent, data_fmod, alias_fmod,
+            normalize, dem
+        )
+        return torch.ops.torchbp.backprojection_polar_2d_knab.default(*cpp_args)
     cpp_args = _prepare_backprojection_polar_2d_args(
         data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent,
         data_fmod, alias_fmod, normalize, dem
@@ -242,9 +275,10 @@ def backprojection_polar_2d_lanczos(
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
-    using lanczos interpolation.
+    using lanczos interpolation. Same as :func:`backprojection_polar_2d`
+    with ``interp_method=("lanczos", order)``.
 
-    Gradient not supported.
+    Gradient not supported. CUDA only.
 
     Parameters
     ----------
@@ -306,11 +340,11 @@ def backprojection_polar_2d_lanczos(
     img : Tensor
         Pseudo-polar format radar image.
     """
-    cpp_args = _prepare_backprojection_polar_2d_lanczos_args(
-        data, grid, fc, r_res, pos, d0, dealias, order, att, g, g_extent,
-        data_fmod, alias_fmod, dem=dem
+    return backprojection_polar_2d(
+        data, grid, fc, r_res, pos, d0=d0, dealias=dealias, att=att, g=g,
+        g_extent=g_extent, data_fmod=data_fmod, alias_fmod=alias_fmod,
+        dem=dem, interp_method=("lanczos", order)
     )
-    return torch.ops.torchbp.backprojection_polar_2d_lanczos.default(*cpp_args)
 
 
 def backprojection_polar_2d_knab(
@@ -332,7 +366,8 @@ def backprojection_polar_2d_knab(
 ) -> Tensor:
     """
     2D backprojection with pseudo-polar coordinates. Interpolates input data
-    using knab interpolation.
+    using knab interpolation. Same as :func:`backprojection_polar_2d` with
+    ``interp_method=("knab", order, oversample)``.
 
     Gradient not supported.
 
@@ -405,11 +440,11 @@ def backprojection_polar_2d_knab(
     img : Tensor
         Pseudo-polar format radar image.
     """
-    cpp_args = _prepare_backprojection_polar_2d_knab_args(
-        data, grid, fc, r_res, pos, d0, dealias, order, oversample, att, g, g_extent,
-        data_fmod, alias_fmod, dem=dem
+    return backprojection_polar_2d(
+        data, grid, fc, r_res, pos, d0=d0, dealias=dealias, att=att, g=g,
+        g_extent=g_extent, data_fmod=data_fmod, alias_fmod=alias_fmod,
+        dem=dem, interp_method=("knab", order, oversample)
     )
-    return torch.ops.torchbp.backprojection_polar_2d_knab.default(*cpp_args)
 
 
 def _prepare_backprojection_cart_2d_args(
@@ -774,31 +809,25 @@ def gpga_backprojection_2d_core(
     assert target_pos.shape == (ntargets, 3)
     assert pos.shape == (nsweeps, 3)
 
-    if type(interp_method) in (list, tuple):
-        method_params = interp_method[1]
-        interp_method = interp_method[0]
-    else:
-        method_params = None
-    if interp_method == "linear":
+    interp_method = parse_interp_method(
+        interp_method, allowed=("linear", "lanczos"))
+    if interp_method[0] == "linear":
         return torch.ops.torchbp.gpga_backprojection_2d.default(
             target_pos, data, pos, sweep_samples, nsweeps, fc, r_res, ntargets, d0, data_fmod
         )
-    elif interp_method == "lanczos":
-        return torch.ops.torchbp.gpga_backprojection_2d_lanczos.default(
-            target_pos,
-            data,
-            pos,
-            sweep_samples,
-            nsweeps,
-            fc,
-            r_res,
-            ntargets,
-            d0,
-            method_params,
-            data_fmod
-        )
-    else:
-        raise ValueError(f"Unknown interp_method f{interp_method}")
+    return torch.ops.torchbp.gpga_backprojection_2d_lanczos.default(
+        target_pos,
+        data,
+        pos,
+        sweep_samples,
+        nsweeps,
+        fc,
+        r_res,
+        ntargets,
+        d0,
+        interp_method[1],
+        data_fmod
+    )
 
 
 def blocksvd_alpha(

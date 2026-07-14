@@ -4,6 +4,7 @@ import numpy as np
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
 import unittest
+import unittest.mock
 import torchbp
 from torch import Tensor
 
@@ -249,6 +250,106 @@ class TestFFBPAntennaPattern(TestCase):
         # Poly-Knab merge differs at the ULP level between CPU and CUDA and is
         # amplified by the weighted normalization (cf. TestFFBPMerge2PolyWeighted).
         torch.testing.assert_close(out_cpu, out_gpu.cpu(), atol=3e-2, rtol=5e-2)
+
+
+class TestFfbpDataInterpMethod(TestCase):
+    """data_interp_method plumbing to the base level backprojections."""
+
+    fc = 6e9
+    r_res = 0.5
+    nsamples = 256
+    nsweeps = 64
+    grid = {"r": (100.0, 150.0), "theta": (-0.2, 0.2), "nr": 64, "ntheta": 64}
+
+    def _scene(self):
+        # Point targets with a 2x oversampled sinc envelope, like the afbp
+        # tests: smooth enough that both linear and knab interpolation
+        # follow it and the ffbp merge error dominates the comparison.
+        c0 = 299792458.0
+        lam = c0 / self.fc
+        pos = torch.zeros((self.nsweeps, 3))
+        pos[:, 1] = lam / 4 * (torch.arange(self.nsweeps) - self.nsweeps / 2)
+        targets = [(125.0, 0.0), (110.0, 0.15), (140.0, -0.12)]
+        data = torch.zeros((self.nsweeps, self.nsamples), dtype=torch.complex64)
+        i = torch.arange(self.nsamples, dtype=torch.float64)
+        for r, th in targets:
+            tx = r * np.sqrt(1 - th * th)
+            ty = r * th
+            d = torch.sqrt((pos[:, 0].double() - tx) ** 2
+                           + (pos[:, 1].double() - ty) ** 2)
+            env = torch.special.sinc((i[None, :] * self.r_res - d[:, None]) / (2 * self.r_res))
+            ph = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)[:, None]
+            data += (env * ph).to(torch.complex64)
+        return data, pos
+
+    def test_few_sweeps_matches_direct_exactly(self):
+        # nsweeps < divisions takes the direct backprojection early path,
+        # which must forward the method verbatim.
+        data, pos = self._scene()
+        data, pos = data[:1], pos[:1]
+        method = ("knab", 6, 2.0)
+        out = torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
+                               stages=3, data_interp_method=method)
+        ref = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fc, self.r_res, pos, interp_method=method)[0]
+        self.assertEqual((out - ref).abs().max().item(), 0.0)
+
+    def test_leaf_calls_get_method(self):
+        # Spy on the leaf backprojections: every one must receive the
+        # method (ffbp-vs-direct accuracy itself is merge-limited and
+        # method-independent, so an end-to-end comparison cannot see the
+        # plumbing).
+        import sys
+        import torchbp.ops.ffbp
+        ffbp_mod = sys.modules["torchbp.ops.ffbp"]
+        data, pos = self._scene()
+        method = ("knab", 6, 2.0)
+        seen = []
+        real_bp = ffbp_mod.backprojection_polar_2d
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("interp_method"))
+            return real_bp(*args, **kwargs)
+
+        with unittest.mock.patch.object(
+                ffbp_mod, "backprojection_polar_2d", side_effect=spy):
+            out = torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
+                                   stages=2, data_interp_method=method)
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertGreater(len(seen), 1)
+        self.assertTrue(all(m == method for m in seen))
+        # ffbp output must track the leaf method: identical run with linear
+        # leaves differs.
+        out_lin = torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
+                                   stages=2)
+        self.assertGreater((out - out_lin).abs().max().item(), 0.0)
+
+    def test_afbp_base_gets_method(self):
+        import sys
+        import torchbp.ops.ffbp
+        ffbp_mod = sys.modules["torchbp.ops.ffbp"]
+        data, pos = self._scene()
+        method = ("knab", 6, 2.0)
+        seen = []
+        real_afbp = ffbp_mod.afbp
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("data_interp_method"))
+            return real_afbp(*args, **kwargs)
+
+        with unittest.mock.patch.object(ffbp_mod, "afbp", side_effect=spy):
+            out = torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
+                                   stages=2, afbp_nsub=2,
+                                   data_interp_method=method)
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertGreater(len(seen), 1)
+        self.assertTrue(all(m == method for m in seen))
+
+    def test_invalid_method(self):
+        data, pos = self._scene()
+        with self.assertRaises(ValueError):
+            torchbp.ops.ffbp(data, self.grid, self.fc, self.r_res, pos,
+                             stages=2, data_interp_method=("knab", 6))
 
 
 class TestFFBPRemainderSweeps(TestCase):

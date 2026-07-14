@@ -9,7 +9,7 @@ from .backproj import backprojection_polar_2d, backprojection_polar_2d_tx_power,
 from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, ffbp_tx_power_merge2, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
-from ._utils import AntennaPattern, unpack_polar_grid
+from ._utils import AntennaPattern, unpack_polar_grid, parse_interp_method
 
 if TYPE_CHECKING:
     from ..grid import PolarGrid
@@ -213,6 +213,7 @@ def ffbp(
     divisions: int = 2,
     d0: float = 0.0,
     interp_method: tuple = ("knab", 6, 1.5),
+    data_interp_method: "str | tuple" = "linear",
     oversample_r: float = 1.4,
     oversample_theta: float = 1.4,
     grid_oversample: float = 1,
@@ -272,8 +273,19 @@ def ffbp(
     d0 : float
         Zero range correction.
     interp_method : tuple
-        Interpolation method: ("knab", order, oversample) where order is the
-        number of samples used and oversample is the oversampling factor.
+        Interpolation method of the polar-image merges: ("knab", order,
+        oversample) where order is the number of samples used and oversample
+        is the oversampling factor of the internal polar grids
+        (``oversample_r``/``oversample_theta``).
+    data_interp_method : str or tuple
+        Range interpolation method of the range-compressed data in the base
+        level backprojections, see :func:`backprojection_polar_2d`. Its
+        oversample is the range FFT oversampling of the data, which is
+        unrelated to the grid oversampling of ``interp_method``. The base
+        level is where range interpolation error enters the merge tree, so
+        a short ("knab", order, oversample) kernel here removes the range
+        aliasing of insufficiently smooth data at a small cost relative to
+        the merges. Default is "linear" (the previous behavior).
     oversample_r : float
         Internally oversample range by this amount to avoid aliasing.
     oversample_theta : float
@@ -380,11 +392,10 @@ def ffbp(
         im_margin = max(0, grid_oversample * oversample_r - 1)
         alias_fmod = -torch.pi * (1 - im_margin / (1 + im_margin))
 
-    # Parse interpolation method - only knab is supported
-    if interp_method[0] != "knab":
-        raise ValueError("interp_method should be ('knab', order, oversample)")
-    if len(interp_method) != 3:
-        raise ValueError("interp_method should be ('knab', order, oversample)")
+    # Only knab is supported for the merges
+    interp_method = parse_interp_method(interp_method, allowed=("knab",))
+    data_interp_method = parse_interp_method(
+        data_interp_method, name="data_interp_method")
 
     knab_order = interp_method[1]
     knab_oversample = interp_method[2]
@@ -421,6 +432,7 @@ def ffbp(
             data_fmod=data_fmod,
             alias_fmod=alias_fmod if (output_alias and dealias) else 0.0,
             att=att, g=g, g_extent=g_extent, dem=dem,
+            interp_method=data_interp_method,
         )[0]
 
     # Worst (needed / cap) guard shortfall over the whole merge tree,
@@ -438,6 +450,7 @@ def ffbp(
         guard_shortfall=guard_shortfall,
         dem=dem,
         dem_grid=grid,
+        data_interp_method=data_interp_method,
     )
     # A small shortfall only truncates the window support of guard bins,
     # whose error reaches the scene attenuated by the interpolation kernel
@@ -553,6 +566,7 @@ def _ffbp_impl(
     dem: Tensor | None = None,
     dem_grid: dict | None = None,
     dem_off: Tensor | None = None,
+    data_interp_method: "str | tuple" = "linear",
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients.
 
@@ -774,6 +788,7 @@ def _ffbp_impl(
                 dem=dem,
                 dem_grid=dem_grid,
                 dem_off=dem_off_local,
+                data_interp_method=data_interp_method,
             )
         else:
             # When using antenna pattern, request unnormalized output
@@ -785,7 +800,8 @@ def _ffbp_impl(
                     nsub=afbp_nsub, d0=d0, dealias=True,
                     data_fmod=data_fmod, alias_fmod=alias_fmod,
                     att=att_local, g=g, g_extent=g_extent,
-                    normalize=normalize
+                    normalize=normalize,
+                    data_interp_method=data_interp_method,
                 )[None]
             else:
                 if dem is not None:
@@ -799,7 +815,8 @@ def _ffbp_impl(
                     dealias=True,
                     data_fmod=data_fmod, alias_fmod=alias_fmod,
                     att=att_local, g=g, g_extent=g_extent, normalize=normalize,
-                    dem=dem_local
+                    dem=dem_local,
+                    interp_method=data_interp_method,
                 )
 
             # Compute weight maps at base level for antenna pattern weighting

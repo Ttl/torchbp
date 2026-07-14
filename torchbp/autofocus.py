@@ -1149,7 +1149,9 @@ def gpga(
         per-algorithm defaults. "ffbp" defaults to
         {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4};
         "cfbp"/"cfbp_adaptive" default to {"stages": 4}; "afbp" requires
-        {"nsub": N}.
+        {"nsub": N}. The range interpolation method of the data is also set
+        here, e.g. {"interp_method": ("knab", 6, 2.0)} for polar "bp" or
+        {"data_interp_method": ("knab", 6, 2.0)} for "ffbp"/"afbp".
     window_width : int or None
         Initial low-pass filter window width in samples. None for initial
         maximum size.

@@ -96,6 +96,27 @@ class TestAFBP(TestCase):
         rel = ((out - ref).abs().max() / ref.abs().max()).item()
         self.assertLess(rel, 2e-2)
 
+    def test_data_interp_method_knab(self):
+        # Subaperture backprojections with knab range interpolation; the
+        # fusion is interpolation-free, so the output must match the direct
+        # knab backprojection like the linear case matches linear.
+        data, pos = self._scene()
+        method = ("knab", 6, 2.0)
+        ref = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fc, self.r_res, pos,
+            interp_method=method)[0]
+        out = torchbp.ops.afbp(data, self.grid, self.fc, self.r_res, pos,
+                               nsub=8, data_interp_method=method)
+        rel = ((out - ref).abs().max() / ref.abs().max()).item()
+        self.assertLess(rel, 2e-2)
+
+    def test_data_interp_method_grad_raises(self):
+        data, pos = self._scene()
+        data.requires_grad_(True)
+        with self.assertRaises(ValueError):
+            torchbp.ops.afbp(data, self.grid, self.fc, self.r_res, pos,
+                             nsub=8, data_interp_method=("knab", 6, 2.0))
+
     def test_nsub1_fallback_exact(self):
         data, pos = self._scene()
         ref = torchbp.ops.backprojection_polar_2d(
