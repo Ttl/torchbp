@@ -1195,60 +1195,65 @@ static void ffbp_merge2_geom_pass_cpu(float d, float dz, float theta1,
     }
 }
 
-// Interpolation window and weight pass for the polynomial merge kernels.
-// TAPS is the interpolation order rounded up to even (window capacity).
-// For each pixel it stores the TAPS-wide window start, clamped into
-// [0, N - TAPS] so the tap gather never reads out of bounds, and the tap
-// weights, both in [tap][pixel] layout: range weights wr_buf and theta
-// weights wt_buf. The gather applies the range weights while accumulating
-// rows and the theta weights once in its final reduction, so neither needs
-// a per-pixel layout (an earlier interleaved-pair transpose of the theta
-// weights for the row loop cost more than the rest of this pass).
-// Taps outside the exact kernel support |dx| < a
-// (window clamping at the image edges, off-center clamped windows, odd
-// order in an even-capacity window) get exactly zero weight instead of a
-// variable tap count. This matches the exact kernel, which vanishes at
-// |dx| >= a, where the variable-count window of interp_2d_poly in
-// cuda/util.h includes a |dx| == a tap with the small polynomial fit
-// residual when the window lands on integer positions. Lanes with
-// dri_buf < 0 hold garbage weights but in-bounds window starts; the gather
-// pass skips them.
-template<int N_COEFS, int TAPS>
-static void ffbp_merge2_poly_weights_pass_cpu(const float *coefs, int order,
-        int Nr, int Ntheta, int nchunk,
+// Fractional-position rows in the merge interpolation weight table.
+#define MERGE_INTERP_TABLE_PHASES 2048
+
+// Polyphase interpolation weight table for the polynomial merge kernels.
+// Row p holds the ``taps`` tap weights for fractional sample position
+// p/nphase; tap j applies to sample (int)x - (taps/2 - 1) + j. The weights
+// are the polynomial fit of the Knab kernel evaluated in double (the same
+// kernel the CUDA poly path evaluates per pixel), zero outside the
+// |x| < order/2 support of the exact kernel (order can be odd in an
+// even-capacity window). Built per merge call; the cost is negligible next
+// to the merge itself. Nearest-row lookup quantizes the fraction to
+// 1/(2*nphase), a ~-70 dB weight error, comparable to the fit residual at
+// practical orders. Replacing the vectorized per-pixel Horner weight pass
+// with this table measures 1.5-1.7x on the whole merge (same trade as the
+// knab table backprojection kernel in backproj.cpp).
+static std::vector<float> merge_interp_table(const float *coefs, int n_coefs,
+        int taps, int order, int nphase) {
+    const double a = 0.5 * order;
+    std::vector<float> table((size_t)(nphase + 1) * taps);
+    for (int p = 0; p <= nphase; p++) {
+        const double frac = (double)p / nphase;
+        for (int j = 0; j < taps; j++) {
+            const double x = frac + (taps / 2 - 1) - j;
+            const double t = (x / a) * (x / a);
+            double w = 0.0;
+            if (t < 1.0) {
+                double inner = coefs[n_coefs - 1];
+                for (int i = n_coefs - 2; i >= 0; i--) {
+                    inner = inner * t + coefs[i];
+                }
+                w = t * inner + 1.0;
+            }
+            table[(size_t)p * taps + j] = (float)w;
+        }
+    }
+    return table;
+}
+
+// Interpolation window and phase-index pass for the polynomial merge
+// kernels. For each pixel it stores the unclamped TAPS-wide window start
+// (it can hang past the image edges near the border; the gather clips)
+// and the nearest weight table row of the fractional position on both
+// axes. Lanes with dri_buf < 0 get table row 0 and are skipped by the
+// gather pass.
+template<int TAPS>
+static void ffbp_merge2_table_index_pass_cpu(int nphase, int nchunk,
         const float *dri_buf, const float *dti_buf,
-        int *ir_buf, int *it_buf,
-        float wr_buf[][MERGE_CHUNK], float wt_buf[][MERGE_CHUNK]) {
-    const float a = 0.5f * order;
-    const float inv_a2 = 1.0f / (a * a);
-    // Weights are computed in [tap][pixel] layout so the Horner recurrences
-    // vectorize across pixels; a per-pixel layout would scalarize this
-    // pass, which then dominates the whole kernel.
+        int *ir_buf, int *it_buf, int *pr_buf, int *pt_buf) {
 #pragma omp simd
     for (int q = 0; q < nchunk; q++) {
         const float x = dri_buf[q];
         const float y = dti_buf[q];
-        const int sx = std::max(0, std::min((int)ceilf(x - a), Nr - TAPS));
-        const int sy = std::max(0, std::min((int)ceilf(y - a), Ntheta - TAPS));
-        ir_buf[q] = sx;
-        it_buf[q] = sy;
-        // The forced unroll keeps the q loop a single-level nest; without it
-        // gcc leaves this an inner loop and then refuses to vectorize over q
-        // ("loop nest containing two or more consecutive inner loops").
-#pragma GCC unroll 8
-        for (int j = 0; j < TAPS; j++) {
-            // Branchless support mask (0/1 multiply): a conditional around
-            // the polynomial evaluation compiles to a branch, which stops
-            // the vectorization of the whole q loop.
-            const float dx = x - (float)(sx + j);
-            const float tx = dx * dx * inv_a2;
-            const float mx = tx < 1.0f ? 1.0f : 0.0f;
-            wr_buf[j][q] = mx * polyval_c0_one_cpu<N_COEFS>(coefs, tx);
-            const float dy = y - (float)(sy + j);
-            const float ty = dy * dy * inv_a2;
-            const float my = ty < 1.0f ? 1.0f : 0.0f;
-            wt_buf[j][q] = my * polyval_c0_one_cpu<N_COEFS>(coefs, ty);
-        }
+        const bool ok = x >= 0.0f;
+        const int ix = ok ? (int)x : 0;
+        const int iy = ok ? (int)y : 0;
+        ir_buf[q] = ix - (TAPS / 2 - 1);
+        it_buf[q] = iy - (TAPS / 2 - 1);
+        pr_buf[q] = ok ? (int)((x - ix) * nphase + 0.5f) : 0;
+        pt_buf[q] = ok ? (int)((y - iy) * nphase + 0.5f) : 0;
     }
 }
 
@@ -1256,32 +1261,52 @@ static void ffbp_merge2_poly_weights_pass_cpu(const float *coefs, int order,
 // TAPS x TAPS window accumulated as contiguous dot products of the
 // interleaved (re, im) image rows. The fixed trip counts and row-uniform
 // weights keep the accumulation vectorized (variable tap counts compile to
-// a scalar gather instead, about 2x slower). The theta weights are
-// constant across the range taps, so the rows are accumulated with the
-// range weight only and the theta weight is applied once per column in the
-// final reduction; the reduction reads the [tap][pixel] weight layout
-// directly, its handful of strided scalar loads is much cheaper than
-// transposing the weights per pixel. Accumulates in plain floats: gcc
-// optimizes this much better than the c10::complex operator chain.
+// a scalar gather instead, about 2x slower). The weight rows are two
+// contiguous loads from the polyphase table next to the sample gather
+// (gathering them in the vector index pass instead measures slower, as in
+// the knab table backprojection kernel). The theta weights are constant
+// across the range taps, so the rows are accumulated with the range weight
+// only and the theta weight is applied once per column in the final
+// reduction. The window is fully in bounds everywhere except a TAPS/2-wide
+// band at the source grid edges, so the bounds branch predicts well; the
+// border path clips the window to the image, which gives the same values
+// as the exact kernel with zero samples outside (clipped taps either have
+// |dx| >= order/2 and zero table weight, or read outside the image).
+// Accumulates in plain floats: gcc optimizes this much better than the
+// c10::complex operator chain.
 template<int TAPS>
-static inline complex64_t ffbp_merge2_poly_taps_cpu(const complex64_t *img,
-        int Ntheta, int q, const int *ir_buf, const int *it_buf,
-        const float wr_buf[][MERGE_CHUNK], const float wt_buf[][MERGE_CHUNK]) {
-    float acc2[2*TAPS] = {0.0f};
-    const float *row = (const float*)(img + (size_t)ir_buf[q] * Ntheta + it_buf[q]);
-    for (int i = 0; i < TAPS; i++) {
-        const float wxi = wr_buf[i][q];
-#pragma omp simd
-        for (int k = 0; k < 2*TAPS; k++) {
-            acc2[k] += row[k] * wxi;
-        }
-        row += 2 * Ntheta;
-    }
+static inline complex64_t ffbp_merge2_table_taps_cpu(const complex64_t *img,
+        int Nr, int Ntheta, int su, int sv, const float *wr, const float *wt) {
     float sr = 0.0f, si = 0.0f;
-    for (int k = 0; k < TAPS; k++) {
-        const float wyk = wt_buf[k][q];
-        sr += acc2[2*k] * wyk;
-        si += acc2[2*k+1] * wyk;
+    if (su >= 0 && su + TAPS <= Nr && sv >= 0 && sv + TAPS <= Ntheta) {
+        float acc2[2*TAPS] = {0.0f};
+        const float *row = (const float*)(img + (size_t)su * Ntheta + sv);
+        for (int i = 0; i < TAPS; i++) {
+            const float wxi = wr[i];
+#pragma omp simd
+            for (int k = 0; k < 2*TAPS; k++) {
+                acc2[k] += row[k] * wxi;
+            }
+            row += 2 * Ntheta;
+        }
+        for (int k = 0; k < TAPS; k++) {
+            sr += acc2[2*k] * wt[k];
+            si += acc2[2*k+1] * wt[k];
+        }
+    } else {
+        const int i0 = std::max(0, -su), i1 = std::min(TAPS, Nr - su);
+        const int j0 = std::max(0, -sv), j1 = std::min(TAPS, Ntheta - sv);
+        for (int i = i0; i < i1; i++) {
+            const float *row = (const float*)(img + (size_t)(su + i) * Ntheta + sv);
+            const float wxi = wr[i];
+            float rr = 0.0f, ri = 0.0f;
+            for (int j = j0; j < j1; j++) {
+                rr += row[2*j] * wt[j];
+                ri += row[2*j+1] * wt[j];
+            }
+            sr += rr * wxi;
+            si += ri * wxi;
+        }
     }
     return {sr, si};
 }
@@ -1455,20 +1480,20 @@ static void ffbp_merge2_kernel_knab_cpu(const complex64_t *img0, const complex64
     }
 }
 
-template<int N_COEFS, int TAPS>
+template<int TAPS>
 static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64_t *img1,
         complex64_t *out, const float *dorigin,
         float ref_phase, const float *r0, const float *dr, const float *theta0,
         const float *dtheta, const int *Nr, const int *Ntheta, float r1, float dr1, float theta1,
-        float dtheta1, int Nr1, int Ntheta1, float z1, int order, const float *coefs,
+        float dtheta1, int Nr1, int Ntheta1, float z1, const float *w_table,
         int alias, float alias_fmod, const float *dem, float dem_r_scale,
         float dem_theta_scale, int dem_nr, int dem_ntheta, int idr, int tb) {
     float dri_buf[MERGE_CHUNK], dti_buf[MERGE_CHUNK];
     float rp_buf[MERGE_CHUNK], tp_buf[MERGE_CHUNK];
     float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
     float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
-    float wr_buf[TAPS][MERGE_CHUNK], wt_buf[TAPS][MERGE_CHUNK];
     int ir_buf[MERGE_CHUNK], it_buf[MERGE_CHUNK];
+    int pr_buf[MERGE_CHUNK], pt_buf[MERGE_CHUNK];
 
     const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
     const float d = r1 + dr1 * idr;
@@ -1501,16 +1526,17 @@ static void ffbp_merge2_kernel_poly_cpu(const complex64_t *img0, const complex64
                     Nr[id], Ntheta[id], alias_fmod, idr, nchunk, nullptr, nullptr,
                     dri_buf, dti_buf, rp_buf, tp_buf, cs_buf, sn_buf);
         }
-        ffbp_merge2_poly_weights_pass_cpu<N_COEFS, TAPS>(coefs, order,
-                Nr[id], Ntheta[id], nchunk, dri_buf, dti_buf,
-                ir_buf, it_buf, wr_buf, wt_buf);
+        ffbp_merge2_table_index_pass_cpu<TAPS>(MERGE_INTERP_TABLE_PHASES,
+                nchunk, dri_buf, dti_buf, ir_buf, it_buf, pr_buf, pt_buf);
         // Per-pixel pass: data-dependent interpolation gather.
         for (int q = 0; q < nchunk; q++) {
             if (dri_buf[q] < 0.0f) {
                 continue;
             }
-            complex64_t v = ffbp_merge2_poly_taps_cpu<TAPS>(img, Ntheta[id], q,
-                    ir_buf, it_buf, wr_buf, wt_buf);
+            complex64_t v = ffbp_merge2_table_taps_cpu<TAPS>(img, Nr[id], Ntheta[id],
+                    ir_buf[q], it_buf[q],
+                    w_table + (size_t)pr_buf[q] * TAPS,
+                    w_table + (size_t)pt_buf[q] * TAPS);
             accr[q] += v.real() * cs_buf[q] - v.imag() * sn_buf[q];
             acci[q] += v.real() * sn_buf[q] + v.imag() * cs_buf[q];
         }
@@ -1772,8 +1798,8 @@ at::Tensor ffbp_merge2_poly_cpu(
     }
 
 
-    // Window capacity of the tap gather: order rounded up to even. The
-    // clamped window start needs taps to fit inside the image on both axes.
+    // Window capacity of the tap gather: order rounded up to even. Matches
+    // the CUDA poly path's minimum image size.
     const int taps = (int)((order + 1) & ~(int64_t)1);
     for (int i = 0; i < 2; i++) {
         TORCH_CHECK(Nr0_ptr[i] >= taps && Ntheta0_ptr[i] >= taps,
@@ -1785,50 +1811,38 @@ at::Tensor ffbp_merge2_poly_cpu(
 
     const int ntchunks = (Ntheta1 + MERGE_CHUNK - 1) / MERGE_CHUNK;
 
-    // Dispatch to template-specialized kernel based on n_coefs and the tap
-    // count. This enables full compile-time unrolling of the polynomial
-    // evaluation and the fixed-length tap gather. Mirrors the n_coefs
-    // dispatch in ffbp_merge2_poly_cuda.
-    #define LAUNCH_KERNEL(N, T) \
+    TORCH_CHECK(n_coefs >= 4 && n_coefs <= 14,
+        "ffbp_merge2_poly: n_coefs must be 4-14, got ", n_coefs);
+    // The polynomial kernel is evaluated into a polyphase weight table once
+    // per call; only the tap count needs a template dispatch for the
+    // fixed-length gather. The CUDA path keeps the per-pixel polynomial
+    // evaluation and its n_coefs dispatch.
+    const std::vector<float> w_table = merge_interp_table(coefs_ptr, n_coefs,
+            taps, (int)order, MERGE_INTERP_TABLE_PHASES);
+    const float *w_table_ptr = w_table.data();
+
+    #define LAUNCH_KERNEL(T) \
         _Pragma("omp parallel for collapse(2) schedule(dynamic)") \
         for (int idr = 0; idr < Nr1; idr++) { \
             for (int tc = 0; tc < ntchunks; tc++) { \
-                ffbp_merge2_kernel_poly_cpu<N, T>(img0_ptr, img1_ptr, out_ptr, dorigin_ptr, \
+                ffbp_merge2_kernel_poly_cpu<T>(img0_ptr, img1_ptr, out_ptr, dorigin_ptr, \
                         ref_phase, r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
-                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, \
+                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, w_table_ptr, \
                         alias, alias_fmod/kPI, \
                         dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta, idr, tc * MERGE_CHUNK); \
             } \
         }
-    #define LAUNCH_TAPS(N) \
-        switch (taps) { \
-            case 2: LAUNCH_KERNEL(N, 2); break; \
-            case 4: LAUNCH_KERNEL(N, 4); break; \
-            case 6: LAUNCH_KERNEL(N, 6); break; \
-            case 8: LAUNCH_KERNEL(N, 8); break; \
-        }
-
-    switch (n_coefs) {
-        case 4: LAUNCH_TAPS(4); break;
-        case 5: LAUNCH_TAPS(5); break;
-        case 6: LAUNCH_TAPS(6); break;
-        case 7: LAUNCH_TAPS(7); break;
-        case 8: LAUNCH_TAPS(8); break;
-        case 9: LAUNCH_TAPS(9); break;
-        case 10: LAUNCH_TAPS(10); break;
-        case 11: LAUNCH_TAPS(11); break;
-        case 12: LAUNCH_TAPS(12); break;
-        case 13: LAUNCH_TAPS(13); break;
-        case 14: LAUNCH_TAPS(14); break;
-        default:
-            TORCH_CHECK(false, "ffbp_merge2_poly: n_coefs must be 4-14, got ", n_coefs);
+    switch (taps) {
+        case 2: LAUNCH_KERNEL(2); break;
+        case 4: LAUNCH_KERNEL(4); break;
+        case 6: LAUNCH_KERNEL(6); break;
+        case 8: LAUNCH_KERNEL(8); break;
     }
-    #undef LAUNCH_TAPS
     #undef LAUNCH_KERNEL
     return out;
 }
 
-template<int N_COEFS, int TAPS>
+template<int TAPS>
 static void ffbp_merge2_kernel_poly_weighted_cpu(
         const complex64_t *img0, const complex64_t *img1,
         complex64_t *out,
@@ -1839,7 +1853,7 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
         const float *r0, const float *dr, const float *theta0, const float *dtheta,
         const int *Nr, const int *Ntheta,
         float r1, float dr1, float theta1, float dtheta1, int Nr1, int Ntheta1,
-        float z1, int order, const float *coefs, int alias, float alias_fmod,
+        float z1, const float *w_table, int alias, float alias_fmod,
         const float *w1_map0, const float *w2_map0,
         float w_r0_0, float w_dr0, float w_theta0_0, float w_dtheta0,
         int w_nr0, int w_ntheta0,
@@ -1853,8 +1867,8 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
     float cs_buf[MERGE_CHUNK], sn_buf[MERGE_CHUNK];
     float accr[MERGE_CHUNK], acci[MERGE_CHUNK];
     float accw1[MERGE_CHUNK], accw2[MERGE_CHUNK];
-    float wr_buf[TAPS][MERGE_CHUNK], wt_buf[TAPS][MERGE_CHUNK];
     int ir_buf[MERGE_CHUNK], it_buf[MERGE_CHUNK];
+    int pr_buf[MERGE_CHUNK], pt_buf[MERGE_CHUNK];
 
     const int nchunk = std::min(MERGE_CHUNK, Ntheta1 - tb);
     const float d = r1 + dr1 * idr;
@@ -1898,16 +1912,17 @@ static void ffbp_merge2_kernel_poly_weighted_cpu(
                     Nr[id], Ntheta[id], alias_fmod, idr, nchunk, nullptr, nullptr,
                     dri_buf, dti_buf, rp_buf, tp_buf, cs_buf, sn_buf);
         }
-        ffbp_merge2_poly_weights_pass_cpu<N_COEFS, TAPS>(coefs, order,
-                Nr[id], Ntheta[id], nchunk, dri_buf, dti_buf,
-                ir_buf, it_buf, wr_buf, wt_buf);
+        ffbp_merge2_table_index_pass_cpu<TAPS>(MERGE_INTERP_TABLE_PHASES,
+                nchunk, dri_buf, dti_buf, ir_buf, it_buf, pr_buf, pt_buf);
         // Per-pixel pass: data-dependent interpolation and weight map gathers.
         for (int q = 0; q < nchunk; q++) {
             if (dri_buf[q] < 0.0f) {
                 continue;
             }
-            complex64_t v = ffbp_merge2_poly_taps_cpu<TAPS>(img, Ntheta[id], q,
-                    ir_buf, it_buf, wr_buf, wt_buf);
+            complex64_t v = ffbp_merge2_table_taps_cpu<TAPS>(img, Nr[id], Ntheta[id],
+                    ir_buf[q], it_buf[q],
+                    w_table + (size_t)pr_buf[q] * TAPS,
+                    w_table + (size_t)pt_buf[q] * TAPS);
 
             const float vr = v.real() * cs_buf[q] - v.imag() * sn_buf[q];
             const float vi = v.real() * sn_buf[q] + v.imag() * cs_buf[q];
@@ -2101,8 +2116,8 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cpu(
     }
 
 
-    // Window capacity of the tap gather: order rounded up to even. The
-    // clamped window start needs taps to fit inside the image on both axes.
+    // Window capacity of the tap gather: order rounded up to even. Matches
+    // the CUDA poly path's minimum image size.
     const int taps = (int)((order + 1) & ~(int64_t)1);
     for (int i = 0; i < 2; i++) {
         TORCH_CHECK(Nr0_ptr[i] >= taps && Ntheta0_ptr[i] >= taps,
@@ -2114,48 +2129,36 @@ std::vector<at::Tensor> ffbp_merge2_poly_weighted_cpu(
 
     const int ntchunks = (Ntheta1 + MERGE_CHUNK - 1) / MERGE_CHUNK;
 
-    // Dispatch to template-specialized kernel based on n_coefs and the tap
-    // count. This enables full compile-time unrolling of the polynomial
-    // evaluation and the fixed-length tap gather. Mirrors the n_coefs
-    // dispatch in ffbp_merge2_poly_weighted_cuda.
-    #define LAUNCH_KERNEL(N, T) \
+    TORCH_CHECK(n_coefs >= 4 && n_coefs <= 14,
+        "ffbp_merge2_poly_weighted: n_coefs must be 4-14, got ", n_coefs);
+    // The polynomial kernel is evaluated into a polyphase weight table once
+    // per call; only the tap count needs a template dispatch for the
+    // fixed-length gather. The CUDA path keeps the per-pixel polynomial
+    // evaluation and its n_coefs dispatch.
+    const std::vector<float> w_table = merge_interp_table(coefs_ptr, n_coefs,
+            taps, (int)order, MERGE_INTERP_TABLE_PHASES);
+    const float *w_table_ptr = w_table.data();
+
+    #define LAUNCH_KERNEL(T) \
         _Pragma("omp parallel for collapse(2) schedule(dynamic)") \
         for (int idr = 0; idr < Nr1; idr++) { \
             for (int tc = 0; tc < ntchunks; tc++) { \
-                ffbp_merge2_kernel_poly_weighted_cpu<N, T>( \
+                ffbp_merge2_kernel_poly_weighted_cpu<T>( \
                         img0_ptr, img1_ptr, out_ptr, w1_out_ptr, w2_out_ptr, dorigin_ptr, ref_phase, \
                         r0_ptr, dr0_ptr, theta0_ptr, dtheta0_ptr, Nr0_ptr, Ntheta0_ptr, \
-                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, order, coefs_ptr, \
+                        r1, dr1, theta1, dtheta1, Nr1, Ntheta1, z1, w_table_ptr, \
                         alias, alias_fmod/kPI, \
                         w1_map0_ptr, w2_map0_ptr, w_r0_0, w_dr0, w_theta0_0, w_dtheta0, w_nr0, w_ntheta0, \
                         w1_map1_ptr, w2_map1_ptr, w_r0_1, w_dr1, w_theta0_1, w_dtheta1, w_nr1, w_ntheta1, \
                         dec, dem_ptr, dem_r_scale, dem_theta_scale, dem_nr, dem_ntheta, idr, tc * MERGE_CHUNK); \
             } \
         }
-    #define LAUNCH_TAPS(N) \
-        switch (taps) { \
-            case 2: LAUNCH_KERNEL(N, 2); break; \
-            case 4: LAUNCH_KERNEL(N, 4); break; \
-            case 6: LAUNCH_KERNEL(N, 6); break; \
-            case 8: LAUNCH_KERNEL(N, 8); break; \
-        }
-
-    switch (n_coefs) {
-        case 4: LAUNCH_TAPS(4); break;
-        case 5: LAUNCH_TAPS(5); break;
-        case 6: LAUNCH_TAPS(6); break;
-        case 7: LAUNCH_TAPS(7); break;
-        case 8: LAUNCH_TAPS(8); break;
-        case 9: LAUNCH_TAPS(9); break;
-        case 10: LAUNCH_TAPS(10); break;
-        case 11: LAUNCH_TAPS(11); break;
-        case 12: LAUNCH_TAPS(12); break;
-        case 13: LAUNCH_TAPS(13); break;
-        case 14: LAUNCH_TAPS(14); break;
-        default:
-            TORCH_CHECK(false, "ffbp_merge2_poly_weighted: n_coefs must be 4-14, got ", n_coefs);
+    switch (taps) {
+        case 2: LAUNCH_KERNEL(2); break;
+        case 4: LAUNCH_KERNEL(4); break;
+        case 6: LAUNCH_KERNEL(6); break;
+        case 8: LAUNCH_KERNEL(8); break;
     }
-    #undef LAUNCH_TAPS
     #undef LAUNCH_KERNEL
 
     std::vector<at::Tensor> ret;

@@ -451,26 +451,5 @@ static T knab_interp_2d_cpu(const T *img, int nx, int ny, float x, float y, int 
     return sum;
 }
 
-// Template-specialized polynomial evaluation for full compile-time unrolling.
-// Evaluates 1 + c1*x + c2*x^2 + ... + cn*x^n using Horner's method.
-// Mirrors polyval_c0_one in cuda/util.h with the coefficients passed as an
-// argument instead of constant memory.
-template<int N_COEFS>
-static inline float polyval_c0_one_cpu(const float *coefs, float x) {
-    float inner = coefs[N_COEFS - 1];
-    for (int i = N_COEFS - 2; i >= 0; i--) {
-        inner = inner * x + coefs[i];
-    }
-    return x * inner + 1.0f;
-}
-
-template<int N_COEFS>
-static inline float poly_interp_kernel_cpu(const float *coefs, float x, float inv_a2) {
-    float x2 = x * x;
-    // Polynomial was fitted for (x/a)²
-    float t = x2 * inv_a2;
-    return polyval_c0_one_cpu<N_COEFS>(coefs, t);
-}
-
 }
 #endif
