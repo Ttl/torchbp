@@ -1,5 +1,6 @@
 #include "util.h"
 #include <cstring>
+#include <climits>
 
 // CPU backprojection, projection and GPGA ops. Mirrors cuda/backproj.cu.
 namespace torchbp {
@@ -13,6 +14,51 @@ namespace torchbp {
 // vectorizable pass interpolates, applies the phasor and accumulates. The
 // antenna gain path adds a vectorizable angle pass (asinf_fast/atan2f_fast,
 // a few ulp from libm).
+// GCC sometimes vectorizes the scalar copy loops into hardware gathers
+// (vpgatherdq), which are microcoded an order of magnitude slower on
+// Downfall-mitigated CPUs. An empty asm on the loaded index blocks
+// vectorization of the containing loop and keeps it scalar.
+#if defined(__GNUC__)
+#define TORCHBP_KEEP_SCALAR(x) __asm__("" : "+r"(x))
+#else
+#define TORCHBP_KEEP_SCALAR(x)
+#endif
+
+// 8-wide GNU vector types for the short-subaperture slab path of the
+// backprojection kernel: __builtin_shuffle compiles to vpermps, turning the
+// data-dependent sample loads into in-register permutes (hardware gathers
+// are microcoded-slow on Downfall-mitigated CPUs). GCC-only; other
+// compilers fall back to the scalar copy pass.
+#if defined(__GNUC__) && !defined(__clang__)
+#define TORCHBP_VEC_SHUFFLE 1
+typedef float v8sf __attribute__((vector_size(32)));
+typedef int v8si __attribute__((vector_size(32)));
+typedef float v8sf_u __attribute__((vector_size(32), aligned(4)));
+typedef int v8si_u __attribute__((vector_size(32), aligned(4)));
+
+// Bilinear antenna gain of 8 adjacent pixels from the (g[gi], g[gi+1]) pair
+// buffers of the scalar gain copy pass, without the validity mask. Same
+// arithmetic as the scalar bilinear in the copy-pass path.
+static inline v8sf gain_bilinear8(const double *g0b, const double *g1b,
+        const float *af_buf, const float *ef_buf, int q) {
+    const float *p0 = (const float*)g0b + 2*q;
+    const float *p1 = (const float*)g1b + 2*q;
+    const v8sf a = *(const v8sf_u*)p0, b = *(const v8sf_u*)(p0 + 8);
+    const v8sf c = *(const v8sf_u*)p1, d = *(const v8sf_u*)(p1 + 8);
+    const v8si ev = {0, 2, 4, 6, 8, 10, 12, 14};
+    const v8si od = {1, 3, 5, 7, 9, 11, 13, 15};
+    const v8sf g00 = __builtin_shuffle(a, b, ev);
+    const v8sf g01 = __builtin_shuffle(a, b, od);
+    const v8sf g10 = __builtin_shuffle(c, d, ev);
+    const v8sf g11 = __builtin_shuffle(c, d, od);
+    const v8sf af = *(const v8sf_u*)&af_buf[q];
+    const v8sf ef = *(const v8sf_u*)&ef_buf[q];
+    const v8sf w0 = g00 + af * (g01 - g00);
+    const v8sf w1 = g10 + af * (g11 - g10);
+    return w0 + ef * (w1 - w0);
+}
+#endif
+
 template<bool HasDem>
 static void backprojection_polar_2d_row_cpu(
           const complex64_t* data,
@@ -127,8 +173,11 @@ static void backprojection_polar_2d_row_cpu(
             const float* data_row = (const float*)(data_b + (size_t)i * sweep_samples);
 
             // Geometry + phase pass. idx = -1 marks pixels outside the data
-            // range window.
-#pragma omp simd
+            // range window. The valid-pixel sample index span is reduced
+            // here (values already live in registers) to pick the slab path
+            // below.
+            int idmin = INT_MAX, idmax = INT_MIN;
+#pragma omp simd reduction(min:idmin) reduction(max:idmax)
             for (int q = 0; q < nchunk; q++) {
                 // Distance in the polar form d^2 = r^2 + |p|^2
                 // - 2*r*(cos(theta)*p_x + sin(theta)*p_y). Inside |theta| <= 1
@@ -160,14 +209,29 @@ static void backprojection_polar_2d_row_cpu(
                 // 0/1 mask in the accumulate pass; a skip branch there would
                 // keep the accumulation scalar.
                 const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
-                idx_buf[q] = ok ? id0 : 0;
-                vld_buf[q] = ok ? 1.0f : 0.0f;
+                const int idc = ok ? id0 : 0;
+                const float vld = ok ? 1.0f : 0.0f;
+                idx_buf[q] = idc;
+                vld_buf[q] = vld;
                 frac_buf[q] = sx - id0;
+                // Valid-pixel index span: invalid pixels don't constrain the
+                // slab window (their contribution is masked to zero).
+                const int idlo = ok ? id0 : INT_MAX;
+                const int idhi = ok ? id0 : INT_MIN;
+                idmin = idlo < idmin ? idlo : idmin;
+                idmax = idhi > idmax ? idhi : idmax;
 
                 float ref_sin, ref_cos;
                 sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
                 cs_buf[q] = ref_cos;
                 sn_buf[q] = ref_sin;
+            }
+
+            // No valid pixel in the chunk: the masked accumulation adds
+            // exact zeros (also to wsum), so the sweep can be skipped
+            // outright (for finite data the results are bit-identical).
+            if (idmin == INT_MAX) {
+                continue;
             }
 
             if (g != nullptr) {
@@ -207,10 +271,81 @@ static void backprojection_polar_2d_row_cpu(
                     gi_buf[q] = ok ? el_int * g_naz + az_int : 0;
                     gvld_buf[q] = ok ? 1.0f : 0.0f;
                 }
+#ifdef TORCHBP_VEC_SHUFFLE
+                const int span = idmax - idmin;
+                if (span <= 6 && nchunk >= 8) {
+                    // Slab tier, see the no-antenna path. The gain pattern
+                    // gather stays scalar (its indices span too many pattern
+                    // entries to slab); the sample loads become permutes and
+                    // the gain pairs deinterleave with constant shuffles.
+                    // Single-register tier only: with the gain work on top,
+                    // the two-register permutes of a 16 tier cost more than
+                    // the two sample moves they save.
+                    for (int q = 0; q < nchunk; q++) {
+                        int gi = gi_buf[q];
+                        TORCHBP_KEEP_SCALAR(gi);
+                        memcpy(&g0_buf[q], g + gi, 8);
+                        memcpy(&g1_buf[q], g + gi + g_naz, 8);
+                    }
+                    float slab_re[8], slab_im[8];
+                    const int nslab = span + 2;
+                    for (int k = 0; k < 8; k++) {
+                        const int j = k < nslab ? idmin + k : idmin;
+                        slab_re[k] = data_row[2*j];
+                        slab_im[k] = data_row[2*j+1];
+                    }
+                    const v8sf vre = *(const v8sf_u*)slab_re;
+                    const v8sf vim = *(const v8sf_u*)slab_im;
+                    const v8si vmin_v = {idmin, idmin, idmin, idmin,
+                                         idmin, idmin, idmin, idmin};
+                    const v8si one_v = {1, 1, 1, 1, 1, 1, 1, 1};
+                    int q = 0;
+                    for (; q + 8 <= nchunk; q += 8) {
+                        const v8sf w = gain_bilinear8(g0_buf, g1_buf,
+                                af_buf, ef_buf, q)
+                                * *(const v8sf_u*)&vld_buf[q]
+                                * *(const v8sf_u*)&gvld_buf[q];
+                        const v8si off = *(const v8si_u*)&idx_buf[q] - vmin_v;
+                        const v8si off1 = off + one_v;
+                        const v8sf v0r = __builtin_shuffle(vre, off);
+                        const v8sf v0i = __builtin_shuffle(vim, off);
+                        const v8sf v1r = __builtin_shuffle(vre, off1);
+                        const v8sf v1i = __builtin_shuffle(vim, off1);
+                        const v8sf f = *(const v8sf_u*)&frac_buf[q];
+                        const v8sf sr = v0r + f * (v1r - v0r);
+                        const v8sf si = v0i + f * (v1i - v0i);
+                        const v8sf cs = *(const v8sf_u*)&cs_buf[q];
+                        const v8sf sn = *(const v8sf_u*)&sn_buf[q];
+                        *(v8sf_u*)&accr[q] += w * (sr * cs - si * sn);
+                        *(v8sf_u*)&acci[q] += w * (sr * sn + si * cs);
+                        *(v8sf_u*)&wsum_buf[q] += w;
+                        *(v8sf_u*)&wsum2_buf[q] += w * w;
+                    }
+                    for (; q < nchunk; q++) {
+                        const float ef = ef_buf[q], af = af_buf[q];
+                        const float *g0 = (const float*)g0_buf;
+                        const float *g1 = (const float*)g1_buf;
+                        const float w0 = g0[2*q] + af * (g0[2*q+1] - g0[2*q]);
+                        const float w1 = g1[2*q] + af * (g1[2*q+1] - g1[2*q]);
+                        const float w = (w0 + ef * (w1 - w0)) * vld_buf[q] * gvld_buf[q];
+                        const float f = frac_buf[q];
+                        const int o = (idx_buf[q] - idmin) & 7;
+                        const int o1 = (o + 1) & 7;
+                        const float sr = slab_re[o] + f * (slab_re[o1] - slab_re[o]);
+                        const float si = slab_im[o] + f * (slab_im[o1] - slab_im[o]);
+                        accr[q] += w * (sr * cs_buf[q] - si * sn_buf[q]);
+                        acci[q] += w * (sr * sn_buf[q] + si * cs_buf[q]);
+                        wsum_buf[q] += w;
+                        wsum2_buf[q] += w * w;
+                    }
+                } else
+#endif // TORCHBP_VEC_SHUFFLE
+                {
                 // Copy pass: only the data-dependent gain and sample loads
                 // stay scalar; everything else moves to the vector pass.
                 for (int q = 0; q < nchunk; q++) {
-                    const int gi = gi_buf[q];
+                    int gi = gi_buf[q];
+                    TORCHBP_KEEP_SCALAR(gi);
                     memcpy(&g0_buf[q], g + gi, 8);
                     memcpy(&g1_buf[q], g + gi + g_naz, 8);
                     const float *s = data_row + 2 * idx_buf[q];
@@ -239,12 +374,114 @@ static void backprojection_polar_2d_row_cpu(
                     wsum_buf[q] += w;
                     wsum2_buf[q] += w * w;
                 }
+                }
             } else {
+                // When the valid pixels of the chunk read from a window of
+                // at most 8 (or 16) samples (short subapertures: idx drifts
+                // by ~aperture_length * dtheta_chunk / r_res samples per
+                // chunk), the samples fit one (two) vector registers per
+                // component and the data-dependent loads become in-register
+                // permutes instead of a scalar gather pass. Invalid pixels
+                // read a wrapped slab element (__builtin_shuffle indexes
+                // modulo slab size) and are masked to zero like in the
+                // copy-pass path.
+#ifdef TORCHBP_VEC_SHUFFLE
+                const int span = idmax - idmin;
+                if (span <= 6 && nchunk >= 8) {
+                    // Deinterleave the <= 8 complex samples once, then
+                    // permute per pixel from registers.
+                    float slab_re[8], slab_im[8];
+                    const int nslab = span + 2;
+                    for (int k = 0; k < 8; k++) {
+                        const int j = k < nslab ? idmin + k : idmin;
+                        slab_re[k] = data_row[2*j];
+                        slab_im[k] = data_row[2*j+1];
+                    }
+                    const v8sf vre = *(const v8sf_u*)slab_re;
+                    const v8sf vim = *(const v8sf_u*)slab_im;
+                    const v8si vmin_v = {idmin, idmin, idmin, idmin,
+                                         idmin, idmin, idmin, idmin};
+                    const v8si one_v = {1, 1, 1, 1, 1, 1, 1, 1};
+                    int q = 0;
+                    for (; q + 8 <= nchunk; q += 8) {
+                        const v8si off = *(const v8si_u*)&idx_buf[q] - vmin_v;
+                        const v8si off1 = off + one_v;
+                        const v8sf v0r = __builtin_shuffle(vre, off);
+                        const v8sf v0i = __builtin_shuffle(vim, off);
+                        const v8sf v1r = __builtin_shuffle(vre, off1);
+                        const v8sf v1i = __builtin_shuffle(vim, off1);
+                        const v8sf f = *(const v8sf_u*)&frac_buf[q];
+                        const v8sf sr = v0r + f * (v1r - v0r);
+                        const v8sf si = v0i + f * (v1i - v0i);
+                        const v8sf m = *(const v8sf_u*)&vld_buf[q];
+                        const v8sf cs = *(const v8sf_u*)&cs_buf[q];
+                        const v8sf sn = *(const v8sf_u*)&sn_buf[q];
+                        *(v8sf_u*)&accr[q] += m * (sr * cs - si * sn);
+                        *(v8sf_u*)&acci[q] += m * (sr * sn + si * cs);
+                    }
+                    for (; q < nchunk; q++) {
+                        const float f = frac_buf[q];
+                        const int o = (idx_buf[q] - idmin) & 7;
+                        const int o1 = (o + 1) & 7;
+                        const float sr = slab_re[o] + f * (slab_re[o1] - slab_re[o]);
+                        const float si = slab_im[o] + f * (slab_im[o1] - slab_im[o]);
+                        const float m = vld_buf[q];
+                        accr[q] += m * (sr * cs_buf[q] - si * sn_buf[q]);
+                        acci[q] += m * (sr * sn_buf[q] + si * cs_buf[q]);
+                    }
+                } else if (span <= 14 && nchunk >= 8) {
+                    // Two-register slab, two-input permute.
+                    float slab_re[16], slab_im[16];
+                    const int nslab = span + 2;
+                    for (int k = 0; k < 16; k++) {
+                        const int j = k < nslab ? idmin + k : idmin;
+                        slab_re[k] = data_row[2*j];
+                        slab_im[k] = data_row[2*j+1];
+                    }
+                    const v8sf vre0 = *(const v8sf_u*)slab_re;
+                    const v8sf vre1 = *(const v8sf_u*)(slab_re + 8);
+                    const v8sf vim0 = *(const v8sf_u*)slab_im;
+                    const v8sf vim1 = *(const v8sf_u*)(slab_im + 8);
+                    const v8si vmin_v = {idmin, idmin, idmin, idmin,
+                                         idmin, idmin, idmin, idmin};
+                    const v8si one_v = {1, 1, 1, 1, 1, 1, 1, 1};
+                    int q = 0;
+                    for (; q + 8 <= nchunk; q += 8) {
+                        const v8si off = *(const v8si_u*)&idx_buf[q] - vmin_v;
+                        const v8si off1 = off + one_v;
+                        const v8sf v0r = __builtin_shuffle(vre0, vre1, off);
+                        const v8sf v0i = __builtin_shuffle(vim0, vim1, off);
+                        const v8sf v1r = __builtin_shuffle(vre0, vre1, off1);
+                        const v8sf v1i = __builtin_shuffle(vim0, vim1, off1);
+                        const v8sf f = *(const v8sf_u*)&frac_buf[q];
+                        const v8sf sr = v0r + f * (v1r - v0r);
+                        const v8sf si = v0i + f * (v1i - v0i);
+                        const v8sf m = *(const v8sf_u*)&vld_buf[q];
+                        const v8sf cs = *(const v8sf_u*)&cs_buf[q];
+                        const v8sf sn = *(const v8sf_u*)&sn_buf[q];
+                        *(v8sf_u*)&accr[q] += m * (sr * cs - si * sn);
+                        *(v8sf_u*)&acci[q] += m * (sr * sn + si * cs);
+                    }
+                    for (; q < nchunk; q++) {
+                        const float f = frac_buf[q];
+                        const int o = (idx_buf[q] - idmin) & 15;
+                        const int o1 = (o + 1) & 15;
+                        const float sr = slab_re[o] + f * (slab_re[o1] - slab_re[o]);
+                        const float si = slab_im[o] + f * (slab_im[o1] - slab_im[o]);
+                        const float m = vld_buf[q];
+                        accr[q] += m * (sr * cs_buf[q] - si * sn_buf[q]);
+                        acci[q] += m * (sr * sn_buf[q] + si * cs_buf[q]);
+                    }
+                } else
+#endif // TORCHBP_VEC_SHUFFLE
+                {
                 // Copy pass: only the data-dependent sample load stays
                 // scalar. Letting the vectorizer emulate this strided
                 // complex gather inside the accumulate loop is slower.
                 for (int q = 0; q < nchunk; q++) {
-                    const float *s = data_row + 2 * idx_buf[q];
+                    int ix = idx_buf[q];
+                    TORCHBP_KEEP_SCALAR(ix);
+                    const float *s = data_row + 2 * ix;
                     memcpy(&v0_buf[q], s, 8);
                     memcpy(&v1_buf[q], s + 2, 8);
                 }
@@ -261,6 +498,7 @@ static void backprojection_polar_2d_row_cpu(
                     const float m = vld_buf[q];
                     accr[q] += m * (sr * cs_buf[q] - si * sn_buf[q]);
                     acci[q] += m * (sr * sn_buf[q] + si * cs_buf[q]);
+                }
                 }
             }
         }
@@ -320,6 +558,7 @@ static void backprojection_polar_2d_row_cpu(
         }
     }
 }
+
 
 
 // Maximum interpolation taps for the knab table backprojection kernel.
@@ -486,8 +725,11 @@ static void backprojection_polar_2d_knab_row_cpu(
 
             // Geometry + phase pass. Out-of-window pixels get idx = 0,
             // table row 0 and are zeroed by the 0/1 mask in the combine
-            // pass, like the linear kernel.
-#pragma omp simd
+            // pass, like the linear kernel. The valid-pixel window start
+            // span is reduced here to pick the slab path below, as in the
+            // linear kernel.
+            int idmin = INT_MAX, idmax = INT_MIN;
+#pragma omp simd reduction(min:idmin) reduction(max:idmax)
             for (int q = 0; q < nchunk; q++) {
                 // Distance in polar form, see
                 // backprojection_polar_2d_row_cpu.
@@ -508,9 +750,14 @@ static void backprojection_polar_2d_knab_row_cpu(
                 const bool ok = (sx >= 0.0f) & (id0 + 1 < sweep_samples);
                 // Window start; can be negative near the data start, the
                 // padding keeps the read in the row.
-                idx_buf[q] = ok ? id0 - (TAPS / 2 - 1) : 0;
+                const int idc = ok ? id0 - (TAPS / 2 - 1) : 0;
+                idx_buf[q] = idc;
                 p_buf[q] = ok ? (int)((sx - id0) * nphase + 0.5f) : 0;
                 vld_buf[q] = ok ? 1.0f : 0.0f;
+                const int idlo = ok ? idc : INT_MAX;
+                const int idhi = ok ? idc : INT_MIN;
+                idmin = idlo < idmin ? idlo : idmin;
+                idmax = idhi > idmax ? idhi : idmax;
 
                 float ref_sin, ref_cos;
                 sincospi(ref_phase * d - data_fmod * sx, &ref_sin, &ref_cos);
@@ -518,17 +765,52 @@ static void backprojection_polar_2d_knab_row_cpu(
                 sn_buf[q] = ref_sin;
             }
 
+            // No valid pixel in the chunk: skip the sweep, see the linear
+            // kernel.
+            if (idmin == INT_MAX) {
+                continue;
+            }
+
+#ifdef TORCHBP_VEC_SHUFFLE
+            // Slab path: valid-pixel tap windows (span + TAPS samples) fit
+            // two vector registers per component, see the linear kernel.
+            // The polyphase weight rows stay a scalar contiguous copy (the
+            // table row index is near-random per pixel).
+            const int span = idmax - idmin;
+            const bool slab = span <= 16 - TAPS && nchunk >= 8;
+            float slab_re[16], slab_im[16];
+            if (slab) {
+                const int nslab = span + TAPS;
+                for (int k = 0; k < 16; k++) {
+                    const int j = k < nslab ? idmin + k : idmin;
+                    slab_re[k] = data_row[2*j];
+                    slab_im[k] = data_row[2*j+1];
+                }
+                for (int q = 0; q < nchunk; q++) {
+                    int p = p_buf[q];
+                    TORCHBP_KEEP_SCALAR(p);
+                    const float *wrow = w_table + (size_t)p * TAPS;
+                    for (int j = 0; j < TAPS; j++) {
+                        w_buf[j][q] = wrow[j];
+                    }
+                }
+            } else
+#endif // TORCHBP_VEC_SHUFFLE
+            {
             // Copy pass: the data-dependent sample and weight table loads
             // stay scalar, everything else moves to the vector pass.
             // (Gathering the weights from the table inside the vector pass
             // instead measures slightly slower.)
             for (int q = 0; q < nchunk; q++) {
-                const float *s = data_row + 2 * idx_buf[q];
+                int ix = idx_buf[q];
+                TORCHBP_KEEP_SCALAR(ix);
+                const float *s = data_row + 2 * ix;
                 const float *wrow = w_table + (size_t)p_buf[q] * TAPS;
                 for (int j = 0; j < TAPS; j++) {
                     memcpy(&v_buf[j][q], s + 2 * j, 8);
                     w_buf[j][q] = wrow[j];
                 }
+            }
             }
 
             if (g != nullptr) {
@@ -565,10 +847,65 @@ static void backprojection_polar_2d_knab_row_cpu(
                     gvld_buf[q] = ok ? 1.0f : 0.0f;
                 }
                 for (int q = 0; q < nchunk; q++) {
-                    const int gi = gi_buf[q];
+                    int gi = gi_buf[q];
+                    TORCHBP_KEEP_SCALAR(gi);
                     memcpy(&g0_buf[q], g + gi, 8);
                     memcpy(&g1_buf[q], g + gi + g_naz, 8);
                 }
+#ifdef TORCHBP_VEC_SHUFFLE
+                if (slab) {
+                    const v8sf vre0 = *(const v8sf_u*)slab_re;
+                    const v8sf vre1 = *(const v8sf_u*)(slab_re + 8);
+                    const v8sf vim0 = *(const v8sf_u*)slab_im;
+                    const v8sf vim1 = *(const v8sf_u*)(slab_im + 8);
+                    const v8si vmin_v = {idmin, idmin, idmin, idmin,
+                                         idmin, idmin, idmin, idmin};
+                    const v8si one_v = {1, 1, 1, 1, 1, 1, 1, 1};
+                    int q = 0;
+                    for (; q + 8 <= nchunk; q += 8) {
+                        const v8sf w = gain_bilinear8(g0_buf, g1_buf,
+                                af_buf, ef_buf, q)
+                                * *(const v8sf_u*)&vld_buf[q]
+                                * *(const v8sf_u*)&gvld_buf[q];
+                        v8si offj = *(const v8si_u*)&idx_buf[q] - vmin_v;
+                        v8sf sr = {0.0f, 0.0f, 0.0f, 0.0f,
+                                   0.0f, 0.0f, 0.0f, 0.0f};
+                        v8sf si = sr;
+                        for (int j = 0; j < TAPS; j++) {
+                            const v8sf wj = *(const v8sf_u*)&w_buf[j][q];
+                            sr += wj * __builtin_shuffle(vre0, vre1, offj);
+                            si += wj * __builtin_shuffle(vim0, vim1, offj);
+                            offj += one_v;
+                        }
+                        const v8sf cs = *(const v8sf_u*)&cs_buf[q];
+                        const v8sf sn = *(const v8sf_u*)&sn_buf[q];
+                        *(v8sf_u*)&accr[q] += w * (sr * cs - si * sn);
+                        *(v8sf_u*)&acci[q] += w * (sr * sn + si * cs);
+                        *(v8sf_u*)&wsum_buf[q] += w;
+                        *(v8sf_u*)&wsum2_buf[q] += w * w;
+                    }
+                    for (; q < nchunk; q++) {
+                        const float ef = ef_buf[q], af = af_buf[q];
+                        const float *g0 = (const float*)g0_buf;
+                        const float *g1 = (const float*)g1_buf;
+                        const float w0 = g0[2*q] + af * (g0[2*q+1] - g0[2*q]);
+                        const float w1 = g1[2*q] + af * (g1[2*q+1] - g1[2*q]);
+                        const float w = (w0 + ef * (w1 - w0)) * vld_buf[q] * gvld_buf[q];
+                        float sr = 0.0f, si = 0.0f;
+                        const int o = idx_buf[q] - idmin;
+                        for (int j = 0; j < TAPS; j++) {
+                            const int oj = (o + j) & 15;
+                            sr += w_buf[j][q] * slab_re[oj];
+                            si += w_buf[j][q] * slab_im[oj];
+                        }
+                        accr[q] += w * (sr * cs_buf[q] - si * sn_buf[q]);
+                        acci[q] += w * (sr * sn_buf[q] + si * cs_buf[q]);
+                        wsum_buf[q] += w;
+                        wsum2_buf[q] += w * w;
+                    }
+                } else
+#endif // TORCHBP_VEC_SHUFFLE
+                {
                 // Vector pass: gain bilinear, tap-unrolled interpolation,
                 // phasor multiply and accumulate, masked by the 0/1
                 // validity products instead of a skip branch.
@@ -592,7 +929,50 @@ static void backprojection_polar_2d_knab_row_cpu(
                     wsum_buf[q] += w;
                     wsum2_buf[q] += w * w;
                 }
+                }
             } else {
+#ifdef TORCHBP_VEC_SHUFFLE
+                if (slab) {
+                    const v8sf vre0 = *(const v8sf_u*)slab_re;
+                    const v8sf vre1 = *(const v8sf_u*)(slab_re + 8);
+                    const v8sf vim0 = *(const v8sf_u*)slab_im;
+                    const v8sf vim1 = *(const v8sf_u*)(slab_im + 8);
+                    const v8si vmin_v = {idmin, idmin, idmin, idmin,
+                                         idmin, idmin, idmin, idmin};
+                    const v8si one_v = {1, 1, 1, 1, 1, 1, 1, 1};
+                    int q = 0;
+                    for (; q + 8 <= nchunk; q += 8) {
+                        v8si offj = *(const v8si_u*)&idx_buf[q] - vmin_v;
+                        v8sf sr = {0.0f, 0.0f, 0.0f, 0.0f,
+                                   0.0f, 0.0f, 0.0f, 0.0f};
+                        v8sf si = sr;
+                        for (int j = 0; j < TAPS; j++) {
+                            const v8sf wj = *(const v8sf_u*)&w_buf[j][q];
+                            sr += wj * __builtin_shuffle(vre0, vre1, offj);
+                            si += wj * __builtin_shuffle(vim0, vim1, offj);
+                            offj += one_v;
+                        }
+                        const v8sf m = *(const v8sf_u*)&vld_buf[q];
+                        const v8sf cs = *(const v8sf_u*)&cs_buf[q];
+                        const v8sf sn = *(const v8sf_u*)&sn_buf[q];
+                        *(v8sf_u*)&accr[q] += m * (sr * cs - si * sn);
+                        *(v8sf_u*)&acci[q] += m * (sr * sn + si * cs);
+                    }
+                    for (; q < nchunk; q++) {
+                        float sr = 0.0f, si = 0.0f;
+                        const int o = idx_buf[q] - idmin;
+                        for (int j = 0; j < TAPS; j++) {
+                            const int oj = (o + j) & 15;
+                            sr += w_buf[j][q] * slab_re[oj];
+                            si += w_buf[j][q] * slab_im[oj];
+                        }
+                        const float m = vld_buf[q];
+                        accr[q] += m * (sr * cs_buf[q] - si * sn_buf[q]);
+                        acci[q] += m * (sr * sn_buf[q] + si * cs_buf[q]);
+                    }
+                } else
+#endif // TORCHBP_VEC_SHUFFLE
+                {
                 // Vector pass: tap-unrolled interpolation, phasor multiply
                 // and accumulate, masked by the 0/1 validity instead of a
                 // skip branch.
@@ -607,6 +987,7 @@ static void backprojection_polar_2d_knab_row_cpu(
                     const float m = vld_buf[q];
                     accr[q] += m * (sr * cs_buf[q] - si * sn_buf[q]);
                     acci[q] += m * (sr * sn_buf[q] + si * cs_buf[q]);
+                }
                 }
             }
         }
@@ -1714,7 +2095,8 @@ static void compute_illumination_row_cpu(
             }
             // Copy pass: only the data-dependent gain loads stay scalar.
             for (int q = 0; q < nchunk; q++) {
-                const int gi = gi_buf[q];
+                int gi = gi_buf[q];
+                TORCHBP_KEEP_SCALAR(gi);
                 memcpy(&g0_buf[q], g + gi, 8);
                 memcpy(&g1_buf[q], g + gi + g_naz, 8);
             }

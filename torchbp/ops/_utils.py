@@ -1,4 +1,5 @@
 from typing import Tuple, Optional
+import math
 import torch
 from torch import Tensor
 from ..grid import unpack_polar_grid, unpack_cartesian_grid
@@ -196,7 +197,9 @@ class AntennaPattern:
     Raises
     ------
     ValueError
-        If only one of g or g_extent is provided
+        If only one of g or g_extent is provided, if g is not 2D, or if
+        g_extent is malformed (wrong length, non-finite values, or
+        non-positive axis widths, e.g. from a wrong element order).
     """
 
     def __init__(self, g: Optional[Tensor] = None, g_extent: Optional[list] = None):
@@ -205,8 +208,24 @@ class AntennaPattern:
 
         self.g = g
         if g is not None:
+            if g.ndim != 2:
+                raise ValueError(
+                    f"g must be a 2D [g_nel, g_naz] tensor, got shape {tuple(g.shape)}")
+            if len(g_extent) != 4:
+                raise ValueError(
+                    "g_extent must be [g_el0, g_az0, g_el1, g_az1], got "
+                    f"{g_extent}")
             self.g_nel, self.g_naz = g.shape
             g_el0, g_az0, g_el1, g_az1 = g_extent
+            if not all(math.isfinite(v) for v in (g_el0, g_az0, g_el1, g_az1)):
+                raise ValueError(f"g_extent values must be finite, got {g_extent}")
+            # A non-positive axis width (typically a wrong element order)
+            # would make the kernel divide by a zero or negative step and
+            # index the pattern out of bounds.
+            if not (g_el1 > g_el0 and g_az1 > g_az0):
+                raise ValueError(
+                    "g_extent must satisfy g_el1 > g_el0 and g_az1 > g_az0; "
+                    f"got {g_extent} (order is [g_el0, g_az0, g_el1, g_az1])")
             self.g_el0, self.g_az0 = g_el0, g_az0
             self.g_el1, self.g_az1 = g_el1, g_az1
             self.g_daz = (g_az1 - g_az0) / self.g_naz
