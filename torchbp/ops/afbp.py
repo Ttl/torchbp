@@ -25,6 +25,16 @@ if TYPE_CHECKING:
 
 kC0 = 299792458.0
 
+# Clearance of the internal grid extent below the azimuth grating replica
+# spacing of the pulse sampling: the replicas have sidelobe skirts (the
+# few-pulse chunk Dirichlet kernel), and because the nsub cap picks the
+# largest fitting value, a capped request would otherwise sit exactly at
+# the replica boundary — measured ~8 % error concentrated at the theta
+# extent edges at fill factor 1.0 vs ~1 % at 0.6 on a full +-1 grid. The
+# clearance costs speedup only for near-limit requests. Also used by
+# :func:`ffbp` to predict a guaranteed base-level fallback up front.
+_GRATING_FILL = 0.7
+
 
 def _bp_polar_shared_dealias(
     data: Tensor,
@@ -40,6 +50,7 @@ def _bp_polar_shared_dealias(
     g: Tensor | None,
     g_extent: list | None,
     normalize: bool,
+    dem: Tensor | None = None,
     interp_method: tuple = ("linear",),
 ) -> Tensor:
     """Dealiased polar backprojection with an explicit shared z0 reference.
@@ -48,38 +59,74 @@ def _bp_polar_shared_dealias(
     dealias carrier reference height is passed in instead of being computed
     from the mean of ``pos``, and batched input is allowed. All afbp
     subapertures must be demodulated with the identical carrier or the
-    wavenumber fusion would see spurious phase steps between them.
+    wavenumber fusion would see spurious phase steps between them; with a
+    DEM the kernel carrier depends only on the pixel and z0, so the shared
+    z0 keeps it identical across the subapertures there too.
     ``interp_method`` is a tuple from :func:`parse_interp_method`; the
     lanczos and knab prepare functions insert their parameters after the
-    z0 argument, so the dealias/z0 indices patched here are the same for
-    every method.
+    z0 argument and ``dem`` is the last argument of every method, so the
+    dealias/z0 indices patched here are the same for every method.
     """
     if interp_method[0] == "lanczos":
         args = list(_prepare_backprojection_polar_2d_lanczos_args(
             data, grid, fc, r_res, pos, d0, False, interp_method[1],
-            att, g, g_extent, data_fmod, alias_fmod, normalize))
+            att, g, g_extent, data_fmod, alias_fmod, normalize, dem))
         op = torch.ops.torchbp.backprojection_polar_2d_lanczos.default
     elif interp_method[0] == "knab":
         args = list(_prepare_backprojection_polar_2d_knab_args(
             data, grid, fc, r_res, pos, d0, False, interp_method[1],
             interp_method[2], att, g, g_extent, data_fmod, alias_fmod,
-            normalize))
+            normalize, dem))
         op = torch.ops.torchbp.backprojection_polar_2d_knab.default
     else:
         args = list(_prepare_backprojection_polar_2d_args(
             data, grid, fc, r_res, pos, d0, False, att, g, g_extent,
-            data_fmod, alias_fmod, normalize))
+            data_fmod, alias_fmod, normalize, dem))
         op = torch.ops.torchbp.backprojection_polar_2d.default
     args[15] = True  # dealias
     args[16] = z0
     return op(*args)
 
 
+def _dem_bilinear(dem: Tensor, nr: int, ntheta: int) -> Tensor:
+    """Sample the DEM onto an [nr, ntheta] grid with the kernels'
+    index-ratio bilinear mapping (cell start convention, edge clamped)."""
+    dem_nr, dem_ntheta = dem.shape
+    device = dem.device
+    fr = torch.arange(nr, device=device, dtype=torch.float32) * (dem_nr / nr)
+    ir0 = fr.long().clamp(max=dem_nr - 1)
+    ir1 = (ir0 + 1).clamp(max=dem_nr - 1)
+    ft = torch.arange(ntheta, device=device, dtype=torch.float32) * (dem_ntheta / ntheta)
+    it0 = ft.long().clamp(max=dem_ntheta - 1)
+    it1 = (it0 + 1).clamp(max=dem_ntheta - 1)
+    wt = (ft - it0)[None, :]
+    rows0 = dem[ir0]
+    rows1 = dem[ir1]
+    za = rows0[:, it0] + wt * (rows0[:, it1] - rows0[:, it0])
+    zb = rows1[:, it0] + wt * (rows1[:, it1] - rows1[:, it0])
+    return za + (fr - ir0)[:, None] * (zb - za)
+
+
+def _dem_row_mean(dem: Tensor, nr: int) -> Tensor:
+    """Per-image-row mean DEM height, [nr] float64 on CPU. Grid rows map to
+    DEM rows by the same index-ratio convention as the kernel sampling."""
+    zr = dem.double().mean(dim=1).cpu()
+    dem_nr = zr.shape[0]
+    fr = torch.arange(nr, dtype=torch.float64) * (dem_nr / nr)
+    i0 = fr.long().clamp(max=dem_nr - 1)
+    i1 = (i0 + 1).clamp(max=dem_nr - 1)
+    return torch.lerp(zr[i0], zr[i1], fr - i0)
+
+
 def _dealias_carrier(
-    grid: dict, fc: float, alias_fmod: float, z0: float, device
+    grid: dict, fc: float, alias_fmod: float, z0: float, device,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """Range carrier removed by the dealias option, ``exp(1j*ph)`` with
-    ``ph = pi*(4*fc/c*sqrt(r^2 + z0^2) - alias_fmod*idr)``, shape [nr, 1].
+    ``ph = pi*(4*fc/c*sqrt(r^2 + zz^2) - alias_fmod*idr)``. Without a DEM
+    ``zz = z0`` and the shape is [nr, 1]; with one the carrier is
+    referenced to the DEM height like the kernel dealias, ``zz = z0 -
+    z(r, theta)``, shape [nr, ntheta].
 
     Multiplying a dealiased image by this restores the ``dealias=False``
     output of :func:`backprojection_polar_2d`. The phase is computed and
@@ -87,9 +134,14 @@ def _dealias_carrier(
     """
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
     idr = torch.arange(nr, device=device, dtype=torch.float64)
-    d = torch.sqrt((r0 + dr * idr) ** 2 + float(z0) ** 2)
-    ph = torch.remainder(4.0 * fc / kC0 * d - alias_fmod * idr, 2.0).float() * torch.pi
-    return torch.polar(torch.ones_like(ph), ph)[:, None]
+    if dem is None:
+        d = torch.sqrt((r0 + dr * idr) ** 2 + float(z0) ** 2)
+        ph = torch.remainder(4.0 * fc / kC0 * d - alias_fmod * idr, 2.0).float() * torch.pi
+        return torch.polar(torch.ones_like(ph), ph)[:, None]
+    zz = float(z0) - _dem_bilinear(dem, nr, ntheta).double()
+    d = torch.sqrt((r0 + dr * idr)[:, None] ** 2 + zz ** 2)
+    ph = torch.remainder(4.0 * fc / kC0 * d - alias_fmod * idr[:, None], 2.0).float() * torch.pi
+    return torch.polar(torch.ones_like(ph), ph)
 
 
 def afbp(
@@ -110,8 +162,8 @@ def afbp(
     normalize: bool = True,
     weight_map_downsample: int = 4,
     weight_eps: float | None = None,
-    _batched_fusion: bool | None = None,
     dem: Tensor | None = None,
+    _batched_fusion: bool | None = None,
     data_interp_method: "str | tuple" = "linear",
 ) -> Tensor:
     """
@@ -185,8 +237,15 @@ def afbp(
         spacing)`` — a subaperture of few pulses has azimuth
         grating replicas at that period which would alias through the
         fusion, and the internal extent grows with nsub through the guard
-        band. A lowered value sits at the constraint boundary, where
-        accuracy degrades gradually. Falls back to direct backprojection
+        band. The cap keeps a clearance below the replica spacing (fill
+        factor 0.7) because the replica sidelobe skirts leak in well
+        before the replicas themselves. Accuracy still degrades gradually
+        as nsub grows: the skirt floor scales with the pulses per
+        subaperture (measured on a full ``|theta| <= 1`` grid: ~1 % error
+        at 30+ pulses per subaperture, several percent below ~10,
+        concentrated at the theta extent edges) — for edge-critical
+        scenes keep the subapertures tens of pulses long rather than
+        requesting the largest nsub. Falls back to direct backprojection
         when no split works: the output theta extent alone reaches the
         grating replicas (a direct image of such a grid carries grating
         lobes anyway), or the decimated grid would not be smaller than
@@ -223,7 +282,20 @@ def afbp(
         direct kernel's exact per-pixel normalization is an aperture-wide
         quantity that cannot be reassembled from subaperture images, so
         ``backprojection_polar_2d(..., normalize=True)`` is only matched
-        where the illumination is not weak.
+        where the illumination is not weak. A gain table that ends inside
+        the scene theta extent puts a hard cutoff step into every
+        subaperture image which the wavenumber fusion cannot represent:
+        the accumulation dims and smears around the cutoff (~40 % loss at
+        the edge columns measured on a full-extent grid; warned). Roll
+        the pattern off smoothly to zero with
+        :func:`torchbp.util.taper_antenna_pattern` to remove the step.
+        Even then the weighted accumulation carries the fusion's spectral
+        leakage floor into weakly illuminated theta zones at full
+        amplitude, where a downstream Wiener normalization amplifies it —
+        inside :func:`ffbp`, scenes reaching the beam edges should use
+        ``antenna_leaf_gain="subaperture"``, which applies the gain after
+        the fusion and attenuates the leakage where the normalization
+        would amplify it.
     g_extent : list or None
         List of [g_el0, g_az0, g_el1, g_az1]. See
         :func:`backprojection_polar_2d`.
@@ -238,6 +310,26 @@ def afbp(
         itself.
     weight_eps : float or None
         Regularization of the antenna normalization, see :func:`ffbp`.
+    dem : Tensor or None
+        Digital elevation model. Height of every pixel in the image, shape
+        [dem_nr, dem_ntheta], covering the same r and theta extent as
+        ``grid``; may be coarser than the grid. The subaperture
+        backprojections place the pixels at the DEM height (edge-clamped
+        over the internal theta guard band) and the dealias carrier is
+        DEM-referenced, matching ``backprojection_polar_2d(..., dem=dem)``
+        with the same ``dealias``. The wavenumber fusion follows the
+        ground-to-slant factor of the per-range-row mean terrain height
+        through its range blocks; the variation of the terrain with theta
+        *within* a row is not representable in the row-ensemble fusion
+        model and causes a localized amplitude error at bright targets on
+        strong theta slopes, growing roughly as ``nsub**2`` while the
+        pixel phase stays exact (measured: a couple percent at nsub=4
+        with relief ~10 % of the slant range, well under 1 % for flat or
+        range-only terrain profiles). Use a smaller ``nsub`` or direct
+        backprojection when peak amplitude accuracy on steep terrain
+        matters. Gradients are not supported with a DEM (the
+        backprojection kernels have no DEM gradient); backward raises
+        like ``backprojection_polar_2d(..., dem=dem)``.
     data_interp_method : str or tuple
         Range interpolation method of the subaperture backprojections, see
         :func:`backprojection_polar_2d`. Gradients are only supported with
@@ -258,9 +350,12 @@ def afbp(
     if hasattr(grid, "to_dict"):
         grid = grid.to_dict()
     if dem is not None:
-        raise NotImplementedError(
-            "afbp does not support dem; use ffbp (with afbp_nsub=1) or "
-            "backprojection_polar_2d")
+        if dem.ndim != 2:
+            raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
+        if dem.dtype != torch.float32:
+            raise ValueError(f"dem must be float32, got {dem.dtype}")
+        if dem.device != data.device:
+            raise ValueError(f"dem must be on the same device as data ({data.device}), got {dem.device}")
     # The wavenumber-domain fusion gathers pulses with an index tensor, so
     # a lazy input is materialized whole here: afbp accepts LazyData but is
     # not memory efficient with it (inside ffbp the input is leaf-sized).
@@ -285,7 +380,7 @@ def afbp(
             data, grid, fc, r_res, pos, nsub, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             guard_theta=guard_theta, att=att, g=g, g_extent=g_extent,
-            normalize=False, _batched_fusion=_batched_fusion,
+            normalize=False, dem=dem, _batched_fusion=_batched_fusion,
             data_interp_method=data_interp_method)
         from .ffbp import _illumination_pulse_decimated, _weighted_normalize
         # The per-pulse footprints move slowly along the aperture, so the
@@ -294,7 +389,8 @@ def afbp(
         # grid itself must stay fine to resolve the sharp footprint
         # boundaries, see _illumination_pulse_decimated.
         w1, w2 = _illumination_pulse_decimated(
-            pos, att, g, g_extent, grid, weight_map_downsample, nsub)
+            pos, att, g, g_extent, grid, weight_map_downsample, nsub,
+            dem=dem)
         return _weighted_normalize(img, w1, w2, eps=weight_eps)
 
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
@@ -308,7 +404,7 @@ def afbp(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             att=att, g=g, g_extent=g_extent, normalize=normalize,
-            interp_method=data_interp_method)[0]
+            dem=dem, interp_method=data_interp_method)[0]
 
     # Effective range wavenumber center of the image. data_fmod shifts the
     # matched filter phase the same way as in cfbp's keff.
@@ -321,13 +417,19 @@ def afbp(
     z0 = float(pos[:, 2].double().mean())
     # Ground-to-slant factor: with nonzero altitude the azimuth carrier of
     # a pixel at ground range r is kr * x * rd(r) with rd(r) = r / sqrt(r^2
-    # + z0^2), so the patch placement depends on ground range. The fusion
-    # runs in the range wavenumber domain where the rows mix all ranges;
-    # rd is handled by fusing the swath in range blocks, each with the
-    # factor at its center (see below). fac here is the swath center value
-    # used by the split sizing and validity checks.
-    r_mid = 0.5 * (r0 + r1)
-    fac = r_mid / math.sqrt(r_mid**2 + z0**2)
+    # + zz^2), zz the height of the platform above the pixel, so the patch
+    # placement depends on ground range. The fusion runs in the range
+    # wavenumber domain where the rows mix all ranges; rd is handled by
+    # fusing the swath in range blocks, each with the factor at its center
+    # (see below). With a DEM the per-row mean terrain height is folded
+    # into rd_rows, so the blocks follow the mean height profile and only
+    # the within-row terrain variation remains as patch misplacement (see
+    # the dem docstring). fac is the swath center value used by the split
+    # sizing and validity checks.
+    r_rows = r0 + dr * torch.arange(nr, dtype=torch.float64)
+    zz_rows = z0 - _dem_row_mean(dem, nr) if dem is not None else z0
+    rd_rows = r_rows / torch.sqrt(r_rows**2 + zz_rows**2)
+    fac = float(rd_rows[nr // 2])
     kr_max = abs(krc) + min(math.pi / dr, math.pi / r_res)
 
     # nsub is an upper bound. The internal grid alpha extent n_c * nsub *
@@ -339,10 +441,11 @@ def afbp(
     # alias through the fusion into the image. The output extent is
     # fixed, so the constraint only bounds the guard and padding
     # contribution and with it nsub: lower nsub until the extent fits,
-    # keeping at least two pulses per subaperture.
+    # keeping at least two pulses per subaperture. The extent must stay
+    # clear of the replicas, not merely inside them (_GRATING_FILL).
     dp = float((pos_y[1:] - pos_y[:-1]).abs().max())
     # Grating-free extent in units of dtheta.
-    e_cells = 2.0 * math.pi / (kr_max * max(dp, 1e-12) * fac * dtheta)
+    e_cells = _GRATING_FILL * 2.0 * math.pi / (kr_max * max(dp, 1e-12) * fac * dtheta)
     nsub_max = min(nsub, nsweeps // 2)
     nsub_eff = nsub_max
     while nsub_eff > 1 and (
@@ -351,14 +454,14 @@ def afbp(
     if nsub_eff <= 1:
         warn("afbp: the pulse spacing cannot support the internal grid "
              "extent for any subaperture split (the output theta extent "
-             "reaches the azimuth grating replicas of the pulse sampling "
-             "within the guard band); falling back to direct "
-             "backprojection")
+             "reaches the clearance of the azimuth grating replicas of "
+             "the pulse sampling within the guard band); falling back to "
+             "direct backprojection")
         return backprojection_polar_2d(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             att=att, g=g, g_extent=g_extent, normalize=normalize,
-            interp_method=data_interp_method)[0]
+            dem=dem, interp_method=data_interp_method)[0]
     nsub = nsub_eff
 
     # Fall back to direct backprojection when the split cannot pay off: a
@@ -373,7 +476,7 @@ def afbp(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             att=att, g=g, g_extent=g_extent, normalize=normalize,
-            interp_method=data_interp_method)[0]
+            dem=dem, interp_method=data_interp_method)[0]
 
     # Split the track into nsub contiguous chunks.
     bounds = split_bounds(nsweeps, nsub)
@@ -395,7 +498,7 @@ def afbp(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             att=att, g=g, g_extent=g_extent, normalize=normalize,
-            interp_method=data_interp_method)[0]
+            dem=dem, interp_method=data_interp_method)[0]
     if kr_max * l_sub * fac * nsub * dtheta > 2.0 * math.pi:
         warn(f"afbp: subaperture spectrum patch does not fit the decimated "
              f"theta grid band; decrease nsub or the grid theta step "
@@ -425,7 +528,7 @@ def afbp(
             data, grid, fc, r_res, pos, d0=d0, dealias=dealias,
             data_fmod=data_fmod, alias_fmod=alias_fmod,
             att=att, g=g, g_extent=g_extent, normalize=normalize,
-            interp_method=data_interp_method)[0]
+            dem=dem, interp_method=data_interp_method)[0]
     n_fine = n_c * nsub
     guard_lo = (n_c - (-(-ntheta // nsub))) // 2
     theta0_i = theta0 - guard_lo * nsub * dtheta
@@ -435,6 +538,38 @@ def afbp(
         "nr": nr,
         "ntheta": n_c,
     }
+    if g is not None:
+        # A gain table column edge with non-negligible gain that falls
+        # inside the grid theta extent is a hard step in the subaperture
+        # image envelopes. Zero-yaw broadside approximation of the pixel
+        # azimuth angle; yaw shifts the pattern and can only make the
+        # cutoff worse. A pattern tapered to ~zero at its edge has no
+        # step and does not warn.
+        az_lo = math.asin(max(-1.0, min(1.0, theta0)))
+        az_hi = math.asin(max(-1.0, min(1.0, theta1)))
+        edge = 0.0
+        if g_extent[1] > az_lo:
+            edge = max(edge, float(g[:, 0].abs().max()))
+        if g_extent[3] < az_hi:
+            edge = max(edge, float(g[:, -1].abs().max()))
+        if edge > 0.01 * float(g.abs().max()):
+            warn("afbp: the antenna gain table ends inside the grid theta "
+                 "extent with non-negligible edge gain; the wavenumber "
+                 "fusion cannot represent the hard gain cutoff at the "
+                 "table edge and the accumulation degrades around it (see "
+                 "the g docstring). Taper the pattern smoothly to zero "
+                 "(torchbp.util.taper_antenna_pattern) or, inside ffbp, "
+                 "use antenna_leaf_gain=\"subaperture\".")
+
+    # The kernels map the DEM to the image grid by index ratio over the
+    # grid extent, so the DEM is resampled onto the guard-extended
+    # internal extent; guard columns take the border value at the
+    # clamped-cosine ground position like the kernels themselves.
+    dem_c = None
+    if dem is not None:
+        from .ffbp import _dem_on_node_grid
+        dem_c = _dem_on_node_grid(
+            dem, grid, grid_c, torch.zeros(2, device=device))
 
     # Padded chunks for one batched backprojection call, built with single
     # gathers instead of per-chunk copies. Rows past a chunk end repeat
@@ -467,13 +602,14 @@ def afbp(
                 "support gradients, only \"linear\" does")
         args = _prepare_backprojection_polar_2d_args(
             data_b, grid_c, fc, r_res, pos_b, d0, False, att_b, g, g_extent,
-            data_fmod, alias_fmod, normalize)
+            data_fmod, alias_fmod, normalize, dem_c)
         imgs = torch.ops.torchbp.backprojection_polar_2d.default(*args)
-        imgs = imgs * _dealias_carrier(grid_c, fc, alias_fmod, z0, device).conj()
+        imgs = imgs * _dealias_carrier(
+            grid_c, fc, alias_fmod, z0, device, dem=dem_c).conj()
     else:
         imgs = _bp_polar_shared_dealias(
             data_b, grid_c, fc, r_res, pos_b, d0, z0, data_fmod, alias_fmod,
-            att_b, g, g_extent, normalize,
+            att_b, g, g_extent, normalize, dem=dem_c,
             interp_method=data_interp_method)
 
     # The guard band and the ceil padding can push internal grid columns
@@ -500,18 +636,23 @@ def afbp(
     # patches of off-center ranges by up to (rd variation) * kr * |x_u|.
     # Each block is fused with the factor at its own center, sized to keep
     # the misplacement below a small fraction of the decimated band. One
-    # block when z0 = 0 (or a short aperture) where rd is constant.
-    r_rows = r0 + dr * torch.arange(nr, dtype=torch.float64)
-    rd_rows = r_rows / torch.sqrt(r_rows**2 + z0**2)
-    rd_span = float(rd_rows.max() - rd_rows.min())
+    # block when z0 = 0 (or a short aperture) where rd is constant. The
+    # partition equalizes the cumulative variation of rd, which reduces to
+    # the equal-rd partition (denser at near range where rd varies
+    # fastest) for the monotone flat-ground profile and stays valid for a
+    # non-monotone DEM profile.
+    rd_var = torch.cat([
+        torch.zeros(1, dtype=torch.float64),
+        torch.cumsum(rd_rows.diff().abs(), 0)])
+    rd_span = float(rd_var[-1])
     x_max = float(x_u.abs().max())
     n_blocks = 1 + int(rd_span * abs(krc) * x_max * nsub * dtheta / (0.1 * 2.0 * math.pi))
     # Short blocks lose range wavenumber resolution for the placement.
     n_blocks = max(1, min(n_blocks, nr // 32))
-    # Equal-rd partition, denser at near range where rd varies fastest.
     if n_blocks > 1:
-        levels = torch.linspace(float(rd_rows[0]), float(rd_rows[-1]), n_blocks + 1)[1:-1]
-        bnds = torch.searchsorted(rd_rows, levels).tolist()
+        levels = torch.linspace(
+            0.0, rd_span, n_blocks + 1, dtype=torch.float64)[1:-1]
+        bnds = torch.searchsorted(rd_var, levels).tolist()
         row_bounds = [0]
         for b in bnds:
             b = max(b, row_bounds[-1] + 32)
@@ -571,7 +712,7 @@ def afbp(
             # Pad the block range FFT to a fast length; the analysis is
             # linear per row so cropping after the inverse FFT is exact.
             nrf = next_fast_len(nrb)
-            fac_b = float(0.5 * (rd_rows[b0] + rd_rows[b1 - 1]))
+            fac_b = float(rd_rows[b0:b1].mean())
             Sb = torch.fft.fft(Sa[:, b0:b1, :], n=nrf, dim=-2)
             fr = torch.fft.fftfreq(nrf, d=dr, dtype=torch.float64, device=device)
             half = 1.0 / (2.0 * dr)
@@ -622,7 +763,7 @@ def afbp(
             fine[b0:b1] = torch.fft.ifft(fine_b, dim=-2)[:nrb]
         fine *= nsub
         return _afbp_finish(fine, grid, fc, alias_fmod, z0, dealias,
-                            guard_lo * nsub, ntheta, device)
+                            guard_lo * nsub, ntheta, device, dem=dem)
 
     # Cap the block size so that every block can be padded to one shared
     # FFT length: the whole per-block fusion then runs as a handful of
@@ -670,7 +811,7 @@ def afbp(
     base_xeq = (-2.0 * math.pi * nua[None, :] / kr[:, None]).float().to(device)
     base_xh = (math.pi * n_c / (n_fine * dtheta) / kr).abs().float().to(device)
     inv_fac = torch.tensor(
-        [1.0 / float(0.5 * (rd_rows[b0] + rd_rows[b1 - 1]))
+        [1.0 / float(rd_rows[b0:b1].mean())
          for b0, b1 in zip(row_bounds[:-1], row_bounds[1:])],
         dtype=torch.float32, device=device)
     xs_f32 = x_s.float().to(device)
@@ -706,7 +847,7 @@ def afbp(
     fine = fine.index_select(0, dest_idx)
     fine *= nsub
     return _afbp_finish(fine, grid, fc, alias_fmod, z0, dealias,
-                        guard_lo * nsub, ntheta, device)
+                        guard_lo * nsub, ntheta, device, dem=dem)
 
 
 def _region_weight(dist: Tensor, x_half: Tensor, x_taper: float) -> Tensor:
@@ -729,11 +870,12 @@ def _afbp_finish(
     gt: int,
     ntheta: int,
     device,
+    dem: Tensor | None = None,
 ) -> Tensor:
     """Inverse azimuth FFT of the assembled fine spectrum, guard crop and
     optional carrier restore."""
     out = torch.fft.ifft(fine, dim=-1)
     out = out[:, gt : gt + ntheta]
     if not dealias:
-        out = out * _dealias_carrier(grid, fc, alias_fmod, z0, device)
+        out = out * _dealias_carrier(grid, fc, alias_fmod, z0, device, dem=dem)
     return out

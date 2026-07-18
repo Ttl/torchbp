@@ -959,6 +959,71 @@ def phase_to_distance(p: Tensor, fc: float) -> Tensor:
     c0 = 299792458
     return c0 * p / (4 * torch.pi * fc)
 
+def taper_antenna_pattern(
+    g: Tensor,
+    g_extent: list,
+    az_margin: float,
+    el_margin: float = 0.0,
+) -> tuple[Tensor, list]:
+    """Extend an antenna gain pattern with a raised-cosine roll-off to zero.
+
+    The backprojection kernels treat angles outside the pattern table as
+    exactly zero gain, so a measured pattern that ends at its measurement
+    extent with nonzero gain has a hard cutoff step there. When the table
+    edge falls inside the scene, the step degrades algorithms that model
+    the gain envelope as smooth: the :func:`torchbp.ops.afbp` wavenumber
+    fusion with per-pulse gain cannot represent the step (the accumulation
+    dims and smears around the cutoff), and with platform yaw the step
+    sweeps over the edge pixels, which also degrades the frozen-gain
+    ``antenna_leaf_gain="subaperture"`` model of :func:`torchbp.ops.ffbp`.
+    Rolling the edge value off to zero over a margin removes the step;
+    the taper region slightly underweights pixels there, consistently in
+    both the accumulation and the illumination maps.
+
+    Parameters
+    ----------
+    g : Tensor
+        Antenna gain pattern, shape [g_nel, g_naz].
+    g_extent : list
+        Pattern extent [g_el0, g_az0, g_el1, g_az1] in radians.
+    az_margin : float
+        Azimuth roll-off width in radians, added on both sides. Rounded
+        to whole table cells; 0 disables.
+    el_margin : float
+        Same for the elevation axis. Default 0.
+
+    Returns
+    -------
+    (g, g_extent) : tuple[Tensor, list]
+        Extended pattern and its extent, same cell size as the input.
+    """
+    if len(g_extent) != 4:
+        raise ValueError(
+            f"g_extent must be [g_el0, g_az0, g_el1, g_az1], got {g_extent}")
+    el0, az0, el1, az1 = [float(v) for v in g_extent]
+
+    def _extend(t: Tensor, x0: float, x1: float, margin: float, dim: int):
+        n_cells = t.shape[dim]
+        d = (x1 - x0) / n_cells
+        n = int(round(margin / d))
+        if n <= 0:
+            return t, x0, x1
+        # Innermost added cell (distance 1 from the edge) keeps most of
+        # the edge value, the outermost is exactly zero.
+        w = 0.5 * (1.0 + torch.cos(
+            torch.pi * torch.arange(1, n + 1, dtype=t.dtype, device=t.device) / n))
+        shape = [1, 1]
+        shape[dim] = n
+        lo = t.narrow(dim, 0, 1) * w.flip(0).reshape(shape)
+        hi = t.narrow(dim, t.shape[dim] - 1, 1) * w.reshape(shape)
+        return torch.cat([lo, t, hi], dim=dim), x0 - n * d, x1 + n * d
+
+    g = torch.as_tensor(g)
+    g, az0, az1 = _extend(g, az0, az1, az_margin, dim=1)
+    g, el0, el1 = _extend(g, el0, el1, el_margin, dim=0)
+    return g.contiguous(), [el0, az0, el1, az1]
+
+
 def wiener_normalize(
     sar: Tensor,
     tx_power: Tensor,

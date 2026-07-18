@@ -695,6 +695,22 @@ class TestGpgaDem(TestGpgaBpPolar):
         )
         self.assertLess((phi - phi_dem).abs().max().item(), 1e-2)
 
+    def test_afbp_matches_bp_with_dem(self):
+        # algorithm="afbp" with a DEM must reproduce the direct-bp phase
+        # estimate (the afbp image matches bp including pixel phase).
+        data, pos, dx = self._dem_scene_with_error()
+        dem = self._dem()
+        common = dict(max_iters=2, target_threshold_db=15, dem=dem)
+        _, phi_bp = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_polar, **common
+        )
+        _, phi_afbp = torchbp.autofocus.gpga(
+            None, data, pos, self.fc, self.r_res, self.grid_polar,
+            algorithm="afbp", image_opts={"nsub": 4}, **common
+        )
+        self.assertTrue(torch.isfinite(phi_afbp).all())
+        self.assertLess((phi_bp - phi_afbp).abs().max().item(), 1e-2)
+
     def test_gpga_dem_focuses(self):
         data, pos, dx = self._dem_scene_with_error()
         dem = self._dem()
@@ -770,12 +786,6 @@ class TestGpgaDem(TestGpgaBpPolar):
         targets, amps, pos = self._scene()
         data = self._make_data(targets, amps, pos)
         dem = torch.zeros(self.dem_nr, self.dem_ntheta)
-        with self.assertRaises(ValueError):
-            torchbp.autofocus.gpga(
-                None, data, pos, self.fc, self.r_res, self.grid_polar,
-                algorithm="afbp", image_opts={"nsub": 4}, dem=dem,
-                max_iters=1,
-            )
         grid_cart = {"x": (85.0, 115.0), "y": (-20.0, 20.0),
                      "nx": 64, "ny": 64}
         with self.assertRaises(ValueError):

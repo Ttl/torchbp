@@ -348,3 +348,31 @@ class TestLowpassFilterWindow(TestCase):
                 torch.testing.assert_close(out_str, out_tensor)
 
 
+
+
+class TestTaperAntennaPattern(TestCase):
+    def test_extends_and_rolls_to_zero(self):
+        g = torch.rand(8, 16) + 0.5
+        g_extent = [-0.4, -0.8, 0.4, 0.8]
+        # az cell 0.1, el cell 0.1
+        g2, e2 = torchbp.util.taper_antenna_pattern(
+            g, g_extent, az_margin=0.2, el_margin=0.1)
+        self.assertEqual(tuple(g2.shape), (8 + 2, 16 + 4))
+        for a, b in zip(e2, [-0.5, -1.0, 0.5, 1.0]):
+            self.assertAlmostEqual(a, b, places=6)
+        # Interior preserved, outermost added cells exactly zero, roll
+        # monotone from the edge value.
+        self.assertTrue(torch.equal(g2[1:-1, 2:-2], g))
+        self.assertEqual(float(g2[:, 0].abs().max()), 0.0)
+        self.assertEqual(float(g2[:, -1].abs().max()), 0.0)
+        self.assertEqual(float(g2[0, :].abs().max()), 0.0)
+        self.assertEqual(float(g2[-1, :].abs().max()), 0.0)
+        self.assertTrue(bool((g2[1:-1, 1] < g2[1:-1, 2]).all()))
+        self.assertTrue(bool((g2[1:-1, -2] < g2[1:-1, -3]).all()))
+
+    def test_zero_margin_is_identity(self):
+        g = torch.rand(4, 8)
+        g_extent = [-0.4, -0.8, 0.4, 0.8]
+        g2, e2 = torchbp.util.taper_antenna_pattern(g, g_extent, 0.0)
+        self.assertTrue(torch.equal(g2, g))
+        self.assertEqual(e2, [-0.4, -0.8, 0.4, 0.8])

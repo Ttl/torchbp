@@ -137,14 +137,16 @@ class TestFfbpDem(TestCase):
     def test_ffbp_dem_matches_direct_bp_cuda(self):
         self._test_ffbp_dem_matches_direct_bp("cuda")
 
-    def test_afbp_dem_raises(self):
-        data, grid, pos = self._random_scene("cpu")
-        dem = torch.zeros(grid["nr"], grid["ntheta"])
-        with self.assertRaises(NotImplementedError):
-            torchbp.ops.afbp(data, grid, 6e9, 0.15, pos, nsub=2, dem=dem)
-        with self.assertRaises(NotImplementedError):
-            torchbp.ops.ffbp(data, grid, 6e9, 0.15, pos, stages=2,
-                             afbp_nsub=2, dem=dem)
+    def test_afbp_base_matches_direct_base(self):
+        # ffbp with the afbp base level and a DEM must match ffbp with the
+        # direct backprojection base level.
+        data, grid, fc, r_res, pos, dem, tr, tth = self._terrain_scene("cpu")
+        img1 = torchbp.ops.ffbp(data, grid, fc, r_res, pos, stages=3,
+                                dem=dem)
+        img2 = torchbp.ops.ffbp(data, grid, fc, r_res, pos, stages=3,
+                                dem=dem, afbp_nsub=4)
+        rel = ((img1 - img2).abs().max() / img1.abs().max()).item()
+        self.assertLess(rel, 1e-2)
 
 
 class TestFFBPAntennaPattern(TestCase):

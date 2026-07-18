@@ -362,7 +362,10 @@ def ffbp(
         from a ``1/afbp_nsub`` subset of the pulses (see
         :func:`_illumination_pulse_decimated`), so their cost also drops
         ``afbp_nsub`` times instead of dominating the base level, at full
-        map resolution.
+        map resolution. With a DEM the afbp fusion adds a small localized
+        amplitude error at bright targets on strong theta terrain slopes
+        (see the ``dem`` note of :func:`afbp`); use direct backprojection
+        base level when peak amplitude accuracy on steep terrain matters.
         Default is 1 (direct backprojection).
     guard_max_ratio : float
         Cap of the automatic theta guard band width, per side, as a
@@ -385,10 +388,9 @@ def ffbp(
         dealias carrier so the merge interpolation sees a terrain-free
         residual. The output matches
         ``backprojection_polar_2d(..., dem=dem)`` with the same ``dealias``
-        (with a DEM the dealias carrier is always DEM-referenced). Not
-        supported together with ``afbp_nsub > 1``. With an antenna pattern
-        both the per-pulse gain weighting and the W1/W2 illumination
-        normalization maps reference the DEM look angles.
+        (with a DEM the dealias carrier is always DEM-referenced). With an
+        antenna pattern both the per-pulse gain weighting and the W1/W2
+        illumination normalization maps reference the DEM look angles.
     antenna_leaf_gain : str
         Granularity of the antenna gain weighting at the base level
         subaperture backprojections (ignored without an antenna pattern):
@@ -405,8 +407,28 @@ def ffbp(
           how much the antenna footprint moves (platform motion, yaw
           oscillation) over one leaf subaperture, so it is accurate for
           short leaves (enough ``stages``) and fast agile-beam data should
-          keep "pulse". Ignored for the afbp base level
-          (``afbp_nsub > 1``), which keeps per-pulse gain.
+          keep "pulse" — except with an afbp base level (``afbp_nsub >
+          1``) on a scene that reaches the beam edges, where "pulse" has
+          two failure modes. A gain table that ends inside the scene
+          theta extent (e.g. full ``|theta| <= 1`` grids) puts a hard
+          cutoff step into the subaperture images, which the afbp
+          wavenumber fusion cannot represent — the accumulation dims and
+          smears around the cutoff while the illumination maps stay
+          exact, so the Wiener normalization cannot recover it (afbp
+          warns). And more generally per-pulse gain bakes the gain
+          envelope into the fused signal, so the fusion's spectral
+          leakage lands at full amplitude in weakly illuminated theta
+          zones, where the Wiener normalization then amplifies it.
+          "subaperture" avoids both: the plain fused image is multiplied
+          by the gain map afterwards, which attenuates any fusion leakage
+          by exactly the factor the normalization later divides by. Its
+          own error is the frozen gain over one leaf — with platform yaw
+          and the long leaves of a shallow afbp configuration it
+          concentrates at the beam edges: keep enough ``stages`` for the
+          yaw rate and roll a hard pattern table edge off smoothly
+          (:func:`torchbp.util.taper_antenna_pattern`) — the sweep of a
+          hard edge across the beam-edge pixels is not representable by
+          any frozen gain.
 
     Returns
     -------
@@ -451,9 +473,44 @@ def ffbp(
         raise ValueError(f"antenna_leaf_gain must be 'pulse' or 'subaperture', "
                          f"got {antenna_leaf_gain!r}")
 
+    if afbp_nsub > 1 and nsweeps >= 2:
+        # Definite no-op detection. The polar leaf grids inherit the full
+        # scene theta extent (decimated in columns only), so when the
+        # scene alpha extent alone exceeds the grating clearance of the
+        # pulse sampling, afbp falls back to direct backprojection at
+        # every leaf (see :func:`afbp`); afbp_nsub then has no effect on
+        # the output. The per-leaf afbp warning is easy to miss in a long
+        # run, so predict it loudly here.
+        from .afbp import _GRATING_FILL
+        theta0_s, theta1_s = grid["theta"]
+        r0_s, r1_s = grid["r"]
+        dr_s = (r1_s - r0_s) / grid["nr"]
+        krc = 4.0 * math.pi * fc / 299792458.0 - data_fmod / r_res
+        kr_max = abs(krc) + min(math.pi / dr_s, math.pi / r_res)
+        pos_y = pos[:, 1].double()
+        dp = float((pos_y[1:] - pos_y[:-1]).abs().max())
+        z0_s = float(pos[:, 2].double().mean())
+        r_mid = 0.5 * (r0_s + r1_s)
+        fac = r_mid / math.sqrt(r_mid ** 2 + z0_s ** 2)
+        alpha_g = 2.0 * math.pi / (kr_max * max(dp, 1e-12) * fac)
+        if theta1_s - theta0_s > _GRATING_FILL * alpha_g:
+            warn(f"ffbp: afbp_nsub={afbp_nsub} has no effect: the scene "
+                 f"theta extent ({theta1_s - theta0_s:.2f}) exceeds the "
+                 f"grating replica clearance of the pulse sampling "
+                 f"({_GRATING_FILL * alpha_g:.2f}), so the afbp base "
+                 f"level falls back to direct backprojection at every "
+                 f"subaperture; proceeding with afbp_nsub=1. afbp_nsub "
+                 f"only pays off with a narrower theta extent or denser "
+                 f"pulse spacing; use more stages instead on this grid.")
+            # Normalizing to 1 keeps the rest of the call consistent with
+            # what the fallback would produce anyway: the base level uses
+            # the exact direct paths (fused illumination on CPU, full
+            # pulse count in the "pulse"-mode maps instead of the
+            # 1/afbp_nsub subset that assumed an active afbp base) and
+            # skips the per-leaf fallback overhead.
+            afbp_nsub = 1
+
     if dem is not None:
-        if afbp_nsub > 1:
-            raise NotImplementedError("afbp base level (afbp_nsub > 1) is not implemented with dem")
         if dem.ndim != 2:
             raise ValueError(f"dem must be a 2D [dem_nr, dem_ntheta] tensor, got shape {dem.shape}")
         if dem.dtype != torch.float32:
@@ -570,6 +627,43 @@ def _dem_on_node_grid(
         inp, coords, mode="bilinear",
         padding_mode="border", align_corners=True)[0]
     return (out[0] if dem.dim() == 2 else out).contiguous()
+
+
+def _subaperture_gain_apply(
+    img: Tensor,
+    pos: Tensor,
+    att: Tensor,
+    g: Tensor,
+    g_extent: list,
+    grid: dict,
+    dem: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Constant-gain-per-leaf approximation for a plain (unweighted) base
+    image: the mean gain map wbar (sampled from a few pulses, the same
+    slow-footprint argument as :func:`_illumination_pulse_decimated`)
+    multiplies the image: A = wbar * sum(s). The moments are taken
+    consistently with that model (W1 = n*wbar, W2 = n*wbar**2), so a truly
+    constant gain recovers the exact weighted result; the error is the
+    gain variation over one leaf. ``img`` is the batched [1, nr, ntheta]
+    plain accumulation; returns (img, w1_full, w2_full)."""
+    n_p = pos.shape[0]
+    m = min(n_p, 8)
+    if m < n_p:
+        pidx = torch.linspace(
+            0, n_p - 1, m, device=pos.device).round().long()
+        pos_g = pos[pidx]
+        att_g = att[pidx]
+    else:
+        pos_g = pos
+        att_g = att
+    w1_full, _ = compute_subaperture_illumination(
+        pos_g, att_g, g, g_extent, grid, decimation=1, dem=dem)
+    # Scale the m-pulse sum to the full pulse count.
+    w1_full *= n_p / m
+    img = img * (w1_full / n_p)
+    w1_full = w1_full[None]
+    w2_full = w1_full * w1_full / n_p
+    return img, w1_full, w2_full
 
 
 def _ffbp_impl(
@@ -849,28 +943,44 @@ def _ffbp_impl(
             dem_local = None
             w1_full = None
             w2_full = None
+            # With a DEM the dealias carrier is DEM-referenced, so the
+            # stored image residual stays terrain-free for the merge
+            # interpolation.
+            if dem is not None:
+                dem_local = _dem_on_node_grid(dem, dem_grid, grid_local,
+                                              dem_off_local)
+            sub_gain = use_antenna_pattern and antenna_leaf_gain == "subaperture"
             if afbp_nsub > 1:
+                # With "subaperture" leaf gain the base image is formed
+                # without the antenna pattern: a gain table that ends
+                # inside the scene puts a hard theta step into every
+                # subaperture image, which the wavenumber fusion cannot
+                # represent — the spectral leakage dims the accumulation
+                # around the cutoff (and smears it past it) while the
+                # illumination maps stay exact, so the Wiener
+                # normalization cannot recover it. The mean-gain multiply
+                # of _subaperture_gain_apply keeps the step in the image
+                # domain instead.
                 img = afbp(
                     data_local, grid_local, fc, r_res, pos_local,
                     nsub=afbp_nsub, d0=d0, dealias=True,
                     data_fmod=data_fmod, alias_fmod=alias_fmod,
-                    att=att_local, g=g, g_extent=g_extent,
-                    normalize=normalize,
+                    att=None if sub_gain else att_local,
+                    g=None if sub_gain else g,
+                    g_extent=None if sub_gain else g_extent,
+                    normalize=normalize, dem=dem_local,
                     data_interp_method=data_interp_method,
                 )[None]
+                if sub_gain:
+                    img, w1_full, w2_full = _subaperture_gain_apply(
+                        img, pos_local, att_local, g, g_extent, grid_local,
+                        dem_local)
             else:
-                if dem is not None:
-                    dem_local = _dem_on_node_grid(dem, dem_grid, grid_local,
-                                                  dem_off_local)
-                # With a DEM the dealias carrier is DEM-referenced, so the
-                # stored image residual stays terrain-free for the merge
-                # interpolation.
                 # The antenna-weighted kernel accumulates the W1/W2
                 # illumination moments per pixel anyway; on CPU the fused op
                 # returns them for free instead of recomputing the same
                 # angle pass with compute_illumination, which costs a large
                 # fraction of the backprojection itself.
-                sub_gain = use_antenna_pattern and antenna_leaf_gain == "subaperture"
                 fused_illum = (
                     use_antenna_pattern
                     and not sub_gain
@@ -880,15 +990,6 @@ def _ffbp_impl(
                              and (data_local.requires_grad or pos_local.requires_grad))
                 )
                 if sub_gain:
-                    # Constant-gain-per-leaf approximation: the plain
-                    # backprojection sums the pulses unweighted and the mean
-                    # gain map wbar (sampled from a few pulses, the same
-                    # slow-footprint argument as
-                    # _illumination_pulse_decimated) multiplies the image:
-                    # A = wbar * sum(s). The moments are taken consistently
-                    # with that model (W1 = n*wbar, W2 = n*wbar**2), so a
-                    # truly constant gain recovers the exact weighted
-                    # result; the error is the gain variation over one leaf.
                     img = backprojection_polar_2d(
                         data_local, grid_local, fc, r_res, pos_local, d0=d0,
                         dealias=True,
@@ -896,24 +997,9 @@ def _ffbp_impl(
                         dem=dem_local,
                         interp_method=data_interp_method,
                     )
-                    n_p = pos_local.shape[0]
-                    m = min(n_p, 8)
-                    if m < n_p:
-                        pidx = torch.linspace(
-                            0, n_p - 1, m, device=pos_local.device).round().long()
-                        pos_g = pos_local[pidx]
-                        att_g = att_local[pidx]
-                    else:
-                        pos_g = pos_local
-                        att_g = att_local
-                    w1_full, _ = compute_subaperture_illumination(
-                        pos_g, att_g, g, g_extent, grid_local,
-                        decimation=1, dem=dem_local)
-                    # Scale the m-pulse sum to the full pulse count.
-                    w1_full *= n_p / m
-                    img = img * (w1_full / n_p)
-                    w1_full = w1_full[None]
-                    w2_full = w1_full * w1_full / n_p
+                    img, w1_full, w2_full = _subaperture_gain_apply(
+                        img, pos_local, att_local, g, g_extent, grid_local,
+                        dem_local)
                 elif fused_illum:
                     img, w1_full, w2_full = _backprojection_polar_2d_illum(
                         data_local, grid_local, fc, r_res, pos_local, d0=d0,

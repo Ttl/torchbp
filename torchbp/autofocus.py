@@ -1195,7 +1195,7 @@ def _select_targets(
 _GPGA_POLAR_ALGOS = {
     "bp": (backprojection_polar_2d, True, True, {}),
     "ffbp": (ffbp, True, True, {"stages": 5, "oversample_r": 1.4, "oversample_theta": 1.4}),
-    "afbp": (afbp, True, False, {}),
+    "afbp": (afbp, True, True, {}),
 }
 _GPGA_CART_ALGOS = {
     "bp": (backprojection_cart_2d, False, False, {}),
@@ -1433,7 +1433,7 @@ def gpga(
         coarser than the image grid (bilinearly interpolated). Values are
         pixel z coordinates in the same frame as `pos`. Used both for the
         image formation and for the autofocus target positions. Only
-        supported with a polar grid and algorithm "bp" or "ffbp". See
+        supported with a polar grid. See
         :func:`torchbp.util.dem_to_polar` for resampling a Cartesian DEM
         onto the polar grid. If None (default) targets are assumed to lie
         on the z=0 plane.
@@ -1706,8 +1706,8 @@ def gpga_tde(
         coarser than the image grid (bilinearly interpolated). Values are
         pixel z coordinates in the same frame as `pos`. Used for the image
         formation, the autofocus target positions and the block-center
-        geometry of the position solve. Only supported with a polar grid
-        and algorithm "bp" or "ffbp". See :func:`torchbp.util.dem_to_polar`
+        geometry of the position solve. Only supported with a polar grid.
+        See :func:`torchbp.util.dem_to_polar`
         for resampling a Cartesian DEM onto the polar grid. If None
         (default) targets are assumed to lie on the z=0 plane.
 
