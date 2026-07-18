@@ -550,8 +550,19 @@ def cfbp_adaptive(
             "ny": k * ny,
         }
         img_b = cfbp(
-            data, grid_b, fc, r_res, pos, s, divisions, d0,
-            oversample_y, guard_y, beamwidth, data_fmod, interp_method
+            data,
+            grid_b,
+            fc,
+            r_res,
+            pos,
+            s,
+            divisions=divisions,
+            d0=d0,
+            oversample_y=oversample_y,
+            guard_y=guard_y,
+            beamwidth=beamwidth,
+            data_fmod=data_fmod,
+            interp_method=interp_method,
         )
         # Internal samples lie at y0 + i*Ly/(k*ny); every k-th one is exactly
         # an output grid position, so decimation is pure subsampling.

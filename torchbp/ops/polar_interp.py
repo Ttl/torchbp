@@ -174,7 +174,7 @@ def polar_interp(
             alias_fmod=alias_fmod
         )
     else:
-        raise ValueError(f"Unknown interp_method: {interp_method}")
+        raise ValueError(f"Unknown interp_method: {method}")
 
 
 def _prepare_polar_interp_linear_args(
