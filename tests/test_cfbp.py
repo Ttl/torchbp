@@ -3,8 +3,8 @@ import torch
 import numpy as np
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
-import unittest
 import torchbp
+from conftest import requires_cuda
 
 
 class TestCartTxPowerCFBP(TestCase):
@@ -140,11 +140,11 @@ class TestCartTxPowerCFBP(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_match(self):
         g, g_extent = self._antenna("cuda", az_width=0.4)
         wa, pos, att = self._straight_track("cuda")
@@ -369,11 +369,11 @@ class TestCFBP(TestCase):
     def test_merge2_opcheck_cpu(self):
         self._merge2_opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_merge2_opcheck_cuda(self):
         self._merge2_opcheck("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_merge2_cuda_matches_cpu(self):
         # CPU (MT19937) and CUDA (Philox) randn give different values for the
         # same seed, so the inputs must be built once and copied, not
@@ -389,7 +389,7 @@ class TestCFBP(TestCase):
         rel = ((out_cuda.cpu() - out_cpu).abs().max() / out_cpu.abs().max()).item()
         self.assertLess(rel, 0.05)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cuda_matches_direct(self):
         out_cuda = self._compare("cuda", stages=2)
         out_cpu = self._compare("cpu", stages=2)

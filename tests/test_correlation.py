@@ -4,6 +4,7 @@ from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
 import unittest
 import torchbp
+from conftest import requires_cuda
 
 
 class TestSubpixelCorrelation(TestCase):
@@ -42,7 +43,7 @@ class TestSubpixelCorrelation(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 

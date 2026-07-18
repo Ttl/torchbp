@@ -1,6 +1,13 @@
 import torch
 from torch import Tensor
 
+__all__ = [
+    "resample_2d_lanczos",
+    "resample_2d_knab",
+    "resample_1d_lanczos",
+    "resample_1d_knab",
+]
+
 
 def resample_2d_lanczos(
     img: Tensor,

@@ -2,15 +2,21 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Union, TYPE_CHECKING
+from typing import TYPE_CHECKING
 from warnings import warn
 from .afbp import afbp
-from .backproj import backprojection_polar_2d, _backprojection_polar_2d_illum, backprojection_polar_2d_tx_power, _backprojection_polar_2d_tx_power_accum, _tx_power_finish
+from .backproj import backprojection_polar_2d, _backprojection_polar_2d_illum, _backprojection_polar_2d_tx_power_accum, _tx_power_finish
 from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, ffbp_tx_power_merge2, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
 from ._utils import AntennaPattern, unpack_polar_grid, parse_interp_method
 from ..data import LazyData, materialize as _materialize
+
+__all__ = [
+    "compute_subaperture_illumination",
+    "ffbp",
+    "backprojection_polar_2d_tx_power_ffbp",
+]
 
 if TYPE_CHECKING:
     from ..grid import PolarGrid
@@ -412,7 +418,6 @@ def ffbp(
         grid = grid.to_dict()
 
     nsweeps = data.shape[0]
-    device = data.device
 
     output_alias = alias_fmod is not None
     if alias_fmod is None:

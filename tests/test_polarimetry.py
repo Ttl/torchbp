@@ -2,8 +2,8 @@
 import torch
 import numpy as np
 from torch.testing._internal.common_utils import TestCase
-import unittest
 import torchbp
+from conftest import requires_cuda
 
 
 class TestAinsworth(TestCase):
@@ -124,7 +124,7 @@ class TestAinsworth(TestCase):
     def test_ainsworth_cpu(self):
         self._run("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_ainsworth_cuda(self):
         self._run("cuda")
 

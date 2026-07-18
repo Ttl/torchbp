@@ -1,6 +1,10 @@
 import torch
 from torch import Tensor
 
+__all__ = [
+    "subpixel_correlation_op",
+]
+
 
 def subpixel_correlation_op(im_m: Tensor, im_s: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     if im_m.dim() == 3:

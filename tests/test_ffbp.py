@@ -7,6 +7,7 @@ import unittest
 import unittest.mock
 import torchbp
 from torch import Tensor
+from conftest import requires_cuda
 
 
 class TestFfbpDem(TestCase):
@@ -43,7 +44,7 @@ class TestFfbpDem(TestCase):
     def test_constant_dem_equals_shifted_pos_cpu(self):
         self._test_constant_dem_equals_shifted_pos("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_constant_dem_equals_shifted_pos_cuda(self):
         self._test_constant_dem_equals_shifted_pos("cuda")
 
@@ -132,7 +133,7 @@ class TestFfbpDem(TestCase):
     def test_ffbp_dem_matches_direct_bp_cpu(self):
         self._test_ffbp_dem_matches_direct_bp("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_ffbp_dem_matches_direct_bp_cuda(self):
         self._test_ffbp_dem_matches_direct_bp("cuda")
 
@@ -230,7 +231,7 @@ class TestFFBPAntennaPattern(TestCase):
             a["data"], a["grid"], a["fc"], a["r_res"], a["pos"], dealias=True)
         self.assertLess(float(img.abs().max()), 50.0 * float(ref.abs().max()))
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_weighted_ffbp_cpu_gpu(self):
         a = self._make_inputs("cuda")
 
@@ -446,7 +447,7 @@ class TestFfbpFrameOrigin(TestCase):
         # the frame-origin final merge.
         self._test_nonzero_mean_pos_matches_bp("cpu", divisions=3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_nonzero_mean_pos_matches_bp_cuda(self):
         self._test_nonzero_mean_pos_matches_bp("cuda", divisions=2)
 
@@ -484,11 +485,11 @@ class TestComputeIllumination(TestCase):
     def test_basic_cpu(self):
         self._test_basic("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_basic_cuda(self):
         self._test_basic("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu(self):
         from torchbp.ops import compute_subaperture_illumination
 
@@ -750,11 +751,11 @@ class TestFFBPTxPower(TestCase):
     def test_merge_exactness_cpu(self):
         self._merge_exactness("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_merge_exactness_cuda(self):
         self._merge_exactness("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_accum_cpu_cuda(self):
         from torchbp.ops.backproj import _backprojection_polar_2d_tx_power_accum
 
@@ -772,7 +773,7 @@ class TestFFBPTxPower(TestCase):
                 wa.cpu(), g.cpu(), g_extent, grid, pos.cpu(), att.cpu(), **kw)
             torch.testing.assert_close(out_cpu, out_gpu.cpu(), atol=1e-4, rtol=1e-3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_ffbp_tx_power_cpu_cuda(self):
         g, g_extent = self._antenna("cuda", az_width=0.4)
         wa, pos, att = self._straight_track("cuda")
@@ -819,7 +820,7 @@ class TestFFBPTxPower(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -877,7 +878,7 @@ class TestFFBPTxPower(TestCase):
         return [dict(wa=wa, g=g, g_extent=g_extent, grid=grid, r_res=0.15,
                      pos=pos, att=att, normalization="sigma")]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_match(self):
         from torchbp.ops.backproj import backprojection_cart_2d_tx_power
 

@@ -5,6 +5,7 @@ from torch.testing._internal.optests import opcheck
 import unittest
 import torchbp
 from torch import Tensor
+from conftest import requires_cuda
 
 
 class TestEntropy(TestCase):
@@ -21,7 +22,7 @@ class TestEntropy(TestCase):
         args = {"img": make_tensor((3, 3), dtype=dtype)}
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_ref(self):
         samples = self.sample_inputs("cuda", requires_grad=True)
         for sample in samples:
@@ -80,7 +81,7 @@ class TestEntropy(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 

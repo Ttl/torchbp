@@ -7,6 +7,7 @@ import unittest
 import torchbp
 from torch import Tensor
 from random import uniform
+from conftest import requires_cuda
 
 
 class TestBackprojectionPolar(TestCase):
@@ -48,7 +49,7 @@ class TestBackprojectionPolar(TestCase):
         }
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu(self):
         samples = self.sample_inputs("cuda")
         for sample in samples:
@@ -60,7 +61,7 @@ class TestBackprojectionPolar(TestCase):
             res_cpu = torchbp.ops.backprojection_polar_2d(**sample_cpu)
             torch.testing.assert_close(res_cpu, res_gpu, atol=1e-3, rtol=1e-2)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu_grad(self):
         samples = self.sample_inputs("cuda", requires_grad=True)
         for sample in samples:
@@ -108,7 +109,7 @@ class TestBackprojectionPolar(TestCase):
     def test_gradients_cpu(self):
         self._test_gradients("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
@@ -128,7 +129,7 @@ class TestBackprojectionPolar(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -338,7 +339,7 @@ class TestBackprojectionPolarDem(TestCase):
     def test_zero_dem_matches_no_dem_cpu(self):
         self._test_zero_dem_matches_no_dem("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_zero_dem_matches_no_dem_cuda(self):
         self._test_zero_dem_matches_no_dem("cuda")
 
@@ -357,7 +358,7 @@ class TestBackprojectionPolarDem(TestCase):
     def test_constant_dem_equals_shifted_pos_cpu(self):
         self._test_constant_dem_equals_shifted_pos("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_constant_dem_equals_shifted_pos_cuda(self):
         self._test_constant_dem_equals_shifted_pos("cuda")
 
@@ -393,11 +394,11 @@ class TestBackprojectionPolarDem(TestCase):
     def test_downsampled_dem_cpu(self):
         self._test_downsampled_dem("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_downsampled_dem_cuda(self):
         self._test_downsampled_dem("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu_dem(self):
         data, grid, pos = self._random_inputs("cuda")
         torch.manual_seed(123)
@@ -427,7 +428,7 @@ class TestBackprojectionPolarDem(TestCase):
     def test_dealias_constant_dem_cpu(self):
         self._test_dealias_constant_dem_equals_shifted_pos("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_dealias_constant_dem_cuda(self):
         self._test_dealias_constant_dem_equals_shifted_pos("cuda")
 
@@ -442,7 +443,7 @@ class TestBackprojectionPolarDem(TestCase):
     def test_dem_grad_raises_cpu(self):
         self._test_dem_grad_raises("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_dem_grad_raises_cuda(self):
         self._test_dem_grad_raises("cuda")
 
@@ -462,7 +463,7 @@ class TestBackprojectionPolarDem(TestCase):
     def test_opcheck_dem_cpu(self):
         self._opcheck_dem("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_dem_cuda(self):
         self._opcheck_dem("cuda")
 
@@ -519,7 +520,7 @@ class TestBackprojectionPolarDem(TestCase):
     def test_dem_point_target_cpu(self):
         self._test_dem_point_target("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_dem_point_target_cuda(self):
         self._test_dem_point_target("cuda")
 
@@ -574,7 +575,7 @@ class TestBackprojectionPolarAntennaPattern(TestCase):
     def test_uniform_pattern_normalization_cpu(self):
         self._test_uniform_pattern_normalization("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_uniform_pattern_normalization_cuda(self):
         self._test_uniform_pattern_normalization("cuda")
 
@@ -616,7 +617,7 @@ class TestBackprojectionPolarAntennaPattern(TestCase):
         return dict(data=data, grid=grid, fc=fc, r_res=r_res, pos=pos,
                     att=att, g=g, g_extent=g_extent)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_nonsymmetric_pattern_cpu_gpu(self):
         """CPU and CUDA backprojection must agree with a non-symmetric pattern,
         for both the normalized and unnormalized (FFBP) paths."""
@@ -679,7 +680,7 @@ class TestBackprojectionPolarLanczos(TestCase):
         }
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_basic_execution(self):
         """Test that lanczos backprojection executes without errors."""
         samples = self.sample_inputs("cuda")
@@ -694,7 +695,7 @@ class TestBackprojectionPolarLanczos(TestCase):
             self.assertFalse(torch.isnan(result).any())
             self.assertFalse(torch.isinf(result).any())
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_comparison_with_linear(self):
         """Test that lanczos produces similar results to linear interpolation."""
         samples = self.sample_inputs("cuda")
@@ -726,7 +727,7 @@ class TestBackprojectionPolarLanczos(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -772,7 +773,7 @@ class TestBackprojectionPolarKnab(TestCase):
         }
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_basic_execution(self):
         """Test that knab backprojection executes without errors."""
         samples = self.sample_inputs("cuda")
@@ -787,7 +788,7 @@ class TestBackprojectionPolarKnab(TestCase):
             self.assertFalse(torch.isnan(result).any())
             self.assertFalse(torch.isinf(result).any())
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_comparison_with_linear(self):
         """Test that knab produces similar results to linear interpolation."""
         samples = self.sample_inputs("cuda")
@@ -818,11 +819,11 @@ class TestBackprojectionPolarKnab(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu(self):
         # CUDA evaluates the kernel transcendentally per tap, CPU through the
         # precomputed table; the nearest-row quantization is ~1e-3 relative.
@@ -886,7 +887,7 @@ class TestBackprojectionCart(TestCase):
     def test_gradients_cpu(self):
         self._test_gradients("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
@@ -907,7 +908,7 @@ class TestBackprojectionCart(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -963,7 +964,7 @@ class TestGPGABackprojection2D(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -998,7 +999,7 @@ class TestGPGABackprojection2D(TestCase):
                 ref[t, s] = sval * torch.exp(1j * torch.tensor(angle))
         torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda(self):
         for args in self.sample_inputs("cpu"):
             kw = dict(fc=args["fc"], r_res=args["r_res"], d0=args["d0"],
@@ -1105,11 +1106,11 @@ class TestBlocksvdAlpha(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda(self):
         for args in self.sample_inputs("cpu"):
             kw = dict(
@@ -1171,7 +1172,7 @@ class TestBackprojectionPolar2DTxPower(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -1225,7 +1226,7 @@ class TestBackprojectionCart2DTxPower(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -1302,7 +1303,7 @@ class TestProjectionCart2D(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -1322,7 +1323,7 @@ class TestProjectionCart2D(TestCase):
     def test_opcheck_nufft_cpu(self):
         self._opcheck_nufft("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_nufft_cuda(self):
         self._opcheck_nufft("cuda")
 
@@ -1330,7 +1331,7 @@ class TestProjectionCart2D(TestCase):
     # Output shape
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_output_shape(self):
         """Both ops produce [nbatch, nsweeps, sweep_samples] output."""
         inputs = self._make_inputs("cuda", nx=8, ny=16, nsweeps=4, nbatch=1)
@@ -1345,7 +1346,7 @@ class TestProjectionCart2D(TestCase):
         self.assertEqual(out_direct.shape, (1, nsweeps, M))
         self.assertEqual(out_nufft.shape,  (1, nsweeps, M))
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_output_shape_batched(self):
         """Batched inputs produce [nbatch, nsweeps, sweep_samples] output."""
         nbatch = 3
@@ -1365,7 +1366,7 @@ class TestProjectionCart2D(TestCase):
     # NUFFT vs direct kernel agreement
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_nufft_matches_direct(self):
         """NUFFT output must agree with direct kernel to within 5e-3 relative."""
         inputs = self._make_inputs("cuda")
@@ -1379,7 +1380,7 @@ class TestProjectionCart2D(TestCase):
         self.assertLess(rel_err.item(), 5e-3,
                         f"NUFFT relative error {rel_err.item():.2e} exceeds 5e-3")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_nufft_matches_direct_batched(self):
         """NUFFT / direct agreement holds for nbatch > 1."""
         inputs = self._make_inputs("cuda", nbatch=2)
@@ -1392,7 +1393,7 @@ class TestProjectionCart2D(TestCase):
         rel_err = (out_direct - out_nufft).abs().max() / (ref_scale + 1e-30)
         self.assertLess(rel_err.item(), 5e-3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_nufft_matches_direct_rvp(self):
         """NUFFT / direct agreement holds with use_rvp=True."""
         inputs = self._make_inputs("cuda")
@@ -1438,7 +1439,7 @@ class TestProjectionCart2D(TestCase):
     # Direct formula check (single pixel)
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_single_pixel_direct_formula(self):
         """Projection of a single bright pixel matches the analytical sum.
 
@@ -1496,7 +1497,7 @@ class TestProjectionCart2D(TestCase):
     # DEM support
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_dem_changes_output(self):
         """Passing a non-zero DEM changes the projected output."""
         inputs = self._make_inputs("cuda", nx=8, ny=16)
@@ -1516,7 +1517,7 @@ class TestProjectionCart2D(TestCase):
     # Normalization modes
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_normalizations_differ(self):
         """sigma and gamma normalization produce different results."""
         inputs_sigma = self._make_inputs("cuda")
@@ -1527,7 +1528,7 @@ class TestProjectionCart2D(TestCase):
 
         self.assertFalse(torch.allclose(out_sigma, out_gamma))
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_matches_cuda(self):
         """CPU projection_cart_2d output matches the CUDA kernel.
 
@@ -1650,7 +1651,7 @@ class TestGPGABackprojection2DLanczos(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 

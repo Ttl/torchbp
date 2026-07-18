@@ -1,6 +1,10 @@
 import torch
 from torch import Tensor
 
+__all__ = [
+    "cfar_2d",
+]
+
 
 def cfar_2d(
     img: Tensor, Navg: tuple, Nguard: tuple, threshold: float, peaks_only: bool = False

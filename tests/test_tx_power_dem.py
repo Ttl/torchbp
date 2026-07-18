@@ -22,6 +22,7 @@ from torch.testing._internal.common_utils import TestCase
 
 import torchbp
 from torchbp.util import polar_dem_slopes
+from conftest import requires_cuda
 
 NORMALIZATIONS = ["beta", "sigma", "gamma", "point"]
 
@@ -211,7 +212,7 @@ class TestTxPowerDemDirect(TestCase):
                 wa, g, g_extent, self.grid, 0.15, pos, att, altitude=20.0,
                 normalization="sigma", dem=dem)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_agree(self):
         device = "cuda"
         rr, tt = _grid_axes(self.grid, "cpu")
@@ -357,7 +358,7 @@ class TestTxPowerDemFfbp(TestCase):
         with self.assertRaises(NotImplementedError):
             self._run(device, dem=dem, altitude=20.0)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_agree(self):
         rr, tt = _grid_axes(self.grid, "cpu")
         dem = _terrain(rr[:, None], tt[None, :]).float()

@@ -15,6 +15,11 @@ from ._utils import unpack_polar_grid, parse_interp_method
 from ..data import materialize as _materialize
 from ..util import next_fast_len
 
+__all__ = [
+    "kC0",
+    "afbp",
+]
+
 if TYPE_CHECKING:
     from ..grid import PolarGrid
 

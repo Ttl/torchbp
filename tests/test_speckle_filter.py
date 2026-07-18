@@ -2,8 +2,8 @@
 import torch
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
-import unittest
 import torchbp
+from conftest import requires_cuda
 
 
 class TestLeeFilter(TestCase):
@@ -42,7 +42,7 @@ class TestLeeFilter(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -54,7 +54,7 @@ class TestLeeFilter(TestCase):
             out = torchbp.ops.lee_filter(img, 3, 3, 0.5)
             torch.testing.assert_close(out, torch.full((1, 16, 16), 3.0, dtype=torch.float32))
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda(self):
         for dtype in (torch.float32, torch.complex64):
             for args in self.sample_inputs("cpu", dtype=dtype):

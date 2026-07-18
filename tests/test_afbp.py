@@ -2,8 +2,8 @@
 import torch
 import numpy as np
 from torch.testing._internal.common_utils import TestCase
-import unittest
 import torchbp
+from conftest import requires_cuda
 
 
 class TestAFBP(TestCase):
@@ -67,7 +67,7 @@ class TestAFBP(TestCase):
         self._compare("cpu", dealias=True, alias_fmod=-0.5)
         self._compare("cpu", dealias=True, data_fmod=0.3, alias_fmod=-0.3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_matches_direct_cuda(self):
         self._compare("cuda")
         self._compare("cuda", z0=40.0, dealias=True)

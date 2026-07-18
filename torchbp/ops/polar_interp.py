@@ -10,6 +10,31 @@ from ._utils import (
     check_cartesian_grid_matches_img,
 )
 
+__all__ = [
+    "polar_interp_linear_args",
+    "polar_to_cart_linear_args",
+    "cart_to_polar_linear_args",
+    "select_knab_poly_degree",
+    "compute_knab_poly_coefs_full",
+    "polar_interp",
+    "polar_interp_linear",
+    "polar_interp_lanczos",
+    "ffbp_merge2_lanczos",
+    "ffbp_merge2_knab",
+    "ffbp_merge2_poly",
+    "ffbp_merge2_poly_weighted",
+    "ffbp_merge2",
+    "ffbp_tx_power_merge2",
+    "polar_to_cart",
+    "polar_to_cart_linear",
+    "polar_to_cart_lanczos",
+    "cart_to_polar",
+    "cart_to_polar_linear",
+    "cart_to_polar_lanczos",
+    "div_2d_interp_linear",
+    "mul_2d_interp_linear",
+]
+
 if TYPE_CHECKING:
     from ..grid import PolarGrid, CartesianGrid
 
@@ -1186,8 +1211,6 @@ def ffbp_merge2(
         )
         if use_poly and poly_coefs is not None:
             kwargs['poly_coefs'] = poly_coefs
-        if not use_poly:
-            kwargs.pop('poly_coefs', None)
         return knab_func(
             img0,
             img1,

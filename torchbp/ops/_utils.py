@@ -4,6 +4,15 @@ import torch
 from torch import Tensor
 from ..grid import unpack_polar_grid, unpack_cartesian_grid
 
+__all__ = [
+    "parse_interp_method",
+    "get_batch_dims",
+    "get_batch_dims_img",
+    "check_polar_grid_matches_img",
+    "check_cartesian_grid_matches_img",
+    "AntennaPattern",
+]
+
 
 # Canonical parameter shapes of the interpolation method specs. The
 # descriptions double as the error message.
@@ -244,15 +253,4 @@ class AntennaPattern:
             (g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel)
         """
         return (self.g, self.g_az0, self.g_el0, self.g_daz, self.g_del,
-                self.g_naz, self.g_nel)
-
-    def to_cpp_args_without_tensor(self) -> Tuple:
-        """Convert to tuple for C++ call (excluding tensor).
-
-        Returns
-        -------
-        tuple
-            (g_az0, g_el0, g_daz, g_del, g_naz, g_nel)
-        """
-        return (self.g_az0, self.g_el0, self.g_daz, self.g_del,
                 self.g_naz, self.g_nel)

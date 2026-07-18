@@ -3,10 +3,10 @@ import torch
 import numpy as np
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
-import unittest
 import torchbp
 from torch import Tensor
 import torch.nn.functional as F
+from conftest import requires_cuda
 
 
 class TestBpPolarRangeDealias(TestCase):
@@ -60,7 +60,7 @@ class TestBpPolarRangeDealias(TestCase):
     def test_flat_matches_reference_cpu(self):
         self._test_flat_matches_reference("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_flat_matches_reference_cuda(self):
         self._test_flat_matches_reference("cuda")
 
@@ -77,7 +77,7 @@ class TestBpPolarRangeDealias(TestCase):
     def test_zero_dem_matches_no_dem_cpu(self):
         self._test_zero_dem_matches_no_dem("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_zero_dem_matches_no_dem_cuda(self):
         self._test_zero_dem_matches_no_dem("cuda")
 
@@ -95,7 +95,7 @@ class TestBpPolarRangeDealias(TestCase):
     def test_alias_dealias_roundtrip_cpu(self):
         self._test_alias_dealias_roundtrip("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_alias_dealias_roundtrip_cuda(self):
         self._test_alias_dealias_roundtrip("cuda")
 
@@ -125,7 +125,7 @@ class TestBpPolarRangeDealias(TestCase):
     def test_matches_bp_dealias_dem_cpu(self):
         self._test_matches_bp_dealias_dem("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_matches_bp_dealias_dem_cuda(self):
         self._test_matches_bp_dealias_dem("cuda")
 

@@ -21,17 +21,12 @@ from .ops import (
 from .ops import entropy
 from .util import (
     unwrap,
-    unwrap_ref,
-    detrend,
     weighted_detrend,
     conv_lowpass_filter,
     fft_lowpass_filter_precalculate_window,
     fft_lowpass_filter_window,
-    diff
 )
 import inspect
-from scipy import signal
-from copy import deepcopy
 
 #: Speed of light in vacuum [m/s]. Must match ``kC0`` in ``csrc/cpu/util.h``.
 C0 = 299792458.0

@@ -2,8 +2,8 @@
 import torch
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
-import unittest
 import torchbp
+from conftest import requires_cuda
 
 
 class TestResample2DLanczos(TestCase):
@@ -111,27 +111,27 @@ class TestResample2DLanczos(TestCase):
         max_err = err.max().item()
         self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for varying shift")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_zero_shift_complex(self):
         self._test_zero_shift_identity("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_zero_shift_float(self):
         self._test_zero_shift_identity("cuda", torch.float32)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_complex(self):
         self._test_smooth_function("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_float(self):
         self._test_smooth_function("cuda", torch.float32)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_varying_shift_complex(self):
         self._test_varying_shift("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_varying_shift_float(self):
         self._test_varying_shift("cuda", torch.float32)
 
@@ -163,11 +163,11 @@ class TestResample2DLanczos(TestCase):
             img.cuda(), shift_r.cuda(), shift_az.cuda(), order=6).cpu()
         torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_complex(self):
         self._test_cpu_cuda(torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_float(self):
         self._test_cpu_cuda(torch.float32)
 
@@ -192,7 +192,7 @@ class TestResample2DLanczos(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -250,19 +250,19 @@ class TestResample2DKnab(TestCase):
         self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for smooth function")
         self.assertLess(rms_err, 0.01, f"RMS error {rms_err:.6f} too large for smooth function")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_zero_shift_complex(self):
         self._test_zero_shift_identity("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_zero_shift_float(self):
         self._test_zero_shift_identity("cuda", torch.float32)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_complex(self):
         self._test_smooth_function("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_float(self):
         self._test_smooth_function("cuda", torch.float32)
 
@@ -289,11 +289,11 @@ class TestResample2DKnab(TestCase):
             img.cuda(), shift_r.cuda(), shift_az.cuda(), order=6, oversample=1.5).cpu()
         torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_complex(self):
         self._test_cpu_cuda(torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_float(self):
         self._test_cpu_cuda(torch.float32)
 
@@ -319,7 +319,7 @@ class TestResample2DKnab(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -388,19 +388,19 @@ class TestResample1DLanczos(TestCase):
                 x.movedim(axis, -1), num, axis=-1, order=6).movedim(-1, axis)
             torch.testing.assert_close(out, ref)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_identity_complex(self):
         self._test_identity("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_identity_float(self):
         self._test_identity("cuda", torch.float32)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_complex(self):
         self._test_smooth_upsample("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_float(self):
         self._test_smooth_upsample("cuda", torch.float32)
 
@@ -430,11 +430,11 @@ class TestResample1DLanczos(TestCase):
                 x.cuda(), num, axis=1, order=6).cpu()
             torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_complex(self):
         self._test_cpu_cuda(torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_float(self):
         self._test_cpu_cuda(torch.float32)
 
@@ -457,7 +457,7 @@ class TestResample1DLanczos(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -511,19 +511,19 @@ class TestResample1DKnab(TestCase):
         max_err = err.max().item()
         self.assertLess(max_err, 0.02, f"Max error {max_err:.6f} too large for upsampling")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_identity_complex(self):
         self._test_identity("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_identity_float(self):
         self._test_identity("cuda", torch.float32)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_complex(self):
         self._test_smooth_upsample("cuda", torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_smooth_float(self):
         self._test_smooth_upsample("cuda", torch.float32)
 
@@ -547,11 +547,11 @@ class TestResample1DKnab(TestCase):
                 x.cuda(), num, axis=1, order=6, oversample=1.5).cpu()
             torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-3, atol=1e-3)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_complex(self):
         self._test_cpu_cuda(torch.complex64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_float(self):
         self._test_cpu_cuda(torch.float32)
 
@@ -575,7 +575,7 @@ class TestResample1DKnab(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 

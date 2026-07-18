@@ -2,6 +2,10 @@ import torch
 from torch import Tensor
 from typing import TYPE_CHECKING
 
+__all__ = [
+    "multilook_polar",
+]
+
 if TYPE_CHECKING:
     from ..grid import PolarGrid
 

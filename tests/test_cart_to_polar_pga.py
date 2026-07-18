@@ -15,13 +15,13 @@ the image.
 
 Run standalone for metrics: python tests/test_cart_to_polar_pga.py
 """
-import unittest
 
 import torch
 import torchbp
 from torchbp.autofocus import pga
 from torchbp.util import entropy
 from numpy import hamming
+from conftest import requires_cuda
 
 C0 = 299792458.0
 
@@ -197,12 +197,12 @@ def test_pga_cpu():
     check_pga("cpu")
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+@requires_cuda
 def test_round_trip_cuda():
     check_round_trip("cuda")
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+@requires_cuda
 def test_pga_cuda():
     check_pga("cuda")
 

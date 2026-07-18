@@ -2,11 +2,11 @@
 import torch
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
-import unittest
 import torchbp
 from torch import Tensor
 import torch.nn.functional as F
 from random import uniform
+from conftest import requires_cuda
 
 
 class TestPolarInterpLinear(TestCase):
@@ -39,7 +39,7 @@ class TestPolarInterpLinear(TestCase):
         }
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu_grad(self):
         samples = self.sample_inputs("cuda", requires_grad=True)
         for sample in samples:
@@ -73,7 +73,7 @@ class TestPolarInterpLinear(TestCase):
             ]
             torch.testing.assert_close(grads_cpu, grads_gpu, atol=1e-3, rtol=1e-2)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu(self):
         samples = self.sample_inputs("cuda")
         for sample in samples:
@@ -101,7 +101,7 @@ class TestPolarInterpLinear(TestCase):
         self._test_gradients("cpu")
         self._test_gradients("cpu", dtype=torch.float64)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
@@ -121,7 +121,7 @@ class TestPolarInterpLinear(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -156,7 +156,7 @@ class TestPolarToCartLinear(TestCase):
         }
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu_grad(self):
         samples = self.sample_inputs("cuda", requires_grad=True)
         for sample in samples:
@@ -190,7 +190,7 @@ class TestPolarToCartLinear(TestCase):
             ]
             torch.testing.assert_close(grads_cpu, grads_gpu, atol=1e-3, rtol=1e-2)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu(self):
         samples = self.sample_inputs("cuda")
         for sample in samples:
@@ -218,7 +218,7 @@ class TestPolarToCartLinear(TestCase):
         # float64 not tested: CPU forward supports only complex64/float32
         self._test_gradients("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
@@ -238,7 +238,7 @@ class TestPolarToCartLinear(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -273,7 +273,7 @@ class TestCartToPolarLinear(TestCase):
         }
         return [args]
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu_grad(self):
         samples = self.sample_inputs("cuda", requires_grad=True)
         for sample in samples:
@@ -307,7 +307,7 @@ class TestCartToPolarLinear(TestCase):
             ]
             torch.testing.assert_close(grads_cpu, grads_gpu, atol=1e-3, rtol=1e-2)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu(self):
         samples = self.sample_inputs("cuda")
         for sample in samples:
@@ -361,7 +361,7 @@ class TestCartToPolarLinear(TestCase):
         # float64 not tested: CPU forward supports only complex64/float32
         self._test_gradients("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
@@ -381,7 +381,7 @@ class TestCartToPolarLinear(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -448,14 +448,14 @@ class TestDivMul2DInterpLinear(TestCase):
     def test_opcheck_div_cpu(self):
         self._opcheck_div("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_div_cuda(self):
         self._opcheck_div("cuda")
 
     def test_opcheck_mul_cpu(self):
         self._opcheck_mul("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_mul_cuda(self):
         self._opcheck_mul("cuda")
 
@@ -475,7 +475,7 @@ class TestDivMul2DInterpLinear(TestCase):
             div = torchbp.ops.div_2d_interp_linear(a, b)
             torch.testing.assert_close(div[:, :-1, :-1], (a / b)[:, :-1, :-1])
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_div(self):
         for args in self.sample_inputs_div("cpu"):
             img1, img2 = args["img1"], args["img2"]
@@ -483,7 +483,7 @@ class TestDivMul2DInterpLinear(TestCase):
             out_gpu = torchbp.ops.div_2d_interp_linear(img1.cuda(), img2.cuda()).cpu()
             torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_mul(self):
         for args in self.sample_inputs_mul("cpu"):
             img1, img2 = args["img1"], args["img2"]
@@ -491,7 +491,7 @@ class TestDivMul2DInterpLinear(TestCase):
             out_gpu = torchbp.ops.mul_2d_interp_linear(img1.cuda(), img2.cuda()).cpu()
             torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_mul_mixed_dtype(self):
         """Complex image times a real weight map (the polarimetry calibration path)."""
         a = torch.randn(2, 5, 5, dtype=torch.complex64)
@@ -561,11 +561,11 @@ class TestFFBPMerge2Poly(TestCase):
     def test_poly_vs_knab_reference_cpu(self):
         self._poly_vs_knab_reference("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_poly_vs_knab_reference(self):
         self._poly_vs_knab_reference("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_poly_with_precomputed_coefs(self):
         """Test that precomputed polynomial coefficients give same result."""
         samples = self.sample_inputs("cuda")
@@ -584,7 +584,7 @@ class TestFFBPMerge2Poly(TestCase):
             # Should be identical
             torch.testing.assert_close(result_precomp, result_auto)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_different_orders(self):
         """Test polynomial approximation with different interpolation orders."""
         samples = self.sample_inputs("cuda")
@@ -656,11 +656,11 @@ class TestFFBPMerge2PolyWeighted(TestCase):
     def test_basic_cpu(self):
         self._test_basic("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_basic_cuda(self):
         self._test_basic("cuda")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_and_gpu(self):
         from torchbp.ops import ffbp_merge2_poly_weighted
 
@@ -748,7 +748,7 @@ class TestPolarInterpLanczos(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -817,7 +817,7 @@ class TestPolarToCartLanczos(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -919,7 +919,7 @@ class TestFFBPMerge2Lanczos(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 

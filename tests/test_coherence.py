@@ -2,8 +2,8 @@
 import torch
 from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.optests import opcheck
-import unittest
 import torchbp
+from conftest import requires_cuda
 
 
 class TestCoherence2D(TestCase):
@@ -36,7 +36,7 @@ class TestCoherence2D(TestCase):
     def test_gradients_cpu(self):
         self._test_gradients("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_gradients_cuda(self):
         self._test_gradients("cuda")
 
@@ -46,7 +46,7 @@ class TestCoherence2D(TestCase):
         c = torchbp.ops.coherence_2d(img, img, (3, 3))
         torch.testing.assert_close(c, torch.ones_like(c))
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda(self):
         for args in self.sample_inputs("cpu"):
             img0, img1 = args["img0"], args["img1"]
@@ -55,7 +55,7 @@ class TestCoherence2D(TestCase):
                 img0.cuda(), img1.cuda(), args["Navg"]).cpu()
             torch.testing.assert_close(out_cpu, out_gpu, rtol=1e-4, atol=1e-5)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda_grad(self):
         """Backward must agree between CPU and CUDA."""
         for args in self.sample_inputs("cpu", requires_grad=False):
@@ -87,7 +87,7 @@ class TestCoherence2D(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -127,7 +127,7 @@ class TestPowerCoherence2D(TestCase):
     def test_opcheck_cpu(self):
         self._opcheck("cpu")
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_opcheck_cuda(self):
         self._opcheck("cuda")
 
@@ -147,7 +147,7 @@ class TestPowerCoherence2D(TestCase):
         self.assertGreaterEqual(pc.min().item(), 0.0)
         self.assertLessEqual(pc.max().item(), 1.0)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
+    @requires_cuda
     def test_cpu_cuda(self):
         for args in self.sample_inputs("cpu"):
             img0, img1 = args["img0"], args["img1"]

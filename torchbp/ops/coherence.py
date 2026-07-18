@@ -1,6 +1,12 @@
 import torch
 from torch import Tensor
 
+__all__ = [
+    "coherence_2d_args",
+    "coherence_2d",
+    "power_coherence_2d",
+]
+
 coherence_2d_args = 7
 
 def _prepare_coherence_2d_args(img0: Tensor, img1: Tensor, Navg: tuple) -> tuple:

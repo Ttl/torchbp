@@ -1,6 +1,10 @@
 import torch
 from torch import Tensor
 
+__all__ = [
+    "lee_filter",
+]
+
 
 def lee_filter(img: Tensor, wx: int, wy: int, cu: float) -> Tensor:
     """
