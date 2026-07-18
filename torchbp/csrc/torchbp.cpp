@@ -93,4 +93,38 @@ TORCH_LIBRARY(torchbp, m) {
   m.def("afbp_fuse(Tensor S, Tensor nua, Tensor xs, Tensor inv_kr, Tensor x_half, Tensor band, float x_c, float x_taper, int kmax) -> Tensor");
 }
 
+// Some ops are implemented for only one backend. Without an explicit stub the
+// dispatcher reports a generic "could not find kernel" error that does not name
+// the op, so register a boxed fallback that fails with an actionable message.
+static void unimplemented_backend(const c10::OperatorHandle &op,
+                                  c10::DispatchKeySet ks,
+                                  torch::jit::Stack *stack) {
+  TORCH_CHECK(false, op.schema().operator_name().name,
+              " is not implemented for this backend. Move the input tensors to "
+              "a supported device.");
+}
+
+static torch::CppFunction unimplemented_stub() {
+  return torch::CppFunction::makeFromBoxedFunction<&unimplemented_backend>();
+}
+
+// CUDA-only ops: give CPU inputs a named error.
+TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
+  m.impl("backprojection_polar_2d_lanczos", unimplemented_stub());
+  m.impl("gpga_backprojection_2d_lanczos", unimplemented_stub());
+  m.impl("cfar_2d", unimplemented_stub());
+  m.impl("entropy", unimplemented_stub());
+  m.impl("entropy_grad", unimplemented_stub());
+  m.impl("abs_sum", unimplemented_stub());
+  m.impl("abs_sum_grad", unimplemented_stub());
+  m.impl("subpixel_correlation", unimplemented_stub());
+}
+
+// CPU-only ops: give CUDA inputs a named error.
+TORCH_LIBRARY_IMPL(torchbp, CUDA, m) {
+  m.impl("backprojection_polar_2d_illum", unimplemented_stub());
+  m.impl("backprojection_polar_2d_knab_illum", unimplemented_stub());
+  m.impl("afbp_fuse", unimplemented_stub());
+}
+
 }
