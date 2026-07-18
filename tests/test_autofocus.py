@@ -792,3 +792,85 @@ class TestGpgaDem(TestGpgaBpPolar):
             )
 
 
+
+
+class TestPhaseToPos(TestCase):
+    """phase_to_pos recovers an injected x position error from pga phase."""
+
+    fc = 6e9
+    r_res = 0.3
+    grid = {"r": (80.0, 120.0), "theta": (-0.25, 0.25), "nr": 64,
+            "ntheta": 256}
+    nsweeps = 256
+    sweep_samples = 512
+
+    def _make_data(self, targets, amps, pos):
+        """Point responses consistent with the backprojection phase model."""
+        c0 = 299792458.0
+        data = torch.zeros(
+            pos.shape[0], self.sweep_samples, dtype=torch.complex64
+        )
+        m_idx = torch.arange(pos.shape[0])
+        for t, a in zip(targets, amps):
+            d = torch.linalg.norm(t[None, :] - pos, dim=1)
+            sx = d / self.r_res
+            phase = torch.exp(-1j * 4 * torch.pi * self.fc / c0 * d)
+            for k in range(-2, 3):
+                idx = torch.floor(sx).long() + k
+                w = torch.clamp(1.5 - (idx.float() - sx).abs(), 0, 1)
+                valid = (idx >= 0) & (idx < self.sweep_samples)
+                data[m_idx[valid], idx[valid]] += a * w[valid] * phase[valid]
+        return data
+
+    @staticmethod
+    def _detrend_on(x, u):
+        A = torch.stack([torch.ones_like(u), u], dim=1)
+        sol = torch.linalg.lstsq(A, x[:, None]).solution
+        return x - (A @ sol)[:, 0]
+
+    def test_recovers_x_error_nonlinear_track(self):
+        torch.manual_seed(5)
+        ntargets = 12
+        r = 90.0 + 20.0 * torch.rand(ntargets)
+        t = -0.15 + 0.3 * torch.rand(ntargets)
+        targets = torch.stack(
+            [r * torch.sqrt(1 - t**2), r * t, torch.zeros_like(r)], dim=1
+        )
+        amps = (1.0 + torch.rand(ntargets)).to(torch.complex64)
+        # Slightly non-linear nominal track: non-uniform along-track
+        # spacing plus a known x bow and z wiggle.
+        f = torch.arange(self.nsweeps) / self.nsweeps
+        pos = torch.zeros(self.nsweeps, 3)
+        pos[:, 1] = torch.linspace(-3.0, 3.0, self.nsweeps) * (
+            1 + 0.05 * torch.sin(2 * torch.pi * f)
+        )
+        pos[:, 0] = 0.05 * torch.sin(torch.pi * f)
+        pos[:, 2] = 30.0 + 0.02 * torch.sin(2 * torch.pi * f)
+
+        dx = 4e-3 * torch.sin(2 * torch.pi * 2 * f + 0.5)
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        data = self._make_data(targets, amps, pos_true)
+
+        img_blur = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fc, self.r_res, pos
+        )[0]
+        img_s = torchbp.util.shift_spectrum(img_blur.clone())
+        _, phi = torchbp.autofocus.pga(img_s)
+        dx_est = torchbp.autofocus.phase_to_pos(phi, self.grid, self.fc, pos)
+
+        # The mean and linear trend are unobservable; compare detrended
+        # in the along-track coordinate.
+        u = pos[:, 1]
+        resid = self._detrend_on(dx - dx_est, u)
+        self.assertLess(
+            resid.pow(2).mean().sqrt().item(),
+            0.3 * self._detrend_on(dx, u).pow(2).mean().sqrt().item(),
+        )
+
+        # The non-shifted path must give the same result.
+        _, phi2 = torchbp.autofocus.pga(img_blur.clone())
+        dx_est2 = torchbp.autofocus.phase_to_pos(
+            phi2, self.grid, self.fc, pos, shifted=False
+        )
+        self.assertLess((dx_est - dx_est2).abs().max().item(), 1e-5)

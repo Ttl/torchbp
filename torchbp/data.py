@@ -326,7 +326,12 @@ class MemmapData(LazyData):
         self._array = array
 
     def _load_range(self, start: int, stop: int):
-        return torch.as_tensor(self._array[start:stop])
+        a = self._array[start:stop]
+        if isinstance(a, np.ndarray) and not a.flags.writeable:
+            # torch.as_tensor warns on read-only arrays (e.g. a mmap_mode="r"
+            # numpy array); the chunk is transformed/copied downstream anyway.
+            a = a.copy()
+        return torch.as_tensor(a)
 
 
 class CachedData(LazyData):

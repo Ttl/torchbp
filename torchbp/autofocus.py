@@ -486,6 +486,92 @@ def pga(
     return img, phi_sum
 
 
+def phase_to_pos(
+    phi: Tensor,
+    grid: "PolarGrid | dict",
+    fc: float,
+    pos: Tensor,
+    shifted: bool = True,
+) -> Tensor:
+    """
+    Convert a phase error profile solved by :func:`pga` to a
+    range-direction (x) platform position error at each pulse.
+
+    A range-direction platform position error ``dx`` at a pulse creates a
+    phase error ``phi = (4 pi fc / c) * cos(az_c) * cos(el) * dx`` on the
+    azimuth spectrum bin that the pulse maps to, where ``az_c`` is the
+    grid center azimuth and ``el`` the elevation angle to the grid center
+    (scene assumed at ``z = 0``). The azimuth spectrum bin of a pulse is
+    proportional to its along-track (y) coordinate, so the solved phase
+    is scaled to meters and interpolated at the actual y coordinate of
+    each pulse. Using the per-pulse coordinates instead of assuming a
+    uniform mapping supports non-uniformly sampled and slightly
+    non-linear tracks.
+
+    The mean and linear trend of the phase error are unobservable to
+    :func:`pga` (they only shift the image) and are removed by its
+    ``remove_trend``, so the returned profile is comparable to the true
+    position error only up to a linear function of the along-track
+    coordinate.
+
+    Parameters
+    ----------
+    phi : Tensor
+        Solved phase error from :func:`pga` in radians. Shape: [ntheta].
+    grid : PolarGrid or dict
+        Polar grid definition of the image the phase was solved from.
+    fc : float
+        RF center frequency in Hz.
+    pos : Tensor
+        Platform positions the image was formed with. Shape: [npulses, 3].
+    shifted : bool
+        True if :func:`torchbp.util.shift_spectrum` was applied to the
+        image before :func:`pga` (azimuth spectrum DC at bin
+        ``ntheta // 2``). False for an image straight from
+        backprojection (DC at bin 0).
+
+    Returns
+    -------
+    dx : Tensor
+        Estimated range-direction (x) position error in meters at each
+        pulse, shape [npulses]. This is the true minus the nominal
+        position: adding it to ``pos[:, 0]`` and re-forming the image
+        corrects the error.
+    """
+    if phi.ndim != 1:
+        raise ValueError("phi should be 1D.")
+    if not _grid_is_polar(grid):
+        raise ValueError("phase_to_pos requires a polar grid.")
+    r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
+    if phi.shape[0] != ntheta:
+        raise ValueError(
+            f"phi length {phi.shape[0]} does not match the grid ({ntheta})."
+        )
+    dev = phi.device
+    rdtype = phi.dtype
+    pos = pos.to(device=dev, dtype=rdtype)
+    c0 = 299792458.0
+    wl = c0 / fc
+    k_wave = 4 * torch.pi * fc / c0
+    if not shifted:
+        phi = torch.fft.fftshift(phi)
+    # Grid-center look geometry, scene assumed at z=0.
+    h = torch.mean(pos[:, 2])
+    r_c = 0.5 * (r0 + r1)
+    cos_el = r_c / torch.sqrt(r_c**2 + h**2)
+    theta_c = 0.5 * (theta0 + theta1)
+    cos_az_c = float(np.sqrt(max(1.0 - theta_c**2, 0.0)))
+    bins = torch.arange(ntheta, device=dev, dtype=rdtype) - ntheta // 2
+    # Along-track coordinate that maps to each fftshifted spectrum bin.
+    u_bins = -bins * wl / (2 * cos_el * dtheta * ntheta)
+    dx_bins = phi / (k_wave * cos_az_c * cos_el)
+    # u_bins descends with bin index; flip for ascending interpolation.
+    dx = _interp1_linear(
+        pos[:, 1], torch.flip(u_bins, [0]), torch.flip(dx_bins, [0])
+    )
+    return dx
+
+
 def pga_xz(
     img: Tensor,
     grid: "PolarGrid | dict",
