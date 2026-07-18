@@ -12,7 +12,7 @@ import torchbp
 from torchbp.util import make_polar_grid
 from torchbp.grid import PolarGrid, CartesianGrid
 from safetensors.torch import safe_open
-from sar_process_safetensor import grid_extent, load_data
+from sar_process_safetensor import grid_extent
 plt.style.use("ggplot")
 
 if __name__ == "__main__":
@@ -58,24 +58,28 @@ if __name__ == "__main__":
 
     c0 = 299792458
 
-    # Load the input data
+    # Open the input data. The raw sweeps are not loaded here: safetensors
+    # supports reading slices on demand, so the sweeps are streamed from
+    # the file chunk by chunk as the backprojection consumes them and the
+    # raw data is never fully resident in memory.
     try:
-        mission, tensors = load_data(filename)
+        f_st = safe_open(filename, framework="pt", device="cpu")
     except FileNotFoundError:
         print(f"Input file {filename} not found.")
-
-    sweeps = tensors["data"][sweep_start:sweep_start+nsweeps].to(dtype=torch.float32)
-    pos = tensors["pos"][sweep_start:sweep_start+nsweeps].cpu().numpy()
-    att = tensors["att"][sweep_start:sweep_start+nsweeps].cpu().numpy()
-    counts = tensors["counts"][sweep_start:sweep_start+nsweeps]
-    nsweeps = sweeps.shape[0]
-    del tensors
+        sys.exit(1)
+    mission = {k: float(v) for k, v in f_st.metadata().items()}
+    data_slice = f_st.get_slice("data")
+    nsweeps = min(nsweeps, data_slice.get_shape()[0] - sweep_start)
+    nsamples = data_slice.get_shape()[-1]
+    pos = f_st.get_tensor("pos")[sweep_start:sweep_start+nsweeps].cpu().numpy()
+    att = f_st.get_tensor("att")[sweep_start:sweep_start+nsweeps].cpu().numpy()
+    counts = f_st.get_tensor("counts")[sweep_start:sweep_start+nsweeps]
 
     bw = mission["bw"]
     fc = mission["fc"]
     fs = mission["fsample"]
     origin_angle = mission["origin_angle"]
-    tsweep = sweeps.shape[-1] / fs
+    tsweep = nsamples / fs
     sweep_interval = mission["pri"]
     res = c0 / (2 * mission["bw"])
 
@@ -123,20 +127,14 @@ if __name__ == "__main__":
     pos = torch.from_numpy(pos).to(dtype=torch.float32, device=dev)
 
     # Generate window functions
-    nsamples = sweeps.shape[-1]
     wr = signal.get_window(range_window, nsamples)
     wr /= np.mean(wr)
     wr = torch.tensor(wr).to(dtype=torch.float32, device=dev)
     wa = torch.tensor(
-        signal.get_window(angle_window, sweeps.shape[0], fftbins=False)
+        signal.get_window(angle_window, nsweeps, fftbins=False)
     ).to(dtype=torch.float32, device=dev)
     wa /= torch.mean(wa)
 
-    # Apply windowing
-    sweeps *= wa[:, None, None].cpu()
-    sweeps *= wr[None, None, :].cpu()
-
-    nsamples = sweeps.shape[-1]
     n = int(nsamples * fft_oversample)
     fft_oversample = n / nsamples
     # Modulation frequency to center the data spectrum to DC for decreased
@@ -148,25 +146,44 @@ if __name__ == "__main__":
     rvp = torch.exp(-1j * torch.pi * f**2 * tsweep / bw)
     r_res = c0 / (2 * bw * fft_oversample)
     del f
-
     data_fmod_f = torch.exp(1j*data_fmod*torch.arange(n//2+1, device=dev))[None,:]
-    fsweeps = torch.zeros((sweeps.shape[0], n // 2 + 1), dtype=data_dtype, device=dev)
-    # FFT radar data in blocks to decrease the maximum needed VRAM
-    blocks = 16
-    block = (sweeps.shape[0] + blocks - 1) // blocks
-    for b in range(blocks):
-        s0 = b * block
-        s1 = min((b + 1) * block, sweeps.shape[0])
-        fsw = torch.fft.rfft(
-            sweeps[s0:s1, 0, :].to(device=dev), n=n, norm="forward", dim=-1
-        ).conj()
+
+    # Lazy range compression: the windows, oversampled FFT and RVP multiply
+    # run per chunk on dev when a backprojection loads sweeps, reading the
+    # raw chunk straight from the safetensors file. Neither the raw nor the
+    # range compressed data is ever fully resident; ffbp streams the data
+    # one leaf subaperture at a time. The azimuth window is indexed with
+    # the absolute sweep indices of the chunk.
+    def range_compress(chunk, start, stop):
+        x = chunk[:, 0, :].to(torch.float32) * wa[start:stop, None] * wr[None, :]
+        fsw = torch.fft.rfft(x, n=n, norm="forward", dim=-1).conj()
         fsw *= data_fmod_f
         fsw *= rvp[None, :]
-        fsweeps[s0:s1] = fsw.to(dtype=data_dtype)
-    del sweeps
-    del fsw
-    del data_fmod_f
-    del rvp
+        return fsw
+
+    fsweeps = torchbp.CallbackData(
+        lambda a, b: data_slice[sweep_start + a:sweep_start + b],
+        (nsweeps, n // 2 + 1), dtype=data_dtype, device=dev,
+        transform=range_compress)
+
+    if autofocus:
+        # The autofocus re-reads the data every iteration, so cache the
+        # range compressed sweeps: on the compute device when they fit
+        # (equivalent to eager range compression), in pinned CPU RAM when
+        # VRAM is short, on a disk file when RAM is short too.
+        nbytes = nsweeps * (n // 2 + 1) * torch.empty(0, dtype=data_dtype).element_size()
+        if nbytes > torchbp.data.available_ram() // 2:
+            storage, storage_device = "disk", None
+        elif dev == "cuda" and nbytes > torch.cuda.mem_get_info()[0] // 2:
+            storage, storage_device = "ram", "cpu"
+        else:
+            storage, storage_device = "ram", None
+        print("Range compressing to", storage if storage_device is None
+              else f"{storage} ({storage_device})", "cache")
+        tstart = time.time()
+        fsweeps = torchbp.CachedData(
+            fsweeps, storage=storage, storage_device=storage_device).fill()
+        print(f"Range compression done in {time.time() - tstart:.3g} s")
 
     pos = pos.to(device=dev)
 
@@ -208,6 +225,16 @@ if __name__ == "__main__":
             interp_method=("knab", 6, 1.3), data_fmod=data_fmod, alias_fmod=None
         )
     else:
+        # Direct backprojection needs the whole tensor at once; materialize
+        # the lazy source in blocks to bound the range compression's peak
+        # memory (ffbp streams it leaf by leaf and needs none of this).
+        full = torch.zeros((len(fsweeps), n // 2 + 1), dtype=data_dtype, device=dev)
+        block = (len(fsweeps) + 15) // 16
+        for s0 in range(0, len(fsweeps), block):
+            s1 = min(s0 + block, len(fsweeps))
+            full[s0:s1] = fsweeps[s0:s1].load()
+        fsweeps = full
+        del full
         sar_img = torchbp.ops.backprojection_polar_2d(
             fsweeps, grid_polar, fc, r_res, pos_centered, d0,
             data_fmod=data_fmod

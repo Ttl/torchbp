@@ -5,12 +5,17 @@ from ._utils import (
     unpack_polar_grid, unpack_cartesian_grid, get_batch_dims, AntennaPattern,
     parse_interp_method,
 )
+from ..data import LazyData, materialize as _materialize
 
 if TYPE_CHECKING:
     from ..grid import PolarGrid, CartesianGrid
 
 cart_2d_nargs = 16
 polar_2d_nargs = 28
+
+# Chunk size in bytes for processing LazyData inputs of per-sweep-independent
+# ops (gpga_backprojection_2d_core) without materializing the full tensor.
+_LAZY_CHUNK_BYTES = 64 << 20
 
 def _prepare_backprojection_polar_2d_args(
     data: Tensor,
@@ -130,7 +135,7 @@ def _prepare_backprojection_polar_2d_knab_args(
 
 
 def backprojection_polar_2d(
-    data: Tensor,
+    data: "Tensor | LazyData",
     grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
@@ -232,6 +237,7 @@ def backprojection_polar_2d(
     img : Tensor
         Pseudo-polar format radar image.
     """
+    data = _materialize(data)
     interp_method = parse_interp_method(interp_method)
     if interp_method[0] != "linear":
         if torch.is_grad_enabled() and (data.requires_grad or pos.requires_grad):
@@ -284,6 +290,7 @@ def _backprojection_polar_2d_illum(
     contribute no data to the image either). Requires an antenna pattern.
     No gradient support.
     """
+    data = _materialize(data)
     interp_method = parse_interp_method(interp_method)
     if interp_method[0] == "linear":
         cpp_args = _prepare_backprojection_polar_2d_args(
@@ -565,6 +572,7 @@ def backprojection_cart_2d(
     img : Tensor
         Cartesian format radar image.
     """
+    data = _materialize(data)
     cpp_args = _prepare_backprojection_cart_2d_args(
         data, grid, fc, r_res, pos, d0, beamwidth, data_fmod
     )
@@ -810,7 +818,7 @@ def projection_cart_2d_nufft(
 
 def gpga_backprojection_2d_core(
     target_pos: Tensor,
-    data: Tensor,
+    data: "Tensor | LazyData",
     pos: Tensor,
     fc: float,
     r_res: float,
@@ -851,6 +859,22 @@ def gpga_backprojection_2d_core(
         Values from input data used in backprojection of each target in
         target_pos tensor. Shape is [ntargets, nsweeps].
     """
+    if isinstance(data, LazyData):
+        # Each output column depends only on its own sweep, so a lazy input
+        # is processed in bounded chunks and the full tensor is never
+        # resident. This keeps the gpga estimation stage memory efficient.
+        nsweeps = data.shape[0]
+        sweep_bytes = data.shape[1] * torch.empty(
+            0, dtype=data.dtype).element_size()
+        chunk = max(1, _LAZY_CHUNK_BYTES // max(1, sweep_bytes))
+        outs = []
+        for i0 in range(0, nsweeps, chunk):
+            i1 = min(i0 + chunk, nsweeps)
+            outs.append(gpga_backprojection_2d_core(
+                target_pos, data[i0:i1].load(), pos[i0:i1], fc, r_res,
+                d0=d0, interp_method=interp_method, data_fmod=data_fmod))
+        return torch.cat(outs, dim=1)
+
     nsweeps = data.shape[0]
     ntargets = target_pos.shape[0]
     sweep_samples = data.shape[1]

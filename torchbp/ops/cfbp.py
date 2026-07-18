@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from copy import deepcopy
 
 from .backproj import backprojection_cart_2d, _backprojection_cart_2d_tx_power_accum, _tx_power_finish
+from ..data import materialize as _materialize
 from ..util import center_pos
 from ._utils import unpack_cartesian_grid, parse_interp_method
 
@@ -318,6 +319,7 @@ def cfbp(
     """
     if hasattr(grid, "to_dict"):
         grid = grid.to_dict()
+    data = _materialize(data)
     if data.dim() != 2:
         raise ValueError("data shape should be [nsweeps, samples]")
     if pos.dim() != 2 or pos.shape[0] != data.shape[0]:
@@ -531,6 +533,7 @@ def cfbp_adaptive(
     """
     if hasattr(grid, "to_dict"):
         grid = grid.to_dict()
+    data = _materialize(data)
     x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
 
     blocks = cfbp_adaptive_blocks(

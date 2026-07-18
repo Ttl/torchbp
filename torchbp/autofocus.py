@@ -4,6 +4,7 @@ import numpy as np
 from torch import Tensor
 from typing import TYPE_CHECKING, Union, Tuple
 from .grid import unpack_polar_grid, unpack_cartesian_grid
+from .data import LazyData
 
 if TYPE_CHECKING:
     from .grid import PolarGrid, CartesianGrid
@@ -1192,7 +1193,7 @@ def _make_image_former(
 
 def gpga(
     img: Tensor | None,
-    data: Tensor,
+    data: Tensor | LazyData,
     pos: Tensor,
     fc: float,
     r_res: float,
@@ -1233,8 +1234,16 @@ def gpga(
         Complex input image. Shape should be: [Range, azimuth] for a polar
         grid or [x, y] for a Cartesian grid. If None image is generated from
         the data.
-    data : Tensor
+    data : Tensor or LazyData
         Range compressed input data. Shape should be [nsweeps, samples].
+        A :class:`torchbp.data.LazyData` source is read in bounded chunks by
+        the phase estimation stage and streamed leaf-by-leaf by
+        ``algorithm="ffbp"``, so data larger than memory can be focused;
+        other algorithms accept a lazy source but materialize it fully on
+        every image formation. A lazy source is re-read on every iteration:
+        if it has an expensive transform pipeline (range compression of raw
+        sweeps), wrap it in :class:`torchbp.data.CachedData` so the
+        pipeline runs only once per sweep.
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
     fc : float
@@ -1448,7 +1457,7 @@ def gpga(
 
 def gpga_tde(
     img: Tensor | None,
-    data: Tensor,
+    data: Tensor | LazyData,
     pos: Tensor,
     fc: float,
     r_res: float,
@@ -1502,8 +1511,13 @@ def gpga_tde(
     img : Tensor or None
         Complex input image. Shape should be: [Range, azimuth].
         If None image is generated from the data.
-    data : Tensor
+    data : Tensor or LazyData
         Range compressed input data. Shape should be [nsweeps, samples].
+        A :class:`torchbp.data.LazyData` source is supported like in
+        :func:`gpga`: chunked estimation reads, streaming image formation
+        with ``algorithm="ffbp"``, full materialization with the other
+        algorithms, re-read on every iteration (consider
+        :class:`torchbp.data.CachedData` for expensive pipelines).
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
     fc : float

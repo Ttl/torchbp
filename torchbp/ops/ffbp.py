@@ -10,6 +10,7 @@ from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weight
 from ..util import center_pos
 from copy import deepcopy
 from ._utils import AntennaPattern, unpack_polar_grid, parse_interp_method
+from ..data import LazyData, materialize as _materialize
 
 if TYPE_CHECKING:
     from ..grid import PolarGrid
@@ -204,7 +205,7 @@ def _weighted_normalize(
 
 
 def ffbp(
-    data: Tensor,
+    data: Tensor | LazyData,
     grid: "PolarGrid | dict",
     fc: float,
     r_res: float,
@@ -236,8 +237,13 @@ def ffbp(
 
     Parameters
     ----------
-    data : Tensor
+    data : Tensor or LazyData
         Range compressed input data. Shape should be [nsweeps, samples].
+        A :class:`torchbp.data.LazyData` source is sliced lazily down the
+        recursion tree and materialized one leaf subaperture at a time, so
+        data much larger than memory can be processed; peak data residency
+        is one leaf's pulses. No gradient flows to the data through a lazy
+        source.
     grid : PolarGrid or dict
         Polar grid definition. Can be:
 
@@ -829,6 +835,10 @@ def _ffbp_impl(
                 antenna_leaf_gain=antenna_leaf_gain,
             )
         else:
+            # Leaf of the merge tree: this is the only place the recursion
+            # consumes raw data, so a lazy input is materialized here and
+            # only ever leaf-sized chunks are resident.
+            data_local = _materialize(data_local)
             # When using antenna pattern, request unnormalized output
             normalize = not use_antenna_pattern
             dem_local = None

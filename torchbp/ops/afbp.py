@@ -12,6 +12,7 @@ from .backproj import (
     _prepare_backprojection_polar_2d_knab_args,
 )
 from ._utils import unpack_polar_grid, parse_interp_method
+from ..data import materialize as _materialize
 from ..util import next_fast_len
 
 if TYPE_CHECKING:
@@ -255,6 +256,10 @@ def afbp(
         raise NotImplementedError(
             "afbp does not support dem; use ffbp (with afbp_nsub=1) or "
             "backprojection_polar_2d")
+    # The wavenumber-domain fusion gathers pulses with an index tensor, so
+    # a lazy input is materialized whole here: afbp accepts LazyData but is
+    # not memory efficient with it (inside ffbp the input is leaf-sized).
+    data = _materialize(data)
     if data.dim() != 2:
         raise ValueError("data shape should be [nsweeps, samples]")
     if pos.dim() != 2 or pos.shape[0] != data.shape[0]:
