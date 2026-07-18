@@ -229,6 +229,7 @@ def ffbp(
     afbp_nsub: int = 1,
     guard_max_ratio: float = 0.125,
     dem: Tensor | None = None,
+    antenna_leaf_gain: str = "pulse",
 ) -> Tensor:
     """
     Fast factorized backprojection.
@@ -376,6 +377,24 @@ def ffbp(
         supported together with ``afbp_nsub > 1``. With an antenna pattern
         both the per-pulse gain weighting and the W1/W2 illumination
         normalization maps reference the DEM look angles.
+    antenna_leaf_gain : str
+        Granularity of the antenna gain weighting at the base level
+        subaperture backprojections (ignored without an antenna pattern):
+
+        - "pulse" (default): exact per-pulse gain toward each pixel inside
+          the backprojection kernel.
+        - "subaperture": approximate the gain as constant over each base
+          subaperture: the leaves run the plain (unweighted) backprojection
+          and are multiplied by a per-pixel mean gain map computed from a
+          few sampled pulses, with the W1/W2 moments taken consistently as
+          ``n*w`` and ``n*w**2``. The merges still weight the subapertures
+          against each other exactly, so this only freezes the gain
+          variation *within* one leaf: the approximation error scales with
+          how much the antenna footprint moves (platform motion, yaw
+          oscillation) over one leaf subaperture, so it is accurate for
+          short leaves (enough ``stages``) and fast agile-beam data should
+          keep "pulse". Ignored for the afbp base level
+          (``afbp_nsub > 1``), which keeps per-pulse gain.
 
     Returns
     -------
@@ -417,6 +436,9 @@ def ffbp(
             raise ValueError("g_extent must be provided when antenna pattern g is specified")
         if att.shape[0] != nsweeps:
             raise ValueError(f"att must have {nsweeps} sweeps, got {att.shape[0]}")
+    if antenna_leaf_gain not in ("pulse", "subaperture"):
+        raise ValueError(f"antenna_leaf_gain must be 'pulse' or 'subaperture', "
+                         f"got {antenna_leaf_gain!r}")
 
     if dem is not None:
         if afbp_nsub > 1:
@@ -455,6 +477,7 @@ def ffbp(
         dem=dem,
         dem_grid=grid,
         data_interp_method=data_interp_method,
+        antenna_leaf_gain=antenna_leaf_gain,
     )
     # A small shortfall only truncates the window support of guard bins,
     # whose error reaches the scene attenuated by the interpolation kernel
@@ -571,6 +594,7 @@ def _ffbp_impl(
     dem_grid: dict | None = None,
     dem_off: Tensor | None = None,
     data_interp_method: "str | tuple" = "linear",
+    antenna_leaf_gain: str = "pulse",
 ) -> Tensor:
     """Internal implementation of ffbp with precomputed polynomial coefficients.
 
@@ -802,6 +826,7 @@ def _ffbp_impl(
                 dem_grid=dem_grid,
                 dem_off=dem_off_local,
                 data_interp_method=data_interp_method,
+                antenna_leaf_gain=antenna_leaf_gain,
             )
         else:
             # When using antenna pattern, request unnormalized output
@@ -830,14 +855,51 @@ def _ffbp_impl(
                 # returns them for free instead of recomputing the same
                 # angle pass with compute_illumination, which costs a large
                 # fraction of the backprojection itself.
+                sub_gain = use_antenna_pattern and antenna_leaf_gain == "subaperture"
                 fused_illum = (
                     use_antenna_pattern
+                    and not sub_gain
                     and data_local.device.type == "cpu"
                     and data_interp_method[0] in ("linear", "knab")
                     and not (torch.is_grad_enabled()
                              and (data_local.requires_grad or pos_local.requires_grad))
                 )
-                if fused_illum:
+                if sub_gain:
+                    # Constant-gain-per-leaf approximation: the plain
+                    # backprojection sums the pulses unweighted and the mean
+                    # gain map wbar (sampled from a few pulses, the same
+                    # slow-footprint argument as
+                    # _illumination_pulse_decimated) multiplies the image:
+                    # A = wbar * sum(s). The moments are taken consistently
+                    # with that model (W1 = n*wbar, W2 = n*wbar**2), so a
+                    # truly constant gain recovers the exact weighted
+                    # result; the error is the gain variation over one leaf.
+                    img = backprojection_polar_2d(
+                        data_local, grid_local, fc, r_res, pos_local, d0=d0,
+                        dealias=True,
+                        data_fmod=data_fmod, alias_fmod=alias_fmod,
+                        dem=dem_local,
+                        interp_method=data_interp_method,
+                    )
+                    n_p = pos_local.shape[0]
+                    m = min(n_p, 8)
+                    if m < n_p:
+                        pidx = torch.linspace(
+                            0, n_p - 1, m, device=pos_local.device).round().long()
+                        pos_g = pos_local[pidx]
+                        att_g = att_local[pidx]
+                    else:
+                        pos_g = pos_local
+                        att_g = att_local
+                    w1_full, _ = compute_subaperture_illumination(
+                        pos_g, att_g, g, g_extent, grid_local,
+                        decimation=1, dem=dem_local)
+                    # Scale the m-pulse sum to the full pulse count.
+                    w1_full *= n_p / m
+                    img = img * (w1_full / n_p)
+                    w1_full = w1_full[None]
+                    w2_full = w1_full * w1_full / n_p
+                elif fused_illum:
                     img, w1_full, w2_full = _backprojection_polar_2d_illum(
                         data_local, grid_local, fc, r_res, pos_local, d0=d0,
                         dealias=True,
