@@ -33,6 +33,9 @@ import inspect
 from scipy import signal
 from copy import deepcopy
 
+#: Speed of light in vacuum [m/s]. Must match ``kC0`` in ``csrc/cpu/util.h``.
+C0 = 299792458.0
+
 
 def pga_estimator(
     g: Tensor,
@@ -550,9 +553,8 @@ def phase_to_pos(
     dev = phi.device
     rdtype = phi.dtype
     pos = pos.to(device=dev, dtype=rdtype)
-    c0 = 299792458.0
-    wl = c0 / fc
-    k_wave = 4 * torch.pi * fc / c0
+    wl = C0 / fc
+    k_wave = 4 * torch.pi * fc / C0
     if not shifted:
         phi = torch.fft.fftshift(phi)
     # Grid-center look geometry, scene assumed at z=0.
@@ -715,8 +717,7 @@ def pga_xz(
         raise ValueError("estimate_z requires range_divisions >= 2.")
     dev = img.device
     rdtype = img.real.dtype
-    c0 = 299792458.0
-    k_wave = 4 * torch.pi * fc / c0
+    k_wave = 4 * torch.pi * fc / C0
 
     # Per-row look geometry: grid r is ground range from the platform
     # reference (origin), scene assumed at z=0.
@@ -1530,8 +1531,7 @@ def gpga(
         if remove_trend:
             phi_sum = weighted_detrend(phi_sum, beam_w)
         # Phase to distance
-        c0 = 299792458
-        d = phi_sum * c0 / (4 * torch.pi * fc)
+        d = phi_sum * C0 / (4 * torch.pi * fc)
         pos_new[:, 0] = pos[:, 0] + d
 
         img = form_image(pos_new)
@@ -1791,7 +1791,7 @@ def gpga_tde(
     if h == 0:
         estimate_z = False
 
-    wl = 3e8 / fc
+    wl = C0 / fc
 
     if verbose:
         print("Iteration, Window width, RMS error")
@@ -1883,8 +1883,7 @@ def gpga_tde(
                 phi = unwrap(phi)
                 phi = weighted_detrend(phi, beam_w)
                 # Phase to distance
-                c0 = 299792458
-                d = phi * c0 / (4 * torch.pi * fc)
+                d = phi * C0 / (4 * torch.pi * fc)
                 local_d[ir * azimuth_divisions + jr, :] = d
 
                 # Normalize to avoid overflow with near-noiseless targets.
@@ -2129,7 +2128,6 @@ def insar_rme_blocksvd(
         ``-angle(v_complex)`` (before mean removal and unwrapping).
     """
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
-    c0 = 299792458.0
     device = data_s.device
     nsweeps_s = data_s.shape[0]
 
@@ -2252,7 +2250,7 @@ def insar_rme_blocksvd(
     phi = unwrap(phi)
     phi = phi - phi.mean()
 
-    d_corr = phi * (c0 / (4.0 * torch.pi * fc))
+    d_corr = phi * (C0 / (4.0 * torch.pi * fc))
     pos_s_new = pos_s.clone()
     pos_s_new[:, 0] = pos_s[:, 0] + d_corr
 
@@ -2395,7 +2393,6 @@ def insar_rme_blocksvd_strata(
     r0_full, r1_full, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(
         grid_polar
     )
-    c0 = 299792458.0
     device = data_s.device
     nsweeps_s = data_s.shape[0]
     n_axes = 1 + int(estimate_z)
@@ -2526,7 +2523,7 @@ def insar_rme_blocksvd_strata(
             phi_s = unwrap(phi_raw)
         phi_s = phi_s - phi_s.mean()
         phi_per_strata[s] = phi_s
-        dr_per_strata[s] = phi_s * (c0 / (4.0 * torch.pi * fc))
+        dr_per_strata[s] = phi_s * (C0 / (4.0 * torch.pi * fc))
         mag_per_strata[s] = v_s.abs()
         strata_rc[s] = rc
         strata_valid[s] = True
@@ -2844,8 +2841,7 @@ def insar_rme_multisquint(
     r0_full, r1_full, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(
         grid_polar
     )
-    c0 = 299792458.0
-    wl = c0 / fc
+    wl = C0 / fc
     k = 4.0 * torch.pi / wl
     device = img_s.device
     nsweeps = pos_s.shape[0]
@@ -3398,7 +3394,7 @@ def minimum_entropy_grad_autofocus(
     pos_orig = pos.clone()
     vopt.requires_grad = True
 
-    wl = 3e8 / fc
+    wl = C0 / fc
     lr = lr_max
 
     opt = torch.optim.SGD([vopt], momentum=0, lr=1)
