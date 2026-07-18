@@ -1,0 +1,26 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+
+# Docs build output
+docs/build/
+
+# Editor / scratch files
+*.bak
+*.orig
+*.rej
+*.patch
+
+# Example and test outputs
+examples/*.png
+examples/*.p
+examples/*.safetensors
