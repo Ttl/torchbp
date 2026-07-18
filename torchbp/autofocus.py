@@ -40,6 +40,8 @@ def pga_estimator(
     return_weight: bool = False,
     weight: Tensor | None = None,
     weight_gate: float = 0.2,
+    weight_norm: Tensor | None = None,
+    weight_pair: Tensor | None = None,
 ) -> Union[Tuple[Tensor, Tensor], Tensor]:
     """
     Estimate phase error from set of measurements.
@@ -69,6 +71,14 @@ def pga_estimator(
         Relative weight (to each target's maximum) below which a sample is
         considered out of beam for the "wls" amplitude statistics and the
         "ml" gating.
+    weight_norm : Tensor or None
+        Optional precomputed ``weight / max(weight, dim=1)``; skips the
+        per-call normalization when the same weights are reused over many
+        calls. Must match ``weight``.
+    weight_pair : Tensor or None
+        Optional precomputed ``weight_norm * shift(weight_norm)`` pair
+        product (``wn * pad(wn[..., :-1], (1, 0))``), same reuse purpose.
+        Must match ``weight``.
 
     References
     ----------
@@ -92,13 +102,19 @@ def pga_estimator(
     """
     tiny = 1e-12
     if weight is not None:
-        wn = weight / torch.clamp(
-            torch.amax(weight, dim=1, keepdim=True), min=tiny
-        )
+        if weight_norm is not None:
+            wn = weight_norm
+        else:
+            wn = weight / torch.clamp(
+                torch.amax(weight, dim=1, keepdim=True), min=tiny
+            )
         in_beam = wn > weight_gate
         # Weight for the phase-difference products between consecutive
         # measurements: both samples of the pair must be in the beam.
-        wpair = wn * torch.nn.functional.pad(wn[..., :-1], (1, 0))
+        if weight_pair is not None:
+            wpair = weight_pair
+        else:
+            wpair = wn * torch.nn.functional.pad(wn[..., :-1], (1, 0))
     if estimator == "ml":
         gw = g if weight is None else g * in_beam
         u, s, v = torch.linalg.svd(gw)
@@ -972,20 +988,31 @@ class _AntennaWeightCache:
         )
         self._pos_ref = None
         self._r_min = float("inf")
-        # key -> (target position [3], weight row [nsweeps])
+        # key -> (target position [3], weight row [nsweeps]). Only the raw
+        # rows are cached: the derived wn/wpair products are recomputed
+        # per call as whole-matrix ops, which is a few cheap passes,
+        # instead of tripling the cache's resident memory (the rows
+        # already reach hundreds of MB on large scenes).
         self._rows = {}
 
-    def get(self, keys: list, target_pos: Tensor, pos: Tensor) -> Tensor:
+    def get(
+        self, keys: list, target_pos: Tensor, pos: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Weight rows for the targets identified by hashable ``keys``.
 
-        Equal to ``_antenna_weights(target_pos, pos, ...)`` up to the
-        drift tolerance. Entries whose key is not in ``keys`` are dropped,
-        so the cache holds one iteration's worth of rows.
+        Returns ``(w, wn, wpair)``: the ``_antenna_weights(target_pos,
+        pos, ...)`` rows (up to the drift tolerance) plus their derived
+        per-target normalization ``wn = w / max(w)`` and pair product
+        ``wpair = wn * shift(wn)`` that the wls estimator and the beam
+        gating consume every iteration. Entries whose key is not in
+        ``keys`` are dropped, so the cache holds one iteration's worth of
+        rows.
         """
         if len(keys) == 0:
-            return _antenna_weights(
+            w = _antenna_weights(
                 target_pos, pos, self._att, self._g, self._g_extent
             )
+            return w, w.clone(), w.clone()
         if self._pos_ref is not None:
             drift = float(
                 torch.max(torch.linalg.norm(pos - self._pos_ref, dim=-1))
@@ -1025,9 +1052,11 @@ class _AntennaWeightCache:
             )
             for j, i in enumerate(missing):
                 self._rows[keys[i]] = (target_pos[i], w_new[j])
-        out = torch.stack([self._rows[k][1] for k in keys])
+        w = torch.stack([self._rows[k][1] for k in keys])
         self._rows = {k: self._rows[k] for k in keys}
-        return out
+        wn = w / torch.clamp(torch.amax(w, dim=1, keepdim=True), min=1e-12)
+        wpair = wn * torch.nn.functional.pad(wn[..., :-1], (1, 0))
+        return w, wn, wpair
 
 
 def _select_targets(
@@ -1378,27 +1407,29 @@ def gpga(
         )
         target_w = None
         beam_w = None
+        target_wn = None
+        target_wpair = None
         if use_antenna_weight:
             keys = rows.tolist()
-            target_w = ant_cache.get(keys, target_pos, pos_new)
+            target_w, target_wn, target_wpair = ant_cache.get(
+                keys, target_pos, pos_new
+            )
             # Zero the out-of-beam samples before lowpass filtering so
             # unrelated clutter at the target's range ring is not smeared
             # into the illuminated interval.
-            wn = target_w / torch.clamp(
-                torch.amax(target_w, dim=1, keepdim=True), min=1e-12
-            )
-            target_data = target_data * (wn > beam_gate)
+            target_data = target_data * (target_wn > beam_gate)
             # Per-sweep illumination for the trend fit. Sweeps that no
             # target illuminates only hold a constant extrapolated phase
             # and would bias an unweighted line fit.
-            beam_w = torch.sum(wn**2, dim=0)
+            beam_w = torch.sum(target_wn**2, dim=0)
         # Filter samples
         if window_width is not None and window_width < target_data.shape[1]:
             target_data = fft_lowpass_filter_window(
                 target_data, window=lp_w, window_width=window_width
             )
         phi = pga_estimator(
-            target_data, estimator, eps, weight=target_w, weight_gate=beam_gate
+            target_data, estimator, eps, weight=target_w, weight_gate=beam_gate,
+            weight_norm=target_wn, weight_pair=target_wpair,
         )
         phi_sum = unwrap(phi_sum + phi)
         if remove_trend:
@@ -1716,17 +1747,17 @@ def gpga_tde(
                     data_fmod=data_fmod,
                 )
                 target_w = None
+                target_wn = None
+                target_wpair = None
                 if use_antenna_weight:
                     keys = rows.tolist()
-                    target_w = ant_caches[
+                    target_w, target_wn, target_wpair = ant_caches[
                         ir * azimuth_divisions + jr
                     ].get(keys, target_pos, pos_new)
                     # Zero the out-of-beam samples before lowpass filtering
                     # so unrelated clutter at the target's range ring is not
                     # smeared into the illuminated interval.
-                    awn = target_w / torch.clamp(
-                        torch.amax(target_w, dim=1, keepdim=True), min=1e-12
-                    )
+                    awn = target_wn
                     target_data = target_data * (awn > beam_gate)
                 # Filter samples
                 if window_width is not None and window_width < target_data.shape[1]:
@@ -1736,6 +1767,7 @@ def gpga_tde(
                 phi, w = pga_estimator(
                     target_data, "wls", eps, return_weight=True,
                     weight=target_w, weight_gate=beam_gate,
+                    weight_norm=target_wn, weight_pair=target_wpair,
                 )
                 block_w = 1 / torch.sum(1 / w)
                 beam_w = None
