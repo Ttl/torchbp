@@ -945,6 +945,91 @@ def _antenna_weights(
     return torch.where(valid, w, torch.zeros_like(w))
 
 
+class _AntennaWeightCache:
+    """Cache of :func:`_antenna_weights` rows across gpga iterations.
+
+    The weight row of a target is insensitive to look-angle changes well
+    below the pattern table cell size, and between autofocus iterations
+    both endpoints move far less than that: the track by the per-iteration
+    position correction, and the target by however far the per-row argmax
+    reselection drifts (typically a pixel). Rows are therefore cached by
+    the target's image row (selection picks at most one target per row)
+    and reused while both stay inside an angular budget of half a pattern
+    cell at the nearest cached target range: the whole cache is emptied
+    when the track drifts past it, and an individual row is recomputed
+    when its reselected target moved past it. Only targets failing these
+    checks are recomputed, so the weight error is bounded by about one
+    pattern cell's worth of the cell-to-cell variation.
+    """
+
+    def __init__(self, att: Tensor, g: Tensor, g_extent: list):
+        self._att = att
+        self._g = g
+        self._g_extent = g_extent
+        g_el0, g_az0, g_el1, g_az1 = g_extent
+        self._tol = 0.5 * min(
+            (g_el1 - g_el0) / g.shape[0], (g_az1 - g_az0) / g.shape[1]
+        )
+        self._pos_ref = None
+        self._r_min = float("inf")
+        # key -> (target position [3], weight row [nsweeps])
+        self._rows = {}
+
+    def get(self, keys: list, target_pos: Tensor, pos: Tensor) -> Tensor:
+        """Weight rows for the targets identified by hashable ``keys``.
+
+        Equal to ``_antenna_weights(target_pos, pos, ...)`` up to the
+        drift tolerance. Entries whose key is not in ``keys`` are dropped,
+        so the cache holds one iteration's worth of rows.
+        """
+        if len(keys) == 0:
+            return _antenna_weights(
+                target_pos, pos, self._att, self._g, self._g_extent
+            )
+        if self._pos_ref is not None:
+            drift = float(
+                torch.max(torch.linalg.norm(pos - self._pos_ref, dim=-1))
+            )
+            if drift > self._r_min * self._tol:
+                self._rows.clear()
+                self._pos_ref = None
+        if self._pos_ref is None:
+            self._pos_ref = pos.clone()
+            self._r_min = float("inf")
+        missing = [i for i, k in enumerate(keys) if k not in self._rows]
+        hits = [i for i, k in enumerate(keys) if k in self._rows]
+        if hits:
+            # One vectorized distance check (and one device sync) for all
+            # cached candidates: a reselected target that moved past the
+            # angular budget gets its row recomputed.
+            cached_pos = torch.stack([self._rows[keys[i]][0] for i in hits])
+            far = (
+                torch.linalg.norm(target_pos[hits] - cached_pos, dim=-1)
+                > self._r_min * self._tol
+            ).tolist()
+            missing += [i for i, f in zip(hits, far) if f]
+            missing.sort()
+        if missing:
+            miss_pos = target_pos[missing]
+            w_new = _antenna_weights(
+                miss_pos, pos, self._att, self._g, self._g_extent
+            )
+            # Conservative lower bound of the target range for the drift
+            # tolerance: distance to the track centroid minus the track
+            # radius.
+            c = torch.mean(pos, dim=0)
+            track_r = torch.max(torch.linalg.norm(pos - c, dim=-1))
+            d_min = torch.min(torch.linalg.norm(miss_pos - c, dim=-1))
+            self._r_min = min(
+                self._r_min, max(float(d_min - track_r), 1.0)
+            )
+            for j, i in enumerate(missing):
+                self._rows[keys[i]] = (target_pos[i], w_new[j])
+        out = torch.stack([self._rows[k][1] for k in keys])
+        self._rows = {k: self._rows[k] for k in keys}
+        return out
+
+
 def _select_targets(
     img: Tensor,
     target_threshold_db: float,
@@ -1265,6 +1350,10 @@ def gpga(
         att is not None and g is not None and g_extent is not None
     )
 
+    ant_cache = (
+        _AntennaWeightCache(att, g, g_extent) if use_antenna_weight else None
+    )
+
     if window_width is None:
         window_width = data.shape[0]
 
@@ -1290,7 +1379,8 @@ def gpga(
         target_w = None
         beam_w = None
         if use_antenna_weight:
-            target_w = _antenna_weights(target_pos, pos_new, att, g, g_extent)
+            keys = rows.tolist()
+            target_w = ant_cache.get(keys, target_pos, pos_new)
             # Zero the out-of-beam samples before lowpass filtering so
             # unrelated clutter at the target's range ring is not smeared
             # into the illuminated interval.
@@ -1529,6 +1619,13 @@ def gpga_tde(
     use_antenna_weight = (
         att is not None and g is not None and g_extent is not None
     )
+    # Per-block caches: target keys are block-local row indices.
+    ant_caches = None
+    if use_antenna_weight:
+        ant_caches = [
+            _AntennaWeightCache(att, g, g_extent)
+            for _ in range(range_divisions * azimuth_divisions)
+        ]
 
     if window_width is None:
         window_width = data.shape[0] // azimuth_divisions
@@ -1620,9 +1717,10 @@ def gpga_tde(
                 )
                 target_w = None
                 if use_antenna_weight:
-                    target_w = _antenna_weights(
-                        target_pos, pos_new, att, g, g_extent
-                    )
+                    keys = rows.tolist()
+                    target_w = ant_caches[
+                        ir * azimuth_divisions + jr
+                    ].get(keys, target_pos, pos_new)
                     # Zero the out-of-beam samples before lowpass filtering
                     # so unrelated clutter at the target's range ring is not
                     # smeared into the illuminated interval.
