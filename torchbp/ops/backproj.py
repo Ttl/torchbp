@@ -257,6 +257,54 @@ def backprojection_polar_2d(
     return torch.ops.torchbp.backprojection_polar_2d.default(*cpp_args)
 
 
+def _backprojection_polar_2d_illum(
+    data: Tensor,
+    grid: "PolarGrid | dict",
+    fc: float,
+    r_res: float,
+    pos: Tensor,
+    d0: float = 0.0,
+    dealias: bool = False,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    data_fmod: float = 0,
+    alias_fmod: float = 0,
+    normalize: bool = False,
+    dem: Tensor | None = None,
+    interp_method: "str | tuple" = "linear",
+) -> tuple:
+    """Fused :func:`backprojection_polar_2d` + illumination moments (CPU only).
+
+    Returns ``(img, w1, w2)`` where ``w1``/``w2`` are the [nbatch, nr, ntheta]
+    per-pixel illumination moments ``W1 = sum(g)`` and ``W2 = sum(g**2)`` that
+    the antenna-weighted backprojection accumulates anyway. Equivalent to a
+    separate :func:`compute_subaperture_illumination` call at ``decimation=1``
+    except that pixels outside the data range window have zero weight (they
+    contribute no data to the image either). Requires an antenna pattern.
+    No gradient support.
+    """
+    interp_method = parse_interp_method(interp_method)
+    if interp_method[0] == "linear":
+        cpp_args = _prepare_backprojection_polar_2d_args(
+            data, grid, fc, r_res, pos, d0, dealias, att, g, g_extent,
+            data_fmod, alias_fmod, normalize, dem
+        )
+        ret = torch.ops.torchbp.backprojection_polar_2d_illum.default(*cpp_args)
+    elif interp_method[0] == "knab":
+        cpp_args = _prepare_backprojection_polar_2d_knab_args(
+            data, grid, fc, r_res, pos, d0, dealias, interp_method[1],
+            interp_method[2], att, g, g_extent, data_fmod, alias_fmod,
+            normalize, dem
+        )
+        ret = torch.ops.torchbp.backprojection_polar_2d_knab_illum.default(*cpp_args)
+    else:
+        raise ValueError(
+            f"interp_method={interp_method[0]!r} not supported with fused "
+            "illumination output")
+    return ret[0], ret[1], ret[2]
+
+
 def backprojection_polar_2d_lanczos(
     data: Tensor,
     grid: "PolarGrid | dict",

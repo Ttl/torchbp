@@ -65,6 +65,8 @@ static void backprojection_polar_2d_row_cpu(
           const float* pos,
           const float* att,
           complex64_t* img,
+          float* w1_out,
+          float* w2_out,
           int sweep_samples,
           int nsweeps,
           float ref_phase,
@@ -237,6 +239,10 @@ static void backprojection_polar_2d_row_cpu(
             if (g != nullptr) {
                 const float att0 = att[idbatch * nsweeps * 3 + 3 * i + 0];
                 const float att2 = att[idbatch * nsweeps * 3 + 3 * i + 2];
+                // Reciprocal multiplies: the compiler keeps /g_del as a
+                // vdivps per pixel without -ffast-math.
+                const float g_del_inv = 1.0f / g_del;
+                const float g_daz_inv = 1.0f / g_daz;
                 // Angle pass: bilinear antenna pattern coordinates.
                 // Out-of-pattern pixels get gvld = 0 and read pattern
                 // element 0.
@@ -256,8 +262,8 @@ static void backprojection_polar_2d_row_cpu(
                     const float el_deg = look_angle - att0;
                     const float az_deg = atan2f_fast(py, px) - att2;
 
-                    const float el_idx = (el_deg - g_el0) / g_del;
-                    const float az_idx = (az_deg - g_az0) / g_daz;
+                    const float el_idx = (el_deg - g_el0) * g_del_inv;
+                    const float az_idx = (az_deg - g_az0) * g_daz_inv;
 
                     const int el_int = (int)el_idx;
                     const int az_int = (int)az_idx;
@@ -502,6 +508,21 @@ static void backprojection_polar_2d_row_cpu(
                 }
             }
         }
+        // Raw illumination moments of the row: the antenna path accumulates
+        // per pixel exactly the W1 = Σg and W2 = Σg² maps that
+        // compute_illumination would recompute from scratch, so the fused
+        // op stores them for free. Unlike compute_illumination the sums
+        // also carry the data range window mask (vld), which zeroes the
+        // moments of pixels that received no data.
+        if (g != nullptr && w1_out != nullptr) {
+            float* w1_row = w1_out + ((size_t)idbatch * Nr + idr) * Ntheta;
+            float* w2_row = w2_out + ((size_t)idbatch * Nr + idr) * Ntheta;
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                w1_row[tb + q] = wsum_buf[q];
+                w2_row[tb + q] = wsum2_buf[q];
+            }
+        }
         // Normalize to same average as without antenna pattern.
         // Unweighted: Σs = scene * Σg (signal has g)
         // Weighted: Σ(s * g) = scene * Σg²
@@ -616,6 +637,8 @@ static void backprojection_polar_2d_knab_row_cpu(
           const float* pos,
           const float* att,
           complex64_t* img,
+          float* w1_out,
+          float* w2_out,
           int sweep_samples,
           int nsweeps,
           float ref_phase,
@@ -816,6 +839,9 @@ static void backprojection_polar_2d_knab_row_cpu(
             if (g != nullptr) {
                 const float att0 = att[idbatch * nsweeps * 3 + 3 * i + 0];
                 const float att2 = att[idbatch * nsweeps * 3 + 3 * i + 2];
+                // Reciprocal multiplies, see backprojection_polar_2d_row_cpu.
+                const float g_del_inv = 1.0f / g_del;
+                const float g_daz_inv = 1.0f / g_daz;
                 // Angle pass: bilinear antenna pattern coordinates, same as
                 // backprojection_polar_2d_row_cpu.
 #pragma omp simd
@@ -834,8 +860,8 @@ static void backprojection_polar_2d_knab_row_cpu(
                     const float el_deg = look_angle - att0;
                     const float az_deg = atan2f_fast(py, px) - att2;
 
-                    const float el_idx = (el_deg - g_el0) / g_del;
-                    const float az_idx = (az_deg - g_az0) / g_daz;
+                    const float el_idx = (el_deg - g_el0) * g_del_inv;
+                    const float az_idx = (az_deg - g_az0) * g_daz_inv;
 
                     const int el_int = (int)el_idx;
                     const int az_int = (int)az_idx;
@@ -991,6 +1017,17 @@ static void backprojection_polar_2d_knab_row_cpu(
                 }
             }
         }
+        // Raw illumination moments of the row, see
+        // backprojection_polar_2d_row_cpu.
+        if (g != nullptr && w1_out != nullptr) {
+            float* w1_row = w1_out + ((size_t)idbatch * Nr + idr) * Ntheta;
+            float* w2_row = w2_out + ((size_t)idbatch * Nr + idr) * Ntheta;
+#pragma omp simd
+            for (int q = 0; q < nchunk; q++) {
+                w1_row[tb + q] = wsum_buf[q];
+                w2_row[tb + q] = wsum2_buf[q];
+            }
+        }
         // Normalization and dealias epilogue, same as
         // backprojection_polar_2d_row_cpu.
         if (g != nullptr && normalize) {
@@ -1035,7 +1072,7 @@ static void backprojection_polar_2d_knab_row_cpu(
 }
 
 
-at::Tensor backprojection_polar_2d_cpu(
+static at::Tensor backprojection_polar_2d_core_cpu(
           const at::Tensor &data,
           const at::Tensor &pos,
           const at::Tensor &att,
@@ -1063,7 +1100,9 @@ at::Tensor backprojection_polar_2d_cpu(
           double data_fmod,
           double alias_fmod,
           bool normalize,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          float* w1_out_ptr,
+          float* w2_out_ptr) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
@@ -1138,6 +1177,8 @@ at::Tensor backprojection_polar_2d_cpu(
                           pos_ptr,
                           att_ptr,
                           img_ptr,
+                          w1_out_ptr,
+                          w2_out_ptr,
                           sweep_samples,
                           nsweeps,
                           ref_phase,
@@ -1168,7 +1209,93 @@ at::Tensor backprojection_polar_2d_cpu(
 	return img;
 }
 
-at::Tensor backprojection_polar_2d_knab_cpu(
+at::Tensor backprojection_polar_2d_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          int64_t dealias,
+          double z0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          double data_fmod,
+          double alias_fmod,
+          bool normalize,
+          const at::Tensor &dem) {
+    return backprojection_polar_2d_core_cpu(
+        data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
+        r0, dr, theta0, dtheta, Nr, Ntheta, d0, dealias, z0,
+        g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+        data_fmod, alias_fmod, normalize, dem, nullptr, nullptr);
+}
+
+// Fused backprojection + illumination moments: like
+// backprojection_polar_2d_cpu with an antenna pattern, but also returns
+// the per-pixel W1 = Σg and W2 = Σg² illumination maps that the antenna
+// path accumulates anyway (compute_illumination recomputes the identical
+// angle pass, which costs a large fraction of the backprojection itself).
+// Unlike compute_illumination the moments carry the data range window
+// mask, so pixels that received no data have zero weight.
+std::vector<at::Tensor> backprojection_polar_2d_illum_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          int64_t dealias,
+          double z0,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          double data_fmod,
+          double alias_fmod,
+          bool normalize,
+          const at::Tensor &dem) {
+    TORCH_CHECK(g.defined(),
+        "backprojection_polar_2d_illum requires an antenna pattern");
+    auto wopts = torch::TensorOptions().dtype(at::kFloat).device(data.device());
+    at::Tensor w1 = torch::empty({nbatch, Nr, Ntheta}, wopts);
+    at::Tensor w2 = torch::empty({nbatch, Nr, Ntheta}, wopts);
+    at::Tensor img = backprojection_polar_2d_core_cpu(
+        data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
+        r0, dr, theta0, dtheta, Nr, Ntheta, d0, dealias, z0,
+        g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+        data_fmod, alias_fmod, normalize, dem,
+        w1.data_ptr<float>(), w2.data_ptr<float>());
+    return {img, w1, w2};
+}
+
+static at::Tensor backprojection_polar_2d_knab_core_cpu(
           const at::Tensor &data,
           const at::Tensor &pos,
           const at::Tensor &att,
@@ -1198,7 +1325,9 @@ at::Tensor backprojection_polar_2d_knab_cpu(
           double data_fmod,
           double alias_fmod,
           bool normalize,
-          const at::Tensor &dem) {
+          const at::Tensor &dem,
+          float* w1_out_ptr,
+          float* w2_out_ptr) {
 	TORCH_CHECK(pos.dtype() == at::kFloat);
 	TORCH_CHECK(data.dtype() == at::kComplexFloat);
 	TORCH_INTERNAL_ASSERT(pos.device().type() == at::DeviceType::CPU);
@@ -1290,6 +1419,8 @@ at::Tensor backprojection_polar_2d_knab_cpu(
                               pos_ptr,
                               att_ptr,
                               img_ptr,
+                              w1_out_ptr,
+                              w2_out_ptr,
                               sweep_samples,
                               nsweeps,
                               ref_phase,
@@ -1332,6 +1463,91 @@ at::Tensor backprojection_polar_2d_knab_cpu(
     case 16: launch(std::integral_constant<int, 16>{}); break;
     }
 	return img;
+}
+
+at::Tensor backprojection_polar_2d_knab_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          int64_t dealias,
+          double z0,
+          int64_t order,
+          double oversample,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          double data_fmod,
+          double alias_fmod,
+          bool normalize,
+          const at::Tensor &dem) {
+    return backprojection_polar_2d_knab_core_cpu(
+        data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
+        r0, dr, theta0, dtheta, Nr, Ntheta, d0, dealias, z0,
+        order, oversample, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+        data_fmod, alias_fmod, normalize, dem, nullptr, nullptr);
+}
+
+// Fused knab backprojection + illumination moments, see
+// backprojection_polar_2d_illum_cpu.
+std::vector<at::Tensor> backprojection_polar_2d_knab_illum_cpu(
+          const at::Tensor &data,
+          const at::Tensor &pos,
+          const at::Tensor &att,
+          int64_t nbatch,
+          int64_t sweep_samples,
+          int64_t nsweeps,
+          double fc,
+          double r_res,
+          double r0,
+          double dr,
+          double theta0,
+          double dtheta,
+          int64_t Nr,
+          int64_t Ntheta,
+          double d0,
+          int64_t dealias,
+          double z0,
+          int64_t order,
+          double oversample,
+          const at::Tensor &g,
+          double g_az0,
+          double g_el0,
+          double g_daz,
+          double g_del,
+          int64_t g_naz,
+          int64_t g_nel,
+          double data_fmod,
+          double alias_fmod,
+          bool normalize,
+          const at::Tensor &dem) {
+    TORCH_CHECK(g.defined(),
+        "backprojection_polar_2d_knab_illum requires an antenna pattern");
+    auto wopts = torch::TensorOptions().dtype(at::kFloat).device(data.device());
+    at::Tensor w1 = torch::empty({nbatch, Nr, Ntheta}, wopts);
+    at::Tensor w2 = torch::empty({nbatch, Nr, Ntheta}, wopts);
+    at::Tensor img = backprojection_polar_2d_knab_core_cpu(
+        data, pos, att, nbatch, sweep_samples, nsweeps, fc, r_res,
+        r0, dr, theta0, dtheta, Nr, Ntheta, d0, dealias, z0,
+        order, oversample, g, g_az0, g_el0, g_daz, g_del, g_naz, g_nel,
+        data_fmod, alias_fmod, normalize, dem,
+        w1.data_ptr<float>(), w2.data_ptr<float>());
+    return {img, w1, w2};
 }
 
 static void backprojection_polar_2d_grad_kernel_cpu(
@@ -2055,6 +2271,9 @@ static void compute_illumination_row_cpu(
                 att_el = att[i * 3 + 0];
                 att_az = att[i * 3 + 2];
             }
+            // Reciprocal multiplies, see backprojection_polar_2d_row_cpu.
+            const float g_del_inv = 1.0f / g_del;
+            const float g_daz_inv = 1.0f / g_daz;
 
             // Angle pass: bilinear antenna pattern coordinates.
 #pragma omp simd
@@ -2079,8 +2298,8 @@ static void compute_illumination_row_cpu(
                 const float el = look_angle - att_el;
                 const float az = atan2f_fast(py, px) - att_az;
 
-                const float el_idx = (el - g_el0) / g_del;
-                const float az_idx = (az - g_az0) / g_daz;
+                const float el_idx = (el - g_el0) * g_del_inv;
+                const float az_idx = (az - g_az0) * g_daz_inv;
                 const int el_int = (int)el_idx;
                 const int az_int = (int)az_idx;
                 const bool ok = (el_idx >= 0.0f) & (el_int + 1 < g_nel) &
@@ -4237,7 +4456,9 @@ at::Tensor polar_range_dealias_cpu(
 // Registers CPU implementations
 TORCH_LIBRARY_IMPL(torchbp, CPU, m) {
   m.impl("backprojection_polar_2d", &backprojection_polar_2d_cpu);
+  m.impl("backprojection_polar_2d_illum", &backprojection_polar_2d_illum_cpu);
   m.impl("backprojection_polar_2d_knab", &backprojection_polar_2d_knab_cpu);
+  m.impl("backprojection_polar_2d_knab_illum", &backprojection_polar_2d_knab_illum_cpu);
   m.impl("backprojection_polar_2d_grad", &backprojection_polar_2d_grad_cpu);
   m.impl("backprojection_polar_2d_tx_power", &backprojection_polar_2d_tx_power_cpu);
   m.impl("backprojection_polar_2d_tx_power_slant", &backprojection_polar_2d_tx_power_slant_cpu);

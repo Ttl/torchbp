@@ -5,7 +5,7 @@ from torch import Tensor
 from typing import Union, TYPE_CHECKING
 from warnings import warn
 from .afbp import afbp
-from .backproj import backprojection_polar_2d, backprojection_polar_2d_tx_power, _backprojection_polar_2d_tx_power_accum, _tx_power_finish
+from .backproj import backprojection_polar_2d, _backprojection_polar_2d_illum, backprojection_polar_2d_tx_power, _backprojection_polar_2d_tx_power_accum, _tx_power_finish
 from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, ffbp_tx_power_merge2, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
@@ -807,6 +807,8 @@ def _ffbp_impl(
             # When using antenna pattern, request unnormalized output
             normalize = not use_antenna_pattern
             dem_local = None
+            w1_full = None
+            w2_full = None
             if afbp_nsub > 1:
                 img = afbp(
                     data_local, grid_local, fc, r_res, pos_local,
@@ -823,31 +825,62 @@ def _ffbp_impl(
                 # With a DEM the dealias carrier is DEM-referenced, so the
                 # stored image residual stays terrain-free for the merge
                 # interpolation.
-                img = backprojection_polar_2d(
-                    data_local, grid_local, fc, r_res, pos_local, d0=d0,
-                    dealias=True,
-                    data_fmod=data_fmod, alias_fmod=alias_fmod,
-                    att=att_local, g=g, g_extent=g_extent, normalize=normalize,
-                    dem=dem_local,
-                    interp_method=data_interp_method,
+                # The antenna-weighted kernel accumulates the W1/W2
+                # illumination moments per pixel anyway; on CPU the fused op
+                # returns them for free instead of recomputing the same
+                # angle pass with compute_illumination, which costs a large
+                # fraction of the backprojection itself.
+                fused_illum = (
+                    use_antenna_pattern
+                    and data_local.device.type == "cpu"
+                    and data_interp_method[0] in ("linear", "knab")
+                    and not (torch.is_grad_enabled()
+                             and (data_local.requires_grad or pos_local.requires_grad))
                 )
+                if fused_illum:
+                    img, w1_full, w2_full = _backprojection_polar_2d_illum(
+                        data_local, grid_local, fc, r_res, pos_local, d0=d0,
+                        dealias=True,
+                        data_fmod=data_fmod, alias_fmod=alias_fmod,
+                        att=att_local, g=g, g_extent=g_extent,
+                        normalize=normalize,
+                        dem=dem_local,
+                        interp_method=data_interp_method,
+                    )
+                else:
+                    img = backprojection_polar_2d(
+                        data_local, grid_local, fc, r_res, pos_local, d0=d0,
+                        dealias=True,
+                        data_fmod=data_fmod, alias_fmod=alias_fmod,
+                        att=att_local, g=g, g_extent=g_extent, normalize=normalize,
+                        dem=dem_local,
+                        interp_method=data_interp_method,
+                    )
 
             # Compute weight maps at base level for antenna pattern weighting
             w1_map = None
             w2_map = None
             weight_grid = None
             if use_antenna_pattern:
-                # An afbp base level stands in for log2(afbp_nsub) more
-                # recursion levels whose per-node illumination would have
-                # cost 1/afbp_nsub as much; decimate the pulses by the
-                # same factor to match, otherwise the maps cost more than
-                # the afbp base itself. afbp_nsub=1 reduces to the plain
-                # decimated maps. CUDA kernel outputs at decimated
-                # resolution directly.
-                w1_map, w2_map = _illumination_pulse_decimated(
-                    pos_local, att_local, g, g_extent, grid_local,
-                    weight_map_downsample, afbp_nsub, dem=dem_local
-                )
+                if w1_full is not None:
+                    # Fused full-resolution maps; the decimated map
+                    # convention samples the full-grid pixels dec * i, which
+                    # is exactly a stride slice.
+                    dec = weight_map_downsample
+                    w1_map = w1_full[0, ::dec, ::dec].contiguous()
+                    w2_map = w2_full[0, ::dec, ::dec].contiguous()
+                else:
+                    # An afbp base level stands in for log2(afbp_nsub) more
+                    # recursion levels whose per-node illumination would have
+                    # cost 1/afbp_nsub as much; decimate the pulses by the
+                    # same factor to match, otherwise the maps cost more than
+                    # the afbp base itself. afbp_nsub=1 reduces to the plain
+                    # decimated maps. CUDA kernel outputs at decimated
+                    # resolution directly.
+                    w1_map, w2_map = _illumination_pulse_decimated(
+                        pos_local, att_local, g, g_extent, grid_local,
+                        weight_map_downsample, afbp_nsub, dem=dem_local
+                    )
                 # Create weight grid matching output dimensions
                 dec = weight_map_downsample
                 out_nr = (grid_local["nr"] + dec - 1) // dec
