@@ -399,6 +399,45 @@ static inline float knab_kernel_norm_cpu(int order, float v) {
     return expf(-2.0f*a*kPI*v);
 }
 
+// Build a polyphase interpolation table: nphase+1 phases x taps weights,
+// laid out phase-major so a hot loop gathers one contiguous tap row.
+// `kernel(x)` is evaluated in double at the tap offset x of each phase;
+// it is called once per table entry at setup time, so passing it as a
+// template functor keeps the call inlined and off the hot path.
+template<class KernelFn>
+static std::vector<float> build_polyphase_table(int taps, int nphase,
+                                                KernelFn kernel) {
+    std::vector<float> table((size_t)(nphase + 1) * taps);
+    for (int p = 0; p <= nphase; p++) {
+        const double frac = (double)p / nphase;
+        for (int j = 0; j < taps; j++) {
+            const double x = frac + (taps / 2 - 1) - j;
+            table[(size_t)p * taps + j] = (float)kernel(x);
+        }
+    }
+    return table;
+}
+
+// Knab windowed sinc in double, as the exp form used by knab_kernel_cpu:
+// with norm = exp(-2*pi*v*a) it is exactly sinc(x)*cosh(A*s)/cosh(A) for
+// A = pi*v*a and s = sqrt(1 - (x/a)^2), but without the cosh overflow.
+static inline double knab_kernel_double(double x, double a, double v) {
+    if (std::fabs(x) >= a) {
+        return 0.0;
+    }
+    if (x == 0.0) {
+        return 1.0;
+    }
+    const double xa = x / a;
+    const double sinc = std::sin(M_PI * x) / (M_PI * x);
+    if (v <= 0.0) {
+        return sinc;
+    }
+    const double norm = std::exp(-2.0 * a * M_PI * v);
+    const double n = std::exp(M_PI * a * v * (std::sqrt(1.0 - xa * xa) - 1.0));
+    return sinc * (norm / (n * (norm + 1.0)) + n / (norm + 1.0));
+}
+
 static inline float knab_kernel_cpu(float x, float a, float v, float norm) {
     if (fabsf(x) >= a) {
         return 0.0f;

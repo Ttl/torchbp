@@ -11,7 +11,7 @@ from .backproj import (
     _prepare_backprojection_polar_2d_lanczos_args,
     _prepare_backprojection_polar_2d_knab_args,
 )
-from ._utils import unpack_polar_grid, parse_interp_method
+from ._utils import unpack_polar_grid, parse_interp_method, split_bounds
 from ..data import materialize as _materialize
 from ..util import next_fast_len
 
@@ -376,7 +376,7 @@ def afbp(
             interp_method=data_interp_method)[0]
 
     # Split the track into nsub contiguous chunks.
-    bounds = [round(i * nsweeps / nsub) for i in range(nsub + 1)]
+    bounds = split_bounds(nsweeps, nsub)
     m = max(bounds[i + 1] - bounds[i] for i in range(nsub))
     x_u = torch.tensor([float(pos_y[bounds[u] : bounds[u + 1]].mean())
                         for u in range(nsub)], dtype=torch.float64)

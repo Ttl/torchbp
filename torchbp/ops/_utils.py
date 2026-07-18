@@ -5,6 +5,7 @@ from torch import Tensor
 from ..grid import unpack_polar_grid, unpack_cartesian_grid
 
 __all__ = [
+    "split_bounds",
     "parse_interp_method",
     "get_batch_dims",
     "get_batch_dims_img",
@@ -23,6 +24,29 @@ _INTERP_METHOD_FORMS = {
     "knab": '("knab", order, oversample)',
 }
 _INTERP_METHOD_LENGTHS = {"linear": 1, "fft": 1, "lanczos": 2, "knab": 3}
+
+
+def split_bounds(nsweeps: int, divisions: int) -> list:
+    """Split ``nsweeps`` pulses into ``divisions`` contiguous subapertures.
+
+    Returns the ``divisions + 1`` boundary indices, so subaperture ``i``
+    covers ``[bounds[i], bounds[i + 1])``. The split is as even as integer
+    rounding allows; with ``divisions > nsweeps`` some subapertures come out
+    empty and the callers skip them.
+
+    Parameters
+    ----------
+    nsweeps : int
+        Total number of pulses.
+    divisions : int
+        Number of subapertures.
+
+    Returns
+    -------
+    list of int
+        Monotonic boundary indices from 0 to ``nsweeps``.
+    """
+    return [round(i * nsweeps / divisions) for i in range(divisions + 1)]
 
 
 def parse_interp_method(

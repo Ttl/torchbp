@@ -8,6 +8,7 @@ from ._utils import (
     get_batch_dims_img,
     check_polar_grid_matches_img,
     check_cartesian_grid_matches_img,
+    parse_interp_method,
 )
 
 __all__ = [
@@ -167,11 +168,9 @@ def polar_interp(
     out : Tensor
         Interpolated radar image.
     """
-    if type(method) in (list, tuple):
-        method_params = method[1]
-        method = method[0]
-    else:
-        method_params = None
+    method_spec = parse_interp_method(
+        method, allowed=("linear", "lanczos"), name="method")
+    method = method_spec[0]
 
     dorigin = origin_new - origin_old
     if origin_new.dim() == 2:
@@ -195,11 +194,9 @@ def polar_interp(
             rotation,
             grid_polar_new,
             z0,
-            order=method_params,
+            order=method_spec[1],
             alias_fmod=alias_fmod
         )
-    else:
-        raise ValueError(f"Unknown interp_method: {method}")
 
 
 def _prepare_polar_interp_linear_args(
@@ -391,6 +388,82 @@ def polar_interp_lanczos(
     )
 
 
+def _alias_mode(alias: bool, output_alias: bool) -> int:
+    """Encode the (input aliased, output aliased) pair the merge ops take."""
+    if alias:
+        return 1 if not output_alias else 2
+    return 3 if not output_alias else 0
+
+
+def _pack_merge_grids(
+    grid_polars,
+    grid_polar_new,
+    device,
+    nvalid: int = 2,
+    step_fill: float = 0.0,
+):
+    """Flatten the per-child polar grids into the tensors the merge ops take.
+
+    Parameters
+    ----------
+    grid_polars : sequence of dict
+        Source (child) polar grids, one per merge input.
+    grid_polar_new : dict or None
+        Output grid. None means the extents of the last child at twice its
+        angular sampling, which is the default ffbp merge output grid.
+    device : torch.device
+        Device to allocate the parameter tensors on.
+    nvalid : int
+        Number of leading child slots actually populated. Trailing slots keep
+        their initial value; used by the tx_power merge, where the second
+        input is optional.
+    step_fill : float
+        Initial value of the ``dr0``/``dtheta0`` slots. Pass a nonzero value
+        when unpopulated slots must not carry a zero step.
+
+    Returns
+    -------
+    tuple
+        ``(r0, dr0, theta0, dtheta0, Nr0, Ntheta0, r3_0, dr3, theta3_0,
+        dtheta3, nr3, ntheta3)``: six per-child tensors followed by the
+        output grid's scalar parameters.
+    """
+    nimages = 2
+    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
+    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    dr0 = torch.full((nimages,), step_fill, dtype=torch.float32, device=device)
+    dtheta0 = torch.full((nimages,), step_fill, dtype=torch.float32, device=device)
+    for i in range(nvalid):
+        r1_0, r1_1 = grid_polars[i]["r"]
+        theta1_0, theta1_1 = grid_polars[i]["theta"]
+        ntheta1 = grid_polars[i]["ntheta"]
+        nr1 = grid_polars[i]["nr"]
+        r0[i] = r1_0
+        dr0[i] = (r1_1 - r1_0) / nr1
+        theta0[i] = theta1_0
+        dtheta0[i] = (theta1_1 - theta1_0) / ntheta1
+        Nr0[i] = nr1
+        Ntheta0[i] = ntheta1
+
+    if grid_polar_new is None:
+        # Falls back to the extents of the last child visited above.
+        r3_0, r3_1 = r1_0, r1_1
+        theta3_0, theta3_1 = theta1_0, theta1_1
+        nr3 = nr1
+        ntheta3 = 2 * ntheta1
+    else:
+        r3_0, r3_1 = grid_polar_new["r"]
+        theta3_0, theta3_1 = grid_polar_new["theta"]
+        ntheta3 = grid_polar_new["ntheta"]
+        nr3 = grid_polar_new["nr"]
+    dtheta3 = (theta3_1 - theta3_0) / ntheta3
+    dr3 = (r3_1 - r3_0) / nr3
+    return (r0, dr0, theta0, dtheta0, Nr0, Ntheta0,
+            r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3)
+
+
 def ffbp_merge2_lanczos(
     img0: Tensor,
     img1: Tensor,
@@ -463,55 +536,16 @@ def ffbp_merge2_lanczos(
     """
 
     device = img0.device
-    nimages = 2
 
-    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dr0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dtheta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    for i in range(nimages):
-        r1_0, r1_1 = grid_polars[i]["r"]
-        theta1_0, theta1_1 = grid_polars[i]["theta"]
-        ntheta1 = grid_polars[i]["ntheta"]
-        nr1 = grid_polars[i]["nr"]
-        dtheta1 = (theta1_1 - theta1_0) / ntheta1
-        dr1 = (r1_1 - r1_0) / nr1
-        r0[i] = r1_0
-        dr0[i] = dr1
-        theta0[i] = theta1_0
-        dtheta0[i] = dtheta1
-        Nr0[i] = nr1
-        Ntheta0[i] = ntheta1
-
-    if grid_polar_new is None:
-        r3_0 = r1_0
-        r3_1 = r1_1
-        theta3_0 = theta1_0
-        theta3_1 = theta1_1
-        nr3 = nr1
-        ntheta3 = 2 * ntheta1
-    else:
-        r3_0, r3_1 = grid_polar_new["r"]
-        theta3_0, theta3_1 = grid_polar_new["theta"]
-        ntheta3 = grid_polar_new["ntheta"]
-        nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
+    (r0, dr0, theta0, dtheta0, Nr0, Ntheta0,
+     r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3) = _pack_merge_grids(
+        grid_polars, grid_polar_new, device)
 
     assert dorigin0.shape == (3,)
     assert dorigin1.shape == (3,)
     dorigin = torch.stack((dorigin0, dorigin1), dim=0)
 
-    alias_mode = 0
-    if alias:
-        if not output_alias:
-            alias_mode = 1
-        else:
-            alias_mode = 2
-    elif not output_alias:
-        alias_mode = 3
+    alias_mode = _alias_mode(alias, output_alias)
 
     return torch.ops.torchbp.ffbp_merge2_lanczos.default(
         img0,
@@ -619,55 +653,16 @@ def ffbp_merge2_knab(
     """
 
     device = img0.device
-    nimages = 2
 
-    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dr0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dtheta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    for i in range(nimages):
-        r1_0, r1_1 = grid_polars[i]["r"]
-        theta1_0, theta1_1 = grid_polars[i]["theta"]
-        ntheta1 = grid_polars[i]["ntheta"]
-        nr1 = grid_polars[i]["nr"]
-        dtheta1 = (theta1_1 - theta1_0) / ntheta1
-        dr1 = (r1_1 - r1_0) / nr1
-        r0[i] = r1_0
-        dr0[i] = dr1
-        theta0[i] = theta1_0
-        dtheta0[i] = dtheta1
-        Nr0[i] = nr1
-        Ntheta0[i] = ntheta1
-
-    if grid_polar_new is None:
-        r3_0 = r1_0
-        r3_1 = r1_1
-        theta3_0 = theta1_0
-        theta3_1 = theta1_1
-        nr3 = nr1
-        ntheta3 = 2 * ntheta1
-    else:
-        r3_0, r3_1 = grid_polar_new["r"]
-        theta3_0, theta3_1 = grid_polar_new["theta"]
-        ntheta3 = grid_polar_new["ntheta"]
-        nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
+    (r0, dr0, theta0, dtheta0, Nr0, Ntheta0,
+     r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3) = _pack_merge_grids(
+        grid_polars, grid_polar_new, device)
 
     assert dorigin0.shape == (3,)
     assert dorigin1.shape == (3,)
     dorigin = torch.stack((dorigin0, dorigin1), dim=0)
 
-    alias_mode = 0
-    if alias:
-        if not output_alias:
-            alias_mode = 1
-        else:
-            alias_mode = 2
-    elif not output_alias:
-        alias_mode = 3
+    alias_mode = _alias_mode(alias, output_alias)
 
     return torch.ops.torchbp.ffbp_merge2_knab.default(
         img0,
@@ -788,7 +783,6 @@ def ffbp_merge2_poly(
     """
 
     device = img0.device
-    nimages = 2
 
     if order > 8:
         raise ValueError(f"Polynomial interpolation knab order must be <= 8, got {order}")
@@ -805,53 +799,15 @@ def ffbp_merge2_poly(
     else:
         poly_coefs = poly_coefs.to(device)
 
-    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dr0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    theta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dtheta0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    for i in range(nimages):
-        r1_0, r1_1 = grid_polars[i]["r"]
-        theta1_0, theta1_1 = grid_polars[i]["theta"]
-        ntheta1 = grid_polars[i]["ntheta"]
-        nr1 = grid_polars[i]["nr"]
-        dtheta1 = (theta1_1 - theta1_0) / ntheta1
-        dr1 = (r1_1 - r1_0) / nr1
-        r0[i] = r1_0
-        dr0[i] = dr1
-        theta0[i] = theta1_0
-        dtheta0[i] = dtheta1
-        Nr0[i] = nr1
-        Ntheta0[i] = ntheta1
-
-    if grid_polar_new is None:
-        r3_0 = r1_0
-        r3_1 = r1_1
-        theta3_0 = theta1_0
-        theta3_1 = theta1_1
-        nr3 = nr1
-        ntheta3 = 2 * ntheta1
-    else:
-        r3_0, r3_1 = grid_polar_new["r"]
-        theta3_0, theta3_1 = grid_polar_new["theta"]
-        ntheta3 = grid_polar_new["ntheta"]
-        nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
+    (r0, dr0, theta0, dtheta0, Nr0, Ntheta0,
+     r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3) = _pack_merge_grids(
+        grid_polars, grid_polar_new, device)
 
     assert dorigin0.shape == (3,)
     assert dorigin1.shape == (3,)
     dorigin = torch.stack((dorigin0, dorigin1), dim=0)
 
-    alias_mode = 0
-    if alias:
-        if not output_alias:
-            alias_mode = 1
-        else:
-            alias_mode = 2
-    elif not output_alias:
-        alias_mode = 3
+    alias_mode = _alias_mode(alias, output_alias)
 
     return torch.ops.torchbp.ffbp_merge2_poly.default(
         img0,
@@ -983,7 +939,6 @@ def ffbp_merge2_poly_weighted(
         Grid definition for the output weight maps if output_weight_map is True, else None.
     """
     device = img0.device
-    nimages = 2
 
     if order > 8:
         raise ValueError(f"Polynomial interpolation knab order must be <= 8, got {order}")
@@ -995,53 +950,15 @@ def ffbp_merge2_poly_weighted(
     else:
         poly_coefs = poly_coefs.to(device)
 
-    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dr0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
-    theta0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dtheta0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
-    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    for i in range(nimages):
-        r1_0, r1_1 = grid_polars[i]["r"]
-        theta1_0, theta1_1 = grid_polars[i]["theta"]
-        ntheta1 = grid_polars[i]["ntheta"]
-        nr1 = grid_polars[i]["nr"]
-        dtheta1 = (theta1_1 - theta1_0) / ntheta1
-        dr1 = (r1_1 - r1_0) / nr1
-        r0[i] = r1_0
-        dr0_t[i] = dr1
-        theta0_t[i] = theta1_0
-        dtheta0_t[i] = dtheta1
-        Nr0[i] = nr1
-        Ntheta0[i] = ntheta1
-
-    if grid_polar_new is None:
-        r3_0 = r1_0
-        r3_1 = r1_1
-        theta3_0 = theta1_0
-        theta3_1 = theta1_1
-        nr3 = nr1
-        ntheta3 = 2 * ntheta1
-    else:
-        r3_0, r3_1 = grid_polar_new["r"]
-        theta3_0, theta3_1 = grid_polar_new["theta"]
-        ntheta3 = grid_polar_new["ntheta"]
-        nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
+    (r0, dr0_t, theta0_t, dtheta0_t, Nr0, Ntheta0,
+     r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3) = _pack_merge_grids(
+        grid_polars, grid_polar_new, device)
 
     assert dorigin0.shape == (3,)
     assert dorigin1.shape == (3,)
     dorigin = torch.stack((dorigin0, dorigin1), dim=0)
 
-    alias_mode = 0
-    if alias:
-        if not output_alias:
-            alias_mode = 1
-        else:
-            alias_mode = 2
-    elif not output_alias:
-        alias_mode = 3
+    alias_mode = _alias_mode(alias, output_alias)
 
     # Prepare weight map parameters
     def get_weight_grid_params(w1_map, w2_map, wgrid):
@@ -1189,41 +1106,31 @@ def ffbp_merge2(
     out : Tensor
         Interpolated radar image.
     """
-    if type(method) in (list, tuple):
-        method_params = method[1:]
-        method = method[0]
-    else:
-        method_params = None
+    _, order, oversample = parse_interp_method(method, allowed=("knab",))
 
-    if method == "knab":
-        if len(method_params) != 2:
-            raise ValueError("Knab interpolation needs sample length and oversampling factor as argument")
-        order = method_params[0]
-        use_poly = use_poly and order <= 8
-        knab_func = ffbp_merge2_poly if use_poly else ffbp_merge2_knab
-        kwargs = dict(
-            dem=dem,
-            order=order,
-            oversample=method_params[1],
-            alias=alias,
-            alias_fmod=alias_fmod,
-            output_alias=output_alias
-        )
-        if use_poly and poly_coefs is not None:
-            kwargs['poly_coefs'] = poly_coefs
-        return knab_func(
-            img0,
-            img1,
-            dorigin0,
-            dorigin1,
-            grid_polars,
-            fc,
-            grid_polar_new,
-            z0,
-            **kwargs
-        )
-    else:
-        raise ValueError(f"Unknown interp_method: {method}")
+    use_poly = use_poly and order <= 8
+    knab_func = ffbp_merge2_poly if use_poly else ffbp_merge2_knab
+    kwargs = dict(
+        dem=dem,
+        order=order,
+        oversample=oversample,
+        alias=alias,
+        alias_fmod=alias_fmod,
+        output_alias=output_alias
+    )
+    if use_poly and poly_coefs is not None:
+        kwargs['poly_coefs'] = poly_coefs
+    return knab_func(
+        img0,
+        img1,
+        dorigin0,
+        dorigin1,
+        grid_polars,
+        fc,
+        grid_polar_new,
+        z0,
+        **kwargs
+    )
 
 
 def ffbp_tx_power_merge2(
@@ -1276,7 +1183,6 @@ def ffbp_tx_power_merge2(
         Merged accumulator map, shape [4, nr_new, ntheta_new].
     """
     device = acc0.device
-    nimages = 2
 
     if hasattr(grid_polar_new, "to_dict"):
         grid_polar_new = grid_polar_new.to_dict()
@@ -1284,31 +1190,11 @@ def ffbp_tx_power_merge2(
         g.to_dict() if hasattr(g, "to_dict") else g for g in grid_polars
     ]
 
-    r0 = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dr0_t = torch.ones(nimages, dtype=torch.float32, device=device)
-    theta0_t = torch.zeros(nimages, dtype=torch.float32, device=device)
-    dtheta0_t = torch.ones(nimages, dtype=torch.float32, device=device)
-    Nr0 = torch.zeros(nimages, dtype=torch.int32, device=device)
-    Ntheta0 = torch.zeros(nimages, dtype=torch.int32, device=device)
+    # Unused second slot keeps a unit step so the kernel never divides by zero.
     nvalid = 1 if acc1 is None else 2
-    for i in range(nvalid):
-        r1_0, r1_1 = grid_polars[i]["r"]
-        theta1_0, theta1_1 = grid_polars[i]["theta"]
-        ntheta1 = grid_polars[i]["ntheta"]
-        nr1 = grid_polars[i]["nr"]
-        r0[i] = r1_0
-        dr0_t[i] = (r1_1 - r1_0) / nr1
-        theta0_t[i] = theta1_0
-        dtheta0_t[i] = (theta1_1 - theta1_0) / ntheta1
-        Nr0[i] = nr1
-        Ntheta0[i] = ntheta1
-
-    r3_0, r3_1 = grid_polar_new["r"]
-    theta3_0, theta3_1 = grid_polar_new["theta"]
-    ntheta3 = grid_polar_new["ntheta"]
-    nr3 = grid_polar_new["nr"]
-    dtheta3 = (theta3_1 - theta3_0) / ntheta3
-    dr3 = (r3_1 - r3_0) / nr3
+    (r0, dr0_t, theta0_t, dtheta0_t, Nr0, Ntheta0,
+     r3_0, dr3, theta3_0, dtheta3, nr3, ntheta3) = _pack_merge_grids(
+        grid_polars, grid_polar_new, device, nvalid=nvalid, step_fill=1.0)
 
     assert dorigin0.shape == (3,)
     if acc1 is None:
@@ -1391,20 +1277,17 @@ def polar_to_cart(
     out : Tensor
         Interpolated radar image.
     """
-    if type(method) in (list, tuple):
-        method_params = method[1]
-        method = method[0]
-    else:
-        method_params = None
+    method_spec = parse_interp_method(
+        method, allowed=("linear", "lanczos"), name="method")
+    method = method_spec[0]
 
     if method == "linear":
         return polar_to_cart_linear(img, origin, grid_polar, grid_cart, fc, rotation, alias_fmod)
-    elif method == "lanczos":
-        return polar_to_cart_lanczos(
-            img, origin, grid_polar, grid_cart, fc, rotation, alias_fmod, order=method_params
-        )
     else:
-        raise ValueError(f"Unknown method: {method}")
+        return polar_to_cart_lanczos(
+            img, origin, grid_polar, grid_cart, fc, rotation, alias_fmod,
+            order=method_spec[1]
+        )
 
 
 def _prepare_polar_to_cart_linear_args(
@@ -1626,20 +1509,17 @@ def cart_to_polar(
     out : Tensor
         Interpolated radar image in [range, angle] format.
     """
-    if type(method) in (list, tuple):
-        method_params = method[1]
-        method = method[0]
-    else:
-        method_params = None
+    method_spec = parse_interp_method(
+        method, allowed=("linear", "lanczos"), name="method")
+    method = method_spec[0]
 
     if method == "linear":
         return cart_to_polar_linear(img, origin, grid_cart, grid_polar, fc, rotation, alias_fmod)
-    elif method == "lanczos":
-        return cart_to_polar_lanczos(
-            img, origin, grid_cart, grid_polar, fc, rotation, alias_fmod, order=method_params
-        )
     else:
-        raise ValueError(f"Unknown method: {method}")
+        return cart_to_polar_lanczos(
+            img, origin, grid_cart, grid_polar, fc, rotation, alias_fmod,
+            order=method_spec[1]
+        )
 
 
 def _prepare_cart_to_polar_linear_args(

@@ -9,7 +9,7 @@ from .backproj import backprojection_polar_2d, _backprojection_polar_2d_illum, _
 from .polar_interp import ffbp_merge2, ffbp_merge2_poly, ffbp_merge2_poly_weighted, ffbp_tx_power_merge2, compute_knab_poly_coefs_full, select_knab_poly_degree
 from ..util import center_pos
 from copy import deepcopy
-from ._utils import AntennaPattern, unpack_polar_grid, parse_interp_method
+from ._utils import AntennaPattern, unpack_polar_grid, parse_interp_method, split_bounds
 from ..data import LazyData, materialize as _materialize
 
 __all__ = [
@@ -652,7 +652,7 @@ def _ffbp_impl(
     # Split at rounded boundaries so that no sweeps are dropped when
     # divisions does not divide nsweeps. Subaperture sizes differ by at most
     # one sweep, which the merge handles.
-    bounds = [round(i * nsweeps / divisions) for i in range(divisions + 1)]
+    bounds = split_bounds(nsweeps, divisions)
 
     # Children guard sizing. A merge output pixel at theta = t reads the
     # child image at tp = (d*t + dy)/rp, so the child grid must cover the
@@ -1247,7 +1247,7 @@ def _ffbp_tx_power_impl(
         return None
 
     nodes = []
-    edges = torch.linspace(0, nsweeps, divisions + 1).long()
+    edges = split_bounds(nsweeps, divisions)
     for d_idx in range(divisions):
         i0 = int(edges[d_idx])
         i1 = int(edges[d_idx + 1])

@@ -595,27 +595,8 @@ static void backprojection_polar_2d_row_cpu(
 // at practical orders.
 static std::vector<float> knab_interp_table(int taps, float v, int nphase) {
     const double a = 0.5 * taps;
-    std::vector<float> table((size_t)(nphase + 1) * taps);
-    for (int p = 0; p <= nphase; p++) {
-        const double frac = (double)p / nphase;
-        for (int j = 0; j < taps; j++) {
-            const double x = frac + (taps / 2 - 1) - j;
-            double w;
-            if (std::fabs(x) >= a) {
-                w = 0.0;
-            } else if (x == 0.0) {
-                w = 1.0;
-            } else {
-                const double xa = x / a;
-                w = std::sin(M_PI * x) / (M_PI * x);
-                if (v > 0.0f)
-                    w *= std::cosh(M_PI * v * a * std::sqrt(1.0 - xa * xa))
-                       / std::cosh(M_PI * v * a);
-            }
-            table[(size_t)p * taps + j] = (float)w;
-        }
-    }
-    return table;
+    return build_polyphase_table(taps, nphase,
+        [a, v](double x) { return knab_kernel_double(x, a, (double)v); });
 }
 
 // Knab-interpolation variant of backprojection_polar_2d_row_cpu. Same pass

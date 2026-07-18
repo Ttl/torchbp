@@ -9,7 +9,7 @@ from copy import deepcopy
 from .backproj import backprojection_cart_2d, _backprojection_cart_2d_tx_power_accum, _tx_power_finish
 from ..data import materialize as _materialize
 from ..util import center_pos
-from ._utils import unpack_cartesian_grid, parse_interp_method
+from ._utils import unpack_cartesian_grid, parse_interp_method, split_bounds
 
 __all__ = [
     "kC0",
@@ -600,7 +600,7 @@ def _cfbp_impl(
     nsweeps = data.shape[0]
 
     imgs = []
-    bounds = [round(i * nsweeps / divisions) for i in range(divisions + 1)]
+    bounds = split_bounds(nsweeps, divisions)
     for d_idx in range(divisions):
         data_local = data[bounds[d_idx] : bounds[d_idx + 1]]
         pos_chunk = pos[bounds[d_idx] : bounds[d_idx + 1]]
@@ -850,7 +850,7 @@ def _cfbp_tx_power_impl(
         return None
 
     nodes = []
-    edges = torch.linspace(0, nsweeps, divisions + 1).long()
+    edges = split_bounds(nsweeps, divisions)
     for d_idx in range(divisions):
         i0 = int(edges[d_idx])
         i1 = int(edges[d_idx + 1])
