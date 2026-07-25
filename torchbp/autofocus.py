@@ -267,9 +267,34 @@ def pga(
     support_gate: float = 0.01,
     max_targets: int | None = None,
     truncate: bool = True,
+    grid: "PolarGrid | dict | None" = None,
+    fc: float | None = None,
+    pos: Tensor | None = None,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    shifted: bool = True,
+    dem: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Phase gradient autofocus
+
+    If an antenna pattern is given (``g`` is not None), each selected
+    target's azimuth spectrum samples are additionally weighted by the
+    modeled two-way antenna illumination. The spectrum bin to along-track
+    pulse position mapping is the same far-field linear-track model as
+    :func:`phase_to_pos` and the antenna model matches the gain lookup in
+    the backprojection kernels.
+
+    In stripmap-like collections each target is illuminated only part of
+    the full aperture. The global spectrum support gate only masks bins
+    that no target occupies. For an individual target, bins outside its own
+    illumination still enter its pair products and its "wls" amplitude
+    statistics as clutter. The per-target antenna weight gates those
+    samples out, exactly as the antenna-weighted :func:`gpga` path does in
+    the pulse domain. In spotlight collections where every target is
+    illuminated over the full aperture the weighting makes little
+    difference.
 
     Parameters
     ----------
@@ -323,6 +348,36 @@ def pga(
         about ``window`` independent estimate values, so a 4x oversampled
         short FFT loses almost nothing. Only affects speed; disable to
         reproduce the exact full-length estimates.
+    grid : PolarGrid or dict or None
+        Polar grid definition of the image. Required for antenna
+        weighting.
+    fc : float or None
+        RF center frequency in Hz. Required for antenna weighting.
+    pos : Tensor or None
+        Platform positions the image was formed with. Shape:
+        [npulses, 3]. The track is assumed near-linear along the y axis.
+        Required for antenna weighting.
+    att : Tensor or None
+        Antenna rotation [roll, pitch, yaw] per pulse. Shape:
+        [npulses, 3]. Required for antenna weighting.
+    g : Tensor or None
+        Square-root of two-way antenna gain in spherical coordinates,
+        shape: [elevation, azimuth]. If TX antenna equals RX antenna, then
+        this should be just antenna gain. None (default) disables the
+        antenna weighting.
+    g_extent : list or None
+        Antenna gain extent in radians: [el0, az0, el1, az1]. Required
+        for antenna weighting.
+    shifted : bool
+        True if :func:`torchbp.util.shift_spectrum` was applied to the
+        image (azimuth spectrum DC at bin ``ntheta // 2``). False for an
+        image straight from backprojection (DC at bin 0). Only used by
+        the antenna weighting, where the spectrum layout matters: a wrong
+        value mirrors the illumination weights. Without an antenna
+        pattern ``pga`` is indifferent to the layout.
+    dem : Tensor or None
+        Optional DEM sharing the grid extent for the antenna weighting
+        target heights, otherwise targets are assumed at ``z = 0``.
 
     Returns
     -------
@@ -337,6 +392,33 @@ def pga(
     if window_exp > 1 or window_exp < 0:
         raise ValueError(f"Invalid window_exp {window_exp}")
     nr, ntheta = img.shape
+    antenna = g is not None
+    if antenna:
+        if (
+            grid is None
+            or fc is None
+            or pos is None
+            or att is None
+            or g_extent is None
+        ):
+            raise ValueError(
+                "Antenna weighting requires grid, fc, pos, att, g and "
+                "g_extent."
+            )
+        if not _grid_is_polar(grid):
+            raise ValueError("Antenna weighting requires a polar grid.")
+        _, _, _, _, g_nr, g_ntheta, _, _ = unpack_polar_grid(grid)
+        if img.shape != (g_nr, g_ntheta):
+            raise ValueError(
+                f"Image shape {tuple(img.shape)} does not match the grid "
+                f"({g_nr}, {g_ntheta})."
+            )
+        rdtype = img.real.dtype
+        pos = pos.to(device=img.device, dtype=rdtype)
+        att = att.to(device=img.device, dtype=rdtype)
+        g = g.to(device=img.device, dtype=rdtype)
+        if dem is not None:
+            dem = dem.to(device=img.device, dtype=rdtype)
     phi_sum = torch.zeros(ntheta, device=img.device, dtype=img.real.dtype)
     if window_width is None:
         window_width = pga_window_estimate(img)
@@ -389,8 +471,20 @@ def pga(
             rpeaks = rpeaks[rows]
             img_est = img[rows]
         else:
+            rows = None
             img_est = img
         del a_img
+        w_t = None
+        if antenna:
+            est_rows = rows if rows is not None else torch.arange(nr, device=dev)
+            # Per-target spectrum weight in the unrolled full-length layout,
+            # combined with the global support mask.
+            w_t = _antenna_spectrum_weights(
+                grid, fc, pos, att, g, g_extent, est_rows, rpeaks,
+                shifted=shifted, dem=dem,
+            )
+            if mask is not None:
+                w_t = w_t * mask[None, :]
         w2 = window // 2
         m_len = ntheta
         if truncate:
@@ -409,12 +503,12 @@ def pga(
             )
             idx = (rpeaks[:, None] + offs[None, :]) % ntheta
             gs = torch.gather(img_est, 1, idx)
-            g = torch.zeros(
+            gw = torch.zeros(
                 gs.shape[0], m_len, dtype=img.dtype, device=dev
             )
-            g[:, : w2 + 1] = gs[:, : w2 + 1]
+            gw[:, : w2 + 1] = gs[:, : w2 + 1]
             if w2 > 0:
-                g[:, m_len - w2 :] = gs[:, w2 + 1 :]
+                gw[:, m_len - w2 :] = gs[:, w2 + 1 :]
             del gs
         else:
             m_len = ntheta
@@ -424,32 +518,37 @@ def pga(
             idx = (
                 torch.arange(ntheta, device=dev)[None, :] + rpeaks[:, None]
             ) % ntheta
-            g = torch.gather(img_est, 1, idx)
+            gw = torch.gather(img_est, 1, idx)
             # Apply window
-            g[:, 1 + w2 : ntheta - w2] = 0
+            gw[:, 1 + w2 : ntheta - w2] = 0
         del img_est, idx
         if offload:
             F = F.to(device="cpu")
         # IFFT across theta
-        g = torch.fft.fft(g, axis=-1)
+        gw = torch.fft.fft(gw, axis=-1)
         k_gap_m = 0
         est_w = est_weight
+        bin_map = None
+        if m_len != ntheta:
+            # The short FFT samples the same spectrum on a coarser grid.
+            bin_map = torch.round(
+                torch.arange(m_len, device=dev) * (ntheta / m_len)
+            ).long() % ntheta
         if spectrum_support:
             if m_len == ntheta:
                 k_gap_m = k_gap
             else:
-                # The short FFT samples the same spectrum on a coarser
-                # grid; resample the support mask and gap onto it.
+                # Resample the support mask and gap onto the coarser grid.
                 k_gap_m = int(round(k_gap * m_len / ntheta))
-                pos = torch.round(
-                    torch.arange(m_len, device=dev) * (ntheta / m_len)
-                ).long() % ntheta
-                est_w = torch.roll(mask[pos], -k_gap_m).to(
+                est_w = torch.roll(mask[bin_map], -k_gap_m).to(
                     img.real.dtype
                 )[None, :]
-            g = torch.roll(g, -k_gap_m, dims=-1)
-        phi = pga_estimator(g, estimator, eps, weight=est_w)
-        del g
+            gw = torch.roll(gw, -k_gap_m, dims=-1)
+        if w_t is not None:
+            wt_m = w_t if bin_map is None else w_t[:, bin_map]
+            est_w = torch.roll(wt_m, -k_gap_m, dims=-1)
+        phi = pga_estimator(gw, estimator, eps, weight=est_w)
+        del gw
         # Unwrap in the rolled frame where the occupied band is contiguous
         # and the estimate is smooth.
         phi = unwrap(phi)
@@ -586,6 +685,11 @@ def pga_xz(
     spectrum_support: bool = True,
     support_gate: float = 0.01,
     truncate: bool = True,
+    pos: Tensor | None = None,
+    att: Tensor | None = None,
+    g: Tensor | None = None,
+    g_extent: list | None = None,
+    dem: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     Phase gradient autofocus with range-direction and vertical (x, z)
@@ -620,6 +724,21 @@ def pga_xz(
     is proportional to the theta coordinate within the image, which does
     not decompose over range rows. At broadside it is also the component
     that defocuses least.
+
+    If an antenna pattern is given (``g`` is not None), each range row's
+    azimuth spectrum samples are weighted by the modeled two-way antenna
+    illumination toward its strongest target, as in the antenna-weighted
+    :func:`pga`. This gates out the out-of-beam clutter bins in
+    stripmap-like collections where each target is illuminated only part
+    of the aperture. ``pga_xz`` expects an image straight from
+    backprojection (no :func:`torchbp.util.shift_spectrum`), so unlike in
+    :func:`pga` there is no ``shifted`` option. Note that in this regime
+    the block-wise estimation needs several illuminated targets per range
+    block: each gated target constrains the phase only over its own
+    spectrum sub-band, and where a block's targets leave coverage gaps
+    the integrated block phase picks up offsets that corrupt the per-bin
+    solve. With too few targets per block the antenna-weighted
+    :func:`pga` is the more robust choice.
 
     Parameters
     ----------
@@ -679,6 +798,24 @@ def pga_xz(
         same resampling step that handles the per-block ``cos(el)``
         scaling. Only affects speed; disable to reproduce the exact
         full-length estimates.
+    pos : Tensor or None
+        Platform positions the image was formed with. Shape:
+        [npulses, 3]. The track is assumed near-linear along the y axis.
+        Required for antenna weighting.
+    att : Tensor or None
+        Antenna rotation [roll, pitch, yaw] per pulse. Shape:
+        [npulses, 3]. Required for antenna weighting.
+    g : Tensor or None
+        Square-root of two-way antenna gain in spherical coordinates,
+        shape: [elevation, azimuth]. If TX antenna equals RX antenna, then
+        this should be just antenna gain. None (default) disables the
+        antenna weighting.
+    g_extent : list or None
+        Antenna gain extent in radians: [el0, az0, el1, az1]. Required
+        for antenna weighting.
+    dem : Tensor or None
+        Optional DEM sharing the grid extent for the antenna weighting
+        target heights, otherwise targets are assumed at ``z = 0``.
 
     Returns
     -------
@@ -713,6 +850,17 @@ def pga_xz(
     dev = img.device
     rdtype = img.real.dtype
     k_wave = 4 * torch.pi * fc / C0
+    antenna = g is not None
+    if antenna:
+        if pos is None or att is None or g_extent is None:
+            raise ValueError(
+                "Antenna weighting requires pos, att, g and g_extent."
+            )
+        pos = pos.to(device=dev, dtype=rdtype)
+        att = att.to(device=dev, dtype=rdtype)
+        g = g.to(device=dev, dtype=rdtype)
+        if dem is not None:
+            dem = dem.to(device=dev, dtype=rdtype)
 
     # Per-row look geometry: grid r is ground range from the platform
     # reference (origin), scene assumed at z=0.
@@ -786,15 +934,16 @@ def pga_xz(
         use_trunc = truncate and m_len <= ntheta // 2
         if use_trunc:
             f_m = torch.arange(m_len, device=dev, dtype=rdtype) - m_len // 2
+            # Full-length spectrum column of each short-grid bin, for
+            # sampling the support mask and the antenna weights.
+            cidx = torch.clamp(
+                torch.round(f_m * (ntheta / m_len)).long() + ntheta // 2,
+                0,
+                ntheta - 1,
+            )
             est_w = None
             if spectrum_support:
-                # Sample the support mask onto the short grid.
-                pos = torch.clamp(
-                    torch.round(f_m * (ntheta / m_len)).long() + ntheta // 2,
-                    0,
-                    ntheta - 1,
-                )
-                est_w = est_weight[:, pos]
+                est_w = est_weight[:, cidx]
             offs = torch.cat(
                 [
                     torch.arange(0, w2 + 1, device=dev),
@@ -804,6 +953,7 @@ def pga_xz(
         else:
             m_len = ntheta
             f_m = f_axis
+            cidx = None
             est_w = est_weight
         for b in range(nb):
             b1 = (b + 1) * rdiv if b < nb - 1 else nr
@@ -816,24 +966,38 @@ def pga_xz(
                 # indices) so a peak shift stays a linear phase.
                 idx = (rpeaks[:, None] + offs[None, :]) % ntheta
                 gs = torch.gather(sub, 1, idx)
-                g = torch.zeros(
+                gw = torch.zeros(
                     gs.shape[0], m_len, dtype=img.dtype, device=dev
                 )
-                g[:, : w2 + 1] = gs[:, : w2 + 1]
+                gw[:, : w2 + 1] = gs[:, : w2 + 1]
                 if w2 > 0:
-                    g[:, m_len - w2 :] = gs[:, w2 + 1 :]
+                    gw[:, m_len - w2 :] = gs[:, w2 + 1 :]
                 del gs
             else:
                 idx = (
                     torch.arange(ntheta, device=dev)[None, :]
                     + rpeaks[:, None]
                 ) % ntheta
-                g = torch.gather(sub, 1, idx)
+                gw = torch.gather(sub, 1, idx)
                 # Apply window
-                g[:, 1 + w2 : ntheta - w2] = 0
-            g = torch.fft.fftshift(torch.fft.fft(g, axis=-1), dim=-1)
+                gw[:, 1 + w2 : ntheta - w2] = 0
+            gw = torch.fft.fftshift(torch.fft.fft(gw, axis=-1), dim=-1)
+            est_wb = est_w
+            if antenna:
+                # Per-target spectrum weight combined with the support
+                # mask. The estimation spectrum here is fftshifted, which
+                # for the expected unshifted input image is the layout
+                # shifted=True of _antenna_spectrum_weights produces.
+                rows_b = torch.arange(b * rdiv, b1, device=dev)
+                w_t = _antenna_spectrum_weights(
+                    grid, fc, pos, att, g, g_extent, rows_b, rpeaks,
+                    shifted=True, dem=dem,
+                )
+                if est_weight is not None:
+                    w_t = w_t * est_weight
+                est_wb = w_t if cidx is None else w_t[:, cidx]
             phi, w = pga_estimator(
-                g, "wls", eps, return_weight=True, weight=est_w
+                gw, "wls", eps, return_weight=True, weight=est_wb
             )
             phi = unwrap(phi)
             # SCR-weighted block geometry: where the strong targets are.
@@ -1042,6 +1206,86 @@ def _antenna_weights(
         + v11 * ef * af
     )
     return torch.where(valid, w, torch.zeros_like(w))
+
+
+def _antenna_spectrum_weights(
+    grid: "PolarGrid | dict",
+    fc: float,
+    pos: Tensor,
+    att: Tensor,
+    g: Tensor,
+    g_extent: list,
+    rows: Tensor,
+    rpeaks: Tensor,
+    shifted: bool = True,
+    dem: Tensor | None = None,
+) -> Tensor:
+    """Two-way antenna amplitude toward each target per azimuth spectrum bin.
+
+    Each azimuth spectrum bin of a polar image maps to the along-track
+    platform coordinate that illuminated it,
+    ``u = -f * wl / (2 * cos_el * dtheta * ntheta)`` with ``f`` the signed
+    bin frequency — the same far-field linear-track mapping as
+    :func:`phase_to_pos`, with the elevation cosine taken per target.
+    :func:`_antenna_weights` is evaluated at the actual pulse positions and
+    interpolated onto the bin coordinates; bins mapping outside the flown
+    track get zero weight.
+
+    Parameters
+    ----------
+    grid : PolarGrid or dict
+        Polar grid definition of the image.
+    fc : float
+        RF center frequency in Hz.
+    pos : Tensor
+        Platform positions, shape [npulses, 3], near-linear along y.
+    att : Tensor
+        Antenna rotation [roll, pitch, yaw] per pulse. Shape [npulses, 3].
+    g : Tensor
+        Square-root of two-way antenna gain. Shape [elevation, azimuth].
+    g_extent : list
+        [el0, az0, el1, az1] pattern extent in radians.
+    rows : Tensor
+        Range row index of each target. Shape [ntargets].
+    rpeaks : Tensor
+        Azimuth (theta) column index of each target. Shape [ntargets].
+    shifted : bool
+        Azimuth spectrum layout, see the antenna weighting in :func:`pga`.
+    dem : Tensor or None
+        Optional DEM sharing the grid extent, else targets at ``z = 0``.
+
+    Returns
+    -------
+    w : Tensor
+        Antenna amplitude weight per spectrum bin. Shape [ntargets, ntheta].
+    """
+    _, _, _, _, _, ntheta, _, dtheta = unpack_polar_grid(grid)
+    dev = pos.device
+    rdtype = pos.dtype
+    wl = C0 / fc
+    target_pos = _pixel_to_world(grid, rows.to(rdtype), rpeaks.to(rdtype), dem)
+    w = _antenna_weights(target_pos, pos, att, g, g_extent)
+    ys, order = torch.sort(pos[:, 1])
+    w = w[:, order]
+    # Grid range is ground range: per-target elevation cosine to the mean
+    # platform altitude.
+    rho = torch.sqrt(target_pos[:, 0] ** 2 + target_pos[:, 1] ** 2)
+    dz = torch.mean(pos[:, 2]) - target_pos[:, 2]
+    cos_el = rho / torch.clamp(torch.sqrt(rho**2 + dz**2), min=1e-9)
+    f = torch.fft.fftfreq(ntheta, device=dev).to(rdtype) * ntheta
+    if shifted:
+        f = torch.fft.fftshift(f)
+    uq = -f[None, :] * wl / (2 * cos_el[:, None] * dtheta * ntheta)
+    idx = torch.searchsorted(ys.contiguous(), uq.reshape(-1).contiguous())
+    idx = idx.reshape(uq.shape).clamp(1, ys.shape[0] - 1)
+    y0 = ys[idx - 1]
+    y1 = ys[idx]
+    t = ((uq - y0) / torch.clamp(y1 - y0, min=1e-12)).clamp(0, 1)
+    w0 = torch.gather(w, 1, idx - 1)
+    w1 = torch.gather(w, 1, idx)
+    wq = w0 + t * (w1 - w0)
+    inside = (uq >= ys[0]) & (uq <= ys[-1])
+    return torch.where(inside, wq, torch.zeros_like(wq))
 
 
 class _AntennaWeightCache:
