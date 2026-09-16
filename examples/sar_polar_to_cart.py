@@ -26,7 +26,9 @@ if __name__ == "__main__":
         dev = "cpu"
     print("Device:", dev)
     sar_img = torch.from_numpy(sar_img).to(dtype=torch.complex64, device=dev)
-    fc = mission["fc"]
+    fcenter = mission["fc"]
+    bw = mission["bw"]
+    fc = fcenter - bw/2
     print("Entropy", entropy(sar_img).item())
 
     # Increase Cartesian image size

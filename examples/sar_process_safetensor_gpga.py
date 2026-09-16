@@ -2,6 +2,7 @@
 # Example SAR data processing script.
 # Sample data can be downloaded from: https://hforsten.com/sar.safetensors.zip
 import sys
+import os
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -30,12 +31,12 @@ if __name__ == "__main__":
     # Azimuth range in polar image in sin of radians. 1 for full 180 degrees.
     theta_limit = 1
     # Decrease the number of sweeps to speed up the calculation
-    nsweeps = 10000 # Max 51200
+    nsweeps = int(os.environ.get("NSWEEPS", "10000")) # Max 51200
     sweep_start = 0
 
     # Windowing functions
     range_window = "hamming"
-    angle_window = ("taylor", 4, 50)
+    angle_window = ("taylor", 4, 30)
     # FFT oversampling factor. Increase to decrease interpolation error.
     fft_oversample = 1.5
     if torch.cuda.is_available():
@@ -49,12 +50,17 @@ if __name__ == "__main__":
     # Distance in radar data corresponding to zero actual distance
     # Slightly higher than zero due to antenna feedlines and other delays.
     d0 = 0.5
-    data_dtype = torch.complex64  # Can be `torch.complex32` to save VRAM
-    # Use fast factorized backprojection, slightly reduces the image quality
-    # but is faster.
-    ffbp = True
+    dtype = os.environ.get("DTYPE", "64")
+    if dtype == "64":
+        data_dtype = torch.complex64
+    elif dtype == "32":
+        data_dtype = torch.complex32
+    else:
+        raise ValueError(f"Unknown dtype {dtype}")
+    # Use fast factorized backprojection.
+    ffbp = os.environ.get("FFBP", "1") != "0"
     # Autofocus image to improve image quality.
-    autofocus = True
+    autofocus = os.environ.get("AUTOFOCUS", "1") != "0"
 
     c0 = 299792458
 
@@ -76,7 +82,9 @@ if __name__ == "__main__":
     counts = f_st.get_tensor("counts")[sweep_start:sweep_start+nsweeps]
 
     bw = mission["bw"]
-    fc = mission["fc"]
+    fcenter = mission["fc"]
+    # Backprojection phase reference for FMCW is at the sweep start
+    fc = fcenter - bw/2
     fs = mission["fsample"]
     origin_angle = mission["origin_angle"]
     tsweep = nsamples / fs
@@ -94,7 +102,7 @@ if __name__ == "__main__":
 
     # Calculate polar grid
     d = np.linalg.norm(pos[-1] - pos[0])
-    wl = c0 / fc
+    wl = c0 / (fcenter + bw/2)
     spacing = d / wl / nsweeps
     # Critically spaced array would be 0.25 wavelengths apart
     ntheta = int(1 + nsweeps * spacing * theta_limit / 0.25)
@@ -200,7 +208,7 @@ if __name__ == "__main__":
             grid_polar_autofocus, d0=d0,
             azimuth_divisions=8, range_divisions=8,
             algorithm="ffbp" if ffbp else "bp",
-            data_fmod=data_fmod, verbose=True
+            data_fmod=data_fmod, verbose=True,
         )
         synchronize()
         print(f"Autofocus done in {time.time() - tstart:.3g} s")

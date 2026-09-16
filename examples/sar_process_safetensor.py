@@ -2,6 +2,7 @@
 # Example SAR data processing script.
 # Sample data can be downloaded from: https://hforsten.com/sar.safetensors.zip
 import sys
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.signal as signal
@@ -87,18 +88,27 @@ if __name__ == "__main__":
     # Azimuth range in polar image in sin of radians. 1 for full 180 degrees.
     theta_limit = 1
     # Decrease the number of sweeps to speed up the calculation
-    nsweeps = 10000 # Max 51200
+    nsweeps = int(os.environ.get("NSWEEPS", "10000")) # Max 51200
     sweep_start = 0
     # Maximum number of autofocus iterations
     max_steps = 15
+    autofocus = os.environ.get("AUTOFOCUS", "1") != "0"
+    if not autofocus:
+        max_steps = 0
     # Maximum autofocus position update in wavelengths
     # Optimal value depends on the maximum error in the image
     max_step_limit = 0.5  # Try 5 with 50k sweeps
-    data_dtype = torch.complex64  # Can be `torch.complex32` to save VRAM
+    dtype = os.environ.get("DTYPE", "64")
+    if dtype == "64":
+        data_dtype = torch.complex64
+    elif dtype == "32":
+        raise ValueError(f"Unsupported dtype {dtype}")
+    else:
+        raise ValueError(f"Unknown dtype {dtype}")
 
     # Windowing functions
     range_window = "hamming"
-    angle_window = ("taylor", 4, 50)
+    angle_window = ("taylor", 4, 30)
     # FFT oversampling factor. Increase to decrease interpolation error.
     fft_oversample = 1.5
     dev = torch.device("cuda")
@@ -125,7 +135,8 @@ if __name__ == "__main__":
     del tensors
 
     bw = mission["bw"]
-    fc = mission["fc"]
+    fcenter = mission["fc"]
+    fc = fcenter - bw/2
     fs = mission["fsample"]
     origin_angle = mission["origin_angle"]
     tsweep = sweeps.shape[-1] / fs
@@ -143,7 +154,7 @@ if __name__ == "__main__":
 
     # Calculate polar grid
     d = np.linalg.norm(pos[-1] - pos[0])
-    wl = c0 / fc
+    wl = c0 / (fcenter + bw/2)
     spacing = d / wl / nsweeps
     # Critically spaced array would be 0.25 wavelengths apart
     ntheta = int(1 + nsweeps * spacing * theta_limit / 0.25)
