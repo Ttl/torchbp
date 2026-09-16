@@ -4,9 +4,10 @@ Instructions:
 
  1. Download the sample data from: https://hforsten.com/sar.safetensors.zip
  2. Unzip the file to this directory.
- 3. Run `sar_process_safetensor.py` (optimization based minimum entropy
-    autofocus) or `sar_process_safetensor_gpga.py` (generalized phase gradient
-    autofocus). It will process the file and display polar formatted image.
+ 3. Run `sar_process_safetensor_gpga.py` (generalized phase gradient autofocus,
+    fast and good quality output) or `sar_process_safetensor_min_entropy.py`
+    (optimization based minimum entropy autofocus, worse image quality and much
+    slower). It will process the file and display polar formatted image.
     Processed image is also saved to disk for next step.
  4. Run `sar_polar_to_cart.py` to display the previously saved image in Cartesian grid.
 

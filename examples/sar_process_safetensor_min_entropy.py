@@ -126,6 +126,7 @@ if __name__ == "__main__":
         mission, tensors = load_data(filename)
     except FileNotFoundError:
         print(f"Input file {filename} not found.")
+        sys.exit(1)
 
     sweeps = tensors["data"][sweep_start:sweep_start+nsweeps].to(dtype=torch.float32)
     pos = tensors["pos"][sweep_start:sweep_start+nsweeps].cpu().numpy()
