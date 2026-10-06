@@ -13,7 +13,7 @@ import torchbp
 from torchbp.util import make_polar_grid
 from torchbp.grid import PolarGrid, CartesianGrid
 from safetensors.torch import safe_open
-from sar_process_safetensor import grid_extent
+from sar_process_safetensor_min_entropy import grid_extent
 plt.style.use("ggplot")
 
 if __name__ == "__main__":
@@ -205,7 +205,7 @@ if __name__ == "__main__":
         tstart = time.time()
         sar_img, pos_new = torchbp.autofocus.gpga_tde(
             None, fsweeps, pos_centered, fc, r_res,
-            grid_polar_autofocus, d0=d0,
+            grid_polar_autofocus, fcenter=fcenter, d0=d0,
             azimuth_divisions=8, range_divisions=8,
             algorithm="ffbp" if ffbp else "bp",
             data_fmod=data_fmod, verbose=True,

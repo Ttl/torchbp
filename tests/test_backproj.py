@@ -7,7 +7,7 @@ import unittest
 import torchbp
 from torch import Tensor
 from random import uniform
-from conftest import requires_cuda
+from conftest import requires_cuda, C0, fmcw_scene
 
 
 class TestBackprojectionPolar(TestCase):
@@ -1708,3 +1708,65 @@ class TestGPGABackprojection2DLanczos(TestCase):
         self._opcheck("cuda")
 
 
+
+
+class TestFcConvention(TestCase):
+    """The kernel folds ``fc`` and ``data_fmod`` into one effective carrier
+    ``4*pi*fc/c - data_fmod/r_res``, so every ``(fc, data_fmod)`` pair with
+    the same effective carrier forms the same complex image, and the pixel
+    phase of a displaced target scales with the spectral center frequency
+    whatever ``fc`` was used (see docs/source/examples/fc_choice.ipynb).
+    """
+
+    device = "cpu"
+    fstart = 1.0e9
+    bw = 1.0e9
+    tsweep = 100e-6
+    fs = 20e6
+    nsweeps = 64
+    grid = {"r": (95.0, 105.0), "theta": (-0.15, 0.15), "nr": 200, "ntheta": 64}
+
+    def _scene(self, dx=0.0):
+        pos = torch.zeros(self.nsweeps, 3, device=self.device)
+        pos[:, 1] = torch.linspace(-self.nsweeps / 2, self.nsweeps / 2,
+                                   self.nsweeps, device=self.device)
+        pos[:, 1] *= 0.25 * C0 / (self.fstart + self.bw)
+        pos[:, 0] += dx
+        targets = torch.tensor([[100.0, 0.0, 0.0], [103.0, 5.0, 0.0]],
+                               device=self.device)
+        data, data_fmod, r_res = fmcw_scene(
+            targets, pos, self.fstart, self.bw, self.tsweep, self.fs)
+        return data, data_fmod, r_res, pos
+
+    def test_equal_effective_carrier_same_image(self):
+        data, fmod0, r_res, pos = self._scene()
+        ref = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fstart, r_res, pos, data_fmod=fmod0)[0]
+        for fc in (-1.0e9, 0.0, 1.5e9, 2.0e9):
+            fmod = fmod0 + 4 * np.pi * (fc - self.fstart) * r_res / C0
+            img = torchbp.ops.backprojection_polar_2d(
+                data, self.grid, fc, r_res, pos, data_fmod=fmod)[0]
+            rel = ((img - ref).abs().max() / ref.abs().max()).item()
+            self.assertLess(rel, 1e-3, f"fc={fc:.2e}: relative difference {rel:.2e}")
+
+    def test_pixel_phase_scales_with_spectral_center(self):
+        shift = 1e-3
+        data, fmod0, r_res, pos = self._scene()
+        data2, _, _, _ = self._scene(dx=shift)
+        fcenter = self.fstart + self.bw / 2
+        for fc in (self.fstart, fcenter):
+            fmod = fmod0 + 4 * np.pi * (fc - self.fstart) * r_res / C0
+            img = torchbp.ops.backprojection_polar_2d(
+                data, self.grid, fc, r_res, pos, data_fmod=fmod)[0]
+            img2 = torchbp.ops.backprojection_polar_2d(
+                data2, self.grid, fc, r_res, pos, data_fmod=fmod)[0]
+            i, j = divmod(torch.argmax(img.abs()).item(), img.shape[1])
+            dphi = torch.angle(img2[i, j] * img[i, j].conj()).item()
+            f_meas = dphi * C0 / (4 * np.pi * shift)
+            self.assertLess(abs(f_meas - fcenter) / fcenter, 0.02,
+                            f"fc={fc:.2e}: measured {f_meas:.4e} Hz")
+
+
+@requires_cuda
+class TestFcConventionCuda(TestFcConvention):
+    device = "cuda"

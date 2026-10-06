@@ -464,10 +464,29 @@ class TestCFBPAdaptive(TestCase):
         rel_plain = ((out_plain - ref).abs().max() / ref.abs().max()).item()
         self.assertGreater(rel_plain, 10 * rel)
 
+    def test_effective_carrier_convention(self):
+        # Same data with a shifted phase reference: (fc, data_fmod) pairs
+        # with equal keff = 4*fc/c - data_fmod/(pi*r_res) must give the same
+        # image, including the adaptive block layout.
+        data, pos = self._scene()
+        df = -1e8
+        fmod = 4 * np.pi * df * self.r_res / 299792458.0
+        ref = torchbp.ops.cfbp_adaptive(
+            data, self.grid, self.fc, self.r_res, pos, stages=4,
+            data_oversample=1.2
+        )
+        out = torchbp.ops.cfbp_adaptive(
+            data, self.grid, self.fc + df, self.r_res, pos, stages=4,
+            data_oversample=1.2, data_fmod=fmod
+        )
+        rel = ((out - ref).abs().max() / ref.abs().max()).item()
+        self.assertLess(rel, 1e-2, f"convention difference {rel:.2e}")
+
     def test_blocks(self):
         _, pos = self._scene()
+        keff = 4.0 * self.fc / 299792458.0
         blocks = torchbp.ops.cfbp_adaptive_blocks(
-            self.grid, pos, self.fc, self.r_res, stages=4, data_oversample=1.2
+            self.grid, pos, keff, self.r_res, stages=4, data_oversample=1.2
         )
         # Blocks cover all rows contiguously and density decreases with range.
         self.assertEqual(blocks[0][0], 0)

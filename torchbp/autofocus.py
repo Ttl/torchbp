@@ -371,7 +371,7 @@ def pga(
     max_targets: int | None = None,
     truncate: bool = True,
     grid: "PolarGrid | dict | None" = None,
-    fc: float | None = None,
+    fcenter: float | None = None,
     pos: Tensor | None = None,
     att: Tensor | None = None,
     g: Tensor | None = None,
@@ -454,8 +454,11 @@ def pga(
     grid : PolarGrid or dict or None
         Polar grid definition of the image. Required for antenna
         weighting.
-    fc : float or None
-        RF center frequency in Hz. Required for antenna weighting.
+    fcenter : float or None
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
+        Required for antenna weighting.
     pos : Tensor or None
         Platform positions the image was formed with. Shape:
         [npulses, 3]. The track is assumed near-linear along the y axis.
@@ -499,13 +502,13 @@ def pga(
     if antenna:
         if (
             grid is None
-            or fc is None
+            or fcenter is None
             or pos is None
             or att is None
             or g_extent is None
         ):
             raise ValueError(
-                "Antenna weighting requires grid, fc, pos, att, g and "
+                "Antenna weighting requires grid, fcenter, pos, att, g and "
                 "g_extent."
             )
         if not _grid_is_polar(grid):
@@ -583,7 +586,7 @@ def pga(
             # Per-target spectrum weight in the unrolled full-length layout,
             # combined with the global support mask.
             w_t = _antenna_spectrum_weights(
-                grid, fc, pos, att, g, g_extent, est_rows, rpeaks,
+                grid, fcenter, pos, att, g, g_extent, est_rows, rpeaks,
                 shifted=shifted, dem=dem,
             )
             if mask is not None:
@@ -689,7 +692,7 @@ def pga(
 def phase_to_pos(
     phi: Tensor,
     grid: "PolarGrid | dict",
-    fc: float,
+    fcenter: float,
     pos: Tensor,
     shifted: bool = True,
 ) -> Tensor:
@@ -698,7 +701,7 @@ def phase_to_pos(
     range-direction (x) platform position error at each pulse.
 
     A range-direction platform position error ``dx`` at a pulse creates a
-    phase error ``phi = (4 pi fc / c) * cos(az_c) * cos(el) * dx`` on the
+    phase error ``phi = (4 pi fcenter / c) * cos(az_c) * cos(el) * dx`` on the
     azimuth spectrum bin that the pulse maps to, where ``az_c`` is the
     grid center azimuth and ``el`` the elevation angle to the grid center
     (scene assumed at ``z = 0``). The azimuth spectrum bin of a pulse is
@@ -720,8 +723,10 @@ def phase_to_pos(
         Solved phase error from :func:`pga` in radians. Shape: [ntheta].
     grid : PolarGrid or dict
         Polar grid definition of the image the phase was solved from.
-    fc : float
-        RF center frequency in Hz.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     pos : Tensor
         Platform positions the image was formed with. Shape: [npulses, 3].
     shifted : bool
@@ -750,8 +755,8 @@ def phase_to_pos(
     dev = phi.device
     rdtype = phi.dtype
     pos = pos.to(device=dev, dtype=rdtype)
-    wl = C0 / fc
-    k_wave = 4 * torch.pi * fc / C0
+    wl = C0 / fcenter
+    k_wave = 4 * torch.pi * fcenter / C0
     if not shifted:
         phi = torch.fft.fftshift(phi)
     # Grid-center look geometry, scene assumed at z=0.
@@ -774,7 +779,7 @@ def phase_to_pos(
 def pga_xz(
     img: Tensor,
     grid: "PolarGrid | dict",
-    fc: float,
+    fcenter: float,
     h: float,
     range_divisions: int = 4,
     window_width: int | None = None,
@@ -806,7 +811,7 @@ def pga_xz(
     assumed at ``z = 0``), so the error decomposes over the image: at
     range row ``r`` and azimuth spectrum bin ``k``
 
-    ``phi(k, r) = (4 pi fc / c) * (cos(az_c) * cos(el(r)) * dx(k) + sin(el(r)) * dz(k))``
+    ``phi(k, r) = (4 pi fcenter / c) * (cos(az_c) * cos(el(r)) * dx(k) + sin(el(r)) * dz(k))``
 
     where ``az_c`` is the grid center azimuth. The profiles ``dx`` and
     ``dz`` are estimated by running the PGA estimator on blocks of range
@@ -849,8 +854,10 @@ def pga_xz(
         Complex input image on a polar grid. Shape: [range, azimuth].
     grid : PolarGrid or dict
         Polar grid definition of the image.
-    fc : float
-        RF center frequency in Hz.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     h : float
         Mean platform altitude above the scene plane in meters
         (e.g. ``torch.mean(pos[:, 2])``).
@@ -952,7 +959,7 @@ def pga_xz(
         raise ValueError("estimate_z requires range_divisions >= 2.")
     dev = img.device
     rdtype = img.real.dtype
-    k_wave = 4 * torch.pi * fc / C0
+    k_wave = 4 * torch.pi * fcenter / C0
     antenna = g is not None
     if antenna:
         if pos is None or att is None or g_extent is None:
@@ -1093,7 +1100,7 @@ def pga_xz(
                 # shifted=True of _antenna_spectrum_weights produces.
                 rows_b = torch.arange(b * rdiv, b1, device=dev)
                 w_t = _antenna_spectrum_weights(
-                    grid, fc, pos, att, g, g_extent, rows_b, rpeaks,
+                    grid, fcenter, pos, att, g, g_extent, rows_b, rpeaks,
                     shifted=True, dem=dem,
                 )
                 if est_weight is not None:
@@ -1365,7 +1372,7 @@ def _antenna_weights(
 
 def _antenna_spectrum_weights(
     grid: "PolarGrid | dict",
-    fc: float,
+    fcenter: float,
     pos: Tensor,
     att: Tensor,
     g: Tensor,
@@ -1390,8 +1397,10 @@ def _antenna_spectrum_weights(
     ----------
     grid : PolarGrid or dict
         Polar grid definition of the image.
-    fc : float
-        RF center frequency in Hz.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     pos : Tensor
         Platform positions, shape [npulses, 3], near-linear along y.
     att : Tensor
@@ -1417,7 +1426,7 @@ def _antenna_spectrum_weights(
     _, _, _, _, _, ntheta, _, dtheta = unpack_polar_grid(grid)
     dev = pos.device
     rdtype = pos.dtype
-    wl = C0 / fc
+    wl = C0 / fcenter
     target_pos = _pixel_to_world(grid, rows.to(rdtype), rpeaks.to(rdtype), dem)
     w = _antenna_weights(target_pos, pos, att, g, g_extent)
     ys, order = torch.sort(pos[:, 1])
@@ -1761,6 +1770,7 @@ def gpga(
     fc: float,
     r_res: float,
     grid: "PolarGrid | CartesianGrid | dict",
+    fcenter: float | None = None,
     algorithm: str = "bp",
     image_opts: dict | None = None,
     window_width: int | None = None,
@@ -1810,7 +1820,9 @@ def gpga(
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -1823,6 +1835,11 @@ def gpga(
           equivalent dict {"r": ..., "theta": ..., "nr": ..., "ntheta": ...}.
         - CartesianGrid object: CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny),
           or the equivalent dict {"x": ..., "y": ..., "nx": ..., "ny": ...}.
+    fcenter : float or None
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength
+        used to convert the solved phase to distance. Not necessarily the same
+        as ``fc``, which is a phase reference (see :doc:`/examples/fc_choice`).
+        Default None uses ``fc``.
     algorithm : str
         Image formation algorithm. For a polar grid: "bp"
         (:func:`torchbp.ops.backprojection_polar_2d`, default), "ffbp"
@@ -1930,8 +1947,12 @@ def gpga(
     img : Tensor
         Focused SAR image.
     phi : Tensor
-        Solved phase error.
+        Solved phase error in radians at the wavelength ``c / fcenter``:
+        ``torchbp.util.phase_to_distance(phi, fcenter)`` is the applied
+        range-direction position correction.
     """
+    if fcenter is None:
+        fcenter = fc
     # A lazy conjugate view (e.g. data straight from fft(...).conj()) is
     # materialized by the dispatcher on every custom-op call, which the
     # iteration loop makes hundreds of times; resolve it once. No-op for
@@ -2007,7 +2028,7 @@ def gpga(
         if remove_trend:
             phi_sum = weighted_detrend(phi_sum, beam_w)
         # Phase to distance
-        d = phi_sum * C0 / (4 * torch.pi * fc)
+        d = phi_sum * C0 / (4 * torch.pi * fcenter)
         pos_new[:, 0] = pos[:, 0] + d
 
         img = form_image(pos_new)
@@ -2026,6 +2047,7 @@ def gpga_tde(
     grid: "PolarGrid | CartesianGrid | dict",
     azimuth_divisions: int,
     range_divisions: int,
+    fcenter: float | None = None,
     algorithm: str = "bp",
     image_opts: dict | None = None,
     window_width: int | None = None,
@@ -2089,7 +2111,9 @@ def gpga_tde(
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -2100,6 +2124,11 @@ def gpga_tde(
         Number of divisions for local images in azimuth direction.
     range_divisions : int
         Number of divisions for local images in range direction.
+    fcenter : float or None
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength
+        used to convert the solved phase to distance. Not necessarily the same
+        as ``fc``, which is a phase reference (see :doc:`/examples/fc_choice`).
+        Default None uses ``fc``.
     algorithm : str
         Image formation algorithm. See :func:`gpga`.
     image_opts : dict or None
@@ -2271,6 +2300,8 @@ def gpga_tde(
     pos_new : Tensor
         Solved 3D position error.
     """
+    if fcenter is None:
+        fcenter = fc
     # A lazy conjugate view (e.g. data straight from fft(...).conj()) is
     # materialized by the dispatcher on every custom-op call, which the
     # iteration loop makes hundreds of times; resolve it once. No-op for
@@ -2338,7 +2369,7 @@ def gpga_tde(
     if h == 0:
         estimate_z = False
 
-    wl = C0 / fc
+    wl = C0 / fcenter
 
     if verbose:
         print("Iteration, Window width, RMS error")
@@ -2445,7 +2476,7 @@ def gpga_tde(
                 phi = unwrap(phi)
                 phi = weighted_detrend(phi, beam_w)
                 # Phase to distance
-                d = phi * C0 / (4 * torch.pi * fc)
+                d = phi * C0 / (4 * torch.pi * fcenter)
                 local_d[ir * azimuth_divisions + jr, :] = d
 
                 # Normalize to avoid overflow with near-noiseless targets.
@@ -2629,6 +2660,7 @@ def insar_rme_blocksvd(
     fc: float,
     r_res: float,
     grid_polar: "PolarGrid | dict",
+    fcenter: float | None = None,
     n_az_blocks: int = 32,
     n_r_blocks: int = 16,
     d0: float = 0.0,
@@ -2693,11 +2725,18 @@ def insar_rme_blocksvd(
         same grid as the slave will be reformed on; no master/slave image
         interpolation is performed.
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
     grid_polar : PolarGrid or dict
         Polar grid definition.
+    fcenter : float or None
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength
+        used to convert the solved phase to distance. Not necessarily the same
+        as ``fc``, which is a phase reference (see :doc:`/examples/fc_choice`).
+        Default None uses ``fc``.
     n_az_blocks, n_r_blocks : int
         Image tiling. The total number of blocks is the product. Use enough
         azimuth blocks to give multi-block coverage of every sweep
@@ -2788,6 +2827,8 @@ def insar_rme_blocksvd(
         Returned only when ``return_complex=True``. The RME phase is
         ``-angle(v_complex)`` (before mean removal and unwrapping).
     """
+    if fcenter is None:
+        fcenter = fc
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid_polar)
     device = data_s.device
     nsweeps_s = data_s.shape[0]
@@ -2945,7 +2986,7 @@ def insar_rme_blocksvd(
     phi = unwrap(phi)
     phi = phi - phi.mean()
 
-    d_corr = phi * (C0 / (4.0 * torch.pi * fc))
+    d_corr = phi * (C0 / (4.0 * torch.pi * fcenter))
     pos_s_new = pos_s.clone()
     pos_s_new[:, 0] = pos_s[:, 0] + d_corr
 
@@ -3000,7 +3041,7 @@ def _blocksvd_odd_channel(
 
 
 def _blocksvd_strata_phase(
-    s: int, v_s: Tensor, rc: float, fc: float, phi_lowpass: int,
+    s: int, v_s: Tensor, rc: float, fcenter: float, phi_lowpass: int,
     phi_per_strata: Tensor, dr_per_strata: Tensor, mag_per_strata: Tensor,
     strata_rc: Tensor, strata_valid: Tensor,
 ) -> None:
@@ -3024,7 +3065,7 @@ def _blocksvd_strata_phase(
         phi_s = unwrap(phi_raw)
     phi_s = phi_s - phi_s.mean()
     phi_per_strata[s] = phi_s
-    dr_per_strata[s] = phi_s * (C0 / (4.0 * torch.pi * fc))
+    dr_per_strata[s] = phi_s * (C0 / (4.0 * torch.pi * fcenter))
     mag_per_strata[s] = v_s.abs()
     strata_rc[s] = rc
     strata_valid[s] = True
@@ -3037,6 +3078,7 @@ def insar_rme_blocksvd_strata(
     fc: float,
     r_res: float,
     grid_polar: "PolarGrid | dict",
+    fcenter: float | None = None,
     n_strata: int = 8,
     n_az_blocks_per_strata: int = 32,
     strata_spacing: str = "elevation",
@@ -3097,6 +3139,11 @@ def insar_rme_blocksvd_strata(
     ----------
     data_s, pos_s, img_m, fc, r_res, grid_polar
         Same as :func:`insar_rme_blocksvd`.
+    fcenter : float or None
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength
+        used to convert the solved phase to distance. Not necessarily the same
+        as ``fc``, which is a phase reference (see :doc:`/examples/fc_choice`).
+        Default None uses ``fc``.
     n_strata : int
         Number of range strata. Should be >= 2 for XZ mode (more strata
         → more LS averaging, but each strata has fewer pixels).
@@ -3202,13 +3249,15 @@ def insar_rme_blocksvd_strata(
     phi_strata : Tensor [n_strata, nsweeps], optional
         Returned when ``return_phi_strata=True``.
     """
+    if fcenter is None:
+        fcenter = fc
     r0_full, r1_full, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(
         grid_polar
     )
     device = data_s.device
     nsweeps_s = data_s.shape[0]
     n_axes = 1 + int(estimate_z)
-    k_wave = 4.0 * torch.pi * fc / C0
+    k_wave = 4.0 * torch.pi * fcenter / C0
     z_map = None
     if dem is not None:
         if altitude is not None:
@@ -3342,7 +3391,7 @@ def insar_rme_blocksvd_strata(
 
         _bs = insar_rme_blocksvd(
             data_s, pos_s, img_m[i0:i1, :], fc, r_res, gp_s,
-            n_az_blocks=n_az_blocks_per_strata, n_r_blocks=1,
+            fcenter=fcenter, n_az_blocks=n_az_blocks_per_strata, n_r_blocks=1,
             d0=d0, data_fmod=data_fmod,
             row_weight="coherence", align_blocks=True,
             align_iters=align_iters,
@@ -3394,7 +3443,7 @@ def insar_rme_blocksvd_strata(
             if y_repass > 0:
                 y_cache.append((s, A_s, lever, g_even, lx_b, lz_b))
         _blocksvd_strata_phase(
-            s, v_s, rc, fc, phi_lowpass, phi_per_strata, dr_per_strata,
+            s, v_s, rc, fcenter, phi_lowpass, phi_per_strata, dr_per_strata,
             mag_per_strata, strata_rc, strata_valid)
 
         if verbose:
@@ -3564,7 +3613,7 @@ def insar_rme_blocksvd_strata(
                     y_num += w_y * dey_s
                     y_den += w_y
                 _blocksvd_strata_phase(
-                    s, v.conj(), rc, fc, phi_lowpass,
+                    s, v.conj(), rc, fcenter, phi_lowpass,
                     phi_per_strata, dr_per_strata, mag_per_strata,
                     strata_rc, strata_valid)
             ey_res = y_num / (y_den + 1e-30)
@@ -3731,6 +3780,7 @@ def insar_rme_multisquint(
     pos_s: Tensor,
     fc: float,
     grid_polar: "PolarGrid | dict",
+    fcenter: float | None = None,
     n_looks: int = 32,
     look_width: float = 2.0,
     n_r_bands: int = 4,
@@ -3816,9 +3866,16 @@ def insar_rme_multisquint(
         Slave platform positions [nsweeps, 3] in the backprojection frame.
         Along-track (Y) coordinates must be ascending.
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     grid_polar : PolarGrid or dict
         Polar grid definition.
+    fcenter : float or None
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength
+        of the sub-look band mapping and of the phase to distance conversion.
+        Not necessarily the same as ``fc``, which is a phase reference (see
+        :doc:`/examples/fc_choice`). Default None uses ``fc``.
     n_looks : int
         Number of squinted looks across the along-track extent. The
         recovered error profile has ``n_looks`` samples along the track,
@@ -3945,10 +4002,12 @@ def insar_rme_multisquint(
         Returned when ``return_phi_bands=True``. Last iteration's
         per-band RME phase.
     """
+    if fcenter is None:
+        fcenter = fc
     r0_full, r1_full, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(
         grid_polar
     )
-    wl = C0 / fc
+    wl = C0 / fcenter
     k = 4.0 * torch.pi / wl
     device = img_s.device
     nsweeps = pos_s.shape[0]
@@ -4533,7 +4592,9 @@ def minimum_entropy_grad_autofocus(
     pos : Tensor
         Position at each data sample.
     fc : float
-        RF frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -4561,9 +4622,10 @@ def minimum_entropy_grad_autofocus(
         Print progress during optimization.
     convergence_limit : float
         If maximum position change is below this value stop optimization.
-        Units in wavelengths.
+        Units of ``c / fc``; the limit is loose, so the phase reference
+        frequency is used in place of the center frequency.
     max_step_limit : float
-        Maximum step size in wavelengths.
+        Maximum step size in units of ``c / fc``.
     grad_limit_quantile : float
         Quantile used for maximum step size calculation.
         0 to 1 range.
@@ -4718,7 +4780,9 @@ def bp_polar_grad_minimum_entropy(
     pos : Tensor
         Position at each data sample.
     fc : float
-        RF frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -4746,9 +4810,10 @@ def bp_polar_grad_minimum_entropy(
         Print progress during optimization.
     convergence_limit : float
         If maximum position change is below this value stop optimization.
-        Units in wavelengths.
+        Units of ``c / fc``; the limit is loose, so the phase reference
+        frequency is used in place of the center frequency.
     max_step_limit : float
-        Maximum step size in wavelengths.
+        Maximum step size in units of ``c / fc``.
     grad_limit_quantile : float
         Quantile used for maximum step size calculation.
         0 to 1 range.
@@ -4807,7 +4872,9 @@ def bp_cart_grad_minimum_entropy(
     pos : Tensor
         Position at each data sample.
     fc : float
-        RF frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -4835,9 +4902,10 @@ def bp_cart_grad_minimum_entropy(
         Print progress during optimization.
     convergence_limit : float
         If maximum position change is below this value stop optimization.
-        Units in wavelengths.
+        Units of ``c / fc``; the limit is loose, so the phase reference
+        frequency is used in place of the center frequency.
     max_step_limit : float
-        Maximum step size in wavelengths.
+        Maximum step size in units of ``c / fc``.
     grad_limit_quantile : float
         Quantile used for maximum step size calculation.
         0 to 1 range.

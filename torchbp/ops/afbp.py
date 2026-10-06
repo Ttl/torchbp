@@ -218,7 +218,9 @@ def afbp(
         ntheta <= lambda_min / (2 * L / nsub)`` where ``L`` is the aperture
         length (checked, warns when violated).
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,

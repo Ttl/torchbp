@@ -87,7 +87,7 @@ def goldstein_filter(igram: Tensor, patch_size: int=64, w: int=3, alpha: float=1
     return filtered
 
 
-def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Tensor, fc: float, model: str = "layover") -> Tensor:
+def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Tensor, fcenter: float, model: str = "layover") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -101,8 +101,10 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
         3D antenna phase center location of the master image.
     origin2 : Tensor
         3D antenna phase center location of the slave image.
-    fc : float
-        RF center frequency in Hz.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     model : str
         Height-sensitivity model. ``"layover"`` (default): the scatterer
         imaged at a ground-plane pixel is the one whose master range equals
@@ -119,7 +121,7 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
     device = unw.device
 
     c0 = 299792458
-    wl = c0 / fc
+    wl = c0 / fcenter
 
     v1 = coords - origin1[:,None,None]
     v2 = coords - origin2[:,None,None]
@@ -144,7 +146,7 @@ def phase_to_elevation(unw: Tensor, coords: Tensor, origin1: Tensor, origin2: Te
     return z
 
 
-def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "PolarGrid | dict", model: str = "layover") -> Tensor:
+def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fcenter: float, grid: "PolarGrid | dict", model: str = "layover") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -156,8 +158,10 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
         3D antenna phase center location of the master image.
     origin2 : Tensor
         3D antenna phase center location of the slave image.
-    fc : float
-        RF center frequency in Hz.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     grid : PolarGrid or dict
         Image grid definition. PolarGrid object or dictionary.
     model : str
@@ -181,10 +185,10 @@ def phase_to_elevation_polar(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: 
     theta = theta0 + dtheta * torch.arange(ntheta, device=device)
     coords = torch.stack([r[:,None] * torch.sqrt(1 - theta**2)[None,:], r[:,None] * theta[None,:], torch.zeros_like(unw)])
 
-    return phase_to_elevation(unw, coords, origin1, origin2, fc, model=model)
+    return phase_to_elevation(unw, coords, origin1, origin2, fcenter, model=model)
 
 
-def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float, grid: "CartesianGrid | dict", model: str = "layover") -> Tensor:
+def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fcenter: float, grid: "CartesianGrid | dict", model: str = "layover") -> Tensor:
     """
     Convert phase unwrapped interferogram to elevation.
 
@@ -196,8 +200,10 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
         3D antenna phase center location of the master image.
     origin2 : Tensor
         3D antenna phase center location of the slave image.
-    fc : float
-        RF center frequency in Hz.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     grid : CartesianGrid or dict
         Image grid definition. CartesianGrid object or dictionary.
     model : str
@@ -223,17 +229,27 @@ def phase_to_elevation_cart(unw: Tensor, origin1: Tensor, origin2: Tensor, fc: f
         dtype=x.dtype)], indexing="ij"))
     coords = coords[..., 0]
 
-    return phase_to_elevation(unw, coords, origin1, origin2, fc, model=model)
+    return phase_to_elevation(unw, coords, origin1, origin2, fcenter, model=model)
 
 
 def flat_earth_phase_polar(origin1: Tensor, origin2: Tensor, fc: float, grid: "PolarGrid | dict") -> Tensor:
     """
     Compute flat earth interferometric phase for a polar grid.
 
-    For images formed by backprojection on a flat (z=0) grid, the
-    interferometric phase contains baseline geometry fringes even over
-    flat terrain. This function computes that phase so it can be removed,
-    isolating the topographic signal.
+    Images backprojected onto the flat (z=0) grid without dealiasing have
+    no flat-earth phase: the phase compensation of each image already
+    removes the range to its own origin, so the interferogram
+    ``img1 * conj(img2)`` of flat terrain is zero and only the topographic
+    signal remains. Images dealiased with
+    :func:`torchbp.util.bp_polar_range_dealias`, each with its own origin,
+    carry the dealias ramps and their interferogram over flat terrain is
+    ``-flat_earth_phase_polar(origin1, origin2, fc, grid)``; add the
+    returned phase to flatten it. Dealiasing both images with the same
+    origin also leaves no flat-earth phase.
+
+    The sign is the traditional convention, opposite to the backprojection
+    interferogram, consistent with the negation in
+    :func:`phase_to_elevation`.
 
     Parameters
     ----------
@@ -242,7 +258,10 @@ def flat_earth_phase_polar(origin1: Tensor, origin2: Tensor, fc: float, grid: "P
     origin2 : Tensor
         3D antenna phase center of the slave image [x, y, z].
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency the images were dealiased with, i.e. the
+        ``fc`` given to :func:`torchbp.util.bp_polar_range_dealias`. This is
+        the backprojection phase reference, not the transmitted center
+        frequency (see :doc:`/examples/fc_choice`).
     grid : PolarGrid or dict
         Polar grid definition.
 
@@ -269,6 +288,9 @@ def flat_earth_phase_cart(origin1: Tensor, origin2: Tensor, fc: float, grid: "Ca
     """
     Compute flat earth interferometric phase for a Cartesian grid.
 
+    See :func:`flat_earth_phase_polar`: only images dealiased with their
+    own origins carry this phase, with the opposite sign.
+
     Parameters
     ----------
     origin1 : Tensor
@@ -276,7 +298,10 @@ def flat_earth_phase_cart(origin1: Tensor, origin2: Tensor, fc: float, grid: "Ca
     origin2 : Tensor
         3D antenna phase center of the slave image [x, y, z].
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency the images were dealiased with, i.e. the
+        ``fc`` given to :func:`torchbp.util.bp_polar_range_dealias`. This is
+        the backprojection phase reference, not the transmitted center
+        frequency (see :doc:`/examples/fc_choice`).
     grid : CartesianGrid or dict
         Cartesian grid definition.
 
@@ -298,7 +323,7 @@ def flat_earth_phase_cart(origin1: Tensor, origin2: Tensor, fc: float, grid: "Ca
 
 
 def elevation_to_phase_slant_polar(
-    z: "Tensor | float", origin1: Tensor, origin2: Tensor, fc: float,
+    z: "Tensor | float", origin1: Tensor, origin2: Tensor, fcenter: float,
     grid: "PolarGrid | dict"
 ) -> Tensor:
     """
@@ -306,11 +331,16 @@ def elevation_to_phase_slant_polar(
 
     For scatterers at height z above the imaging plane::
 
-        phi = (4pi fc/c0)*(r1 − r2)
+        phi = (4pi fcenter/c0)*(r1 − r2)
 
     where r_n = slant range in nth image
 
-    Reduces to :func:`flat_earth_phase_polar` when z = 0.
+    Traditional slant-range model with a single physical wavelength. Its
+    ``z = 0`` value is the flat-earth phase of that model, which is not the
+    flat-earth phase of a dealiased backprojection interferogram
+    (:func:`flat_earth_phase_polar` evaluated with the image ``fc``); only
+    the topographic difference ``phi(z) - phi(0)`` is used by
+    :func:`phase_to_elevation_slant_polar`.
 
     Parameters
     ----------
@@ -320,8 +350,10 @@ def elevation_to_phase_slant_polar(
         Master APC [x, y, z].
     origin2 : Tensor
         Slave APC [x, y, z].
-    fc : float
-        RF center frequency (Hz).
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     grid : PolarGrid or dict
         Polar grid definition.
 
@@ -341,11 +373,11 @@ def elevation_to_phase_slant_polar(
     c0 = 299792458
     d1 = torch.sqrt((x - origin1[0]) ** 2 + (y - origin1[1]) ** 2 + (origin1[2] - z) ** 2)
     d2 = torch.sqrt((x - origin2[0]) ** 2 + (y - origin2[1]) ** 2 + (origin2[2] - z) ** 2)
-    return 4 * torch.pi * fc / c0 * (d1 - d2)
+    return 4 * torch.pi * fcenter / c0 * (d1 - d2)
 
 
 def phase_to_elevation_slant_polar(
-    unw: Tensor, origin1: Tensor, origin2: Tensor, fc: float,
+    unw: Tensor, origin1: Tensor, origin2: Tensor, fcenter: float,
     grid: "PolarGrid | dict", n_iter: int = 5
 ) -> Tensor:
     """
@@ -367,8 +399,10 @@ def phase_to_elevation_slant_polar(
         Master APC [x, y, z].
     origin2 : Tensor
         Slave APC [x, y, z].
-    fc : float
-        RF center frequency (Hz).
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     grid : PolarGrid or dict
         Polar grid definition.
     n_iter : int
@@ -383,9 +417,9 @@ def phase_to_elevation_slant_polar(
     # phase_to_elevation_polar uses z = -wl*unw/(4*pi*sens) which has
     # a negation for the BP conjugate-phase convention. Here the
     # phase is in the direct convention, so negate the initial guess.
-    z = -phase_to_elevation_polar(unw, origin1, origin2, fc, grid)
+    z = -phase_to_elevation_polar(unw, origin1, origin2, fcenter, grid)
 
-    phi_flat = elevation_to_phase_slant_polar(0.0, origin1, origin2, fc, grid)
+    phi_flat = elevation_to_phase_slant_polar(0.0, origin1, origin2, fcenter, grid)
 
     r0, r1, theta0, theta1, nr, ntheta, dr, dtheta = unpack_polar_grid(grid)
     device = unw.device
@@ -395,7 +429,7 @@ def phase_to_elevation_slant_polar(
     y = r[:, None] * theta[None, :]
 
     c0 = 299792458
-    k = 4 * torch.pi * fc / c0
+    k = 4 * torch.pi * fcenter / c0
     a1 = (x - origin1[0]) ** 2 + (y - origin1[1]) ** 2
     a2 = (x - origin2[0]) ** 2 + (y - origin2[1]) ** 2
 

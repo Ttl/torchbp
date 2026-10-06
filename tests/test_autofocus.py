@@ -3,7 +3,7 @@ import torch
 from torch.testing._internal.common_utils import TestCase
 import torchbp
 
-from conftest import requires_cuda
+from conftest import requires_cuda, C0, fmcw_scene
 
 
 class TestInsarRmeBlocksvd(TestCase):
@@ -1252,6 +1252,132 @@ class TestPhaseToPos(TestCase):
         self.assertLess((dx_est - dx_est2).abs().max().item(), 1e-5)
 
 
+class _FmcwAutofocusScene:
+    """Sweep-start referenced FMCW data of a few point targets on a slightly
+    non-linear track with a sinusoidal x position error. The spectral center
+    ``fcenter = fstart + bw / 2`` differs from the phase reference ``fstart``
+    by a factor of 1.5 (1 GHz sweep starting at 1 GHz), so a phase to
+    distance conversion with the wrong frequency fails clearly.
+    """
+
+    fstart = 1.0e9
+    bw = 1.0e9
+    tsweep = 100e-6
+    fs = 20e6
+    nsweeps = 128
+    grid = {"r": (90.0, 110.0), "theta": (-0.2, 0.2), "nr": 200,
+            "ntheta": 128}
+    dx_amp = 8e-3
+
+    @property
+    def fcenter(self):
+        return self.fstart + self.bw / 2
+
+    def _scene(self):
+        n = self.nsweeps
+        t = torch.arange(n) / n
+        pos = torch.zeros(n, 3)
+        pos[:, 1] = torch.linspace(-n / 2, n / 2, n) * (
+            0.25 * C0 / (self.fstart + self.bw)) * (
+            1 + 0.05 * torch.sin(2 * torch.pi * t))
+        pos[:, 0] = 0.05 * torch.sin(torch.pi * t)
+        dx = self.dx_amp * torch.sin(2 * torch.pi * 2 * t + 0.5)
+        pos_true = pos.clone()
+        pos_true[:, 0] += dx
+        # Five well separated targets; more targets with overlapping range
+        # profiles degrade the gpga estimate for reasons unrelated to fc.
+        targets = torch.tensor(
+            [[100.0, 0.0, 0.0], [105.0, 10.0, 0.0], [97.0, -5.0, 0.0],
+             [102.0, -10.0, 0.0], [95.0, 5.0, 0.0]])
+        wa = torch.hamming_window(n, periodic=False)
+        data, data_fmod, r_res = fmcw_scene(
+            targets, pos_true, self.fstart, self.bw, self.tsweep, self.fs,
+            wa=wa)
+        return data, data_fmod, r_res, pos, dx
+
+    @staticmethod
+    def _detrend_on(x, u):
+        A = torch.stack([torch.ones_like(u), u], dim=1)
+        sol = torch.linalg.lstsq(A, x[:, None]).solution
+        return x - (A @ sol)[:, 0]
+
+    def _residual(self, dx_est, dx, u):
+        """Detrended rms residual relative to the detrended true error."""
+        r = self._detrend_on(dx - dx_est, u).pow(2).mean().sqrt()
+        return (r / self._detrend_on(dx, u).pow(2).mean().sqrt()).item()
+
+
+class TestPhaseToPosFcenter(_FmcwAutofocusScene, TestCase):
+    """phase_to_pos must be given the spectral center frequency, not the
+    phase reference the image was formed with."""
+
+    fstart = 2.0e9  # fcenter / fstart = 1.25
+
+    def test_fcenter_recovers_fstart_does_not(self):
+        torch.manual_seed(1)
+        data, data_fmod, r_res, pos, dx = self._scene()
+        img = torchbp.ops.backprojection_polar_2d(
+            data, self.grid, self.fstart, r_res, pos, dealias=True,
+            data_fmod=data_fmod)[0]
+        img = torchbp.util.shift_spectrum(img)
+        _, phi = torchbp.autofocus.pga(img, estimator="wls")
+        u = pos[:, 1]
+        dx_c = torchbp.autofocus.phase_to_pos(phi, self.grid, self.fcenter, pos)
+        dx_s = torchbp.autofocus.phase_to_pos(phi, self.grid, self.fstart, pos)
+        res_c = self._residual(dx_c, dx, u)
+        res_s = self._residual(dx_s, dx, u)
+        self.assertLess(res_c, 0.4, f"fcenter residual {res_c:.2f}")
+        self.assertGreater(res_s, 0.5, f"fstart residual {res_s:.2f}")
+
+
+class TestGpgaFcenter(_FmcwAutofocusScene, TestCase):
+    """gpga and gpga_tde convert phase to distance with ``fcenter``. With it
+    a pure x error is solved in one iteration and the returned phase of
+    gpga is in ``fcenter`` units; with the default ``fcenter = fc`` and
+    sweep-start data the single-step correction is scaled by
+    ``fcenter / fc``."""
+
+    def test_gpga_single_step(self):
+        torch.manual_seed(2)
+        data, data_fmod, r_res, pos, dx = self._scene()
+        u = pos[:, 1]
+        common = dict(max_iters=1, target_threshold_db=15, data_fmod=data_fmod)
+        _, phi = torchbp.autofocus.gpga(
+            None, data, pos, self.fstart, r_res, self.grid,
+            fcenter=self.fcenter, **common)
+        d = torchbp.util.phase_to_distance(phi, self.fcenter)
+        res = self._residual(d, dx, u)
+        self.assertLess(res, 0.3, f"gpga(fcenter) residual {res:.2f}")
+
+        # Default fcenter = fc: phi is in fc units and the applied step is
+        # 1.5x too large.
+        _, phi_fc = torchbp.autofocus.gpga(
+            None, data, pos, self.fstart, r_res, self.grid, **common)
+        d_fc = torchbp.util.phase_to_distance(phi_fc, self.fstart)
+        res_fc = self._residual(d_fc, dx, u)
+        self.assertGreater(res_fc, 0.35, f"gpga(fc) residual {res_fc:.2f}")
+        # Same phase estimate, only the conversion differs.
+        d_fc_c = torchbp.util.phase_to_distance(phi_fc, self.fcenter)
+        self.assertLess(self._residual(d_fc_c, dx, u), 0.3)
+
+    def test_gpga_tde_single_step(self):
+        torch.manual_seed(3)
+        data, data_fmod, r_res, pos, dx = self._scene()
+        u = pos[:, 1]
+        common = dict(azimuth_divisions=2, range_divisions=2, max_iters=1,
+                      estimate_z=False, target_threshold_db=15,
+                      data_fmod=data_fmod)
+        _, pos_new = torchbp.autofocus.gpga_tde(
+            None, data, pos, self.fstart, r_res, self.grid,
+            fcenter=self.fcenter, **common)
+        res = self._residual(pos_new[:, 0] - pos[:, 0], dx, u)
+        self.assertLess(res, 0.3, f"gpga_tde(fcenter) residual {res:.2f}")
+        _, pos_fc = torchbp.autofocus.gpga_tde(
+            None, data, pos, self.fstart, r_res, self.grid, **common)
+        res_fc = self._residual(pos_fc[:, 0] - pos[:, 0], dx, u)
+        self.assertGreater(res_fc, 0.35, f"gpga_tde(fc) residual {res_fc:.2f}")
+
+
 # ----------------------------------------------------------------------
 # CUDA re-runs.
 #
@@ -1386,4 +1512,14 @@ class TestGpgaDemCuda(_OnCuda, TestGpgaDem):
 
 @requires_cuda
 class TestPhaseToPosCuda(_OnCuda, TestPhaseToPos):
+    pass
+
+
+@requires_cuda
+class TestPhaseToPosFcenterCuda(_OnCuda, TestPhaseToPosFcenter):
+    pass
+
+
+@requires_cuda
+class TestGpgaFcenterCuda(_OnCuda, TestGpgaFcenter):
     pass

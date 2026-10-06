@@ -150,7 +150,8 @@ def polar_interp(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Angle rotation to apply in radians.
     grid_polar_new : dict, optional
@@ -262,7 +263,8 @@ def polar_interp_linear(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Angle rotation to apply in radians.
     grid_polar_new : dict, optional
@@ -316,7 +318,8 @@ def polar_interp_lanczos(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Angle rotation to apply in radians.
     grid_polar_new : dict, optional
@@ -506,7 +509,8 @@ def ffbp_merge2_lanczos(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     grid_polar_new : dict, optional
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
@@ -617,7 +621,8 @@ def ffbp_merge2_knab(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     grid_polar_new : dict, optional
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
@@ -745,7 +750,8 @@ def ffbp_merge2_poly(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     grid_polar_new : dict, optional
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
@@ -909,7 +915,8 @@ def ffbp_merge2_poly_weighted(
     grid_polars : list of PolarGrid or dict
         List of polar grid definitions for each input image.
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     grid_polar_new : PolarGrid or dict, optional
         Grid definition of the output image.
     z0 : float
@@ -1110,7 +1117,8 @@ def ffbp_merge2(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     grid_polar_new : dict, optional
         Grid definition of the new image.
         If None uses the same grid as input, but with double the angle points.
@@ -1306,7 +1314,8 @@ def polar_to_cart(
         - CartesianGrid object: ``CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny)``
         - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Polar origin rotation angle.
     method : str or tuple
@@ -1393,7 +1402,8 @@ def polar_to_cart_linear(
         - CartesianGrid object: ``CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny)``
         - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Polar origin rotation angle.
     alias_fmod : float
@@ -1447,7 +1457,8 @@ def polar_to_cart_lanczos(
         - CartesianGrid object: ``CartesianGrid(x_range=(x0, x1), y_range=(y0, y1), nx=nx, ny=ny)``
         - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Polar origin rotation angle.
     order : int
@@ -1538,7 +1549,8 @@ def cart_to_polar(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Polar origin rotation angle.
     alias_fmod : float
@@ -1625,7 +1637,8 @@ def cart_to_polar_linear(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Polar origin rotation angle.
     alias_fmod : float
@@ -1681,7 +1694,8 @@ def cart_to_polar_lanczos(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view)
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     rotation : float
         Polar origin rotation angle.
     alias_fmod : float

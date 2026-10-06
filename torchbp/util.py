@@ -30,7 +30,8 @@ def bp_polar_range_dealias(
     origin : Tensor
         Center of the platform position.
     fc : float
-        RF center frequency.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     grid_polar : PolarGrid or dict
         Polar grid definition. Can be:
 
@@ -119,7 +120,8 @@ def bp_polar_range_alias(
     origin : Tensor
         Center of the platform position.
     fc : float
-        RF center frequency.
+        Phase reference frequency in Hz that the image was formed with, the
+        same ``fc`` that was passed to backprojection.
     grid_polar : PolarGrid or dict
         Polar grid definition. Can be:
 
@@ -661,7 +663,9 @@ def generate_fmcw_data(
         [nsweeps, 3] tensor of platform positions. When `vel` is provided,
         `pos[s]` is the platform position at the midpoint of sweep `s`.
     fc : float
-        RF center frequency in Hz.
+        Frequency at the first sample of the sweep in Hz. The generated data are
+        phase referenced to it, so pass the same value as ``fc`` to
+        backprojection.
     bw : float
         RF bandwidth in Hz.
     tsweep : float
@@ -945,19 +949,26 @@ def polar_dem_slopes(
     return torch.stack([dem, dzdx, dzdy]).contiguous()
 
 
-def phase_to_distance(p: Tensor, fc: float) -> Tensor:
+def phase_to_distance(p: Tensor, fcenter: float) -> Tensor:
     """
     Convert radar reflection phase shift to distance.
+
+    The phase must be read at a fixed image position: the phase of a
+    backprojection pixel changes by ``4*pi*fcenter*dR/c`` when the target
+    moves by ``dR`` in line-of-sight, for any phase reference ``fc`` the
+    image was formed with (see :doc:`/examples/fc_choice`).
 
     Parameters
     ----------
     p : Tensor
         Phase shift tensor.
-    fc : float
-        RF center frequency.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference.
     """
     c0 = 299792458
-    return c0 * p / (4 * torch.pi * fc)
+    return c0 * p / (4 * torch.pi * fcenter)
 
 def taper_antenna_pattern(
     g: Tensor,

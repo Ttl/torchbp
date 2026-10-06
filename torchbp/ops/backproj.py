@@ -189,7 +189,12 @@ def backprojection_polar_2d(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency in Hz, the carrier of the per-pixel phase
+        compensation ``exp(+j*4*pi*fc*R/c)``. Must match the phase reference of
+        the range-compressed data, which is not necessarily the RF center
+        frequency: for FMCW data range compressed with a plain FFT it is the
+        frequency at the first ADC sample (the sweep start frequency). See
+        :doc:`/examples/fc_choice`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -367,7 +372,9 @@ def backprojection_polar_2d_lanczos(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -464,7 +471,9 @@ def backprojection_polar_2d_knab(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -570,7 +579,9 @@ def backprojection_cart_2d(
         - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
 
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -696,7 +707,9 @@ def projection_cart_2d(
         - dict: ``{"x": (x0, x1), "y": (y0, y1), "nx": nx, "ny": ny}``
 
     fc : float
-        RF center frequency in Hz.
+        Frequency at the first sample of the sweep in Hz. The generated data are
+        phase referenced to it, so pass the same value as ``fc`` to
+        backprojection.
     fs : float
         Sampling frequency in Hz.
     gamma : float
@@ -856,7 +869,9 @@ def gpga_backprojection_2d_core(
     pos : Tensor
         Position of the platform at each data point. Shape should be [nsweeps, 3].
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -968,7 +983,9 @@ def blocksvd_alpha(
         half-open index ranges into ``img``; ``alpha[b, m]`` is zero for
         sweeps outside ``[sweep_lo, sweep_hi)``.
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
     r0, dr, theta0, dtheta : float
@@ -1511,7 +1528,7 @@ def backprojection_polar_2d_resolution(
     g: Tensor,
     g_extent: list,
     grid: "PolarGrid | dict",
-    fc: float,
+    fcenter: float,
     pos: Tensor,
     att: Tensor,
     altitude: float = 0.0,
@@ -1534,8 +1551,10 @@ def backprojection_polar_2d_resolution(
         ``[el0, az0, el1, az1]`` angular extent of ``g`` in radians.
     grid : PolarGrid or dict
         Polar grid definition, ``theta`` is the sine of the azimuth angle.
-    fc : float
-        Radar center frequency (Hz). Used for the wavelength ``c/fc``.
+    fcenter : float
+        Center frequency of the transmitted spectrum in Hz, sets the wavelength.
+        Not necessarily the same as the backprojection ``fc``, which is a phase
+        reference (see :doc:`/examples/fc_choice`).
     pos : Tensor
         Platform position per sweep, shape: [nsweeps, 3] or [nbatch, nsweeps, 3].
     att : Tensor
@@ -1571,7 +1590,7 @@ def backprojection_polar_2d_resolution(
 
     device = g.device
     dtype = g.dtype
-    wl = 299792458.0 / fc
+    wl = 299792458.0 / fcenter
 
     g_el0, g_az0, g_el1, g_az1 = g_extent
     g_nel, g_naz = g.shape

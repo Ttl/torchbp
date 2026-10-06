@@ -263,7 +263,9 @@ def cfbp(
 
         The grid should be oversampled for good interpolation accuracy.
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -384,7 +386,7 @@ def _k_bucket(k: int) -> int:
 def cfbp_adaptive_blocks(
     grid: "CartesianGrid | dict",
     pos: Tensor,
-    fc: float,
+    keff: float,
     r_res: float,
     stages: int,
     divisions: int = 2,
@@ -398,9 +400,11 @@ def cfbp_adaptive_blocks(
     For every output row (ground range x) the demodulated subaperture image
     y-bandwidth is estimated at each recursion level as::
 
-        B(l, rho) = (2*fc/c) * l / sqrt((l/2)**2 + rho**2) + sin_max / (data_oversample * r_res)
+        B(l, rho) = (keff/2) * l / sqrt((l/2)**2 + rho**2) + sin_max / (data_oversample * r_res)
 
-    where ``l`` is the subaperture length at that level, ``rho = sqrt(x**2 +
+    where ``keff = 4*fc/c - data_fmod/(pi*r_res)`` is the effective range
+    wavenumber of the data in cycles per meter (``4*fcenter/c`` for centered
+    data), ``l`` is the subaperture length at that level, ``rho = sqrt(x**2 +
     h**2)`` is the closest slant distance from the row to the track line, and
     ``sin_max`` is the largest angle of arrival at the row. The first term is
     the subaperture angular extent seen from the pixel (saturates for long
@@ -442,7 +446,7 @@ def cfbp_adaptive_blocks(
         n //= divisions
         s_max += 1
 
-    kc = 2.0 * fc / kC0  # cycles/m per unit sin(theta)
+    kc = 0.5 * keff  # cycles/m per unit sin(theta)
     b_env = 1.0 / (r_res * data_oversample)
 
     x = x0 + dx * torch.arange(nx, dtype=torch.float64)
@@ -546,8 +550,9 @@ def cfbp_adaptive(
     data = _materialize(data)
     x0, x1, y0, y1, nx, ny, dx, dy = unpack_cartesian_grid(grid)
 
+    keff = 4.0 * fc / kC0 - data_fmod / (torch.pi * r_res)
     blocks = cfbp_adaptive_blocks(
-        grid, pos, fc, r_res, stages, divisions, oversample_y, data_oversample,
+        grid, pos, keff, r_res, stages, divisions, oversample_y, data_oversample,
         merge_cost
     )
 

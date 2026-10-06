@@ -269,7 +269,9 @@ def ffbp(
 
         where ``theta`` represents sin of angle (-1, 1 for 180 degree view).
     fc : float
-        RF center frequency in Hz.
+        Phase reference frequency of the range-compressed data in Hz, not
+        necessarily the RF center frequency. See
+        :func:`torchbp.ops.backprojection_polar_2d`.
     r_res : float
         Range bin resolution in data (meters).
         For FMCW radar: c/(2*bw*oversample), where c is speed of light, bw is sweep bandwidth,
@@ -726,7 +728,7 @@ def _subaperture_gain_apply(
 
 
 def _nearfield_spread(m2: float, rp: float, tp: float, z0: float,
-                      dr_child: float, fc: float) -> float:
+                      dr_child: float, krc: float) -> float:
     """Worst-case local range-frequency spread (radians per range sample) of
     a subaperture image's content at pixel (rp, tp).
 
@@ -738,8 +740,12 @@ def _nearfield_spread(m2: float, rp: float, tp: float, z0: float,
     shift is compensated by the merge kernels (ffbp_merge2_range_fmod), but
     the spread cannot be removed pointwise. When it exceeds the sampling
     margin the merge interpolation of that subaperture aliases.
+
+    ``krc`` is the effective range wavenumber of the data,
+    ``4*pi*fc/c - data_fmod/r_res`` (the spectral center for centered
+    data), not the phase reference ``fc`` alone.
     """
-    k = 4.0 * math.pi * fc / 299792458.0
+    k = abs(krc)
     h = math.sqrt(3.0 * max(m2, 0.0))
     A = rp * rp + z0 * z0
     A15 = A * math.sqrt(max(A, 1e-12))
@@ -749,11 +755,11 @@ def _nearfield_spread(m2: float, rp: float, tp: float, z0: float,
 
 
 def _nearfield_spread_max(m2: float, rp: float, t0: float, t1: float,
-                          z0: float, dr_child: float, fc: float) -> float:
+                          z0: float, dr_child: float, krc: float) -> float:
     """Maximum of _nearfield_spread over the grid theta extent (the odd term
     peaks at the theta edges, the even term near broadside)."""
     tps = (0.0, 0.5 * abs(t0), 0.5 * abs(t1), abs(t0), abs(t1))
-    return max(_nearfield_spread(m2, rp, tp, z0, dr_child, fc) for tp in tps)
+    return max(_nearfield_spread(m2, rp, tp, z0, dr_child, krc) for tp in tps)
 
 
 def _ffbp_impl(
@@ -867,8 +873,9 @@ def _ffbp_impl(
         # Deeper levels divide the aperture (and so the variance) by
         # divisions^2 per level (uniform pulse spacing approximation).
         m2_l1 = m2_all / divisions ** 2
+        krc_nf = 4.0 * math.pi * fc / 299792458.0 - data_fmod / r_res
         if _nearfield_spread_max(m2_l1, r0_g, t0_g, t1_g, z0_g,
-                                 dr_child_nf, fc) > nf_thr:
+                                 dr_child_nf, krc_nf) > nf_thr:
             # First row where the normal tree's final-merge children are
             # cleanly interpolable; rows below it get re-assembled.
             nr_g = grid["nr"]
@@ -876,7 +883,7 @@ def _ffbp_impl(
             row = 0
             while row < nr_g and _nearfield_spread_max(
                     m2_l1, r0_g + dr_g * row, t0_g, t1_g, z0_g,
-                    dr_child_nf, fc) > nf_thr:
+                    dr_child_nf, krc_nf) > nf_thr:
                 row += step
             nf_band_nr = min(row + step, nr_g)
             # Assembly depth: smallest extra depth whose subapertures are
@@ -886,11 +893,11 @@ def _ffbp_impl(
                    and divisions ** (2 + nf_extra) * 2 <= nsweeps
                    and _nearfield_spread_max(
                        m2_all / divisions ** (2 * (1 + nf_extra)), r0_g,
-                       t0_g, t1_g, z0_g, dr_child_nf, fc) > nf_thr):
+                       t0_g, t1_g, z0_g, dr_child_nf, krc_nf) > nf_thr):
                 nf_extra += 1
             if _nearfield_spread_max(
                     m2_all / divisions ** (2 * (1 + nf_extra)), r0_g,
-                    t0_g, t1_g, z0_g, dr_child_nf, fc) > nf_thr:
+                    t0_g, t1_g, z0_g, dr_child_nf, krc_nf) > nf_thr:
                 warn(f"ffbp: near-field criterion still exceeded at "
                      f"r={r0_g:.1f} m with the deepest available "
                      f"subaperture split ({divisions ** (1 + nf_extra)} "

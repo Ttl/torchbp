@@ -248,10 +248,11 @@ if __name__ == "__main__":
                     device=dev, dtype=torch.float32)[None,:]
             pos_centered = pos - origin
             sar_img, phi = torchbp.autofocus.gpga(None, fsweeps,
-                    pos_centered, fc, r_res, grid_polar_autofocus,
+                    pos_centered, fc, r_res, grid_polar_autofocus, fcenter=fcenter,
                     window_width=nsweeps//8, d0=d0, target_threshold_db=20, data_fmod=data_fmod)
 
-            d = torchbp.util.phase_to_distance(phi, fc)
+            # phi is in units of the wavelength c/fcenter, same as the gpga correction.
+            d = torchbp.util.phase_to_distance(phi, fcenter)
             d -= torch.mean(d)
             pos[:,0] = pos[:,0] + d
 
